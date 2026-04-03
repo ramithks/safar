@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     # Job queue
     redis_url: str = "redis://localhost:6379/0"
 
+    # GCP Cloud Storage — videos and frames
+    gcs_bucket_name: Optional[str] = None
+
+    # Supabase — persistent job results
+    supabase_url: Optional[str] = None
+    supabase_service_key: Optional[str] = None
+
     # App
     app_env: str = "development"
     log_level: str = "INFO"

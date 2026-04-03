@@ -64,6 +64,7 @@ class LocationSegment(BaseModel):
     detection_source: Literal["gemini", "unknown"]
     frame_timestamp_seconds: float
     frame_thumbnail_b64: Optional[str] = None
+    frame_thumbnail_url: Optional[str] = None  # GCS public URL (preferred over b64)
     # Primary matched place (full details from Places API, or Gemini data if Places disabled)
     place: Optional[PlaceDetail] = None
     # Direct Google Maps search link — reliable even when coords are approximate

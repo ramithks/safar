@@ -92,6 +92,8 @@ async def run_pipeline(
             on_event(event)
 
     pipeline_start = time.time()
+    video_gcs_url: Optional[str] = None
+    frame_gcs_urls: dict[str, str] = {}
 
     try:
         # ── Stage 1: Download ────────────────────────────────────────────────────
@@ -129,6 +131,17 @@ async def run_pipeline(
                 metadata=metadata,
             )
 
+        # ── Upload video to GCS ──────────────────────────────────────────────────
+        if settings.gcs_bucket_name:
+            try:
+                from app.storage.gcs import upload_video as gcs_upload_video
+                video_gcs_url = await asyncio.get_event_loop().run_in_executor(
+                    None, gcs_upload_video, job_id, video_path, settings.gcs_bucket_name
+                )
+                emit("stage_complete", {"stage": "upload_video", "gcs_url": video_gcs_url})
+            except Exception as e:
+                logger.warning(f"GCS video upload failed: {e}")
+
         # ── Stage 2: Scene Detection ─────────────────────────────────────────────
         emit("stage_start", {"stage": "scene_detection", "message": "Detecting scene changes..."})
         t = time.time()
@@ -158,6 +171,17 @@ async def run_pipeline(
         # Cap to max_unique_frames
         if len(unique_frames) > settings.max_unique_frames:
             unique_frames = unique_frames[:settings.max_unique_frames]
+
+        # ── Upload frames to GCS ─────────────────────────────────────────────────
+        if settings.gcs_bucket_name:
+            try:
+                from app.storage.gcs import upload_frames as gcs_upload_frames
+                frame_paths = [f.frame_path for f in unique_frames]
+                frame_gcs_urls = await asyncio.get_event_loop().run_in_executor(
+                    None, gcs_upload_frames, job_id, frame_paths, settings.gcs_bucket_name
+                )
+            except Exception as e:
+                logger.warning(f"GCS frame upload failed: {e}")
 
         emit("stage_complete", {
             "stage": "frame_extraction",
@@ -222,7 +246,7 @@ async def run_pipeline(
         ]
 
         # ── Assemble timeline ────────────────────────────────────────────────────
-        timeline = _build_timeline(enriched_pairs, ctx)
+        timeline = _build_timeline(enriched_pairs, ctx, frame_gcs_urls)
 
         # Cap to max_locations
         timeline = timeline[:ctx.max_locations]
@@ -246,7 +270,7 @@ async def run_pipeline(
             "total_duration_ms": total_ms,
         })
 
-        return ReelResult(
+        result = ReelResult(
             job_id=job_id,
             status="completed",
             reel=ReelInfo(
@@ -268,6 +292,22 @@ async def run_pipeline(
             metadata=metadata,
         )
 
+        # ── Persist to Supabase ──────────────────────────────────────────────────
+        if settings.supabase_url and settings.supabase_service_key:
+            try:
+                from app.storage.supabase_client import save_job_result
+                save_job_result(
+                    job_id=job_id,
+                    reel_url=reel_url,
+                    status="completed",
+                    result_dict=result.model_dump(mode="json"),
+                    video_gcs_url=video_gcs_url,
+                )
+            except Exception as e:
+                logger.warning(f"Supabase save failed: {e}")
+
+        return result
+
     finally:
         # Always clean up temp files
         _cleanup(work_dir)
@@ -282,6 +322,7 @@ def _normalize_name(name: str) -> str:
 def _build_timeline(
     enriched_pairs: list[tuple[VisionResult, EnrichmentResult]],
     ctx: PipelineContext,
+    frame_gcs_urls: Optional[dict[str, str]] = None,
 ) -> list[LocationSegment]:
     """Convert enriched vision results into a deduplicated, ordered timeline.
 
@@ -334,19 +375,23 @@ def _build_timeline(
             # Upgrade thumbnail if this frame has higher confidence
             if vr.confidence > existing.confidence:
                 existing.confidence = vr.confidence
-                try:
-                    with open(vr.frame.frame_path, "rb") as f:
-                        existing.frame_thumbnail_b64 = base64.b64encode(f.read()).decode("utf-8")
-                except Exception:
-                    pass
+                existing.frame_thumbnail_url = (frame_gcs_urls or {}).get(vr.frame.frame_path)
+                if not existing.frame_thumbnail_url:
+                    try:
+                        with open(vr.frame.frame_path, "rb") as f:
+                            existing.frame_thumbnail_b64 = base64.b64encode(f.read()).decode("utf-8")
+                    except Exception:
+                        pass
             continue
 
+        gcs_url = (frame_gcs_urls or {}).get(vr.frame.frame_path)
         frame_b64 = None
-        try:
-            with open(vr.frame.frame_path, "rb") as f:
-                frame_b64 = base64.b64encode(f.read()).decode("utf-8")
-        except Exception:
-            pass
+        if not gcs_url:
+            try:
+                with open(vr.frame.frame_path, "rb") as f:
+                    frame_b64 = base64.b64encode(f.read()).decode("utf-8")
+            except Exception:
+                pass
 
         segment = LocationSegment(
             segment_id=f"seg_{len(timeline) + 1:03d}",
@@ -357,6 +402,7 @@ def _build_timeline(
             detection_source=vr.detection_source,
             frame_timestamp_seconds=vr.frame.timestamp_seconds,
             frame_thumbnail_b64=frame_b64,
+            frame_thumbnail_url=gcs_url,
             place=place,
             maps_search_url=vr.maps_search_url,
             nearby_suggestions=enrichment.suggestions,
