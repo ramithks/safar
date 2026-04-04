@@ -14,7 +14,7 @@ services:
 
   api:
     build: .
-    ports:
+    expose:
       - "8000"
     environment:
       - REDIS_URL=redis://redis:6379/0
