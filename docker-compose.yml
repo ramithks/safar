@@ -16,6 +16,12 @@ services:
     build: .
     expose:
       - "8000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`backend.travbuddy.in`)"
+      - "traefik.http.routers.api.entrypoints=https"
+      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
     environment:
       - REDIS_URL=redis://redis:6379/0
       - TEMP_DIR=/tmp/travbuddy
