@@ -15,7 +15,7 @@ services:
   api:
     build: .
     ports:
-      - "8080:8000"
+      - "8000"
     environment:
       - REDIS_URL=redis://redis:6379/0
       - TEMP_DIR=/tmp/travbuddy
