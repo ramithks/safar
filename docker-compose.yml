@@ -15,21 +15,13 @@ services:
   api:
     build: .
     ports:
-      - "8000:8000"
+      - "8080:8000"
     environment:
       - REDIS_URL=redis://redis:6379/0
       - TEMP_DIR=/tmp/travbuddy
       - PLACES_CACHE_DIR=/tmp/travbuddy/places_cache
-      # ── Set these in Coolify UI → Environment Variables ──
-      # GEMINI_API_KEY
-      # GOOGLE_MAPS_API_KEY
-      # GCS_BUCKET_NAME
-      # SUPABASE_URL
-      # SUPABASE_SERVICE_KEY
-      # GOOGLE_APPLICATION_CREDENTIALS  (path to GCS key JSON if not using Workload Identity)
     volumes:
       - /tmp/travbuddy:/tmp/travbuddy
-      - gcs_creds:/secrets:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -37,15 +29,13 @@ services:
 
   worker:
     build: .
-    command: celery -A app.workers.celery_app.celery_app worker --loglevel=info --concurrency=2
+    command: celery -A app.workers.celery_app.celery_app worker --loglevel=info --concurrency=1
     environment:
       - REDIS_URL=redis://redis:6379/0
       - TEMP_DIR=/tmp/travbuddy
       - PLACES_CACHE_DIR=/tmp/travbuddy/places_cache
-      # ── Same env vars as api — set in Coolify UI ──
     volumes:
       - /tmp/travbuddy:/tmp/travbuddy
-      - gcs_creds:/secrets:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -53,9 +43,3 @@ services:
 
 volumes:
   redis_data:
-  gcs_creds:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /home/sahilverma/secrets

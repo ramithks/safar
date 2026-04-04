@@ -1,33 +1,29 @@
-name: Deploy to GCP
+name: CI
 
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
-  deploy:
+  lint:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          host: ${{ secrets.GCP_HOST }}
-          username: ${{ secrets.GCP_USER }}
-          key: ${{ secrets.GCP_SSH_KEY }}
-          script: |
-            set -e
-            cd ~/travbuddy_backend
+          python-version: "3.11"
 
-            echo "── Pulling latest code ──"
-            git pull origin main
+      - name: Install dependencies
+        run: |
+          pip install ruff
+          pip install -r requirements.txt --quiet
 
-            echo "── Installing dependencies ──"
-            source venv/bin/activate
-            pip install -r requirements.txt --quiet
+      - name: Lint
+        run: ruff check .
 
-            echo "── Restarting services ──"
-            sudo systemctl restart travbuddy
-            sudo systemctl restart celery
-
-            echo "── Deploy complete ──"
-            sudo systemctl status travbuddy --no-pager
+# Deploy is handled automatically by Coolify via GitHub webhook on push to main.
+# No SSH or manual deploy step needed here.
