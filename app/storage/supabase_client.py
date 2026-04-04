@@ -20,6 +20,29 @@ def _get_client():
     return _client
 
 
+def get_cached_scan(reel_url: str) -> dict | None:
+    """
+    Return the result dict of the most recent completed scan for this URL,
+    or None if no cached result exists.
+    """
+    try:
+        client = _get_client()
+        resp = (
+            client.table("reel_scans")
+            .select("job_id, result")
+            .eq("reel_url", reel_url)
+            .eq("status", "completed")
+            .order("completed_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if resp.data:
+            return resp.data[0]
+    except Exception as e:
+        logger.warning(f"Cache lookup failed for {reel_url}: {e}")
+    return None
+
+
 def save_reel_scan(
     job_id: str,
     reel_url: str,

@@ -124,12 +124,13 @@ def store_job_result(job_id: str, result, events: list[dict]):
     r = _get_redis()
     now = datetime.now(timezone.utc).isoformat()
 
-    result_dict = result.model_dump(mode="json")
+    result_dict = result if isinstance(result, dict) else result.model_dump(mode="json")
+    status = result_dict.get("status") if isinstance(result, dict) else result.status
 
     r.hset(
         f"job:{job_id}",
         mapping={
-            "status": result.status,
+            "status": status,
             "updated_at": now,
             "completed_at": now,
             "result": json.dumps(result_dict),
