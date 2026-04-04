@@ -346,6 +346,7 @@ def _build_timeline(
             place = PlaceDetail(
                 place_id=f"gemini_{vr.frame.scene_index}",
                 name=vr.landmark_name,
+                category=vr.place_type,
                 address=PlaceAddress(
                     formatted=vr.address or ", ".join(
                         p for p in [vr.city, vr.country] if p
