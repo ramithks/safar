@@ -11,8 +11,11 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Gemini 2.5 Flash — vision + location identification
-    gemini_api_key: Optional[str] = None
+    # Vertex AI — Gemini 2.5 Flash via Vertex (uses ADC / service account)
+    gcp_project: Optional[str] = None
+    gcp_location: str = "us-central1"
+    # Path to a service account JSON key; leave unset to use ADC
+    google_application_credentials: Optional[str] = None
 
     # Google Maps — Places API for place enrichment (optional but recommended)
     google_maps_api_key: Optional[str] = None

@@ -31,8 +31,8 @@ def _check_redis() -> str:
 
 def _check_vision_api() -> str:
     from app.config import settings
-    if not settings.google_api_key and not settings.google_application_credentials:
-        return "not configured"
+    if not settings.gcp_project:
+        return "not configured (GCP_PROJECT missing)"
     return "ok"
 
 

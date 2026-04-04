@@ -26,8 +26,12 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - TEMP_DIR=/tmp/travbuddy
       - PLACES_CACHE_DIR=/tmp/travbuddy/places_cache
+      - GCP_PROJECT=${GCP_PROJECT}
+      - GCP_LOCATION=${GCP_LOCATION:-us-central1}
+      - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gcp_key.json
     volumes:
       - /tmp/travbuddy:/tmp/travbuddy
+      - ${GCP_KEY_FILE}:/run/secrets/gcp_key.json:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -40,8 +44,12 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - TEMP_DIR=/tmp/travbuddy
       - PLACES_CACHE_DIR=/tmp/travbuddy/places_cache
+      - GCP_PROJECT=${GCP_PROJECT}
+      - GCP_LOCATION=${GCP_LOCATION:-us-central1}
+      - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gcp_key.json
     volumes:
       - /tmp/travbuddy:/tmp/travbuddy
+      - ${GCP_KEY_FILE}:/run/secrets/gcp_key.json:ro
     depends_on:
       redis:
         condition: service_healthy
