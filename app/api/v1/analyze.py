@@ -28,6 +28,7 @@ async def analyze_reel(request: Request, body: AnalyzeReelRequest):
         reel_url=body.reel_url,
         options=body.options.model_dump(),
         metadata=body.metadata,
+        user_id=body.user_id,
     )
 
     base_url = str(request.base_url).rstrip("/")

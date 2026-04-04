@@ -34,7 +34,14 @@ celery_app.conf.update(
 
 
 @celery_app.task(bind=True, name="travbuddy.analyze_reel", max_retries=0)
-def analyze_reel_task(self, job_id: str, reel_url: str, options: dict, metadata: Optional[dict]):
+def analyze_reel_task(
+    self,
+    job_id: str,
+    reel_url: str,
+    options: dict,
+    metadata: Optional[dict],
+    user_id: Optional[str] = None,
+):
     """
     Celery task that runs the full pipeline.
     Stores progress and result in Redis so the API can serve them.
@@ -58,6 +65,7 @@ def analyze_reel_task(self, job_id: str, reel_url: str, options: dict, metadata:
             reel_url=reel_url,
             options=options,
             metadata=metadata,
+            user_id=user_id,
             on_event=on_event,
         )
     )

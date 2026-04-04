@@ -13,6 +13,7 @@ class AnalyzeOptions(BaseModel):
 
 class AnalyzeReelRequest(BaseModel):
     reel_url: str
+    user_id: Optional[str] = None   # Supabase auth user UUID — sent by frontend
     options: AnalyzeOptions = AnalyzeOptions()
     metadata: Optional[dict[str, Any]] = None
 

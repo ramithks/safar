@@ -66,6 +66,7 @@ async def run_pipeline(
     reel_url: str,
     options: dict,
     metadata: Optional[dict] = None,
+    user_id: Optional[str] = None,
     on_event: Optional[Callable[[PipelineEvent], None]] = None,
 ) -> ReelResult:
     """
@@ -295,13 +296,16 @@ async def run_pipeline(
         # ── Persist to Supabase ──────────────────────────────────────────────────
         if settings.supabase_url and settings.supabase_service_key:
             try:
-                from app.storage.supabase_client import save_job_result
-                save_job_result(
+                from app.storage.supabase_client import save_reel_scan
+                save_reel_scan(
                     job_id=job_id,
                     reel_url=reel_url,
-                    status="completed",
+                    user_id=user_id,
+                    caption=download_result.caption,
+                    video_url=video_gcs_url,
+                    frame_urls=list(frame_gcs_urls.values()),
                     result_dict=result.model_dump(mode="json"),
-                    video_gcs_url=video_gcs_url,
+                    status="completed",
                 )
             except Exception as e:
                 logger.warning(f"Supabase save failed: {e}")
