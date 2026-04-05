@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     supabase_url: Optional[str] = None
     supabase_service_key: Optional[str] = None
 
+    # Proxy — used as fallback when Instagram rate-limits or blocks direct requests
+    # Format: http://user:pass@host:port/
+    instagram_proxy_url: Optional[str] = None
+
+    # Celery concurrency — keep low to avoid Instagram rate limits per IP
+    celery_worker_concurrency: int = 8
+
     # App
     app_env: str = "development"
     log_level: str = "INFO"

@@ -28,8 +28,9 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
     task_acks_late=True,
-    worker_prefetch_multiplier=1,  # one task at a time per worker
-    result_expires=86400,          # results kept for 24 hours
+    worker_prefetch_multiplier=1,           # one task at a time per worker process
+    worker_concurrency=settings.celery_worker_concurrency,  # cap concurrent workers (rate-limit protection)
+    result_expires=86400,                   # results kept for 24 hours
 )
 
 
