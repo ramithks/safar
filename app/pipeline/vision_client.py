@@ -11,6 +11,7 @@ Frames are sent in parallel using a thread pool (max 5 concurrent).
 import json
 import logging
 import re
+import time
 import urllib.parse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
@@ -34,12 +35,13 @@ VALID_PLACE_TYPES = {
     "attraction", "resort", "spa", "rooftop", "other",
 }
 
-# Max parallel requests to Gemini
-MAX_CONCURRENT = 5
+# Max parallel requests to Gemini — keep low to avoid Vertex AI 429 rate limits
+MAX_CONCURRENT = 3
 
 # Per-frame timeout and retry config
-GEMINI_TIMEOUT_SECONDS = 25  # seconds before a single frame call is considered stalled
-MAX_RETRIES = 1              # retry once on timeout or transient error
+GEMINI_TIMEOUT_SECONDS = 50   # thinking model can take 30-60s on complex frames
+MAX_RETRIES = 1               # retry once on timeout or transient error
+RETRY_BACKOFF_SECONDS = 15    # wait before retry to let rate limit window reset
 
 # Module-level client — created once on first use
 _client: Optional[genai.Client] = None
@@ -284,7 +286,8 @@ def _run_parallel(frames: list[ExtractedFrame], prompt: str) -> list[VisionResul
 def _call_gemini_with_retry(frame: ExtractedFrame, prompt: str) -> VisionResult:
     """
     Call Gemini for a single frame with a per-attempt timeout.
-    Retries up to MAX_RETRIES times on timeout or transient error.
+    Retries up to MAX_RETRIES times on timeout or 429 rate limit.
+    Sleeps RETRY_BACKOFF_SECONDS before retrying to let the rate limit window reset.
     """
     for attempt in range(MAX_RETRIES + 1):
         # Run the blocking Gemini call in its own short-lived executor so we
@@ -299,8 +302,11 @@ def _call_gemini_with_retry(frame: ExtractedFrame, prompt: str) -> VisionResult:
                     f"(attempt {attempt + 1}/{MAX_RETRIES + 1})"
                 )
             except Exception as e:
+                is_rate_limit = "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
                 logger.warning(
-                    f"Frame {frame.scene_index}: error on attempt {attempt + 1}: {e}"
+                    f"Frame {frame.scene_index}: "
+                    f"{'rate limited (429)' if is_rate_limit else 'error'} "
+                    f"on attempt {attempt + 1}: {e}"
                 )
 
         if attempt >= MAX_RETRIES:
@@ -308,6 +314,12 @@ def _call_gemini_with_retry(frame: ExtractedFrame, prompt: str) -> VisionResult:
                 f"Frame {frame.scene_index}: all {MAX_RETRIES + 1} attempts failed — skipping"
             )
             return VisionResult(frame=frame)
+
+        # Back off before retrying so Vertex AI rate limit window can reset
+        logger.info(
+            f"Frame {frame.scene_index}: waiting {RETRY_BACKOFF_SECONDS}s before retry..."
+        )
+        time.sleep(RETRY_BACKOFF_SECONDS)
 
     return VisionResult(frame=frame)
 
@@ -420,7 +432,10 @@ def _call_gemini(frame: ExtractedFrame, prompt: str) -> VisionResult:
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.1,
-                max_output_tokens=8192,  # thinking model needs headroom for reasoning tokens
+                max_output_tokens=8192,
+                # Cap thinking budget so the model doesn't spend 60s reasoning
+                # over an ambiguous frame — 2048 tokens is plenty for location ID.
+                thinking_config=types.ThinkingConfig(thinking_budget=2048),
             ),
         )
     except Exception as e:
