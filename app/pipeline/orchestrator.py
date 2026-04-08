@@ -208,7 +208,7 @@ async def run_pipeline(
         vision_results = await asyncio.get_event_loop().run_in_executor(
             None, analyze_frames, unique_frames, caption_ctx
         )
-        ctx.inc_api("vision_ai", len(unique_frames))
+        ctx.inc_api("vision_ai", 1)
 
         # Emit location_found events as we parse results
         for vr in vision_results:

@@ -1,12 +1,16 @@
 """
-Vision client using Gemini 2.5 Flash Lite via Vertex AI (google-genai SDK).
+Vision client using Gemini 2.5 Flash via Vertex AI (google-genai SDK).
+
+Key reliability improvements:
+  1. Batch all frames for a reel into ONE Gemini call (reduces API calls N→1).
+  2. Exponential backoff: 1s → 2s → 4s → 8s (max) on 429 / transient errors.
+  3. Multi-region fallback: asia-south1 → global → us-central1.
+  4. Google Search Grounding: reduces hallucinations, anchors to real places.
 
 Authentication uses Application Default Credentials (ADC).
   - On GCP (Cloud Run, GCE, etc.): automatic via metadata server.
   - Locally: run `gcloud auth application-default login`, or set
     GOOGLE_APPLICATION_CREDENTIALS to a service account key JSON.
-
-Frames are sent in parallel using a thread pool (max 5 concurrent).
 """
 import json
 import logging
@@ -14,7 +18,6 @@ import re
 import time
 import urllib.parse
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -35,21 +38,36 @@ VALID_PLACE_TYPES = {
     "attraction", "resort", "spa", "rooftop", "other",
 }
 
-# Max parallel requests to Gemini — keep low to avoid Vertex AI 429 rate limits
-MAX_CONCURRENT = 3
+# ── Region fallback chain ─────────────────────────────────────────────────────
+# Try asia-south1 first (closest to India), then the global endpoint, then
+# us-central1 as last resort.  Each client is lazily created and cached.
+_REGION_CHAIN = ["asia-south1", "global", "us-central1"]
+_region_clients: dict[str, genai.Client] = {}
 
-# Per-frame timeout and retry config
-GEMINI_TIMEOUT_SECONDS = 50   # thinking model can take 30-60s on complex frames
-MAX_RETRIES = 1               # retry once on timeout or transient error
-RETRY_BACKOFF_SECONDS = 15    # wait before retry to let rate limit window reset
-
-# Module-level client — created once on first use
-_client: Optional[genai.Client] = None
+# ── Retry / backoff config ─────────────────────────────────────────────────────
+# Exponential: 1 → 2 → 4 → 8 seconds between attempts.
+_BACKOFF_BASE_SECONDS = 1
+_BACKOFF_MULTIPLIER = 2
+_BACKOFF_MAX_SECONDS = 8
+MAX_RETRIES = 4                  # up to 4 retries across all regions
+GEMINI_TIMEOUT_SECONDS = 90     # batch call can take longer; allow 90s
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
+_BATCH_SYSTEM_PROMPT = """\
+You are a world-class travel location expert with encyclopedic knowledge of
+restaurants, cafes, hotels, bars, landmarks, and attractions globally.
+You excel at identifying specific named venues from visual cues — signage,
+architecture, decor, menus, uniforms, and surroundings.
+When identifying places, use Google Search to verify that the place exists
+and confirm its exact address, coordinates, and category.
+"""
+
 _JSON_SCHEMA = """\
-Return ONLY a valid JSON object — no markdown, no explanation, nothing else:
+Return ONLY a valid JSON array — one object per frame, in the SAME ORDER as
+the images were provided.  No markdown fences, no explanation, nothing else.
+
+Each object MUST have exactly these keys:
 {
   "name": "exact establishment name, or null if cannot identify",
   "place_type": "one of: cafe | restaurant | hotel | bar | club | lounge | landmark | monument | park | museum | gallery | market | attraction | resort | spa | rooftop | other — or null",
@@ -91,7 +109,6 @@ def parse_caption(caption: str) -> Optional[CaptionContext]:
     place_hints = [p.strip() for p in re.findall(r'📍([^\n📍#@]+)', caption) if p.strip()]
 
     # Extract city — require capital letter start so "in the end" doesn't match.
-    # \b word boundary prevents matching "in" inside a word like "Diggin".
     city_patterns = [
         r'\b(?:in|at|cafes? in|places? in|visit in|spots? in)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)',
         r'#([A-Z][a-z]+(?:cafes?|restaurants?|food|places?))',
@@ -111,7 +128,8 @@ def parse_caption(caption: str) -> Optional[CaptionContext]:
         "hyderabad": "India", "pune": "India", "chennai": "India",
         "dubai": "United Arab Emirates", "abu dhabi": "United Arab Emirates",
         "london": "United Kingdom", "manchester": "United Kingdom",
-        "paris": "France", "new york": "United States", "los angeles": "United States",
+        "paris": "France", "new york": "United States",
+        "los angeles": "United States",
         "singapore": "Singapore", "bangkok": "Thailand", "tokyo": "Japan",
         "bali": "Indonesia", "istanbul": "Turkey",
     }
@@ -135,48 +153,47 @@ def parse_caption(caption: str) -> Optional[CaptionContext]:
 # ── Prompt builder ─────────────────────────────────────────────────────────────
 
 
-def _build_prompt(caption_ctx: Optional[CaptionContext]) -> str:
-    """Assemble the full prompt for a Gemini call."""
+def _build_batch_prompt(
+    num_frames: int,
+    caption_ctx: Optional[CaptionContext],
+) -> str:
+    """Assemble the full prompt for a BATCH Gemini call (all frames at once)."""
     parts = []
 
     if caption_ctx and (caption_ctx.city or caption_ctx.place_hints):
-        # ── Constrained prompt: caption gave us city/place context ──────────────
         parts.append(
-            "You are a travel location expert. This image is a frame from an Instagram "
-            "travel reel. Identify the exact cafe, restaurant, hotel, bar, or other "
-            "named venue shown."
+            f"The following {num_frames} images are sequential frames from a single "
+            f"Instagram travel reel.  Identify the exact cafe, restaurant, hotel, bar, "
+            f"or other named venue shown in EACH frame."
         )
-
         if caption_ctx.city:
             loc = caption_ctx.city
             if caption_ctx.country:
                 loc += f", {caption_ctx.country}"
             parts.append(
                 f"IMPORTANT: This reel is about places in {loc}. "
-                f"If the venue exists in multiple cities, pick the {loc} branch. "
+                f"If a venue exists in multiple cities, pick the {loc} branch. "
                 f"Do NOT return a location outside {loc}."
             )
-
         if caption_ctx.place_hints:
             hints = ", ".join(f'"{p}"' for p in caption_ctx.place_hints)
             parts.append(
                 f"The reel caption mentions these specific places: {hints}. "
-                f"Identify which ONE of these is shown in this frame."
+                f"Match each frame to ONE of these places where possible."
             )
-
     else:
-        # ── Open prompt: no caption context ─────────────────────────────────────
         parts.append(
-            "You are a travel location expert. This image is a frame from an Instagram "
-            "travel reel. Identify the exact cafe, restaurant, hotel, bar, landmark, or "
-            "other named venue shown in this image."
+            f"The following {num_frames} images are sequential frames from a single "
+            f"Instagram travel reel.  For EACH frame identify the exact cafe, "
+            f"restaurant, hotel, bar, landmark, or other named venue shown."
         )
 
     parts.append(
         "Only identify real, visitable places a traveler would visit. "
-        "If this is a person, generic food with no establishment visible, a private home, "
-        "or you genuinely cannot identify a specific named venue — set name=null and confidence=0.0. "
-        "Use your full geographic and cultural knowledge. "
+        "If a frame shows a person, generic food with no establishment visible, "
+        "a private home, or you genuinely cannot identify a specific named venue — "
+        "set name=null and confidence=0.0. "
+        "Use Google Search to verify every place you identify. "
         "Be precise about the exact branch/location."
     )
     parts.append(_JSON_SCHEMA)
@@ -213,12 +230,12 @@ def analyze_frames(
     caption_ctx: Optional[CaptionContext] = None,
 ) -> list[VisionResult]:
     """
-    Send all frames to Gemini 2.5 Flash Lite (Vertex AI) in parallel.
+    Send ALL frames for a reel to Gemini in a SINGLE batched API call.
 
-    Two-pass strategy when no caption city context is available:
-      Pass 1 — unconstrained: analyze all frames freely.
-      Pass 2 — consensus requery: lock outlier frames to the dominant city so
-               Gemini picks the local branch, not a famous foreign one.
+    Strategy:
+      Pass 1 — batch call: all frames in one request with Google Search grounding.
+      Pass 2 — consensus requery (when no caption city): re-query outliers with
+               the majority-vote city locked in to eliminate cross-city drift.
     """
     if not frames:
         return []
@@ -227,14 +244,13 @@ def analyze_frames(
         logger.error("GCP_PROJECT not set — vision analysis disabled")
         return [VisionResult(frame=f) for f in frames]
 
-    prompt = _build_prompt(caption_ctx)
-    if caption_ctx and caption_ctx.place_hints:
-        logger.info(
-            f"Caption-constrained prompt — {len(caption_ctx.place_hints)} hints, "
-            f"city={caption_ctx.city}"
-        )
+    prompt = _build_batch_prompt(len(frames), caption_ctx)
+    logger.info(
+        f"Batch Gemini call: {len(frames)} frames, "
+        f"caption_ctx={'yes' if caption_ctx else 'no'}"
+    )
 
-    final = _run_parallel(frames, prompt)
+    final = _run_batch_with_retry(frames, prompt)
 
     # Two-pass consensus requery — only when caption gave us no city context
     if not (caption_ctx and (caption_ctx.city or caption_ctx.place_hints)):
@@ -245,211 +261,162 @@ def analyze_frames(
     return final
 
 
-# ── Internal helpers ───────────────────────────────────────────────────────────
+# ── Region client management ───────────────────────────────────────────────────
 
 
-def _get_client() -> genai.Client:
-    global _client
-    if _client is None:
+def _get_client(location: str) -> genai.Client:
+    """Return (or create) a cached Vertex AI client for the given location."""
+    if location not in _region_clients:
         if not settings.gcp_project:
             raise RuntimeError("GCP_PROJECT is not set — required for Vertex AI")
-        _client = genai.Client(
+        _region_clients[location] = genai.Client(
             vertexai=True,
             project=settings.gcp_project,
-            location=settings.gcp_location,
+            location=location,
         )
         logger.info(
             f"Vertex AI client initialised (project={settings.gcp_project}, "
-            f"location={settings.gcp_location})"
+            f"location={location})"
         )
-    return _client
+    return _region_clients[location]
 
 
-def _run_parallel(frames: list[ExtractedFrame], prompt: str) -> list[VisionResult]:
-    """Run Gemini on all frames in parallel with per-frame timeout + retry."""
-    results: list[Optional[VisionResult]] = [None] * len(frames)
-    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
-        future_to_idx = {
-            executor.submit(_call_gemini_with_retry, frame, prompt): idx
-            for idx, frame in enumerate(frames)
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                results[idx] = future.result()
-            except Exception as e:
-                logger.warning(f"Frame {frames[idx].scene_index}: unexpected error: {e}")
-                results[idx] = VisionResult(frame=frames[idx])
-    return [r if r is not None else VisionResult(frame=frames[i]) for i, r in enumerate(results)]
+# ── Exponential backoff helper ─────────────────────────────────────────────────
 
 
-def _call_gemini_with_retry(frame: ExtractedFrame, prompt: str) -> VisionResult:
-    """
-    Call Gemini for a single frame with a per-attempt timeout.
-    Retries up to MAX_RETRIES times on timeout or 429 rate limit.
-    Sleeps RETRY_BACKOFF_SECONDS before retrying to let the rate limit window reset.
-    """
-    for attempt in range(MAX_RETRIES + 1):
-        # Run the blocking Gemini call in its own short-lived executor so we
-        # can enforce a wall-clock timeout via future.result(timeout=N).
-        with ThreadPoolExecutor(max_workers=1) as inner:
-            fut = inner.submit(_call_gemini, frame, prompt)
-            try:
-                return fut.result(timeout=GEMINI_TIMEOUT_SECONDS)
-            except FutureTimeoutError:
-                logger.warning(
-                    f"Frame {frame.scene_index}: timed out after {GEMINI_TIMEOUT_SECONDS}s "
-                    f"(attempt {attempt + 1}/{MAX_RETRIES + 1})"
-                )
-            except Exception as e:
-                is_rate_limit = "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
-                logger.warning(
-                    f"Frame {frame.scene_index}: "
-                    f"{'rate limited (429)' if is_rate_limit else 'error'} "
-                    f"on attempt {attempt + 1}: {e}"
-                )
-
-        if attempt >= MAX_RETRIES:
-            logger.warning(
-                f"Frame {frame.scene_index}: all {MAX_RETRIES + 1} attempts failed — skipping"
-            )
-            return VisionResult(frame=frame)
-
-        # Back off before retrying so Vertex AI rate limit window can reset
-        logger.info(
-            f"Frame {frame.scene_index}: waiting {RETRY_BACKOFF_SECONDS}s before retry..."
-        )
-        time.sleep(RETRY_BACKOFF_SECONDS)
-
-    return VisionResult(frame=frame)
+def _backoff_delay(attempt: int) -> float:
+    """Return the sleep duration for attempt N (0-indexed), capped at max."""
+    delay = _BACKOFF_BASE_SECONDS * (_BACKOFF_MULTIPLIER ** attempt)
+    return min(delay, _BACKOFF_MAX_SECONDS)
 
 
-def _consensus_requery(
+def _is_rate_limit(exc: Exception) -> bool:
+    msg = str(exc)
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower()
+
+
+# ── Batch call with retry + regional fallback ──────────────────────────────────
+
+
+def _run_batch_with_retry(
     frames: list[ExtractedFrame],
-    results: list[VisionResult],
+    prompt: str,
 ) -> list[VisionResult]:
     """
-    Majority-vote on city/country across all high-confidence results.
-    Re-query outlier frames with the consensus city locked in.
+    Send all frames in one batch Gemini call.
+    Regional fallback: asia-south1 → global → us-central1.
+    Exponential backoff: 1s → 2s → 4s → 8s between attempts.
     """
-    votes: list[tuple[str, str]] = [
-        (r.city.strip().lower(), r.country.strip().lower())
-        for r in results
-        if r.confidence >= settings.min_vision_confidence and r.city and r.country
-    ]
-    if not votes:
-        return results
-
-    (consensus_city_lower, consensus_country_lower), vote_count = Counter(votes).most_common(1)[0]
-    if vote_count < 2:
-        # No clear majority — all cities tied, nothing to correct
-        logger.info("No consensus city (all frames disagree) — skipping requery")
-        return results
-
-    # Outliers = results that disagree with consensus OR have no city (can't be verified)
-    outlier_indices = [
-        i for i, r in enumerate(results)
-        if r.confidence >= settings.min_vision_confidence and r.landmark_name
-        and (
-            # Has a city/country that differs from consensus
-            (r.city and r.country and (
-                r.city.strip().lower() != consensus_city_lower
-                or r.country.strip().lower() != consensus_country_lower
-            ))
-            # OR has a name but no city — can't verify, re-query to ground it
-            or (not r.city or not r.country)
-        )
-    ]
-
-    if not outlier_indices:
-        return results
-
-    winner = next(
-        (r for r in results
-         if r.city and r.country
-         and r.city.strip().lower() == consensus_city_lower
-         and r.country.strip().lower() == consensus_country_lower),
-        None,
-    )
-    consensus_city = winner.city if winner else consensus_city_lower.title()
-    consensus_country = winner.country if winner else consensus_country_lower.title()
-
-    logger.info(
-        f"Consensus city: {consensus_city}, {consensus_country} — "
-        f"re-querying {len(outlier_indices)} outlier frame(s)"
-    )
-
-    city_ctx = CaptionContext(
-        raw="", place_hints=[], city=consensus_city, country=consensus_country,
-    )
-    constrained_prompt = _build_prompt(city_ctx)
-
-    updated = list(results)
-    for i in outlier_indices:
-        original = results[i]
+    # Load all frame images once
+    image_bytes_list: list[bytes] = []
+    for frame in frames:
         try:
-            requeried = _call_gemini_with_retry(frames[i], constrained_prompt)
-            if requeried.confidence >= settings.min_vision_confidence:
-                logger.info(
-                    f"Frame {frames[i].scene_index}: corrected '{original.landmark_name}' "
-                    f"({original.city}) → '{requeried.landmark_name}' ({requeried.city})"
-                )
-                updated[i] = requeried
-            else:
-                # Requery couldn't confidently place this frame in the consensus city.
-                # Drop the original rather than showing a wrong location.
-                logger.info(
-                    f"Frame {frames[i].scene_index}: dropping '{original.landmark_name}' "
-                    f"({original.city}) — could not verify in {consensus_city}"
-                )
-                updated[i] = VisionResult(frame=frames[i])
+            with open(frame.frame_path, "rb") as fh:
+                image_bytes_list.append(fh.read())
         except Exception as e:
-            logger.warning(f"Frame {frames[i].scene_index}: consensus requery failed: {e}")
-            updated[i] = VisionResult(frame=frames[i])
+            logger.warning(f"Frame {frame.scene_index}: could not read image: {e}")
+            image_bytes_list.append(b"")  # placeholder so indices stay aligned
 
-    return updated
+    # Attempt across regions with exponential backoff
+    region_idx = 0
+    attempt = 0
+
+    while attempt <= MAX_RETRIES:
+        location = _REGION_CHAIN[min(region_idx, len(_REGION_CHAIN) - 1)]
+
+        try:
+            client = _get_client(location)
+            results = _call_gemini_batch(client, location, frames, image_bytes_list, prompt)
+            logger.info(f"Batch call succeeded on region '{location}' (attempt {attempt + 1})")
+            return results
+
+        except Exception as exc:
+            rate_limited = _is_rate_limit(exc)
+            logger.warning(
+                f"Batch call failed on region '{location}' "
+                f"(attempt {attempt + 1}/{MAX_RETRIES + 1}): "
+                f"{'rate-limit 429' if rate_limited else type(exc).__name__}: {exc}"
+            )
+
+            if attempt >= MAX_RETRIES:
+                logger.error("All retry attempts exhausted — returning empty results")
+                return [VisionResult(frame=f) for f in frames]
+
+            # Advance to next region on 429; stay on same region for transient errors
+            if rate_limited and region_idx < len(_REGION_CHAIN) - 1:
+                region_idx += 1
+                next_region = _REGION_CHAIN[region_idx]
+                logger.info(f"Rate-limited — falling back to region '{next_region}'")
+
+            delay = _backoff_delay(attempt)
+            logger.info(f"Waiting {delay:.1f}s before retry (attempt {attempt + 2})...")
+            time.sleep(delay)
+            attempt += 1
+
+    return [VisionResult(frame=f) for f in frames]
 
 
-def _call_gemini(frame: ExtractedFrame, prompt: str) -> VisionResult:
-    """Single Gemini call for one frame via Vertex AI SDK."""
-    result = VisionResult(frame=frame)
+def _call_gemini_batch(
+    client: genai.Client,
+    location: str,
+    frames: list[ExtractedFrame],
+    image_bytes_list: list[bytes],
+    prompt: str,
+) -> list[VisionResult]:
+    """
+    Single batch Gemini API call: all frame images + prompt in one request.
+    Uses Google Search Grounding to reduce hallucinations.
+    Returns one VisionResult per frame (same order).
+    """
+    # Build the contents list: interleave images + one final prompt
+    contents: list = []
+    for i, (frame, img_bytes) in enumerate(zip(frames, image_bytes_list)):
+        if img_bytes:
+            contents.append(
+                types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
+            )
+        else:
+            # Skip frames we couldn't load; insert a text placeholder so the
+            # model knows there's a gap — we'll fill with empty result later.
+            contents.append(types.Part.from_text(
+                f"[Frame {i + 1}: image unavailable]"
+            ))
+
+    contents.append(types.Part.from_text(prompt))
+
+    # Google Search Grounding tool — anchors answers to real world data
+    google_search_tool = types.Tool(
+        google_search=types.GoogleSearch()
+    )
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=_BATCH_SYSTEM_PROMPT,
+            temperature=0.1,
+            max_output_tokens=8192,
+            thinking_config=types.ThinkingConfig(thinking_budget=4096),
+            tools=[google_search_tool],
+        ),
+    )
+
+    return _parse_batch_response(response, frames)
+
+
+# ── Response parsing ───────────────────────────────────────────────────────────
+
+
+def _parse_batch_response(response, frames: list[ExtractedFrame]) -> list[VisionResult]:
+    """
+    Parse the batch JSON array response from Gemini.
+    Gemini returns a JSON array with one object per frame.
+    Falls back to an empty result for any frame it can't parse.
+    """
+    empty = [VisionResult(frame=f) for f in frames]
 
     try:
-        with open(frame.frame_path, "rb") as f:
-            image_bytes = f.read()
-    except Exception as e:
-        logger.warning(f"Frame {frame.scene_index}: could not read image: {e}")
-        return result
-
-    try:
-        client = _get_client()
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                prompt,
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.1,
-                max_output_tokens=8192,
-                # Cap thinking budget so the model doesn't spend 60s reasoning
-                # over an ambiguous frame — 2048 tokens is plenty for location ID.
-                thinking_config=types.ThinkingConfig(thinking_budget=2048),
-            ),
-        )
-    except Exception as e:
-        logger.warning(f"Frame {frame.scene_index}: Gemini request failed: {e}")
-        return result
-
-    return _parse_response(response, frame)
-
-
-def _parse_response(response, frame: ExtractedFrame) -> VisionResult:
-    result = VisionResult(frame=frame)
-
-    try:
-        # Thinking model: skip thought parts, take the last non-thought text
+        # Thinking model: skip thought parts, collect the last non-thought text
         text = None
         for candidate in response.candidates:
             for part in reversed(candidate.content.parts):
@@ -460,12 +427,38 @@ def _parse_response(response, frame: ExtractedFrame) -> VisionResult:
                 break
 
         if not text:
-            logger.warning(f"Frame {frame.scene_index}: no output from Gemini")
-            return result
+            logger.warning("Batch response: no output text from Gemini")
+            return empty
 
-        data = json.loads(text)
-    except (AttributeError, json.JSONDecodeError) as e:
-        logger.warning(f"Frame {frame.scene_index}: could not parse response: {e}")
+        # Strip markdown fences if the model included them despite instructions
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.DOTALL)
+        data_list = json.loads(cleaned)
+
+    except (AttributeError, json.JSONDecodeError, ValueError) as e:
+        logger.warning(f"Batch response: could not parse JSON: {e}")
+        return empty
+
+    if not isinstance(data_list, list):
+        logger.warning("Batch response: expected JSON array, got something else")
+        return empty
+
+    results: list[VisionResult] = []
+    for i, frame in enumerate(frames):
+        if i >= len(data_list):
+            logger.warning(f"Batch response: missing entry for frame {frame.scene_index}")
+            results.append(VisionResult(frame=frame))
+            continue
+
+        results.append(_build_vision_result(frame, data_list[i]))
+
+    return results
+
+
+def _build_vision_result(frame: ExtractedFrame, data: dict) -> VisionResult:
+    """Convert a single JSON object from the batch array into a VisionResult."""
+    result = VisionResult(frame=frame)
+
+    if not isinstance(data, dict):
         return result
 
     name = data.get("name")
@@ -476,7 +469,9 @@ def _parse_response(response, frame: ExtractedFrame) -> VisionResult:
     if not name or confidence < settings.min_vision_confidence:
         return result
     if place_type and place_type not in VALID_PLACE_TYPES:
-        logger.debug(f"Frame {frame.scene_index}: rejected type '{place_type}' for '{name}'")
+        logger.debug(
+            f"Frame {frame.scene_index}: rejected type '{place_type}' for '{name}'"
+        )
         return result
 
     result.detection_source = "gemini"
@@ -511,3 +506,93 @@ def _parse_response(response, frame: ExtractedFrame) -> VisionResult:
         f"({'coords' if result.lat else 'no coords'}, conf={confidence:.2f}) — {result.evidence}"
     )
     return result
+
+
+# ── Consensus requery (second pass) ───────────────────────────────────────────
+
+
+def _consensus_requery(
+    frames: list[ExtractedFrame],
+    results: list[VisionResult],
+) -> list[VisionResult]:
+    """
+    Majority-vote on city/country across all high-confidence results.
+    Re-query outlier frames (as a second batch) with the consensus city locked in.
+    """
+    votes: list[tuple[str, str]] = [
+        (r.city.strip().lower(), r.country.strip().lower())
+        for r in results
+        if r.confidence >= settings.min_vision_confidence and r.city and r.country
+    ]
+    if not votes:
+        return results
+
+    (consensus_city_lower, consensus_country_lower), vote_count = Counter(votes).most_common(1)[0]
+    if vote_count < 2:
+        logger.info("No consensus city (all frames disagree) — skipping requery")
+        return results
+
+    outlier_indices = [
+        i for i, r in enumerate(results)
+        if r.confidence >= settings.min_vision_confidence and r.landmark_name
+        and (
+            (r.city and r.country and (
+                r.city.strip().lower() != consensus_city_lower
+                or r.country.strip().lower() != consensus_country_lower
+            ))
+            or (not r.city or not r.country)
+        )
+    ]
+
+    if not outlier_indices:
+        return results
+
+    winner = next(
+        (r for r in results
+         if r.city and r.country
+         and r.city.strip().lower() == consensus_city_lower
+         and r.country.strip().lower() == consensus_country_lower),
+        None,
+    )
+    consensus_city = winner.city if winner else consensus_city_lower.title()
+    consensus_country = winner.country if winner else consensus_country_lower.title()
+
+    logger.info(
+        f"Consensus city: {consensus_city}, {consensus_country} — "
+        f"re-querying {len(outlier_indices)} outlier frame(s) in second batch"
+    )
+
+    city_ctx = CaptionContext(
+        raw="", place_hints=[], city=consensus_city, country=consensus_country,
+    )
+    constrained_prompt = _build_batch_prompt(len(outlier_indices), city_ctx)
+    outlier_frames = [frames[i] for i in outlier_indices]
+
+    try:
+        requeried = _run_batch_with_retry(outlier_frames, constrained_prompt)
+    except Exception as e:
+        logger.warning(f"Consensus requery batch failed: {e}")
+        return results
+
+    updated = list(results)
+    for local_idx, global_idx in enumerate(outlier_indices):
+        if local_idx >= len(requeried):
+            continue
+        requeried_result = requeried[local_idx]
+        original = results[global_idx]
+        if requeried_result.confidence >= settings.min_vision_confidence:
+            logger.info(
+                f"Frame {frames[global_idx].scene_index}: corrected "
+                f"'{original.landmark_name}' ({original.city}) → "
+                f"'{requeried_result.landmark_name}' ({requeried_result.city})"
+            )
+            updated[global_idx] = requeried_result
+        else:
+            logger.info(
+                f"Frame {frames[global_idx].scene_index}: dropping "
+                f"'{original.landmark_name}' ({original.city}) — "
+                f"could not verify in {consensus_city}"
+            )
+            updated[global_idx] = VisionResult(frame=frames[global_idx])
+
+    return updated
