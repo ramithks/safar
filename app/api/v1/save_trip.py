@@ -78,7 +78,7 @@ async def save_trip(body: SaveTripRequest, user=Depends(require_user)):
                 "location_lat": act["lat"],
                 "location_lng": act["lng"],
                 "cost": act.get("estimated_cost") or 0,
-                "type": act.get("category") or "activity",
+                "type": (act.get("type") or "activity").lower(),
                 "metadata": {
                     "location": act.get("location"),
                     "duration_minutes": act.get("duration_minutes") or 60,

@@ -13,7 +13,7 @@ import logging
 import re
 import urllib.parse
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -36,6 +36,10 @@ VALID_PLACE_TYPES = {
 
 # Max parallel requests to Gemini
 MAX_CONCURRENT = 5
+
+# Per-frame timeout and retry config
+GEMINI_TIMEOUT_SECONDS = 25  # seconds before a single frame call is considered stalled
+MAX_RETRIES = 1              # retry once on timeout or transient error
 
 # Module-level client — created once on first use
 _client: Optional[genai.Client] = None
@@ -260,11 +264,11 @@ def _get_client() -> genai.Client:
 
 
 def _run_parallel(frames: list[ExtractedFrame], prompt: str) -> list[VisionResult]:
-    """Run Gemini on all frames in parallel with the given prompt."""
+    """Run Gemini on all frames in parallel with per-frame timeout + retry."""
     results: list[Optional[VisionResult]] = [None] * len(frames)
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
         future_to_idx = {
-            executor.submit(_call_gemini, frame, prompt): idx
+            executor.submit(_call_gemini_with_retry, frame, prompt): idx
             for idx, frame in enumerate(frames)
         }
         for future in as_completed(future_to_idx):
@@ -275,6 +279,37 @@ def _run_parallel(frames: list[ExtractedFrame], prompt: str) -> list[VisionResul
                 logger.warning(f"Frame {frames[idx].scene_index}: unexpected error: {e}")
                 results[idx] = VisionResult(frame=frames[idx])
     return [r if r is not None else VisionResult(frame=frames[i]) for i, r in enumerate(results)]
+
+
+def _call_gemini_with_retry(frame: ExtractedFrame, prompt: str) -> VisionResult:
+    """
+    Call Gemini for a single frame with a per-attempt timeout.
+    Retries up to MAX_RETRIES times on timeout or transient error.
+    """
+    for attempt in range(MAX_RETRIES + 1):
+        # Run the blocking Gemini call in its own short-lived executor so we
+        # can enforce a wall-clock timeout via future.result(timeout=N).
+        with ThreadPoolExecutor(max_workers=1) as inner:
+            fut = inner.submit(_call_gemini, frame, prompt)
+            try:
+                return fut.result(timeout=GEMINI_TIMEOUT_SECONDS)
+            except FutureTimeoutError:
+                logger.warning(
+                    f"Frame {frame.scene_index}: timed out after {GEMINI_TIMEOUT_SECONDS}s "
+                    f"(attempt {attempt + 1}/{MAX_RETRIES + 1})"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Frame {frame.scene_index}: error on attempt {attempt + 1}: {e}"
+                )
+
+        if attempt >= MAX_RETRIES:
+            logger.warning(
+                f"Frame {frame.scene_index}: all {MAX_RETRIES + 1} attempts failed — skipping"
+            )
+            return VisionResult(frame=frame)
+
+    return VisionResult(frame=frame)
 
 
 def _consensus_requery(
@@ -341,7 +376,7 @@ def _consensus_requery(
     for i in outlier_indices:
         original = results[i]
         try:
-            requeried = _call_gemini(frames[i], constrained_prompt)
+            requeried = _call_gemini_with_retry(frames[i], constrained_prompt)
             if requeried.confidence >= settings.min_vision_confidence:
                 logger.info(
                     f"Frame {frames[i].scene_index}: corrected '{original.landmark_name}' "
