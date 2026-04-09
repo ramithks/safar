@@ -15,6 +15,7 @@ import httpx
 from functools import lru_cache
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleAuthRequest
+import google.auth
 from app.config import settings
 
 MODEL_NAME = "gemini-2.5-flash"
@@ -31,24 +32,41 @@ _token_cache: dict = {"token": None, "expiry": 0.0, "project_id": ""}
 
 
 @lru_cache(maxsize=1)
-def _get_sa_info() -> dict:
-    if not settings.google_service_account_json:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
-    return json.loads(settings.google_service_account_json)
+def _get_sa_info() -> dict | None:
+    """Returns parsed service account dict, or None if JSON env var is not set."""
+    raw = (settings.google_service_account_json or "").strip()
+    if not raw:
+        return None
+    return json.loads(raw)
 
 
 def _get_access_token() -> tuple[str, str]:
     """Returns (access_token, project_id). Token is cached for 55 minutes."""
-    sa_info = _get_sa_info()
     now = time.time()
     if _token_cache["token"] and now < _token_cache["expiry"]:
         return _token_cache["token"], _token_cache["project_id"]
-    creds = service_account.Credentials.from_service_account_info(sa_info, scopes=_SCOPES)
-    creds.refresh(GoogleAuthRequest())
+
+    sa_info = _get_sa_info()
+    if sa_info:
+        # Explicit service account JSON provided
+        creds = service_account.Credentials.from_service_account_info(sa_info, scopes=_SCOPES)
+        creds.refresh(GoogleAuthRequest())
+        project_id = sa_info["project_id"]
+    else:
+        # Fall back to Application Default Credentials (ADC)
+        creds, project_id = google.auth.default(scopes=_SCOPES)
+        creds.refresh(GoogleAuthRequest())
+        project_id = project_id or settings.gcp_project or ""
+        if not project_id:
+            raise RuntimeError(
+                "Cannot determine GCP project ID: set GOOGLE_SERVICE_ACCOUNT_JSON "
+                "or GCP_PROJECT env var, or configure ADC with a project."
+            )
+
     _token_cache["token"] = creds.token
-    _token_cache["expiry"] = now + 55 * 60   # 55 min (tokens live 60 min)
-    _token_cache["project_id"] = sa_info["project_id"]
-    return creds.token, sa_info["project_id"]
+    _token_cache["expiry"] = now + 55 * 60
+    _token_cache["project_id"] = project_id
+    return creds.token, project_id
 
 
 async def vertex_generate(
