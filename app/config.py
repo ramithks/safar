@@ -43,9 +43,16 @@ class Settings(BaseSettings):
     # GCP Cloud Storage — videos and frames
     gcs_bucket_name: Optional[str] = None
 
-    # Supabase — persistent job results
+    # Supabase
     supabase_url: Optional[str] = None
-    supabase_service_key: Optional[str] = None
+    supabase_service_key: Optional[str] = None   # service_role key — DB writes, bypasses RLS
+    supabase_anon_key: Optional[str] = None       # anon/public key — JWT verification
+
+    # Vertex AI — service account JSON string (used by plan_trip, plan_day_out)
+    google_service_account_json: Optional[str] = None  # full JSON as a single env var string
+
+    # YouTube API (used by plan_trip for destination videos)
+    youtube_api_key: Optional[str] = None
 
     # Proxy — used as fallback when Instagram rate-limits or blocks direct requests
     # Format: http://user:pass@host:port/

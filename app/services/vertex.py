@@ -1,0 +1,118 @@
+"""
+Vertex AI / Gemini helper.
+
+Authenticates using a service account JSON string (GOOGLE_SERVICE_ACCOUNT_JSON env var),
+then calls the Vertex AI generateContent REST API directly.
+
+Optimisations:
+- Token is cached for 55 minutes (tokens are valid 1 hour) — avoids a Google OAuth
+  round-trip on every request.
+- Single persistent httpx.AsyncClient shared across all calls.
+"""
+import json
+import time
+import httpx
+from functools import lru_cache
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from app.config import settings
+
+MODEL_NAME = "gemini-2.5-flash"
+_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+
+# ── Shared HTTP client ────────────────────────────────────────────────────────
+_http_client = httpx.AsyncClient(
+    timeout=180.0,
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+)
+
+# ── Token cache ───────────────────────────────────────────────────────────────
+_token_cache: dict = {"token": None, "expiry": 0.0, "project_id": ""}
+
+
+@lru_cache(maxsize=1)
+def _get_sa_info() -> dict:
+    if not settings.google_service_account_json:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
+    return json.loads(settings.google_service_account_json)
+
+
+def _get_access_token() -> tuple[str, str]:
+    """Returns (access_token, project_id). Token is cached for 55 minutes."""
+    sa_info = _get_sa_info()
+    now = time.time()
+    if _token_cache["token"] and now < _token_cache["expiry"]:
+        return _token_cache["token"], _token_cache["project_id"]
+    creds = service_account.Credentials.from_service_account_info(sa_info, scopes=_SCOPES)
+    creds.refresh(GoogleAuthRequest())
+    _token_cache["token"] = creds.token
+    _token_cache["expiry"] = now + 55 * 60   # 55 min (tokens live 60 min)
+    _token_cache["project_id"] = sa_info["project_id"]
+    return creds.token, sa_info["project_id"]
+
+
+async def vertex_generate(
+    contents: list[dict] | str,
+    *,
+    model: str = MODEL_NAME,
+    response_mime_type: str | None = None,
+    temperature: float | None = None,
+    max_output_tokens: int | None = None,
+    timeout: float = 120.0,
+) -> str:
+    """
+    Call Vertex AI generateContent and return the raw text response.
+
+    contents can be:
+      - a string  → wrapped as single user message
+      - a list    → passed as-is (role/parts format)
+    """
+    token, project_id = _get_access_token()
+    location = settings.gcp_location or "us-central1"
+
+    if isinstance(contents, str):
+        contents = [{"role": "user", "parts": [{"text": contents}]}]
+
+    body: dict = {"contents": contents}
+    gc: dict = {
+        # Disable extended thinking — cuts latency from ~30-40s to ~5-10s
+        # for structured JSON generation tasks that don't need deep reasoning.
+        "thinkingConfig": {"thinkingBudget": 0},
+    }
+    if response_mime_type:
+        gc["responseMimeType"] = response_mime_type
+    if temperature is not None:
+        gc["temperature"] = temperature
+    if max_output_tokens:
+        gc["maxOutputTokens"] = max_output_tokens
+    body["generationConfig"] = gc
+
+    url = (
+        f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}"
+        f"/locations/{location}/publishers/google/models/{model}:generateContent"
+    )
+
+    r = await _http_client.post(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json=body,
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    data = r.json()
+
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def extract_json(raw: str) -> dict:
+    """Strip markdown fences and parse JSON from a Gemini response."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1]
+        if text.endswith("```"):
+            text = text[: text.rfind("```")]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        text = text[start : end + 1]
+    return json.loads(text)
