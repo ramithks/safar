@@ -379,10 +379,10 @@ def _call_gemini_batch(
             # Skip frames we couldn't load; insert a text placeholder so the
             # model knows there's a gap — we'll fill with empty result later.
             contents.append(types.Part.from_text(
-                f"[Frame {i + 1}: image unavailable]"
+                text=f"[Frame {i + 1}: image unavailable]"
             ))
 
-    contents.append(types.Part.from_text(prompt))
+    contents.append(types.Part.from_text(text=prompt))
 
     # Google Search Grounding tool — anchors answers to real world data
     google_search_tool = types.Tool(
