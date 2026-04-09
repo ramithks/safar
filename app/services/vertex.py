@@ -37,7 +37,12 @@ def _get_sa_info() -> dict | None:
     raw = (settings.google_service_account_json or "").strip()
     if not raw:
         return None
-    return json.loads(raw)
+    sa = json.loads(raw)
+    # Env var managers (Coolify, Docker, etc.) often store literal \n instead of
+    # real newlines. The RSA signer requires actual newlines in the PEM key.
+    if "private_key" in sa and isinstance(sa["private_key"], str):
+        sa["private_key"] = sa["private_key"].replace("\\n", "\n")
+    return sa
 
 
 def _get_access_token() -> tuple[str, str]:
