@@ -96,7 +96,7 @@ async def save_trip(body: SaveTripRequest, user=Depends(require_user)):
         .maybe_single()
         .execute()
     )
-    existing = existing_res.data or {}
+    existing = (existing_res.data if existing_res is not None else None) or {}
     current_trips = int(existing.get("total_trips") or 0)
     affinity: dict = existing.get("destination_affinity") or {}
     affinity[destination_name] = int(affinity.get(destination_name) or 0) + 10
