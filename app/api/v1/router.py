@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 from app.api.v1 import analyze, jobs, health
 from app.api.v1 import cities_feed, trips_feed, city, saved_plans, save_trip, plan_trip, plan_day_out
+from app.api.v1 import bulk_explore
 
 router = APIRouter(prefix="/api/v1")
 
@@ -17,3 +18,4 @@ router.include_router(saved_plans.router, tags=["plans"])
 router.include_router(save_trip.router, tags=["plans"])
 router.include_router(plan_trip.router, tags=["ai"])
 router.include_router(plan_day_out.router, tags=["ai"])
+router.include_router(bulk_explore.router, tags=["explore"])

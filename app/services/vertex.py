@@ -9,7 +9,9 @@ Optimisations:
   round-trip on every request.
 - Single persistent httpx.AsyncClient shared across all calls.
 """
+import asyncio
 import json
+import random
 import time
 import httpx
 from functools import lru_cache
@@ -115,15 +117,29 @@ async def vertex_generate(
         f"/locations/{location}/publishers/google/models/{model}:generateContent"
     )
 
-    r = await _http_client.post(
-        url,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json=body,
-        timeout=timeout,
-    )
-    r.raise_for_status()
-    data = r.json()
+    # Retry with exponential backoff on 429 / 503
+    max_attempts = 6
+    base_delay = 5.0
+    for attempt in range(max_attempts):
+        r = await _http_client.post(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=body,
+            timeout=timeout,
+        )
+        if r.status_code in (429, 503) and attempt < max_attempts - 1:
+            # Honour Retry-After header if present, otherwise exponential backoff + jitter
+            retry_after = r.headers.get("Retry-After")
+            base = float(retry_after) if retry_after else base_delay * (2 ** attempt)
+            jitter = random.uniform(0, base * 0.3)   # ±30% jitter to spread retries
+            delay = min(base + jitter, 120.0)         # cap at 2 minutes
+            print(f"[vertex] {r.status_code} rate limit — retry {attempt + 1}/{max_attempts - 1} in {delay:.1f}s")
+            await asyncio.sleep(delay)
+            continue
+        r.raise_for_status()
+        break
 
+    data = r.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 

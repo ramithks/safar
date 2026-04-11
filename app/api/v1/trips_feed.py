@@ -4,6 +4,7 @@ GET /api/v1/trips-feed?page=1&pageSize=10
 Returns paginated community trips from internal_trip_logs with author profiles.
 No auth required.
 """
+import asyncio
 from fastapi import APIRouter, Query
 from app.db.client import get_db
 from app.services.places import extract_hero_image
@@ -22,31 +23,50 @@ async def trips_feed(
 ):
     db = get_db()
     maps_key = settings.google_maps_api_key or ""
+    loop = asyncio.get_event_loop()
 
     start = (page - 1) * page_size
     end = start + page_size - 1
 
-    res = (
-        db.table("internal_trip_logs")
-        .select("id, destination, days, itinerary_data, user_id, created_at", count="exact")
-        .not_.is_("itinerary_data", "null")
-        .order("created_at", desc=True)
-        .range(start, end)
-        .execute()
-    )
-    rows = res.data or []
-    total = res.count or 0
+    # Run count + data queries in parallel — avoids serial round trips while
+    # keeping them separate (supabase-py returns page count not total when
+    # count="exact" is combined with .range()).
+    def _fetch_count():
+        return (
+            db.table("internal_trip_logs")
+            .select("id", count="exact")
+            .not_.is_("itinerary_data", "null")
+            .execute()
+        )
 
-    # Batch-fetch author profiles
+    def _fetch_page():
+        return (
+            db.table("internal_trip_logs")
+            .select("id, destination, days, itinerary_data, user_id, created_at")
+            .not_.is_("itinerary_data", "null")
+            .order("created_at", desc=True)
+            .range(start, end)
+            .execute()
+        )
+
+    count_res, page_res = await asyncio.gather(
+        loop.run_in_executor(None, _fetch_count),
+        loop.run_in_executor(None, _fetch_page),
+    )
+
+    total = count_res.count or 0
+    rows = page_res.data or []
+
+    # Batch-fetch author profiles (only needed after we have the page rows)
     user_ids = list({r["user_id"] for r in rows if r.get("user_id")})
     profile_map: dict = {}
     if user_ids:
-        p_res = (
+        p_res = await loop.run_in_executor(None, lambda: (
             db.table("profiles")
             .select("id, avatar_url, full_name")
             .in_("id", user_ids)
             .execute()
-        )
+        ))
         for p in p_res.data or []:
             profile_map[p["id"]] = {"avatar_url": p.get("avatar_url"), "full_name": p.get("full_name")}
 

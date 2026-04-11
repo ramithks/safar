@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     # YouTube API (used by plan_trip for destination videos)
     youtube_api_key: Optional[str] = None
 
+    # Bulk Explore Seeder — shared secret for POST /api/v1/bulk-generate-explore
+    bulk_explore_api_key: str = "travbuddy-bulk-2025"
+
     # Proxy — used as fallback when Instagram rate-limits or blocks direct requests
     # Format: http://user:pass@host:port/
     instagram_proxy_url: Optional[str] = None
