@@ -5,19 +5,35 @@ All endpoints require a valid Supabase JWT. Most require the user to be
 an approved member (community_users.approval_status == 'approved').
 
 Tables: community_users, community_plans, plan_participants,
-plan_messages, community_reports, community_blocks
+plan_messages, community_reports, community_blocks, plan_payments
+
+Paid-plan flow (Razorpay, manual capture):
+    1. Host creates plan with is_paid=true, price_paise=N
+    2. User taps "Pay & Request" → POST /plans/{id}/initiate-payment
+       → backend creates Razorpay order, returns checkout config
+    3. RN opens Razorpay SDK; on success posts to /payments/verify
+       → backend verifies signature, marks payment authorized,
+         inserts plan_participants row in 'requested' state
+    4. Host accepts → backend captures payment, marks accepted
+       Host rejects → backend refunds, marks rejected
+    5. Razorpay webhooks reconcile async events at /payments/webhook
 """
+import json
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 import secrets
 import string
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
+from app.config import settings
 from app.db.client import get_db
 from app.deps.auth import require_user
+from app.services import razorpay_client
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/community")
 
 
@@ -48,6 +64,18 @@ class CreatePlanPayload(BaseModel):
     gender_pref: str = "any"
     vibe_tags: list[str] = Field(default_factory=list)
     cover_image: Optional[str] = None
+    city: Optional[str] = None  # if omitted, derived from creator's profile
+    # Paid plans: host sets price; free plans: capped at 10 participants
+    is_paid: bool = False
+    price_paise: Optional[int] = Field(default=None, ge=100)  # min ₹1
+    currency: str = "INR"
+
+
+class VerifyPaymentPayload(BaseModel):
+    plan_id: str
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
 
 
 class RespondPayload(BaseModel):
@@ -233,15 +261,23 @@ async def submit_application(payload: ApplicationPayload, user=Depends(require_u
 @router.get("/plans")
 async def list_plans(
     filter: Optional[str] = Query(default=None, pattern="^(today|upcoming)$"),
+    city: Optional[str] = Query(default=None, min_length=1, max_length=120),
     user=Depends(require_user),
 ):
     db = get_db()
-    _require_approved(db, user.id)
+    profile = _require_approved(db, user.id)
+
+    # City scoping: prefer the live city the client just resolved (device GPS),
+    # fall back to the city stored on the community profile.
+    effective_city = (city or "").strip() or (profile.get("city") or "").strip()
+    if not effective_city:
+        raise HTTPException(status_code=400, detail="City is required (enable location)")
 
     q = (
         db.table("community_plans")
         .select("*")
         .eq("is_cancelled", False)
+        .ilike("city", effective_city)
         .order("datetime", desc=False)
     )
 
@@ -321,15 +357,33 @@ async def get_plan(plan_id: str, user=Depends(require_user)):
 @router.post("/plans")
 async def create_plan(payload: CreatePlanPayload, user=Depends(require_user)):
     db = get_db()
-    _require_approved(db, user.id)
+    profile = _require_approved(db, user.id)
+
+    # Free plans are capped at 10 participants; paid plans use the schema's 2-20 range
+    if payload.is_paid:
+        if not payload.price_paise or payload.price_paise <= 0:
+            raise HTTPException(status_code=400, detail="Paid plans require price_paise > 0")
+        if payload.currency != "INR":
+            raise HTTPException(status_code=400, detail="Only INR is supported")
+    else:
+        if payload.max_people > 10:
+            raise HTTPException(status_code=400, detail="Free plans are capped at 10 participants")
+
+    plan_city = (payload.city or "").strip() or (profile.get("city") or "").strip()
+    if not plan_city:
+        raise HTTPException(status_code=400, detail="City is required to create a plan")
 
     insert_res = db.table("community_plans").insert({
         "creator_id": user.id,
         "title": payload.title,
         "description": payload.description or "",
         "location": payload.location,
+        "city": plan_city,
         "datetime": payload.datetime,
         "max_people": payload.max_people,
+        "is_paid": payload.is_paid,
+        "price_paise": payload.price_paise if payload.is_paid else None,
+        "currency": payload.currency or "INR",
         "gender_pref": payload.gender_pref,
         "vibe_tags": payload.vibe_tags,
         "cover_image": payload.cover_image,
@@ -360,12 +414,13 @@ async def create_plan(payload: CreatePlanPayload, user=Depends(require_user)):
 
 @router.post("/plans/{plan_id}/join")
 async def join_plan(plan_id: str, user=Depends(require_user)):
+    """Free-plan join. Paid plans must use /plans/{id}/initiate-payment."""
     db = get_db()
     _require_approved(db, user.id)
 
     plan_res = (
         db.table("community_plans")
-        .select("creator_id, max_people, is_cancelled")
+        .select("creator_id, max_people, is_cancelled, is_paid")
         .eq("id", plan_id)
         .maybe_single()
         .execute()
@@ -376,6 +431,8 @@ async def join_plan(plan_id: str, user=Depends(require_user)):
         raise HTTPException(status_code=410, detail="Plan was cancelled")
     if plan_res.data["creator_id"] == user.id:
         raise HTTPException(status_code=400, detail="You are the host of this plan")
+    if plan_res.data["is_paid"]:
+        raise HTTPException(status_code=400, detail="Paid plan — use /initiate-payment")
 
     existing = (
         db.table("plan_participants")
@@ -397,20 +454,177 @@ async def join_plan(plan_id: str, user=Depends(require_user)):
     return {"status": "requested"}
 
 
+@router.post("/plans/{plan_id}/initiate-payment")
+async def initiate_payment(plan_id: str, user=Depends(require_user)):
+    """
+    Paid-plan join: create a Razorpay order in 'manual capture' mode.
+    Returns the checkout config the RN SDK needs.
+    """
+    db = get_db()
+    profile = _require_approved(db, user.id)
+
+    plan_res = (
+        db.table("community_plans").select("*").eq("id", plan_id).maybe_single().execute()
+    )
+    if not plan_res.data:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    plan = plan_res.data
+
+    if not plan["is_paid"]:
+        raise HTTPException(status_code=400, detail="Free plan — use /join")
+    if plan["is_cancelled"]:
+        raise HTTPException(status_code=410, detail="Plan was cancelled")
+    if plan["creator_id"] == user.id:
+        raise HTTPException(status_code=400, detail="You are the host of this plan")
+
+    accepted_res = (
+        db.table("plan_participants").select("id", count="exact")
+        .eq("plan_id", plan_id).eq("status", "accepted").execute()
+    )
+    if (accepted_res.count or 0) >= plan["max_people"]:
+        raise HTTPException(status_code=409, detail="Plan is full")
+
+    existing = (
+        db.table("plan_payments").select("*")
+        .eq("plan_id", plan_id).eq("user_id", user.id).maybe_single().execute()
+    )
+    if existing.data and existing.data["status"] in ("authorized", "captured"):
+        raise HTTPException(status_code=409, detail="You already have an active payment for this plan")
+
+    receipt = f"plan_{plan_id[:8]}_{user.id[:8]}"
+    try:
+        order = razorpay_client.create_order(
+            amount_paise=plan["price_paise"],
+            currency=plan["currency"],
+            receipt=receipt,
+            notes={"plan_id": plan_id, "user_id": user.id},
+        )
+    except Exception as e:
+        logger.error("Razorpay order creation failed: %s", e)
+        raise HTTPException(status_code=502, detail="Payment provider error")
+
+    db.table("plan_payments").upsert({
+        "plan_id": plan_id,
+        "user_id": user.id,
+        "razorpay_order_id": order["id"],
+        "amount_paise": plan["price_paise"],
+        "currency": plan["currency"],
+        "status": "created",
+    }, on_conflict="plan_id,user_id").execute()
+
+    return {
+        "order_id": order["id"],
+        "key_id": settings.razorpay_key_id,
+        "amount": plan["price_paise"],
+        "currency": plan["currency"],
+        "name": "TravBuddy",
+        "description": plan["title"],
+        "prefill": {
+            "email": getattr(user, "email", "") or "",
+            "contact": (profile or {}).get("phone_number", "") or "",
+            "name": (profile or {}).get("name", "") or "",
+        },
+    }
+
+
+@router.post("/payments/verify")
+async def verify_payment(payload: VerifyPaymentPayload, user=Depends(require_user)):
+    """RN posts the (order_id, payment_id, signature) tuple after Razorpay checkout."""
+    db = get_db()
+
+    if not razorpay_client.verify_payment_signature(
+        payload.razorpay_order_id, payload.razorpay_payment_id, payload.razorpay_signature
+    ):
+        raise HTTPException(status_code=400, detail="Invalid payment signature")
+
+    payment_res = (
+        db.table("plan_payments").select("*")
+        .eq("razorpay_order_id", payload.razorpay_order_id).maybe_single().execute()
+    )
+    if not payment_res.data:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if payment_res.data["user_id"] != user.id:
+        raise HTTPException(status_code=403, detail="Not your payment")
+    if payment_res.data["plan_id"] != payload.plan_id:
+        raise HTTPException(status_code=400, detail="Plan mismatch")
+
+    db.table("plan_payments").update({
+        "razorpay_payment_id": payload.razorpay_payment_id,
+        "status": "authorized",
+    }).eq("razorpay_order_id", payload.razorpay_order_id).execute()
+
+    db.table("plan_participants").upsert({
+        "plan_id": payload.plan_id,
+        "user_id": user.id,
+        "status": "requested",
+    }, on_conflict="plan_id,user_id").execute()
+
+    return {"status": "authorized"}
+
+
+@router.post("/payments/webhook")
+async def razorpay_webhook(request: Request):
+    """
+    Public endpoint hit by Razorpay for async payment events.
+    Verifies signature, then reconciles plan_payments.status idempotently.
+    """
+    body = await request.body()
+    signature = request.headers.get("x-razorpay-signature", "")
+
+    if not razorpay_client.verify_webhook_signature(body, signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    try:
+        data = json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event = data.get("event", "")
+    payload_obj = data.get("payload", {})
+    db = get_db()
+
+    if event in ("payment.authorized", "payment.captured", "payment.failed"):
+        p = (payload_obj.get("payment") or {}).get("entity") or {}
+        order_id = p.get("order_id")
+        if not order_id:
+            return {"received": True}
+        update: dict = {"razorpay_payment_id": p.get("id")}
+        if event == "payment.authorized":
+            update["status"] = "authorized"
+        elif event == "payment.captured":
+            update["status"] = "captured"
+        elif event == "payment.failed":
+            update["status"] = "failed"
+            update["failure_reason"] = p.get("error_description") or "Payment failed"
+        db.table("plan_payments").update(update).eq("razorpay_order_id", order_id).execute()
+
+    elif event == "refund.processed":
+        r = (payload_obj.get("refund") or {}).get("entity") or {}
+        payment_id = r.get("payment_id")
+        if payment_id:
+            db.table("plan_payments").update({
+                "status": "refunded",
+                "razorpay_refund_id": r.get("id"),
+            }).eq("razorpay_payment_id", payment_id).execute()
+
+    return {"received": True}
+
+
 @router.post("/plans/{plan_id}/respond")
 async def respond_to_request(plan_id: str, payload: RespondPayload, user=Depends(require_user)):
     db = get_db()
 
     plan_res = (
         db.table("community_plans")
-        .select("creator_id, max_people")
+        .select("creator_id, max_people, is_paid")
         .eq("id", plan_id)
         .maybe_single()
         .execute()
     )
     if not plan_res.data:
         raise HTTPException(status_code=404, detail="Plan not found")
-    if plan_res.data["creator_id"] != user.id:
+    plan = plan_res.data
+    if plan["creator_id"] != user.id:
         raise HTTPException(status_code=403, detail="Only the host can respond")
 
     if payload.action not in ("accept", "reject"):
@@ -426,9 +640,44 @@ async def respond_to_request(plan_id: str, payload: RespondPayload, user=Depends
             .eq("status", "accepted")
             .execute()
         )
-        accepted_count = accepted_count_res.count or 0
-        if accepted_count >= plan_res.data["max_people"]:
+        if (accepted_count_res.count or 0) >= plan["max_people"]:
             raise HTTPException(status_code=409, detail="Plan is full")
+
+    # Paid plan: capture on accept, refund on reject. Free plan: no payment touch.
+    if plan["is_paid"]:
+        payment_res = (
+            db.table("plan_payments").select("*")
+            .eq("plan_id", plan_id).eq("user_id", payload.user_id).maybe_single().execute()
+        )
+        if not payment_res.data:
+            raise HTTPException(status_code=409, detail="No payment record for this user")
+        payment = payment_res.data
+
+        if new_status == "accepted":
+            if payment["status"] != "authorized":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Payment not in authorized state (got {payment['status']})",
+                )
+            try:
+                razorpay_client.capture_payment(
+                    payment["razorpay_payment_id"], payment["amount_paise"], payment["currency"]
+                )
+                db.table("plan_payments").update({"status": "captured"}).eq("id", payment["id"]).execute()
+            except Exception as e:
+                logger.error("Razorpay capture failed for payment %s: %s", payment["id"], e)
+                raise HTTPException(status_code=502, detail="Payment capture failed")
+        else:
+            if payment["status"] in ("authorized", "captured"):
+                try:
+                    refund = razorpay_client.refund_payment(payment["razorpay_payment_id"])
+                    db.table("plan_payments").update({
+                        "status": "refunded",
+                        "razorpay_refund_id": refund.get("id"),
+                    }).eq("id", payment["id"]).execute()
+                except Exception as e:
+                    # Don't block rejection on refund API failure — webhook reconciles, support follows up
+                    logger.error("Razorpay refund failed for payment %s: %s", payment["id"], e)
 
     update_res = (
         db.table("plan_participants")
