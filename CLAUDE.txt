@@ -1,0 +1,132 @@
+# TravBuddy Backend — CLAUDE.md
+
+## What this project is
+
+TravBuddy extracts a structured **location timeline** from any Instagram Reel — answer the question "where in the world was this filmed?" The backend handles the full pipeline: download → scene detection → frame deduplication → AI vision → place enrichment → persist.
+
+**Built entirely with Claude Code as the primary agentic coding harness.**
+
+---
+
+## How I use Claude Code
+
+I run Claude Code as an interactive pair-programmer for the entire dev loop — not just for boilerplate. Typical session patterns:
+
+- **Architectural decisions in-conversation**: e.g. "should Places API enrichment run concurrently with vision or after?" — Claude reasons through latency vs. cost tradeoffs and proposes the pipeline shape
+- **Autonomous multi-file refactors**: switching from Gemini REST API (GEMINI_API_KEY) to Vertex AI (`google-genai` SDK, `vertexai=True`) touched 6 files; Claude planned and executed the full change in one pass
+- **Debugging with tool use**: when Vertex AI returned 429s under load, Claude read the logs, identified the concurrency issue, and implemented exponential backoff with configurable max retries — including the test coverage
+- **Test generation**: `tests/test_pipeline.py`, `test_save_trip.py`, etc. were written by Claude after it read the source files and inferred edge cases (null DB responses, empty captions, zero-scene videos)
+- **Cost-driven design**: Claude suggested using Essentials-only Places API fields ($5/1k vs $17/1k) with a diskcache layer (7-day TTL by place_id) — the constraint was mine, the implementation was collaborative
+- **Schema iteration**: the `ReelResult` / `LocationSegment` / `ReelSummary` Pydantic models evolved across many sessions; Claude maintained consistency across models, API responses, and Supabase schema
+
+---
+
+## Stack
+
+| Layer | Tech |
+|---|---|
+| API | FastAPI + uvicorn, async job model (POST submit → GET poll + SSE stream) |
+| Task queue | Celery + Redis |
+| Video download | yt-dlp → custom httpx embed scraper (fallback chain) |
+| Scene detection | PySceneDetect + OpenCV |
+| Frame dedup | pHash (ImageHash) |
+| Vision AI | Gemini 2.5 Flash via Vertex AI (`google-genai` SDK) |
+| Place enrichment | Google Places API, diskcache (7-day TTL) |
+| Storage | GCS (video + frames), Supabase (scan results + user trips) |
+| Auth | GCP ADC + service account JSON via env var |
+
+---
+
+## Pipeline
+
+```
+Instagram URL
+    │
+    ▼
+[yt-dlp / embed scraper]   ← fallback chain
+    │  video file
+    ▼
+[PySceneDetect]            ← scene boundaries
+    │  scene list
+    ▼
+[OpenCV frame extractor]   ← one keyframe per scene
+    │
+    ▼
+[pHash deduplicator]       ← drop near-duplicate frames
+    │  unique frames (capped)
+    ▼
+[Gemini 2.5 Flash @ Vertex AI]  ← name / address / city / country / lat / lng
+    │  VisionResult[]
+    ▼
+[Timeline builder]         ← dedup by normalized name, merge time ranges
+    │  LocationSegment[]
+    ▼
+[Supabase]                 ← persist ReelResult, reel_scans table
+```
+
+SSE events are emitted at each stage boundary so the frontend can stream progress in real time.
+
+---
+
+## Key design decisions
+
+**No Places API in the hot path** — Gemini returns name/address/coordinates directly. Places enrichment is stubbed out but not called; Essentials fields are available if needed later without changing the pipeline shape.
+
+**Async job model** — every reel submit returns a `job_id` immediately. Polling and SSE are both supported. This was Claude's suggestion to keep the API non-blocking and mobile-friendly.
+
+**Supabase caching** — if a reel URL was processed before, return the stored result immediately (skip the full pipeline). Cache key is the normalized URL.
+
+**Exponential backoff on Vertex** — Gemini rate limits (429s) under concurrent load are handled with configurable retries and jitter. Concurrency is intentionally throttled.
+
+---
+
+## How to run
+
+```bash
+# Install
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+
+# Configure
+cp .env.example .env  # set GCP_PROJECT, GOOGLE_SERVICE_ACCOUNT_JSON, SUPABASE_URL, etc.
+
+# Start
+uvicorn app.main:app --reload
+
+# Worker (separate terminal)
+celery -A app.workers.celery_app worker --loglevel=info
+```
+
+API docs: `http://localhost:8000/docs`
+
+---
+
+## Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `GCP_PROJECT` | Vertex AI project ID |
+| `GCP_LOCATION` | Vertex region (default `us-central1`) |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Full JSON string of service account key |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_SERVICE_KEY` | Supabase service role key |
+| `GCS_BUCKET_NAME` | GCS bucket for video/frame storage |
+| `REDIS_URL` | Redis for Celery broker |
+
+---
+
+## Tests
+
+```bash
+pytest tests/ -v
+```
+
+Tests cover: downloader fallback chain, scene detection, pipeline orchestrator (null DB, no scenes, vision failure), save_trip edge cases.
+
+---
+
+## Claude Code workflow notes
+
+- Complex pipeline changes are planned in-conversation first, then Claude executes across all affected files in one pass
+- When a fix touches infra (GCP auth, env var parsing), Claude reads the actual SDK source via web search before proposing a solution — not just training-data guesses
+- All commit messages in this repo were co-authored with Claude Code; the git log is a readable audit trail of the build process

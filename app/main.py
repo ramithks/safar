@@ -6,6 +6,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+import sentry_sdk
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +14,16 @@ from fastapi.responses import JSONResponse
 
 from app.api.v1.router import router
 from app.config import settings
+
+# ── Sentry — must init before FastAPI() to capture startup errors ───────────────
+if settings.sentry_dsn:
+    sentry_sdk.init(
+        dsn=settings.sentry_dsn,
+        environment=settings.app_env,
+        send_default_pii=True,
+        traces_sample_rate=settings.sentry_traces_sample_rate,
+        profiles_sample_rate=settings.sentry_profiles_sample_rate,
+    )
 
 # ── Logging setup ────────────────────────────────────────────────────────────────
 structlog.configure(

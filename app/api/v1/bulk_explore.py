@@ -18,8 +18,8 @@ Request body:
     },
     ...
   ],
-  "demo_user_email": "demo@travbuddy.app",   // optional override
-  "demo_user_password": "TravBuddy_Demo_2025!" // optional override
+  "demo_user_email": "demo@example.com",   // optional override; defaults to BULK_EXPLORE_DEMO_EMAIL
+  "demo_user_password": "<redacted>"       // optional override; defaults to BULK_EXPLORE_DEMO_PASSWORD
 }
 
 Response:
@@ -66,15 +66,18 @@ router = APIRouter()
 ALL_VIBES   = ["culture", "food", "adventure", "nightlife", "nature", "beaches", "art", "wellness", "history", "shopping", "family"]
 ALL_BUDGETS = ["low", "mid", "high"]
 
-# ── Demo account defaults ─────────────────────────────────────────────────────
-DEFAULT_DEMO_EMAIL    = "demo@travbuddy.app"
-DEFAULT_DEMO_PASSWORD = "TravBuddy_Demo_2025!"
+# ── Demo account defaults (loaded from .env) ────────────────────────────────
+import os
+DEFAULT_DEMO_EMAIL    = os.environ.get("BULK_EXPLORE_DEMO_EMAIL", "")
+DEFAULT_DEMO_PASSWORD = os.environ.get("BULK_EXPLORE_DEMO_PASSWORD", "")
 
 # ── API key guard (simple shared secret, loaded from .env) ───────────────────
 BULK_API_KEY = settings.bulk_explore_api_key
 
 
 def _require_bulk_key(x_api_key: str = Header(..., alias="X-API-Key")):
+    if not BULK_API_KEY:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="BULK_EXPLORE_API_KEY not configured")
     if x_api_key != BULK_API_KEY:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 

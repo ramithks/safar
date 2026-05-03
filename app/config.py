@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     youtube_api_key: Optional[str] = None
 
     # Bulk Explore Seeder — shared secret for POST /api/v1/bulk-generate-explore
-    bulk_explore_api_key: str = "travbuddy-bulk-2025"
+    bulk_explore_api_key: Optional[str] = None
 
     # Proxy — used as fallback when Instagram rate-limits or blocks direct requests
     # Format: http://user:pass@host:port/
@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
     temp_dir: str = "/tmp/travbuddy"
+
+    # Sentry — error tracking (project: travbuddy_backend, id: 4511325237346304)
+    sentry_dsn: Optional[str] = None
+    sentry_traces_sample_rate: float = 0.1
+    sentry_profiles_sample_rate: float = 0.1
 
 
 settings = Settings()
