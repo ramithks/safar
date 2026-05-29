@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TravBuddy — Journey Analyzer</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f0f13;color:#e2e8f0;min-height:100vh}
+.header{background:linear-gradient(135deg,#1a1a2e,#16213e);border-bottom:1px solid #2d3748;padding:20px 32px;display:flex;align-items:center;gap:16px}
+.logo{font-size:22px;font-weight:700;color:#fff;letter-spacing:-.5px}.logo span{color:#6366f1}
+.badge{background:#6366f1;color:#fff;font-size:11px;font-weight:600;padding:3px 8px;border-radius:20px;letter-spacing:.5px}
+.paste-zone{max-width:960px;margin:40px auto;padding:0 24px}
+.paste-box{background:#1a1a2e;border:2px dashed #3d4466;border-radius:12px;padding:24px}
+.paste-box label{display:block;font-size:13px;font-weight:600;color:#94a3b8;margin-bottom:10px;text-transform:uppercase;letter-spacing:.8px}
+textarea{width:100%;height:140px;background:#0f0f13;border:1px solid #2d3748;border-radius:8px;color:#e2e8f0;font-family:'Menlo',monospace;font-size:12px;padding:12px;resize:vertical}
+.parse-btn{margin-top:12px;background:#6366f1;color:#fff;border:none;padding:10px 24px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer}
+.parse-btn:hover{background:#4f46e5}
+#dashboard{max-width:1140px;margin:0 auto;padding:0 24px 80px;display:none}
+.section-title{font-size:12px;font-weight:700;color:#6366f1;text-transform:uppercase;letter-spacing:1px;margin-bottom:14px;display:flex;align-items:center;gap:8px;margin-top:32px}
+.section-title::after{content:'';flex:1;height:1px;background:#2d3748}
+
+/* Summary */
+.summary-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-top:20px;margin-bottom:4px}
+.card{background:#1a1a2e;border:1px solid #2d3748;border-radius:12px;padding:18px}
+.card .label{font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px}
+.card .value{font-size:20px;font-weight:700;color:#fff}
+.card .sub{font-size:11px;color:#475569;margin-top:3px}
+.card.accent{border-color:#6366f1;background:linear-gradient(135deg,#1e1b4b,#1a1a2e)}
+
+/* Journey banner */
+.journey-banner{background:linear-gradient(135deg,#1e1b4b,#1a1a2e);border:1px solid #4338ca;border-radius:14px;padding:22px 28px;margin-top:28px;display:flex;align-items:center;gap:20px}
+.city{font-size:26px;font-weight:800;color:#fff}
+.arrow-track{flex:1;display:flex;align-items:center;position:relative}
+.track-line{flex:1;height:2px;background:linear-gradient(90deg,#6366f1,#8b5cf6)}
+.track-dot{width:8px;height:8px;background:#6366f1;border-radius:50%;flex-shrink:0}
+.arrow-label{text-align:center;font-size:12px;color:#94a3b8;position:absolute;width:100%;top:8px}
+.intl-badge{background:#f59e0b22;border:1px solid #f59e0b;color:#f59e0b;font-size:12px;font-weight:600;padding:4px 10px;border-radius:6px}
+
+/* Legs */
+.leg{background:#1a1a2e;border:1px solid #2d3748;border-radius:12px;padding:18px 22px;margin-bottom:10px;display:grid;grid-template-columns:46px 1fr auto;gap:14px;align-items:start}
+.leg:hover{border-color:#4338ca}
+.leg-icon{width:42px;height:42px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}
+.leg-icon.bus{background:#1e3a5f}.leg-icon.train{background:#1a3a2e}.leg-icon.flight{background:#3a1a2e}
+.leg-icon.cab,.leg-icon.shared_cab{background:#3a2a1a}.leg-icon.auto{background:#2a1a3a}.leg-icon.walk{background:#1a2a1a}
+.leg-route{font-size:16px;font-weight:700;color:#fff;margin-bottom:4px}.leg-route span{color:#6366f1}
+.leg-meta{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;color:#64748b;margin-bottom:6px}.leg-meta b{color:#94a3b8}
+.leg-tip{font-size:12px;color:#64748b;background:#0f1117;border-left:3px solid #6366f1;padding:7px 11px;border-radius:0 6px 6px 0;margin-top:6px}
+.leg-right{text-align:right;flex-shrink:0}
+.leg-cost{font-size:17px;font-weight:700;color:#10b981}.leg-dur{font-size:11px;color:#64748b;margin-top:2px}
+.book-btn{display:inline-block;margin-top:8px;background:#6366f1;color:#fff;font-size:12px;font-weight:600;padding:6px 13px;border-radius:6px;text-decoration:none}
+.book-btn:hover{background:#4f46e5}
+.no-book{display:inline-block;margin-top:8px;font-size:11px;color:#475569;background:#1e293b;padding:4px 9px;border-radius:6px}
+
+/* Live buses */
+.bus-table{width:100%;border-collapse:collapse;font-size:12.5px}
+.bus-table th{background:#1a1a2e;border-bottom:1px solid #2d3748;padding:9px 12px;text-align:left;font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.6px}
+.bus-table td{padding:11px 12px;border-bottom:1px solid #1e2538;vertical-align:middle}
+.bus-table tr:hover td{background:#1e1b3a18}
+.op-logo{width:26px;height:26px;border-radius:5px;object-fit:contain;background:#fff;padding:2px;vertical-align:middle;margin-right:7px}
+.op-name{font-weight:600;color:#e2e8f0}
+.bus-type{font-size:10px;color:#475569;display:block;margin-top:1px}
+.timing b{color:#e2e8f0;font-size:13px}
+.timing small{font-size:10px;color:#475569;display:block;margin-top:1px}
+.fare-orig{font-size:15px;font-weight:700;color:#10b981}
+.fare-disc{font-size:15px;font-weight:700;color:#f59e0b}
+.fare-strike{font-size:11px;color:#475569;text-decoration:line-through}
+.seats-pill{background:#1e3a2e;color:#10b981;font-size:10px;font-weight:600;padding:2px 7px;border-radius:20px;display:inline-block}
+.rating-pill{background:#1e2538;color:#f59e0b;font-size:11px;font-weight:700;padding:2px 7px;border-radius:20px;display:inline-flex;align-items:center;gap:3px}
+.amenity{background:#1e293b;color:#64748b;font-size:10px;padding:2px 5px;border-radius:3px;display:inline-block;margin:1px}
+.book-cell a{background:#6366f1;color:#fff;font-size:11px;font-weight:600;padding:5px 12px;border-radius:5px;text-decoration:none;white-space:nowrap}
+.book-cell a:hover{background:#4f46e5}
+.best-badge{background:#f59e0b22;border:1px solid #f59e0b;color:#f59e0b;font-size:9px;font-weight:700;padding:2px 5px;border-radius:3px;margin-left:5px;vertical-align:middle}
+.drop-info{font-size:10px;color:#475569;margin-top:2px}
+
+/* Flights */
+.flight-cards{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+.flight-card{background:#1a1a2e;border:1px solid #2d3748;border-radius:12px;padding:18px 20px;display:flex;flex-direction:column;gap:10px}
+.flight-card.best{border-color:#f59e0b;background:linear-gradient(135deg,#1e1b0a,#1a1a2e)}
+.flight-header{display:flex;align-items:center;justify-content:space-between}
+.airline-name{font-size:14px;font-weight:700;color:#fff}
+.flight-num{font-size:11px;color:#475569}
+.flight-best-tag{background:#f59e0b;color:#000;font-size:9px;font-weight:800;padding:2px 7px;border-radius:4px;letter-spacing:.5px}
+.flight-route{display:flex;align-items:center;gap:10px}
+.f-city{text-align:center}
+.f-city .iata{font-size:20px;font-weight:800;color:#fff}
+.f-city .time{font-size:13px;color:#94a3b8;margin-top:2px}
+.f-city .city-name{font-size:10px;color:#475569}
+.f-line{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px}
+.f-line .dur{font-size:11px;color:#64748b}
+.f-line .stops{font-size:10px;color:#475569}
+.f-dashes{width:100%;height:1px;border-top:1px dashed #2d3748}
+.flight-bottom{display:flex;align-items:center;justify-content:space-between}
+.f-price{font-size:20px;font-weight:800;color:#10b981}
+.f-price small{font-size:11px;font-weight:400;color:#475569}
+.f-book-btn{background:#6366f1;color:#fff;font-size:12px;font-weight:600;padding:7px 15px;border-radius:7px;text-decoration:none}
+.f-book-btn:hover{background:#4f46e5}
+.f-tags{display:flex;gap:6px;flex-wrap:wrap}
+.f-tag{font-size:10px;background:#1e293b;color:#64748b;padding:2px 6px;border-radius:4px}
+.no-flights{background:#1a1a2e;border:1px solid #2d3748;border-radius:12px;padding:24px;text-align:center;color:#475569}
+
+/* Hotels */
+.hotels-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.hotel-card{background:#1a1a2e;border:1px solid #2d3748;border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
+.hotel-card.top{border-color:#f59e0b}
+.hotel-img{height:130px;background:#0f1117;display:flex;align-items:center;justify-content:center;overflow:hidden;position:relative}
+.hotel-img img{width:100%;height:100%;object-fit:cover}
+.top-ribbon{position:absolute;top:8px;left:8px;background:#f59e0b;color:#000;font-size:9px;font-weight:800;padding:2px 7px;border-radius:3px}
+.hotel-body{padding:12px;flex:1;display:flex;flex-direction:column;gap:6px}
+.hotel-name{font-size:13px;font-weight:700;color:#fff}
+.hotel-addr{font-size:10px;color:#475569;line-height:1.4}
+.h-meta{display:flex;gap:6px;flex-wrap:wrap}
+.h-pill{font-size:10px;font-weight:600;padding:2px 7px;border-radius:20px;display:inline-flex;align-items:center;gap:3px}
+.h-pill.r{background:#1e3a2e;color:#10b981}.h-pill.p{background:#1e2a3a;color:#60a5fa}.h-pill.s{background:#1e1b3a;color:#a5b4fc}
+.hotel-foot{margin-top:auto;display:flex;align-items:center;justify-content:space-between}
+.h-price{font-size:16px;font-weight:800;color:#10b981}
+.h-price small{font-size:10px;font-weight:400;color:#475569}
+.h-btn{background:#6366f1;color:#fff;font-size:11px;font-weight:600;padding:6px 12px;border-radius:6px;text-decoration:none}
+.h-btn:hover{background:#4f46e5}
+.h-btn.gs{background:#1e293b;color:#94a3b8;border:1px solid #2d3748}
+
+/* Itinerary */
+.day-card{background:#1a1a2e;border:1px solid #2d3748;border-radius:12px;margin-bottom:16px;overflow:hidden}
+.day-header{background:linear-gradient(90deg,#1e1b4b,#1a1a2e);padding:14px 20px;border-bottom:1px solid #2d3748;display:flex;align-items:center;gap:12px}
+.day-num{background:#6366f1;color:#fff;font-size:11px;font-weight:800;padding:3px 10px;border-radius:20px;letter-spacing:.5px;text-transform:uppercase}
+.day-theme{font-size:15px;font-weight:700;color:#fff}
+.activities{padding:0 20px 12px}
+.activity{display:grid;grid-template-columns:52px 1fr;gap:0;padding:14px 0;border-bottom:1px solid #1e2538;position:relative}
+.activity:last-child{border-bottom:none}
+.activity::before{content:'';position:absolute;left:24px;top:44px;bottom:-14px;width:1px;background:#2d3748}
+.activity:last-child::before{display:none}
+.act-time-col{display:flex;flex-direction:column;align-items:center;gap:4px;padding-top:2px}
+.act-time{font-size:10px;font-weight:700;color:#64748b;text-align:center;line-height:1.2}
+.act-dot{width:10px;height:10px;border-radius:50%;border:2px solid #6366f1;background:#0f0f13;flex-shrink:0}
+.act-dot.food{border-color:#f59e0b}.act-dot.attraction{border-color:#6366f1}.act-dot.experience{border-color:#10b981}.act-dot.rest{border-color:#475569}
+.act-body{padding-left:10px}
+.act-header{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.act-title{font-size:14px;font-weight:700;color:#fff}
+.act-type{font-size:10px;font-weight:600;padding:2px 6px;border-radius:4px;text-transform:uppercase;letter-spacing:.4px}
+.act-type.food{background:#3a2a0a;color:#f59e0b}.act-type.attraction{background:#1e1b4b;color:#a5b4fc}
+.act-type.experience{background:#0a3a2a;color:#34d399}.act-type.rest{background:#1e293b;color:#64748b}
+.act-desc{font-size:12px;color:#64748b;line-height:1.5;margin-bottom:4px}
+.act-footer{display:flex;gap:12px;font-size:11px}
+.act-tip{color:#a5b4fc}.act-cost{color:#10b981;font-weight:600}.act-dur{color:#475569}
+
+/* Tips */
+.tips-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.tip-item{background:#1a1a2e;border:1px solid #2d3748;border-radius:8px;padding:11px 14px;font-size:12px;color:#94a3b8;display:flex;gap:9px;align-items:flex-start}
+.tip-item::before{content:'✓';color:#6366f1;font-weight:700;flex-shrink:0}
+
+/* Misc */
+.summary-quote{background:#1a1a2e;border:1px solid #2d3748;border-radius:12px;padding:14px 18px;font-size:13px;color:#94a3b8;line-height:1.6;font-style:italic;margin-top:8px}
+.depart-box{background:#1e1b4b;border:1px solid #4338ca;border-radius:12px;padding:14px 18px;margin-bottom:4px}
+.depart-label{font-size:11px;font-weight:700;color:#818cf8;text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px}
+.depart-text{font-size:13px;color:#c7d2fe}
+.visa-card{background:#3a1a1a;border:1px solid #dc262644;border-radius:12px;padding:18px 22px}
+.visa-title{font-size:15px;font-weight:700;color:#f87171;margin-bottom:10px}
+.visa-docs{list-style:none;display:flex;flex-direction:column;gap:5px}
+.visa-docs li{font-size:12px;color:#fca5a5;display:flex;gap:7px}
+.visa-docs li::before{content:'→';color:#f87171;flex-shrink:0}
+@media(max-width:768px){
+  .summary-grid{grid-template-columns:repeat(2,1fr)}
+  .hotels-grid,.flight-cards{grid-template-columns:1fr}
+  .tips-grid{grid-template-columns:1fr}
+  .bus-table{display:block;overflow-x:auto}
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">Trav<span>Buddy</span></div>
+  <div class="badge">Journey Analyzer</div>
+</div>
+
+<div class="paste-zone">
+  <div class="paste-box">
+    <label>Paste /api/v1/plan-journey Response JSON</label>
+    <textarea id="jsonInput" placeholder='Paste the full JSON response here and click Analyze...'></textarea>
+    <button class="parse-btn" onclick="parseJSON()">Analyze Response →</button>
+  </div>
+</div>
+
+<div id="dashboard"></div>
+
+<script>
+const MODE_ICONS={bus:'🚌',train:'🚆',flight:'✈️',cab:'🚕',shared_cab:'🚐',auto:'🛺',walk:'🚶',ferry:'⛴️',metro:'🚇'};
+const ACT_ICONS={food:'🍽️',attraction:'🏛️',experience:'🎯',rest:'😴',hotel:'🏨'};
+
+function parseJSON(){
+  const raw=document.getElementById('jsonInput').value.trim();
+  if(!raw)return alert('Paste a JSON response first.');
+  let d;
+  try{d=JSON.parse(raw);}catch(e){return alert('Invalid JSON: '+e.message);}
+  render(d);
+}
+
+function rupee(n){return n!=null?'₹'+Number(n).toLocaleString('en-IN'):'—';}
+function fmtTime(dt){if(!dt)return'—';try{const p=dt.includes('T')||dt.includes(' ')?new Date(dt):null;if(p)return p.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true});}catch(e){}return dt.slice(11,16)||dt;}
+function fmtDate(dt){if(!dt)return'';try{return new Date(dt).toLocaleDateString('en-IN',{day:'numeric',month:'short'});}catch(e){return '';}}
+
+function render(d){
+  const legs=d.legs||[];
+  const buses=legs.flatMap(l=>(l.live_data?.buses||[]));
+  const hotels=(d.destination_hotels?.hotels)||[];
+  const topPick=d.destination_hotels?.top_pick;
+  const flights=(d.flight_alternatives?.flights)||[];
+  const bestFlight=d.flight_alternatives?.best_pick;
+  const itinerary=d.destination_itinerary||[];
+  const origin=legs[0]?.from||d.legs?.[0]?.from||'Origin';
+  const dest=legs[legs.length-1]?.to||'Destination';
+
+  let h='';
+
+  // Journey Banner
+  h+=`<div class="journey-banner">
+    <div class="city">${origin}</div>
+    <div class="arrow-track">
+      <div class="track-dot"></div><div class="track-line"></div><div class="track-dot"></div>
+      <div class="arrow-label">${d.total_duration_approx||''} · ${d.total_distance_km||0} km</div>
+    </div>
+    <div class="city">${dest}</div>
+    ${d.is_international?'<div class="intl-badge">🛂 International</div>':''}
+  </div>`;
+
+  // Summary cards
+  h+=`<div class="summary-grid">
+    <div class="card accent"><div class="label">Total Cost</div><div class="value">${rupee(d.total_estimated_cost)}</div><div class="sub">per person est.</div></div>
+    <div class="card"><div class="label">Duration</div><div class="value">${d.total_duration_approx||'—'}</div><div class="sub">${d.total_distance_km||0} km</div></div>
+    <div class="card"><div class="label">Legs</div><div class="value">${legs.length}</div><div class="sub">${legs.filter(l=>l.has_live_data).length} with live data</div></div>
+    <div class="card"><div class="label">Live Buses</div><div class="value">${buses.length}</div><div class="sub">options found</div></div>
+    <div class="card"><div class="label">Flights</div><div class="value">${flights.length}</div><div class="sub">${flights.length?'alternatives found':'no flights'}</div></div>
+  </div>`;
+
+  if(d.journey_summary) h+=`<div class="summary-quote">"${d.journey_summary}"</div>`;
+
+  // Visa
+  if(d.is_international&&d.visa_info){
+    h+=`<div class="section-title">🛂 Visa & Documents</div>
+    <div class="visa-card"><div class="visa-title">⚠️ ${d.visa_info.visa_type||'Visa Required'}</div>
+    <ul class="visa-docs">${(d.documents_needed||[]).map(doc=>`<li>${doc}</li>`).join('')}</ul>
+    ${d.visa_info.how_to_apply?`<div style="margin-top:10px;font-size:12px;color:#fca5a5">📍 ${d.visa_info.how_to_apply}</div>`:''}</div>`;
+  }
+
+  // Route Legs
+  h+=`<div class="section-title">🗺️ Route Legs</div>`;
+  for(const leg of legs){
+    const icon=MODE_ICONS[leg.mode]||'🚗';
+    h+=`<div class="leg">
+      <div class="leg-icon ${leg.mode}">${icon}</div>
+      <div>
+        <div class="leg-route">Leg ${leg.leg}: ${leg.from} <span>→</span> ${leg.to}</div>
+        <div class="leg-meta">
+          <span><b>Mode:</b> ${(leg.mode||'').replace('_',' ')}</span>
+          <span><b>Operator:</b> ${leg.operator_hint||'—'}</span>
+          <span><b>Departs:</b> ${leg.departure_time_approx||'—'}</span>
+          <span><b>Duration:</b> ${leg.duration_approx||'—'}</span>
+          <span><b>Distance:</b> ${leg.distance_km||0} km</span>
+          <span><b>Book via:</b> ${leg.booking_channel||'—'}</span>
+        </div>
+        ${leg.tips?`<div class="leg-tip">💡 ${leg.tips}</div>`:''}
+        ${leg.notes?`<div style="font-size:11px;color:#475569;margin-top:5px">ℹ️ ${leg.notes}</div>`:''}
+      </div>
+      <div class="leg-right">
+        <div class="leg-cost">${rupee(leg.estimated_cost_per_person)}</div>
+        <div class="leg-dur">/person</div>
+        ${leg.booking_url?`<a class="book-btn" href="${leg.booking_url}" target="_blank">Book →</a>`:
+          `<span class="no-book">${!leg.needs_live_search?'Local / negotiate':'No link'}</span>`}
+      </div>
+    </div>`;
+  }
+
+  // Live Buses
+  if(buses.length){
+    const bestI=buses.reduce((bi,b,i)=>{const fa=x=>x.fare_discounted||x.fare_original||999999;return fa(b)<fa(buses[bi])?i:bi;},0);
+    h+=`<div class="section-title">🚌 Live Bus Options (${buses.length})</div>
+    <div style="overflow-x:auto"><table class="bus-table">
+    <thead><tr><th>Operator</th><th>Departure → Arrival</th><th>Boarding / Drop</th><th>Amenities</th><th style="text-align:right">Fare</th><th>Seats</th><th>Rating</th><th>Book</th></tr></thead><tbody>`;
+    buses.forEach((b,i)=>{
+      h+=`<tr>
+        <td><img class="op-logo" src="${b.logo_url}" onerror="this.style.display='none'">
+          <span class="op-name">${b.operator||'—'}${i===bestI?'<span class="best-badge">BEST VALUE</span>':''}</span>
+          <span class="bus-type">${b.bus_type||''}</span></td>
+        <td class="timing"><b>${fmtTime(b.departure)}</b> → <b>${fmtTime(b.arrival)}</b>
+          <small>${fmtDate(b.departure)} · ${Math.floor(b.duration_min/60)}h ${b.duration_min%60}m</small></td>
+        <td><div style="font-size:11px;color:#94a3b8">📍 ${b.boarding_point||'—'}</div>
+          <div class="drop-info">⬇️ ${b.dropping_point||'—'}</div></td>
+        <td>${(b.amenities||[]).map(a=>`<span class="amenity">${a}</span>`).join('')}</td>
+        <td style="text-align:right">
+          ${b.fare_discounted?`<div class="fare-disc">${rupee(b.fare_discounted)}</div><div class="fare-strike">${rupee(b.fare_original)}</div>`:
+            `<div class="fare-orig">${rupee(b.fare_original)}</div>`}
+        </td>
+        <td><span class="seats-pill">${b.available_seats} left</span></td>
+        <td><span class="rating-pill">★ ${b.rating||'—'}</span></td>
+        <td class="book-cell">${b.booking_url?`<a href="${b.booking_url}" target="_blank">Book →</a>`:'—'}</td>
+      </tr>`;
+    });
+    h+=`</tbody></table></div>`;
+  }
+
+  // Flights
+  const flightNote=d.flight_alternatives?.route_note||'';
+  h+=`<div class="section-title">✈️ Flight Alternatives${d.flight_alternatives?.from_iata?` — ${d.flight_alternatives.from_iata} → ${d.flight_alternatives.to_iata}`:''}${flightNote?` <span style="font-size:10px;font-weight:400;color:#475569;text-transform:none;letter-spacing:0">(${flightNote})</span>`:''}</div>`;
+  if(flights.length){
+    h+=`<div class="flight-cards">`;
+    flights.forEach(f=>{
+      const isBest=bestFlight&&(f.flight_number===bestFlight.flight_number||(f.price_total===bestFlight.price_total&&f.departure_time===bestFlight.departure_time));
+      const depTime=fmtTime(f.departure_time);
+      const arrTime=fmtTime(f.arrival_time);
+      const dur=f.duration_min?`${Math.floor(f.duration_min/60)}h ${f.duration_min%60}m`:'—';
+      const stops=f.stops===0?'Non-stop':f.stops===1?'1 stop':`${f.stops} stops`;
+      const bookUrl=f.booking_url||buildFlightUrl(f,d.flight_alternatives);
+      h+=`<div class="flight-card${isBest?' best':''}">
+        <div class="flight-header">
+          <div>
+            <div class="airline-name">${f.airline||f.airline_code||'—'} ${isBest?'<span class="flight-best-tag">BEST PICK</span>':''}</div>
+            <div class="flight-num">${f.flight_number||''} · ${f.cabin_class||'Economy'}</div>
+          </div>
+          ${f.airline_logo?`<img src="${f.airline_logo}" style="height:28px;width:auto;object-fit:contain;filter:brightness(10)" onerror="this.remove()">`:''}
+        </div>
+        <div class="flight-route">
+          <div class="f-city">
+            <div class="iata">${f.from_airport||d.flight_alternatives?.from_iata||'—'}</div>
+            <div class="time">${depTime}</div>
+            <div class="city-name">${f.from_city||''}</div>
+          </div>
+          <div class="f-line">
+            <div class="dur">✈ ${dur}</div>
+            <div class="f-dashes"></div>
+            <div class="stops">${stops}</div>
+          </div>
+          <div class="f-city" style="text-align:right">
+            <div class="iata">${f.to_airport||d.flight_alternatives?.to_iata||'—'}</div>
+            <div class="time">${arrTime}</div>
+            <div class="city-name">${f.to_city||''}</div>
+          </div>
+        </div>
+        <div class="f-tags">
+          ${f.free_cancellation?'<span class="f-tag">✓ Free cancel</span>':''}
+          ${f.no_prepayment?'<span class="f-tag">No prepay</span>':''}
+          ${f.departure_terminal?`<span class="f-tag">T${f.departure_terminal}</span>`:''}
+          ${f.stops===0?'<span class="f-tag" style="color:#10b981;background:#0a3a2a">Non-stop</span>':''}
+        </div>
+        <div class="flight-bottom">
+          <div class="f-price">${rupee(f.price_total)}<small>/person</small></div>
+          ${bookUrl?`<a class="f-book-btn" href="${bookUrl}" target="_blank">Book →</a>`:'<span style="font-size:11px;color:#475569">No link</span>'}
+        </div>
+      </div>`;
+    });
+    h+=`</div>`;
+  } else {
+    h+=`<div class="no-flights">✈️ No flights found for this route. ${flightNote||'This destination may not have direct flight connectivity.'}</div>`;
+  }
+
+  // Hotels
+  if(hotels.length){
+    const dh=d.destination_hotels;
+    h+=`<div class="section-title">🏨 Hotels near ${dh?.search_location||dest}
+      ${dh?.checkin?`<span style="font-size:10px;font-weight:400;color:#475569;text-transform:none;letter-spacing:0">${dh.checkin} → ${dh.checkout} · ${dh.nights}N · ${dh.source}</span>`:''}
+    </div><div class="hotels-grid">`;
+    hotels.forEach(h_=>{
+      const isTop=topPick&&h_.hotel_id===topPick.hotel_id;
+      const rating=h_.google_rating||h_.review_score||h_.star_rating;
+      const reviews=h_.google_reviews||h_.review_count;
+      const priceN=h_.price_per_night||h_.estimated_price_per_night;
+      const priceT=h_.total_price||h_.price_per_stay;
+      const bookUrl=h_.booking_url||buildHotelSearch(h_,dh?.search_location,dh);
+      let photoHtml='<div style="font-size:42px;text-align:center;padding-top:22px">🏨</div>';
+      if(h_.photos&&h_.photos[0]){
+        const src=h_.photos[0].startsWith('http')?h_.photos[0]:`https://maps.googleapis.com/maps/api/place/photo?maxwidth=400&photo_reference=${h_.photos[0]}&key=AIzaSyDSB95dXxpJvszwe6PAMQx81Ju6ZtyW2MM`;
+        photoHtml=`<img src="${src}" onerror="this.parentElement.innerHTML='🏨'" style="width:100%;height:100%;object-fit:cover">`;
+      }
+      h+=`<div class="hotel-card${isTop?' top':''}">
+        <div class="hotel-img">${photoHtml}${isTop?'<div class="top-ribbon">⭐ TOP PICK</div>':''}</div>
+        <div class="hotel-body">
+          <div class="hotel-name">${h_.name}</div>
+          <div class="hotel-addr">${h_.address||'—'}</div>
+          <div class="h-meta">
+            ${rating?`<span class="h-pill r">★ ${rating}${reviews?' ('+Number(reviews).toLocaleString('en-IN')+')':''}</span>`:''}
+            ${h_.source?`<span class="h-pill s">${h_.source}</span>`:''}
+            ${h_.is_breakfast_included?'<span class="h-pill p">🍳 Brkfst</span>':''}
+            ${h_.free_cancellation?'<span class="h-pill r">✓ Free cancel</span>':''}
+          </div>
+          <div class="hotel-foot">
+            <div>
+              ${priceN?`<div class="h-price">${rupee(priceN)}<small>/night</small></div>`:'<div class="h-price" style="color:#475569">Price N/A</div>'}
+              ${priceT?`<div style="font-size:10px;color:#475569">${rupee(priceT)} total</div>`:''}
+            </div>
+            <a class="h-btn${bookUrl?'':' gs'}" href="${bookUrl||'#'}" target="${bookUrl?'_blank':'_self'}">${bookUrl?'Book →':'No link'}</a>
+          </div>
+        </div>
+      </div>`;
+    });
+    h+=`</div>`;
+  }
+
+  // Destination Itinerary
+  if(itinerary.length){
+    h+=`<div class="section-title">📅 Destination Itinerary — ${dest}</div>`;
+    for(const day of itinerary){
+      h+=`<div class="day-card">
+        <div class="day-header">
+          <span class="day-num">Day ${day.day}</span>
+          <span class="day-theme">${day.theme||''}</span>
+        </div>
+        <div class="activities">`;
+      for(const act of (day.activities||[])){
+        const dotCls=act.type||'attraction';
+        const typeIcon=ACT_ICONS[act.type]||'📍';
+        h+=`<div class="activity">
+          <div class="act-time-col">
+            <div class="act-time">${(act.time||'').replace(' ','\n')}</div>
+            <div class="act-dot ${dotCls}"></div>
+          </div>
+          <div class="act-body">
+            <div class="act-header">
+              <span class="act-title">${typeIcon} ${act.title||''}</span>
+              <span class="act-type ${act.type||''}">${act.type||''}</span>
+            </div>
+            <div class="act-desc">${act.description||''}</div>
+            <div class="act-footer">
+              ${act.tips?`<span class="act-tip">💡 ${act.tips}</span>`:''}
+              ${act.estimated_cost?`<span class="act-cost">${rupee(act.estimated_cost)}</span>`:''}
+              ${act.duration?`<span class="act-dur">⏱ ${act.duration}</span>`:''}
+            </div>
+          </div>
+        </div>`;
+      }
+      h+=`</div></div>`;
+    }
+  }
+
+  // Packing tips
+  if(d.packing_tips?.length){
+    h+=`<div class="section-title">🎒 Packing Tips</div><div class="tips-grid">`;
+    for(const tip of d.packing_tips) h+=`<div class="tip-item">${tip}</div>`;
+    h+=`</div>`;
+  }
+
+  // Best time to depart
+  if(d.best_time_to_depart){
+    h+=`<div class="section-title">⏰ Best Time to Depart</div>
+    <div class="depart-box"><div class="depart-label">Departure Tip</div><div class="depart-text">${d.best_time_to_depart}</div></div>`;
+  }
+
+  const el=document.getElementById('dashboard');
+  el.innerHTML=h;
+  el.style.display='block';
+  el.scrollIntoView({behavior:'smooth'});
+}
+
+function buildFlightUrl(f,fa){
+  if(f.booking_url)return f.booking_url;
+  const fr=fa?.from_iata||'';const to=fa?.to_iata||'';
+  if(fr&&to)return`https://www.makemytrip.com/flights/domestic/results/oneway/${fr}/${to}/200607/1/0/0/E/MYB`;
+  return null;
+}
+function buildHotelSearch(h,loc,dh){
+  if(h.booking_url)return h.booking_url;
+  const name=encodeURIComponent(h.name+' '+(loc||''));
+  return`https://www.google.com/search?q=${name}+hotel+booking`;
+}
+</script>
+</body>
+</html>

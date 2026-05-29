@@ -1,18 +1,19 @@
 """
 POST /api/v1/plan-trip
-Authorization: Bearer <supabase_jwt>
-Body: {
-  "destination": str, "days": int, "budget": "low"|"mid"|"high",
-  "travelers": int, "interests": list[str],
-  "start_date": str, "end_date": str, "is_public": bool, "skip_user_trips": bool
-}
+POST /api/v1/plan-journey
 
-Full AI trip planning: discovers places via Google Places, calls Vertex AI Gemini,
-hydrates activities with real data, fetches YouTube video, optimises routes, saves to DB.
+plan-trip:  Full AI trip itinerary — discovers places, calls Gemini, hydrates with
+            real data, fetches YouTube, optimises routes, saves to DB.
+
+plan-journey: Door-to-door multi-leg journey planner.
+              Phase 1 — Gemini plans the full route (multi-stop, station codes).
+              Phase 2 — Live data fetched in parallel for each bus/train/flight leg.
+              Includes visa + document guidance for international routes.
 """
 import asyncio
 import math
-from datetime import datetime, date, timedelta
+import random
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
@@ -22,8 +23,19 @@ from pydantic import BaseModel
 from app.deps.auth import require_user
 from app.db.client import get_db
 from app.services.vertex import vertex_generate, extract_json
-from app.services.places import search_places, get_place_details, discover_places
+from app.services.places import search_places, discover_places
+from app.services.transport import TransportService
+from app.services.hotels import HotelService
+from app.services.flights import FlightService
+from app.services.railway import RailwayService, city_to_station_code
+from app.services.booking.flights import search_flights as booking_search_flights
+from app.services.easemytrip.flights import search_flights as emt_search_flights
 from app.config import settings
+
+_transport = TransportService()
+_hotels    = HotelService()
+_flights   = FlightService()
+_railway   = RailwayService()
 
 router = APIRouter()
 MODEL = "gemini-2.5-flash"
@@ -56,7 +68,7 @@ VIBE_QUERY_MAP: dict[str, str] = {
 }
 
 
-# ── Request model ─────────────────────────────────────────────────────────────
+# ── Request models ────────────────────────────────────────────────────────────
 
 class PlanTripRequest(BaseModel):
     destination: str
@@ -68,6 +80,40 @@ class PlanTripRequest(BaseModel):
     end_date: str | None = None
     is_public: bool = True
     skip_user_trips: bool = False
+
+
+class PlanJourneyRequest(BaseModel):
+    origin: str
+    destination: str
+    transport_modes: list[str] = []   # ["bus", "train", "flight", "cab"] — empty = Gemini decides
+    travelers: int = 1
+    budget: str = "mid"
+    departure_date: str | None = None
+    stay_nights: int = 2              # nights at destination (used for hotel checkout date)
+    include_itinerary: bool = False   # also generate destination day-plan
+
+
+# ── Retry utility ─────────────────────────────────────────────────────────────
+
+async def _with_retry(
+    coro_fn,
+    *args,
+    max_retries: int = 2,
+    base_delay: float = 1.5,
+    fallback=None,
+    **kwargs,
+):
+    """Call an async function with exponential backoff. Returns fallback after all retries fail."""
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_fn(*args, **kwargs)
+        except Exception as e:
+            if attempt == max_retries:
+                print(f"[retry] {getattr(coro_fn, '__name__', '?')} failed after {max_retries + 1}x: {e}")
+                return fallback
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+            await asyncio.sleep(delay)
+    return fallback
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -216,7 +262,6 @@ async def _fetch_hotel_options(destination: str, days: int, budget_cat: str, bas
 
 
 async def _fetch_hotel_options_raw(destination: str, days: int, safe_budget: str) -> list[dict]:
-    """Fetch raw hotel search results without currency-specific pricing."""
     budget_cat = "budget" if safe_budget == "low" else "luxury" if safe_budget == "high" else "mid-range"
     tier_query = {
         "budget": f"budget affordable hotels hostels in {destination}",
@@ -243,12 +288,11 @@ async def _fetch_hotel_options_raw(destination: str, days: int, safe_budget: str
 
 
 def _price_hotels(raw_hotels: list[dict], budget_cat: str, base_price: int, price_level_map: dict, days: int) -> list[dict]:
-    """Apply currency-aware pricing to raw hotel results."""
     nights = max(1, days - 1)
     result = []
     for h in raw_hotels:
         h = {**h}
-        d = h.pop("_days", days)
+        h.pop("_days", None)
         h["budget_category"] = budget_cat
         h["estimated_price_per_night"] = price_level_map.get(h.get("price_level"), base_price)
         h["total_price"] = price_level_map.get(h.get("price_level"), base_price) * nights
@@ -336,7 +380,7 @@ def _compute_trip_intelligence(itinerary: dict, budget: str, days: int, ceiling_
     }
 
 
-# ── Route ─────────────────────────────────────────────────────────────────────
+# ── plan-trip route ───────────────────────────────────────────────────────────
 
 @router.post("/plan-trip")
 async def plan_trip(body: PlanTripRequest, user=Depends(require_user)):
@@ -353,10 +397,8 @@ async def plan_trip(body: PlanTripRequest, user=Depends(require_user)):
             asyncio.get_event_loop().run_in_executor(None, _fetch_user_profile, db, user_id),
         ),
         asyncio.gather(
-            discover_places(body.destination),
-            # hotel query uses budget_cat which needs profile.currency — use "usd" default for now,
-            # will re-resolve after profile comes back (profile fetch is very fast)
-            _fetch_hotel_options_raw(body.destination, body.days, safe_budget),
+            _with_retry(discover_places, body.destination, fallback={}),
+            _with_retry(_fetch_hotel_options_raw, body.destination, body.days, safe_budget, fallback=[]),
             asyncio.get_event_loop().run_in_executor(None, _fetch_memory_context, db, user_id, body.destination),
         ),
     )
@@ -367,12 +409,10 @@ async def plan_trip(body: PlanTripRequest, user=Depends(require_user)):
     budget_cat = "budget" if safe_budget == "low" else "luxury" if safe_budget == "high" else "mid-range"
     brange = ci["range"][safe_budget]
 
-    # Enrich hotel_options with currency-correct pricing
     hotel_options = _price_hotels(hotel_options, budget_cat, ci["hotel"][budget_cat], ci["level"], body.days)
 
-    # Build place_id → place_data lookup from Phase 1 results (avoids re-fetching in Phase 3)
     place_lookup: dict[str, dict] = {}
-    for cat, places in candidates.items():
+    for cat, places in (candidates or {}).items():
         for p in places:
             pid = p.get("place_id")
             if pid:
@@ -382,13 +422,13 @@ async def plan_trip(body: PlanTripRequest, user=Depends(require_user)):
         {"name": p["name"], "cat": cat, "rating": p.get("rating"), "place_id": p["place_id"],
          "lat": (p.get("geometry") or {}).get("location", {}).get("lat"),
          "lng": (p.get("geometry") or {}).get("location", {}).get("lng")}
-        for cat, places in candidates.items()
+        for cat, places in (candidates or {}).items()
         for p in places
     ]
     dest_photo_ref = (
         (candidates.get("attractions") or [{}])[0].get("photo_reference")
         or (candidates.get("hidden_gems") or [{}])[0].get("photo_reference")
-    )
+    ) if candidates else None
     recommended_hotel = max(hotel_options, key=lambda h: h.get("rating") or 0) if hotel_options else None
 
     personalization = ""
@@ -455,7 +495,9 @@ Return ONLY valid JSON (no markdown):
   ]
 }}"""
 
-    raw = await vertex_generate(prompt, response_mime_type="application/json", timeout=180.0)
+    raw = await _with_retry(vertex_generate, prompt, response_mime_type="application/json", timeout=180.0)
+    if not raw:
+        raise HTTPException(502, "AI trip generation failed after retries")
     ai_json = extract_json(raw)
 
     ai_json["destination_photo_ref"] = dest_photo_ref
@@ -463,8 +505,6 @@ Return ONLY valid JSON (no markdown):
         ai_json["image"] = dest_photo_ref
 
     # Phase 3: hydrate activities + YouTube in parallel
-    # Activities with a known place_id from Phase 1 are hydrated from the local cache —
-    # no extra API call. Only ai_suggested activities trigger a search_places call.
     primary_interest = (body.interests[0] if body.interests else "").lower()
     yt_query = _build_vibe_query(body.destination, primary_interest)
 
@@ -505,7 +545,7 @@ Return ONLY valid JSON (no markdown):
     ai_json["selected_hotel"] = recommended_hotel
     ai_json["trip_intelligence"] = _compute_trip_intelligence(ai_json, safe_budget, body.days, ci["ceiling"])
 
-    # Phase 4: DB writes (fire-and-forget, don't block response)
+    # Phase 4: DB writes (fire-and-forget)
     asyncio.create_task(_db_writes(db, user_id, body, ai_json))
 
     return ai_json
@@ -529,20 +569,18 @@ async def _hydrate_activity(act: dict, destination: str, place_lookup: dict | No
     place_data = None
     pid = act.get("place_id") or ""
 
-    # Fast path: use Phase 1 place data if we have it (no API call needed)
     if pid and place_lookup and pid in place_lookup:
         place_data = place_lookup[pid]
     elif pid and len(pid) > 20 and act.get("source") == "google_places":
-        # Fallback: search by name (cheaper than get_place_details)
         title = act.get("title", "")
-        places = await search_places(f"{title} {destination}")
-        place_data = places[0] if places else None
+        places = await _with_retry(search_places, f"{title} {destination}", fallback=[])
+        place_data = (places or [None])[0]
     elif not pid or act.get("source") == "ai_suggested":
         title = act.get("title", "")
         for prefix in ["Check-in at", "Check-out from", "Lunch at", "Dinner at", "Breakfast at", "Visit", "Explore"]:
             title = title.replace(prefix, "").strip()
-        places = await search_places(f"{title} {destination}")
-        place_data = places[0] if places else None
+        places = await _with_retry(search_places, f"{title} {destination}", fallback=[])
+        place_data = (places or [None])[0]
 
     if place_data:
         geo = (place_data.get("geometry") or {}).get("location", {})
@@ -573,8 +611,457 @@ async def _hydrate_activity(act: dict, destination: str, place_lookup: dict | No
     act["youtube_shorts"] = []
 
 
+# ── Flight alternatives ───────────────────────────────────────────────────────
+
+async def _search_flight_alternatives(
+    from_iata: str, to_iata: str, date: str, travelers: int, limit: int = 4,
+) -> list[dict]:
+    """Search Booking.com + EaseMyTrip in parallel, deduplicate, return up to limit flights."""
+    if not from_iata or not to_iata or not date:
+        return []
+    booking_r, emt_r = await asyncio.gather(
+        _with_retry(booking_search_flights, from_iata, to_iata, date, adults=travelers, limit=limit + 2, fallback=[]),
+        _with_retry(emt_search_flights,     from_iata, to_iata, date, adults=travelers, limit=limit + 2, fallback=[]),
+    )
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for f in (booking_r or []) + (emt_r or []):
+        key = (f.get("flight_number") or "") + str(f.get("departure_time") or "")
+        if key and key in seen:
+            continue
+        seen.add(key)
+        merged.append(f)
+    merged.sort(key=lambda f: f.get("price_total") or 999_999)
+    return merged[:limit]
+
+
+# ── Destination itinerary ─────────────────────────────────────────────────────
+
+async def _gemini_destination_itinerary(
+    destination: str, budget: str, symbol: str, travelers: int,
+) -> list[dict]:
+    """Generate a 2-day arrival itinerary for the destination."""
+    prompt = f"""You are a travel expert. Create a practical 2-day arrival itinerary for {destination}.
+Budget: {budget} ({symbol}/person). Travelers: {travelers}.
+Day 1 = Arrival & orientation. Day 2 = Main highlights.
+
+Return ONLY valid JSON (no markdown):
+[
+  {{
+    "day": 1,
+    "theme": "Arrival & Settle In",
+    "activities": [
+      {{
+        "time": "09:00 AM",
+        "title": "place name",
+        "type": "attraction|food|experience|rest|hotel",
+        "category": "Cafe|Landmark|Market|Viewpoint|Restaurant|Park",
+        "description": "2 sentences about what to do here",
+        "tips": "one practical tip",
+        "estimated_cost": 0,
+        "duration": "1h 30m"
+      }}
+    ]
+  }}
+]"""
+    raw = await _with_retry(vertex_generate, prompt, response_mime_type="application/json", timeout=90.0)
+    if not raw:
+        return []
+    try:
+        import json as _json
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+            text = text[: text.rfind("```")] if text.endswith("```") else text
+        text = text.strip()
+        # Gemini returns a JSON array — find [ ... ] not { ... }
+        start = text.find("[")
+        end   = text.rfind("]")
+        if start >= 0 and end > start:
+            result = _json.loads(text[start : end + 1])
+        else:
+            result = extract_json(text)
+        return result if isinstance(result, list) else [result]
+    except Exception as e:
+        print(f"[itinerary] parse error: {e} | raw[:200]={raw[:200]}")
+        return []
+
+
+# ── plan-journey: Gemini route planning ──────────────────────────────────────
+
+async def _gemini_plan_route(body: PlanJourneyRequest, budget: str, symbol: str, currency: str) -> dict:
+    """
+    Ask Gemini to plan the full multi-leg route.
+    Returns structured JSON with legs, modes, station codes, and visa info for international routes.
+    """
+    modes_hint = (
+        f"Preferred transport modes: {', '.join(body.transport_modes)}."
+        if body.transport_modes
+        else "Choose the best transport combination for this route."
+    )
+    date_hint = f"Departure date: {body.departure_date}." if body.departure_date else "Departure date not specified."
+
+    prompt = f"""You are an expert travel routing specialist with deep knowledge of Indian transport
+networks, international routes, and last-mile connectivity for remote destinations.
+
+JOURNEY REQUEST:
+Origin: {body.origin}
+Destination: {body.destination}
+Travelers: {body.travelers} | Budget: {budget} ({symbol})
+{modes_hint}
+{date_hint}
+
+TASK: Plan the complete, practical door-to-door journey from {body.origin} to {body.destination}.
+
+CRITICAL RULES:
+1. ALWAYS break into logical legs — for remote or hill destinations include intermediate hubs.
+   Example: Delhi → Aut = [Delhi→Bhuntar by overnight bus, Bhuntar→Aut by shared cab]
+   Example: Delhi → Shimla = [Delhi→Kalka by train, Kalka→Shimla by toy train or cab]
+2. For TRAIN legs: include exact Indian Railway station codes (NDLS, PNBE, CDG, etc.)
+   Only suggest train where rail actually exists — Manali, Leh, Spiti, Aut have NO railway.
+3. For BUS legs: mention operator (HRTC, RSRTC, Volvo, etc.) and boarding point if known.
+4. For FLIGHT legs: include airport IATA codes (DEL, BOM, IXL, etc.)
+5. Cab/shared_cab/auto legs: realistic local fares, no live search needed.
+6. If crossing national borders: set is_international=true, provide complete visa guidance.
+7. Cost estimates in {currency.upper()} ({symbol}).
+8. needs_live_search=true ONLY for bus/train/flight (real schedules fetchable).
+   needs_live_search=false for: cab, shared_cab, auto, walk, ferry, metro (no live API).
+9. ALWAYS include search_params for searchable legs with the most search-friendly city names.
+
+INTERNATIONAL CHECK: Are {body.origin} and {body.destination} in different countries?
+If YES → is_international=true, fill visa_info and documents_needed completely.
+
+Return ONLY valid JSON (no markdown):
+{{
+  "is_international": false,
+  "origin_country": "India",
+  "destination_country": "India",
+  "visa_required": false,
+  "visa_info": null,
+  "documents_needed": [],
+  "health_requirements": [],
+  "currency_info": null,
+  "journey_summary": "2-3 sentence narrative of the full journey",
+  "total_distance_km": 0,
+  "total_duration_approx": "Xh Ym",
+  "total_estimated_cost": 0,
+  "best_time_to_depart": "specific departure advice",
+  "packing_tips": ["tip 1", "tip 2"],
+  "hotel_search_location": "nearest town with hotels (use destination if well-known, else nearest hub e.g. Kullu for Aut, Bhuntar for Kasol)",
+  "flight_search": {{
+    "from_iata": "DEL",
+    "to_iata": "KUU",
+    "route_note": "Delhi to Bhuntar/Kullu airport — nearest airport to Aut"
+  }},
+  "legs": [
+    {{
+      "leg": 1,
+      "from": "exact place name",
+      "to": "exact place name",
+      "mode": "bus|train|flight|cab|shared_cab|auto|metro|walk|ferry",
+      "operator_hint": "HRTC / Volvo / IndiGo / local taxi",
+      "departure_time_approx": "22:00 or Flexible or Overnight",
+      "duration_approx": "Xh Ym",
+      "distance_km": 0,
+      "estimated_cost_per_person": 0,
+      "booking_channel": "RedBus / IRCTC / counter / local stand",
+      "tips": "one practical tip",
+      "notes": "important detail about this leg",
+      "needs_live_search": true,
+      "search_params": {{
+        "origin": "search-friendly city name",
+        "destination": "search-friendly city name",
+        "mode_type": "bus|train|flight",
+        "from_station_code": "NDLS",
+        "to_station_code": "CDG",
+        "from_iata": null,
+        "to_iata": null
+      }}
+    }}
+  ]
+}}
+
+For visa_info (international only):
+{{
+  "visa_type": "...",
+  "max_stay_days": 0,
+  "fee": "...",
+  "documents": ["..."],
+  "how_to_apply": "...",
+  "processing_time": "...",
+  "important_notes": "..."
+}}"""
+
+    raw = await _with_retry(
+        vertex_generate, prompt,
+        response_mime_type="application/json",
+        timeout=120.0,
+        max_retries=2,
+    )
+    if not raw:
+        return {}
+    try:
+        return extract_json(raw)
+    except Exception as e:
+        print(f"[plan_journey] Gemini route parse error: {e}")
+        return {}
+
+
+# ── plan-journey route ────────────────────────────────────────────────────────
+
+@router.post("/plan-journey")
+async def plan_journey(body: PlanJourneyRequest, user=Depends(require_user)):
+    """
+    Door-to-door multi-leg journey planner.
+    Phase 1 — Gemini plans the full route with intermediate stops and station codes.
+    Phase 2 — Live transport data fetched in parallel for every bus/train/flight leg.
+    Includes complete visa + document guidance for international trips.
+    """
+    db = get_db()
+    user_id = user.id
+    safe_budget = body.budget if body.budget in ("low", "mid", "high") else "mid"
+
+    # Fetch profile (quick, needed for currency)
+    profile = await asyncio.get_event_loop().run_in_executor(None, _fetch_user_profile, db, user_id)
+    currency_code = (profile.get("currency") or "inr").lower()
+    ci = CURRENCY_CONFIG.get(currency_code) or CURRENCY_CONFIG["inr"]
+    symbol = ci["symbol"]
+
+    # Phase 1 — Gemini plans the route
+    route_plan = await _gemini_plan_route(body, safe_budget, symbol, currency_code)
+    if not route_plan:
+        raise HTTPException(502, "Route planning failed — AI could not plan this journey")
+
+    legs: list[dict] = route_plan.get("legs") or []
+    departure_date = body.departure_date or ""
+
+    # Phase 2 — Build live-search tasks for each searchable leg
+    live_meta: list[tuple[int, str]] = []   # (leg_index, mode_type)
+    live_coros: list = []
+
+    for i, leg in enumerate(legs):
+        if not leg.get("needs_live_search") or not departure_date:
+            leg["has_live_data"] = False
+            continue
+
+        sp = leg.get("search_params") or {}
+        mode = leg.get("mode", "").lower()
+        origin_s = sp.get("origin") or leg.get("from", "")
+        dest_s   = sp.get("destination") or leg.get("to", "")
+
+        if mode == "bus":
+            live_meta.append((i, "bus"))
+            live_coros.append(_with_retry(
+                _transport.search_buses,
+                origin_s, dest_s, departure_date, body.travelers,
+                fallback={"buses": [], "resolved": False},
+            ))
+
+        elif mode in ("train", "railway"):
+            from_code = sp.get("from_station_code") or city_to_station_code(origin_s)
+            to_code   = sp.get("to_station_code")   or city_to_station_code(dest_s)
+            if from_code and to_code:
+                live_meta.append((i, "train"))
+                live_coros.append(_with_retry(
+                    _railway.search,
+                    origin_s, dest_s, departure_date,
+                    from_code=from_code, to_code=to_code,
+                    fallback={"trains": [], "resolved": False},
+                ))
+            else:
+                leg["has_live_data"] = False
+                leg["live_search_note"] = "No railway station found for this route segment"
+
+        elif mode == "flight":
+            live_meta.append((i, "flight"))
+            live_coros.append(_with_retry(
+                _flights.search,
+                origin_s, dest_s, departure_date,
+                adults=body.travelers,
+                fallback={"flights": [], "resolved": False},
+            ))
+
+    # Phase 2b — flight alternatives (always, using Gemini's airport codes)
+    fs = route_plan.get("flight_search") or {}
+    flight_from_iata = fs.get("from_iata") or _flights.resolve_iata(body.origin) or ""
+    flight_to_iata   = fs.get("to_iata")   or _flights.resolve_iata(body.destination) or ""
+    flight_alt_coro = _search_flight_alternatives(
+        flight_from_iata, flight_to_iata, departure_date, body.travelers
+    ) if departure_date and flight_from_iata and flight_to_iata else None
+
+    # Phase 2c — destination itinerary when include_itinerary=True
+    itinerary_coro = _gemini_destination_itinerary(
+        body.destination, safe_budget, symbol, body.travelers
+    ) if body.include_itinerary else None
+
+    # Phase 2d — hotels at destination (always when departure_date given)
+    # Use hotel_search_location from Gemini — it picks the nearest bookable hub
+    # (e.g. "Kullu" for "Aut", "Bhuntar" for "Kasol") to avoid Booking.com 400s.
+    hotel_search_loc = (
+        route_plan.get("hotel_search_location") or body.destination
+    ).strip()
+    hotel_coro = None
+    if departure_date:
+        try:
+            checkin  = (datetime.fromisoformat(departure_date) + timedelta(days=1)).strftime("%Y-%m-%d")
+            checkout = (datetime.fromisoformat(departure_date) + timedelta(days=1 + body.stay_nights)).strftime("%Y-%m-%d")
+            hotel_coro = _with_retry(
+                _hotels.search,
+                hotel_search_loc, checkin, checkout,
+                adults=body.travelers, budget=safe_budget,
+                fallback={"hotels": [], "source": "none"},
+            )
+        except Exception:
+            hotel_coro = None
+
+    # Run all live tasks in parallel
+    extra_coros: list = []
+    if flight_alt_coro:  extra_coros.append(flight_alt_coro)
+    if itinerary_coro:   extra_coros.append(itinerary_coro)
+    if hotel_coro:       extra_coros.append(hotel_coro)
+
+    all_coros = live_coros + extra_coros
+    all_results = await asyncio.gather(*all_coros, return_exceptions=True) if all_coros else []
+
+    transport_results = all_results[: len(live_coros)]
+    extras = all_results[len(live_coros):]
+    ei = 0
+    flight_alt_result = extras[ei] if flight_alt_coro and ei < len(extras) else None; ei += bool(flight_alt_coro)
+    itinerary_result  = extras[ei] if itinerary_coro  and ei < len(extras) else None; ei += bool(itinerary_coro)
+    hotel_result      = extras[ei] if hotel_coro       and ei < len(extras) else None
+
+    # Inject live data + booking links into legs
+    for task_idx, (leg_idx, mode_type) in enumerate(live_meta):
+        if task_idx >= len(transport_results):
+            break
+        result = transport_results[task_idx]
+        if isinstance(result, Exception):
+            legs[leg_idx]["has_live_data"] = False
+            continue
+
+        legs[leg_idx]["live_data"] = result
+        has = bool(
+            result.get("buses")   if mode_type == "bus"    else
+            result.get("trains")  if mode_type == "train"  else
+            result.get("flights") if mode_type == "flight" else False
+        )
+        legs[leg_idx]["has_live_data"] = has
+        legs[leg_idx]["booking_url"] = _leg_booking_url(legs[leg_idx], result, departure_date)
+
+    route_plan["legs"] = legs
+    route_plan["currency"] = symbol
+    route_plan["has_real_data"] = any(leg.get("has_live_data") for leg in legs)
+
+    # Flight alternatives
+    if flight_alt_result and not isinstance(flight_alt_result, Exception) and flight_alt_result:
+        route_plan["flight_alternatives"] = {
+            "from_iata": flight_from_iata,
+            "to_iata": flight_to_iata,
+            "route_note": fs.get("route_note", ""),
+            "flights": flight_alt_result,
+            "best_pick": min(flight_alt_result, key=lambda f: f.get("price_total") or 999_999),
+        }
+    else:
+        route_plan["flight_alternatives"] = {
+            "from_iata": flight_from_iata,
+            "to_iata": flight_to_iata,
+            "route_note": fs.get("route_note", ""),
+            "flights": [],
+            "best_pick": None,
+        }
+
+    # Destination itinerary
+    if itinerary_result and not isinstance(itinerary_result, Exception):
+        route_plan["destination_itinerary"] = itinerary_result
+
+    if hotel_result and not isinstance(hotel_result, Exception):
+        hotels_list = hotel_result.get("hotels") or []
+        ranked = _rank_hotels(hotels_list)
+        route_plan["destination_hotels"] = {
+            "search_location": hotel_search_loc,
+            "source": hotel_result.get("source"),
+            "checkin": (datetime.fromisoformat(departure_date) + timedelta(days=1)).strftime("%Y-%m-%d") if departure_date else None,
+            "checkout": (datetime.fromisoformat(departure_date) + timedelta(days=1 + body.stay_nights)).strftime("%Y-%m-%d") if departure_date else None,
+            "nights": body.stay_nights,
+            "hotels": ranked[:8],
+            "top_pick": ranked[0] if ranked else None,
+        }
+
+    return route_plan
+
+
+def _leg_booking_url(leg: dict, live_result: dict, departure_date: str) -> str | None:
+    """Build a direct booking/search URL for a transport leg."""
+    mode = leg.get("mode", "")
+    sp = leg.get("search_params") or {}
+
+    if mode == "bus":
+        # Use the booking_url already embedded in the first live bus result
+        buses = live_result.get("buses") or []
+        if buses and buses[0].get("booking_url"):
+            return buses[0]["booking_url"]
+        # Fallback: generic RedBus search
+        origin = sp.get("origin") or leg.get("from", "")
+        dest   = sp.get("destination") or leg.get("to", "")
+        slug_o = origin.lower().replace(" ", "-")
+        slug_d = dest.lower().replace(" ", "-")
+        return f"https://www.redbus.in/bus-tickets/{slug_o}-to-{slug_d}"
+
+    if mode in ("train", "railway"):
+        fc = sp.get("from_station_code") or ""
+        tc = sp.get("to_station_code") or ""
+        if fc and tc and departure_date:
+            try:
+                from datetime import datetime as _dt
+                d = _dt.fromisoformat(departure_date).strftime("%Y%m%d")
+                return f"https://www.irctc.co.in/nget/train-search?fromStation={fc}&toStation={tc}&journeyDate={d}"
+            except Exception:
+                pass
+        return f"https://www.confirmtkt.com/train-between-stations/{fc}/{tc}"
+
+    if mode == "flight":
+        flights = live_result.get("flights") or []
+        # EaseMyTrip/Booking.com results may carry a booking_url
+        for f in flights:
+            if f.get("booking_url"):
+                return f["booking_url"]
+        # Fallback: MakeMyTrip search
+        fi = sp.get("from_iata") or ""
+        ti = sp.get("to_iata") or ""
+        date_fmt = departure_date.replace("-", "") if departure_date else ""
+        if fi and ti and date_fmt:
+            return f"https://www.makemytrip.com/flights/domestic/results/oneway/{fi}/{ti}/{date_fmt}/1/0/0/E/MYB"
+
+    return None
+
+
+def _rank_hotels(hotels: list[dict]) -> list[dict]:
+    """Sort hotels by a value score: review_score * 0.6 + price_efficiency * 0.4."""
+    def _score(h: dict) -> float:
+        review = float(h.get("review_score") or h.get("ta_rating") or h.get("star_rating") or 0)
+        price  = float(h.get("price_per_night") or h.get("estimated_price_per_night") or 0)
+        # Higher review → better. Lower price → more efficient (invert: 10k / price, capped at 1)
+        price_eff = min(1.0, 10000 / price) if price > 0 else 0.5
+        return review * 0.6 + price_eff * 10 * 0.4
+
+    return sorted(hotels, key=_score, reverse=True)
+
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+def _pick_city_id(cities: list[dict]) -> int | None:
+    if not cities:
+        return None
+    city_types = [c for c in cities if c.get("type") == "CITY"]
+    area_types = [c for c in cities if c.get("type") == "AREA"]
+    if city_types:
+        return city_types[0]["id"]
+    if area_types:
+        return area_types[0]["id"]
+    return cities[0]["id"]
+
+
 async def _db_writes(db, user_id: str, body: PlanTripRequest, itinerary: dict) -> None:
-    """Non-blocking DB writes after response is sent."""
     try:
         trip_start = datetime.fromisoformat(body.start_date) if body.start_date else datetime.now()
         trip_end = datetime.fromisoformat(body.end_date) if body.end_date else trip_start + timedelta(days=body.days)
