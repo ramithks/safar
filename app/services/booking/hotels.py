@@ -34,7 +34,6 @@ except ImportError:
     CurlAsyncSession = None
 
 _GRAPHQL_URL  = "https://www.booking.com/dml/graphql"
-_AUTOCOMPLETE_URL = "https://accommodations.booking.com/autocomplete.en-gb.json"
 _SEARCH_PAGE  = "https://www.booking.com/searchresults.html"
 _PHOTO_BASE   = "https://cf.bstatic.com"
 
@@ -59,14 +58,37 @@ _GQL_HEADERS = {
     **_COMMON_HEADERS,
     "content-type": "application/json",
     "apollographql-client-name": "b-search-web-searchresults",
-    # apollographql-client-version changes with Booking.com frontend deploys.
-    # If the API returns errors about the client version, update from network tab.
     "apollographql-client-version": "aYSHeUCR",
     "x-booking-context-action-name": "searchresults_irene",
     "x-booking-context-aid": "304142",
     "x-booking-site-type-id": "1",
     "x-booking-topic": "capla_browser_b-search-web-searchresults",
 }
+
+# Separate headers for the AutoComplete query (different client name/version)
+_AUTOCOMPLETE_GQL_HEADERS = {
+    **_COMMON_HEADERS,
+    "content-type": "application/json",
+    "apollographql-client-name": "b-index-lp-web-mfe",
+    "apollographql-client-version": "PDRKZEQM",
+    "x-booking-context-action": "index",
+    "x-booking-context-action-name": "index",
+    "x-booking-context-aid": "304142",
+    "x-booking-site-type-id": "1",
+    "x-booking-topic": "capla_browser_b-index-lp-web-mfe",
+    "referer": "https://www.booking.com/",
+}
+
+_AUTOCOMPLETE_GQL_QUERY = """query AutoComplete($input: AutoCompleteRequestInput!) {
+  autoCompleteSuggestions(input: $input) {
+    results {
+      destination { destId destType latitude longitude countryCode __typename }
+      displayInfo { title label __typename }
+      __typename
+    }
+    __typename
+  }
+}"""
 
 # Known destIds for common Indian destinations (city name → Booking.com numeric ID).
 # Extend via the autocomplete API for anything not listed here.
@@ -121,48 +143,78 @@ query FullSearch($input: SearchQueryInput!) {
 
 async def resolve_dest_id(city_name: str) -> tuple[int | None, str]:
     """
-    Resolve a city name to a Booking.com destId and canonical name.
+    Resolve a city name to a Booking.com destId via the GraphQL AutoComplete API.
     Returns (destId, canonical_name). destId is None if resolution fails.
     """
     key = city_name.lower().strip()
 
-    # Fast path: hardcoded dict
     if key in _DEST_IDS:
         return _DEST_IDS[key], city_name
-
-    # Partial match in hardcoded dict
     for k, dest_id in _DEST_IDS.items():
         if k in key or key in k:
             return dest_id, city_name
 
-    # Autocomplete API (no bot protection — use curl_cffi without impersonation)
     try:
+        pageview_id = secrets.token_hex(8)
+        payload = {
+            "operationName": "AutoComplete",
+            "variables": {
+                "input": {
+                    "prefixQuery": city_name,
+                    "nbSuggestions": 5,
+                    "requestConfig": {"enableRequestContextBoost": True},
+                    "requestContext": {"pageviewId": pageview_id, "location": None},
+                    "fallbackConfig": {
+                        "mergeResults": True,
+                        "nbMaxMergedResults": 6,
+                        "nbMaxThirdPartyResults": 3,
+                        "sources": ["GOOGLE", "HERE"],
+                    },
+                }
+            },
+            "extensions": {},
+            "query": _AUTOCOMPLETE_GQL_QUERY,
+        }
         async with CurlAsyncSession() as s:
-            r = await s.get(
-                _AUTOCOMPLETE_URL,
-                headers={"user-agent": _COMMON_HEADERS["user-agent"]},
-                params={"query": city_name, "rows": 5, "languagecode": "en-us"},
+            csrf_token = await _fetch_csrf_token(s)
+            headers = {
+                **_AUTOCOMPLETE_GQL_HEADERS,
+                "x-booking-csrf-token": csrf_token or "",
+                "x-booking-pageview-id": pageview_id,
+            }
+            r = await s.post(
+                f"{_GRAPHQL_URL}?lang=en-us",
+                headers=headers,
+                json=payload,
+                impersonate="chrome",
                 timeout=10,
             )
         r.raise_for_status()
-        results = r.json().get("results") or []
-        # Prefer city (ci) over district/region
-        for priority_type in ("ci", "di", "re"):
+        results = (
+            (r.json().get("data") or {})
+            .get("autoCompleteSuggestions", {})
+            .get("results") or []
+        )
+        # Prefer CITY, then REGION, then anything
+        for priority in ("CITY", "REGION", "DISTRICT"):
             for item in results:
-                if item.get("type") == priority_type:
-                    dest_id = item.get("value")
-                    label = item.get("label") or city_name
-                    city = label.split(",")[0].strip()
-                    # Cache for future calls
+                dest = item.get("destination") or {}
+                if dest.get("destType") == priority and dest.get("destId"):
+                    dest_id = int(dest["destId"])
+                    label = (item.get("displayInfo") or {}).get("title") or city_name
                     _DEST_IDS[key] = dest_id
-                    return dest_id, city
+                    print(f"[booking_hotels] resolved '{city_name}' → destId={dest_id} ({label})")
+                    return dest_id, label
         if results:
-            dest_id = results[0].get("value")
-            if dest_id:
+            dest = results[0].get("destination") or {}
+            dest_id_str = dest.get("destId")
+            if dest_id_str:
+                dest_id = int(dest_id_str)
+                label = (results[0].get("displayInfo") or {}).get("title") or city_name
                 _DEST_IDS[key] = dest_id
-                return dest_id, results[0].get("label", city_name).split(",")[0].strip()
+                return dest_id, label
     except Exception as e:
-        print(f"[booking_hotels] destId resolve '{city_name}': {e}")
+        print(f"[booking_hotels] AutoComplete '{city_name}': {e}")
 
     return None, city_name
 

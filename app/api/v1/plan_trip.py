@@ -118,6 +118,12 @@ async def _with_retry(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _clean_city(name: str) -> str:
+    """Strip state/country suffixes Gemini appends (e.g. 'Aut, Himachal Pradesh' → 'Aut').
+    RedBus / FlixBus city-ID lookup fails on names with commas."""
+    return name.split(",")[0].strip() if name else name
+
+
 def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
@@ -726,7 +732,11 @@ CRITICAL RULES:
 7. Cost estimates in {currency.upper()} ({symbol}).
 8. needs_live_search=true ONLY for bus/train/flight (real schedules fetchable).
    needs_live_search=false for: cab, shared_cab, auto, walk, ferry, metro (no live API).
-9. ALWAYS include search_params for searchable legs with the most search-friendly city names.
+9. ALWAYS include search_params for searchable legs.
+   CRITICAL: search_params origin/destination must be BARE city names only — NO state, NO country.
+   CORRECT: "origin": "Aut"   WRONG: "origin": "Aut, Himachal Pradesh"
+   CORRECT: "destination": "Bhuntar"   WRONG: "destination": "Bhuntar, Kullu, HP"
+   Commas in city names break the city-ID lookup API and return zero buses.
 
 INTERNATIONAL CHECK: Are {body.origin} and {body.destination} in different countries?
 If YES → is_international=true, fill visa_info and documents_needed completely.
@@ -846,8 +856,8 @@ async def plan_journey(body: PlanJourneyRequest, user=Depends(require_user)):
 
         sp = leg.get("search_params") or {}
         mode = leg.get("mode", "").lower()
-        origin_s = sp.get("origin") or leg.get("from", "")
-        dest_s   = sp.get("destination") or leg.get("to", "")
+        origin_s = _clean_city(sp.get("origin") or leg.get("from", ""))
+        dest_s   = _clean_city(sp.get("destination") or leg.get("to", ""))
 
         if mode == "bus":
             live_meta.append((i, "bus"))

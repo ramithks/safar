@@ -219,8 +219,9 @@ async def search_hotels(
         },
     }
 
-    import asyncio as _asyncio
-    for attempt in range(3):   # retry up to 3x on 429
+    import asyncio as _asyncio, random as _random
+    await _asyncio.sleep(_random.uniform(0.3, 1.2))   # stagger parallel calls
+    for attempt in range(2):   # 1 retry on 429 — keeps total latency under ~4s
         try:
             async with CurlAsyncSession() as s:
                 resp = await s.post(
@@ -233,8 +234,8 @@ async def search_hotels(
                 )
 
             if resp.status_code == 429:
-                wait = 2 ** attempt
-                print(f"[expedia] rate limited (429) — retry {attempt + 1}/3 in {wait}s")
+                wait = 2 + _random.uniform(0, 1)
+                print(f"[expedia] rate limited (429) — retry {attempt + 1}/2 in {wait:.1f}s")
                 await _asyncio.sleep(wait)
                 continue
 
@@ -258,8 +259,8 @@ async def search_hotels(
 
         except Exception as e:
             print(f"[expedia] attempt {attempt + 1} error for '{city_name}': {e}")
-            if attempt < 2:
-                await _asyncio.sleep(2 ** attempt)
+            if attempt < 1:
+                await _asyncio.sleep(1.5)
 
     return []
 

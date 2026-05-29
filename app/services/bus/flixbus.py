@@ -14,14 +14,27 @@ from curl_cffi.requests import AsyncSession as CurlAsyncSession
 _AUTOCOMPLETE_URL = "https://global.api.flixbus.com/search/autocomplete/cities"
 _SEARCH_URL = "https://global.api.flixbus.com/search/service/v4/search"
 
-_HEADERS = {
-    "accept": "application/json",
-    "accept-language": "en-US,en;q=0.9",
+_AUTOCOMPLETE_HEADERS = {
+    "accept": "*/*",
+    "accept-language": "en-US,en;q=0.9,hi;q=0.8",
+    "origin": "https://shop.flixbus.in",
+    "referer": "https://shop.flixbus.in/",
     "user-agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
     ),
-    "x-version": "5",
+    "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "cross-site",
+    "x-feature-flags": '{"webc_search_stations_recommendation":0}',
+}
+
+_SEARCH_HEADERS = {
+    **_AUTOCOMPLETE_HEADERS,
+    "sec-fetch-site": "cross-site",
 }
 
 async def search_city(name: str, country: str = "in") -> list[dict]:
@@ -33,24 +46,31 @@ async def search_city(name: str, country: str = "in") -> list[dict]:
         async with CurlAsyncSession(impersonate="chrome") as s:
             r = await s.get(
                 _AUTOCOMPLETE_URL,
-                headers=_HEADERS,
+                headers=_AUTOCOMPLETE_HEADERS,
                 params={
                     "q": name,
-                    "language": "en",
+                    "lang": "en_IN",
                     "country": country,
                     "flixbus_cities_only": "false",
+                    "is_train_only": "false",
+                    "stations": "false",
+                    "popular_stations_count": "null",
+                    "disabled_countries": "",
                 },
                 timeout=20,
             )
         r.raise_for_status()
-        results = r.json() if isinstance(r.json(), list) else (r.json().get("results") or [])
+        data = r.json()
+        results = data if isinstance(data, list) else (data.get("results") or [])
         return [
             {
                 "id": c.get("id") or c.get("city_id"),
+                "legacy_id": c.get("legacy_id"),
                 "name": c.get("name"),
                 "lat": (c.get("location") or {}).get("lat"),
                 "lon": (c.get("location") or {}).get("lon"),
                 "country": c.get("country") or c.get("country_code"),
+                "is_flixbus_city": c.get("is_flixbus_city", False),
             }
             for c in results
             if c.get("id") or c.get("city_id")
@@ -82,7 +102,7 @@ async def search_buses(
         async with CurlAsyncSession(impersonate="chrome") as s:
             r = await s.get(
                 _SEARCH_URL,
-                headers=_HEADERS,
+                headers=_SEARCH_HEADERS,
                 params={
                     "from_city_id": from_city_id,
                     "to_city_id": to_city_id,
@@ -95,10 +115,16 @@ async def search_buses(
                 },
                 timeout=20,
             )
+        if r.status_code == 400:
+            # 400 = route doesn't exist on FlixBus, not an error
+            return []
         r.raise_for_status()
         data = r.json()
         trips = data.get("trips") or []
-        return [_normalise(t) for t in trips[:limit] if t.get("status") == "available"]
+        results = [_normalise(t) for t in trips[:limit] if t.get("status") == "available"]
+        if results:
+            print(f"[flixbus] {from_city_id}→{to_city_id}: {len(results)} buses found")
+        return results
     except Exception as e:
         print(f"[flixbus] bus search {from_city_id}→{to_city_id} on {date}: {e}")
         return []
