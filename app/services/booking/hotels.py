@@ -3,22 +3,20 @@ Booking.com Hotels API integration.
 POST https://www.booking.com/dml/graphql  (FullSearch operation)
 
 Two-step flow per search:
-  1. Resolve city name → Booking.com destId via autocomplete API
-  2. Fetch fresh 24h CSRF token from search page HTML (cached in memory)
-  3. POST FullSearch GraphQL with dates + destId
+  1. Resolve city name → destId + destType via autocomplete API
+  2. POST FullSearch GraphQL with dates + destId
 
 curl_cffi with impersonate="chrome" required — AWS WAF blocks plain requests.
-CSRF token is a JWT embedded in the search results page HTML.
 
-Key response paths:
-  results[].basicPropertyData.id                           → hotel ID
-  results[].displayName.text                               → name
-  results[].basicPropertyData.location.{latitude,longitude,address}
-  results[].blocks[0].finalPrice.amount                    → per-night price
-  results[].priceDisplayInfoIrene.averagePricePerNight.amountUnformatted
-  results[].priceDisplayInfoIrene.displayPrice.amountPerStay.amountUnformatted
+Key confirmed response paths (live-tested 2026-05-30):
+  search.__typename = "SearchQueryOutput"  (inline fragment required)
+  results[].basicPropertyData.id / pageName / location / reviewScore / starRating
+  results[].basicPropertyData.photos.main.highResUrl.relativeUrl  → webp photo
+  results[].displayName.text
+  results[].priceDisplayInfoIrene.displayPrice.amountPerStay.amountUnformatted  → per-stay total
+  results[].blocks[0].finalPrice.amount  → same total (backup)
   results[].policies.showFreeCancellation
-  results[].topPhotos[].highResJpegUrl.relativeUrl         → prefix https://cf.bstatic.com
+  Photo CDN: https://cf.bstatic.com + relativeUrl  (includes ?k=HASH)
 """
 import re
 import time
@@ -64,8 +62,6 @@ _GQL_HEADERS = {
     "x-booking-site-type-id": "1",
     "x-booking-topic": "capla_browser_b-search-web-searchresults",
 }
-
-# Separate headers for the AutoComplete query (different client name/version)
 _AUTOCOMPLETE_GQL_HEADERS = {
     **_COMMON_HEADERS,
     "content-type": "application/json",
@@ -90,50 +86,56 @@ _AUTOCOMPLETE_GQL_QUERY = """query AutoComplete($input: AutoCompleteRequestInput
   }
 }"""
 
-# Known destIds for common Indian destinations (city name → Booking.com numeric ID).
-# Extend via the autocomplete API for anything not listed here.
-_DEST_IDS: dict[str, int] = {
-    "gurgaon": -2096897, "gurugram": -2096897,
+# Known Indian destinations — (destId, destType)
+_DEST_CACHE: dict[str, tuple[int, str]] = {
+    "gurgaon":   (-2096897, "CITY"),
+    "gurugram":  (-2096897, "CITY"),
+    "goa":       (4127,     "REGION"),
+    "north goa": (5052,     "REGION"),
+    "south goa": (5303,     "REGION"),
 }
 
-# In-process CSRF token cache — valid for 24h per Booking.com's JWT exp field.
-_csrf_cache: dict = {"token": None, "exp": 0.0}
-
-# Minimal GraphQL query — only the fields we actually use.
-_GQL_QUERY = """
-query FullSearch($input: SearchQueryInput!) {
+# Booking.com's `search` field returns SearchQueryOutput — inline fragment required.
+# Price comes from priceDisplayInfoIrene.displayPrice.amountPerStay.amountUnformatted.
+# Photos from basicPropertyData.photos.main.highResUrl.relativeUrl (webp, includes ?k= hash).
+_GQL_QUERY = """query FullSearch($input: SearchQueryInput!) {
   searchQueries {
     search(input: $input) {
-      pagination { nbResultsTotal }
-      results {
-        basicPropertyData {
-          id
-          location { address city latitude longitude }
-          photos { main { highResJpegUrl { relativeUrl } } }
-          reviewScore: reviews {
-            score: totalScore
-            reviewCount: reviewsCount
-            totalScoreTextTag { translation }
+      ... on SearchQueryOutput {
+        results {
+          basicPropertyData {
+            id
+            pageName
+            location { address city latitude longitude }
+            photos {
+              main {
+                highResUrl { relativeUrl }
+                highResJpegUrl { relativeUrl }
+              }
+            }
+            reviewScore: reviews {
+              score: totalScore
+              reviewCount: reviewsCount
+              totalScoreTextTag { translation }
+            }
+            starRating { value }
           }
-          starRating { value }
-          pageName
+          displayName { text }
+          location { mainDistance geoDistanceMeters }
+          policies { showFreeCancellation showNoPrepayment }
+          mealPlanIncluded { text }
+          priceDisplayInfoIrene {
+            displayPrice { amountPerStay { amount amountUnformatted currency } }
+            averagePricePerNight { amount amountUnformatted currency }
+            priceBeforeDiscount { amountPerStay { amount amountUnformatted currency } }
+          }
+          blocks {
+            finalPrice { amount currency }
+            originalPrice { amount currency }
+            freeCancellationUntil
+          }
+          soldOutInfo { isSoldOut }
         }
-        displayName { text }
-        location { mainDistance geoDistanceMeters }
-        policies { showFreeCancellation showNoPrepayment }
-        mealPlanIncluded { text }
-        priceDisplayInfoIrene {
-          displayPrice { amountPerStay { amount amountUnformatted currency } }
-          averagePricePerNight { amount amountUnformatted currency }
-          priceBeforeDiscount { amountPerStay { amount amountUnformatted currency } }
-        }
-        blocks {
-          finalPrice { amount currency }
-          originalPrice { amount currency }
-          freeCancellationUntil
-        }
-        topPhotos { highResJpegUrl { relativeUrl } }
-        soldOutInfo { isSoldOut }
       }
     }
   }
@@ -141,18 +143,20 @@ query FullSearch($input: SearchQueryInput!) {
 """
 
 
-async def resolve_dest_id(city_name: str) -> tuple[int | None, str]:
+async def resolve_dest_id(city_name: str) -> tuple[int | None, str, str]:
     """
-    Resolve a city name to a Booking.com destId via the GraphQL AutoComplete API.
-    Returns (destId, canonical_name). destId is None if resolution fails.
+    Resolve a city name to a Booking.com destId + destType via the autocomplete API.
+    Returns (destId, canonical_name, destType). destId is None if resolution fails.
+    destType is "CITY", "REGION", or "DISTRICT".
     """
     key = city_name.lower().strip()
 
-    if key in _DEST_IDS:
-        return _DEST_IDS[key], city_name
-    for k, dest_id in _DEST_IDS.items():
+    if key in _DEST_CACHE:
+        dest_id, dest_type = _DEST_CACHE[key]
+        return dest_id, city_name, dest_type
+    for k, (did, dtype) in _DEST_CACHE.items():
         if k in key or key in k:
-            return dest_id, city_name
+            return did, city_name, dtype
 
     try:
         pageview_id = secrets.token_hex(8)
@@ -161,7 +165,7 @@ async def resolve_dest_id(city_name: str) -> tuple[int | None, str]:
             "variables": {
                 "input": {
                     "prefixQuery": city_name,
-                    "nbSuggestions": 5,
+                    "nbSuggestions": 8,
                     "requestConfig": {"enableRequestContextBoost": True},
                     "requestContext": {"pageviewId": pageview_id, "location": None},
                     "fallbackConfig": {
@@ -176,15 +180,9 @@ async def resolve_dest_id(city_name: str) -> tuple[int | None, str]:
             "query": _AUTOCOMPLETE_GQL_QUERY,
         }
         async with CurlAsyncSession() as s:
-            csrf_token = await _fetch_csrf_token(s)
-            headers = {
-                **_AUTOCOMPLETE_GQL_HEADERS,
-                "x-booking-csrf-token": csrf_token or "",
-                "x-booking-pageview-id": pageview_id,
-            }
             r = await s.post(
                 f"{_GRAPHQL_URL}?lang=en-us",
-                headers=headers,
+                headers={**_AUTOCOMPLETE_GQL_HEADERS, "x-booking-pageview-id": pageview_id},
                 json=payload,
                 impersonate="chrome",
                 timeout=10,
@@ -195,83 +193,45 @@ async def resolve_dest_id(city_name: str) -> tuple[int | None, str]:
             .get("autoCompleteSuggestions", {})
             .get("results") or []
         )
-        # Prefer CITY, then REGION, then anything
-        for priority in ("CITY", "REGION", "DISTRICT"):
-            for item in results:
-                dest = item.get("destination") or {}
-                if dest.get("destType") == priority and dest.get("destId"):
+        # Two passes: first prefer India, then accept any country
+        for prefer_india in (True, False):
+            for priority in ("CITY", "REGION", "DISTRICT"):
+                for item in results:
+                    dest = item.get("destination") or {}
+                    if dest.get("destType") != priority or not dest.get("destId"):
+                        continue
+                    country = (dest.get("countryCode") or "").lower()
+                    if prefer_india and country not in ("in", "ind"):
+                        continue
                     dest_id = int(dest["destId"])
+                    dest_type = dest["destType"]
                     label = (item.get("displayInfo") or {}).get("title") or city_name
-                    _DEST_IDS[key] = dest_id
-                    print(f"[booking_hotels] resolved '{city_name}' → destId={dest_id} ({label})")
-                    return dest_id, label
+                    _DEST_CACHE[key] = (dest_id, dest_type)
+                    print(f"[booking_hotels] resolved '{city_name}' → destId={dest_id} ({dest_type}: {label})")
+                    return dest_id, label, dest_type
         if results:
-            dest = results[0].get("destination") or {}
+            dest = (results[0].get("destination") or {})
             dest_id_str = dest.get("destId")
             if dest_id_str:
                 dest_id = int(dest_id_str)
+                dest_type = dest.get("destType", "CITY")
                 label = (results[0].get("displayInfo") or {}).get("title") or city_name
-                _DEST_IDS[key] = dest_id
-                return dest_id, label
+                _DEST_CACHE[key] = (dest_id, dest_type)
+                return dest_id, label, dest_type
     except Exception as e:
         print(f"[booking_hotels] AutoComplete '{city_name}': {e}")
 
-    return None, city_name
-
-
-async def _fetch_csrf_token(session) -> str | None:
-    """
-    Fetch a fresh CSRF token from Booking.com's search page HTML.
-    Cached in memory until ~5 minutes before the JWT expires.
-    """
-    now = time.time()
-    if _csrf_cache["token"] and _csrf_cache["exp"] > now + 300:
-        return _csrf_cache["token"]
-
-    try:
-        resp = await session.get(
-            _SEARCH_PAGE,
-            params={"ss": "Delhi", "dest_type": "city", "lang": "en-us"},
-            headers={**_COMMON_HEADERS, "sec-fetch-site": "same-origin"},
-            impersonate="chrome",
-            timeout=15,
-        )
-        html = resp.text
-
-        # Try several patterns Booking.com has used across frontend versions
-        patterns = [
-            r'"csrfToken"\s*:\s*"(eyJ[A-Za-z0-9._-]+)"',
-            r'"csrf_token"\s*:\s*"(eyJ[A-Za-z0-9._-]+)"',
-            r'x-booking-csrf-token["\s,]+:\s*"(eyJ[A-Za-z0-9._-]+)"',
-            r'name="x-booking-csrf-token"[^>]+content="(eyJ[A-Za-z0-9._-]+)"',
-        ]
-        for pat in patterns:
-            m = re.search(pat, html)
-            if m:
-                token = m.group(1)
-                # Parse exp from JWT payload (no signature needed — we're just reading it)
-                try:
-                    padded = token.split(".")[1] + "=="
-                    payload = _json.loads(base64.b64decode(padded + "=" * (4 - len(padded) % 4)))
-                    _csrf_cache["exp"] = float(payload.get("exp", now + 86400))
-                except Exception:
-                    _csrf_cache["exp"] = now + 86400
-                _csrf_cache["token"] = token
-                return token
-    except Exception as e:
-        print(f"[booking_hotels] CSRF fetch error: {e}")
-
-    return None
+    return None, city_name, "CITY"
 
 
 async def search_hotels(
     city_name: str,
-    checkin: str,       # "YYYY-MM-DD"
-    checkout: str,      # "YYYY-MM-DD"
+    checkin: str,
+    checkout: str,
     rooms: int = 1,
     adults: int = 2,
     children: int = 0,
-    sort: str | None = None,   # None=recommended, "price"=cheapest, "class"=stars
+    sort: str | None = None,
     limit: int = 10,
     offset: int = 0,
 ) -> list[dict]:
@@ -283,11 +243,10 @@ async def search_hotels(
         print("[booking_hotels] curl_cffi not installed — pip install curl-cffi")
         return []
 
-    dest_id, city_canonical = await resolve_dest_id(city_name)
-    # For small/obscure Indian destinations, try broader fallback name variants
+    dest_id, city_canonical, dest_type = await resolve_dest_id(city_name)
     if dest_id is None:
         for variant in [f"{city_name} India", f"{city_name} Himachal Pradesh", f"{city_name} Uttarakhand"]:
-            dest_id, city_canonical = await resolve_dest_id(variant)
+            dest_id, city_canonical, dest_type = await resolve_dest_id(variant)
             if dest_id is not None:
                 print(f"[booking_hotels] resolved '{city_name}' via fallback '{variant}'")
                 break
@@ -295,104 +254,102 @@ async def search_hotels(
         print(f"[booking_hotels] could not resolve destId for '{city_name}' — skipping")
         return []
 
-    pageview_id = secrets.token_hex(8)  # 16-char random hex, fresh per request
+    pageview_id = secrets.token_hex(8)
+    dest_type_lower = dest_type.lower()
+
+    # URL query params matching real browser requests (required for pricing)
+    gql_url = (
+        f"{_GRAPHQL_URL}"
+        f"?ss={city_canonical.replace(' ', '+')}"
+        f"&dest_id={dest_id}&dest_type={dest_type_lower}"
+        f"&checkin={checkin}&checkout={checkout}"
+        f"&group_adults={adults}&no_rooms={rooms}&group_children={children}"
+    )
+    referer = (
+        f"{_SEARCH_PAGE}"
+        f"?ss={city_canonical.replace(' ', '+')}"
+        f"&dest_id={dest_id}&dest_type={dest_type_lower}"
+        f"&checkin={checkin}&checkout={checkout}"
+        f"&group_adults={adults}&no_rooms={rooms}&group_children={children}"
+    )
+    raw_query = (
+        f"/searchresults.html?ss={city_canonical}&dest_id={dest_id}&dest_type={dest_type_lower}"
+        f"&checkin={checkin}&checkout={checkout}"
+        f"&group_adults={adults}&no_rooms={rooms}&group_children={children}"
+        f"&lang=en-us&aid=304142"
+    )
+
+    gql_headers = {
+        **_GQL_HEADERS,
+        "x-booking-pageview-id": pageview_id,
+        "referer": referer,
+    }
+
+    payload = {
+        "operationName": "FullSearch",
+        "variables": {
+            "input": {
+                "acidCarouselContext": None,
+                "childrenAges": [],
+                "dates": {"checkin": checkin, "checkout": checkout},
+                "doAvailabilityCheck": False,
+                "encodedAutocompleteMeta": None,
+                "enableCampaigns": True,
+                "filters": {},
+                "flexibleDatesConfig": {
+                    "broadDatesCalendar": {"checkinMonths": [], "los": [], "startWeekdays": []},
+                    "dateFlexUseCase": "DATE_RANGE",
+                    "dateRangeCalendar": {"checkin": [checkin], "checkout": [checkout]},
+                },
+                "forcedBlocks": None,
+                "location": {
+                    "searchString": city_canonical,
+                    "destType": dest_type,
+                    "destId": dest_id,
+                },
+                "metaContext": {
+                    "metaCampaignId": 0,
+                    "externalTotalPrice": None,
+                    "feedPrice": None,
+                    "hotelCenterAccountId": None,
+                    "rateRuleId": None,
+                    "dragongateTraceId": None,
+                    "pricingProductsTag": None,
+                },
+                "nbRooms": rooms,
+                "nbAdults": adults,
+                "nbChildren": children,
+                "showAparthotelAsHotel": True,
+                "needsRoomsMatch": False,
+                "optionalFeatures": {"forceArpExperiments": True, "testProperties": False},
+                "pagination": {"rowsPerPage": limit, "offset": offset},
+                "rawQueryForSession": raw_query,
+                "referrerBlock": {"blockName": "searchbox"},
+                "sbCalendarOpen": False,
+                "sorters": {
+                    "selectedSorter": sort,
+                    "referenceGeoId": None,
+                    "tripTypeIntentId": None,
+                },
+                "travelPurpose": 2,
+                "seoThemeIds": [],
+                "useSearchParamsFromSession": True,
+                "webSearchContext": {
+                    "reason": "CLIENT_SIDE_UPDATE",
+                    "source": "SEARCH_RESULTS",
+                    "outcome": "SEARCH_RESULTS",
+                },
+                "clientSideRequestId": pageview_id,
+            }
+        },
+        "extensions": {},
+        "query": _GQL_QUERY,
+    }
 
     try:
         async with CurlAsyncSession() as s:
-            csrf_token = await _fetch_csrf_token(s)
-            if not csrf_token:
-                print("[booking_hotels] could not obtain CSRF token")
-                return []
-
-            gql_headers = {
-                **_GQL_HEADERS,
-                "x-booking-csrf-token": csrf_token,
-                "x-booking-pageview-id": pageview_id,
-                "referer": (
-                    f"{_SEARCH_PAGE}?ss={city_name}&dest_id={dest_id}&dest_type=city"
-                    f"&checkin={checkin}&checkout={checkout}"
-                    f"&group_adults={adults}&no_rooms={rooms}&group_children={children}"
-                ),
-            }
-
-            raw_query = (
-                f"/searchresults.html?ss={city_name}&dest_id={dest_id}&dest_type=city"
-                f"&checkin={checkin}&checkout={checkout}"
-                f"&group_adults={adults}&no_rooms={rooms}&group_children={children}"
-                f"&lang=en-us&aid=304142"
-            )
-
-            sorters_block = {
-                "selectedSorter": sort,
-                "referenceGeoId": None,
-                "tripTypeIntentId": None,
-            }
-
-            payload = {
-                "operationName": "FullSearch",
-                "variables": {
-                    "includeBundle": False,
-                    "input": {
-                        "acidCarouselContext": None,
-                        "childrenAges": [],
-                        "doAvailabilityCheck": False,
-                        "encodedAutocompleteMeta": None,
-                        "enableCampaigns": True,
-                        "filters": {},
-                        "flexibleDatesConfig": {
-                            "broadDatesCalendar": {
-                                "checkinMonths": [], "los": [], "startWeekdays": []
-                            },
-                            "dateFlexUseCase": "DATE_RANGE",
-                            "dateRangeCalendar": {
-                                "checkin": [checkin],
-                                "checkout": [checkout],
-                            },
-                        },
-                        "forcedBlocks": None,
-                        "location": {
-                            "searchString": city_canonical,
-                            "destType": "CITY",
-                            "destId": dest_id,
-                        },
-                        "metaContext": {
-                            "metaCampaignId": 0,
-                            "externalTotalPrice": None,
-                            "feedPrice": None,
-                            "hotelCenterAccountId": None,
-                            "rateRuleId": None,
-                            "dragongateTraceId": None,
-                            "pricingProductsTag": None,
-                        },
-                        "nbRooms": rooms,
-                        "nbAdults": adults,
-                        "nbChildren": children,
-                        "showAparthotelAsHotel": True,
-                        "needsRoomsMatch": False,
-                        "optionalFeatures": {
-                            "forceArpExperiments": True,
-                            "testProperties": False,
-                        },
-                        "pagination": {
-                            "rowsPerPage": limit,
-                            "offset": offset,
-                        },
-                        "rawQueryForSession": raw_query,
-                        "referrerBlock": {"blockName": "searchbox"},
-                        "sbCalendarOpen": False,
-                        "sorters": sorters_block,
-                        "travelPurpose": 2,
-                        "seoThemeIds": [],
-                        "useSearchParamsFromSession": False,
-                        "clientSideRequestId": pageview_id,
-                    },
-                    "carouselLowCodeExp": False,
-                },
-                "query": _GQL_QUERY,
-            }
-
             resp = await s.post(
-                _GRAPHQL_URL,
+                gql_url,
                 headers=gql_headers,
                 json=payload,
                 impersonate="chrome",
@@ -406,8 +363,8 @@ async def search_hotels(
         data = resp.json()
         errors = data.get("errors") or []
         if errors:
-            print(f"[booking_hotels] GraphQL errors: {[e.get('message') for e in errors[:2]]}")
-            return []
+            msgs = [e.get("message", "") for e in errors[:2]]
+            print(f"[booking_hotels] GraphQL errors: {msgs}")
 
         results = (
             (data.get("data") or {})
@@ -424,7 +381,9 @@ async def search_hotels(
         except Exception:
             nights = 1
 
-        return [_normalise(r, checkin, checkout, nights) for r in results[:limit]]
+        hotels = [_normalise(r, checkin, checkout, nights) for r in results[:limit]]
+        print(f"[booking_hotels] '{city_name}' ({dest_type}): ✓ {len(hotels)} results")
+        return hotels
 
     except Exception as e:
         print(f"[booking_hotels] search '{city_name}' {checkin}→{checkout}: {e}")
@@ -433,57 +392,53 @@ async def search_hotels(
 
 def _normalise(r: dict, checkin: str, checkout: str, nights: int) -> dict:
     basic = r.get("basicPropertyData") or {}
-    loc = basic.get("location") or {}
+    loc   = basic.get("location") or {}
     reviews = basic.get("reviewScore") or {}
     star = basic.get("starRating") or {}
 
-    name = (r.get("displayName") or {}).get("text") or "Unknown"
-    hotel_id = basic.get("id")
+    name      = (r.get("displayName") or {}).get("text") or "Unknown"
+    hotel_id  = basic.get("id")
     page_name = basic.get("pageName") or ""
     booking_url = f"https://www.booking.com/hotel/in/{page_name}.html" if page_name else None
 
-    # Photos — prefix CDN base URL
-    photos: list[str] = []
-    for tp in (r.get("topPhotos") or []):
-        rel = (tp.get("highResJpegUrl") or {}).get("relativeUrl")
-        if rel:
-            photos.append(_PHOTO_BASE + rel)
-    if not photos:
-        main_photo = ((basic.get("photos") or {}).get("main") or {})
-        rel = (main_photo.get("highResJpegUrl") or {}).get("relativeUrl")
-        if rel:
-            photos.append(_PHOTO_BASE + rel)
+    # Photos: highResUrl (webp, includes ?k= hash) > highResJpegUrl fallback
+    main_photo = basic.get("photos", {}).get("main") or {}
+    photo_rel = (
+        (main_photo.get("highResUrl") or main_photo.get("highResJpegUrl") or {})
+        .get("relativeUrl", "")
+    )
+    photos = [_PHOTO_BASE + photo_rel] if photo_rel else []
 
-    # Price
-    price_info = r.get("priceDisplayInfoIrene") or {}
-    avg_night = (price_info.get("averagePricePerNight") or {}).get("amountUnformatted")
-    per_stay = (
+    # Price: displayPrice.amountPerStay is the total for the stay
+    price_info  = r.get("priceDisplayInfoIrene") or {}
+    per_stay_raw = (
         (price_info.get("displayPrice") or {})
         .get("amountPerStay", {})
         .get("amountUnformatted")
     )
-    original_stay = (
+    avg_night_raw = (price_info.get("averagePricePerNight") or {}).get("amountUnformatted")
+    original_raw  = (
         (price_info.get("priceBeforeDiscount") or {})
         .get("amountPerStay", {})
         .get("amountUnformatted")
     )
-    currency = (
-        (price_info.get("averagePricePerNight") or {}).get("currency") or "INR"
-    )
+    currency = (price_info.get("averagePricePerNight") or {}).get("currency") or "INR"
 
-    # Block price (per room per night shown on card)
-    blocks = r.get("blocks") or []
-    block0 = blocks[0] if blocks else {}
-    block_price = _safe_float(block0.get("finalPrice", {}).get("amount"))
+    # Block price as backup
+    blocks     = r.get("blocks") or []
+    block0     = blocks[0] if blocks else {}
+    block_price = _safe_int((block0.get("finalPrice") or {}).get("amount"))
     free_cancel_until = block0.get("freeCancellationUntil")
 
-    price_per_night = avg_night or block_price
-    policies = r.get("policies") or {}
-    free_cancel = policies.get("showFreeCancellation", False) or bool(free_cancel_until)
+    per_stay   = _safe_int(per_stay_raw)
+    avg_night  = _safe_int(avg_night_raw) or (per_stay // nights if per_stay and nights else None) or block_price
+    original   = _safe_int(original_raw)
 
-    meal = (r.get("mealPlanIncluded") or {}).get("text")
-    dist = r.get("location") or {}
-    sold_out = (r.get("soldOutInfo") or {}).get("isSoldOut", False)
+    policies   = r.get("policies") or {}
+    free_cancel = policies.get("showFreeCancellation", False) or bool(free_cancel_until)
+    dist       = r.get("location") or {}
+    sold_out   = (r.get("soldOutInfo") or {}).get("isSoldOut", False)
+    meal       = (r.get("mealPlanIncluded") or {}).get("text")
 
     return {
         "hotel_id": str(hotel_id) if hotel_id else None,
@@ -497,9 +452,9 @@ def _normalise(r: dict, checkin: str, checkout: str, nights: int) -> dict:
         "review_score": _safe_float(reviews.get("score")),
         "review_count": reviews.get("reviewCount"),
         "review_label": (reviews.get("totalScoreTextTag") or {}).get("translation"),
-        "price_per_night": _safe_int(price_per_night),
-        "price_per_stay": _safe_int(per_stay),
-        "price_original_stay": _safe_int(original_stay),
+        "price_per_night": avg_night,
+        "price_per_stay": per_stay,
+        "price_original_stay": original,
         "currency": currency,
         "nights": nights,
         "checkin": checkin,
@@ -508,7 +463,7 @@ def _normalise(r: dict, checkin: str, checkout: str, nights: int) -> dict:
         "free_cancellation_until": free_cancel_until,
         "no_prepayment": policies.get("showNoPrepayment", False),
         "meal_plan": meal,
-        "photos": photos[:6],
+        "photos": photos,
         "booking_url": booking_url,
         "is_sold_out": sold_out,
         "source": "booking",

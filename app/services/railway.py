@@ -1,6 +1,15 @@
 """
 Indian Railway search via ConfirmTKT API.
 India-only — only applies when both origin and destination are Indian cities.
+
+Station resolution: ConfirmTKT v2 auto-suggestion API only.
+No hardcoded values — cache populated on first lookup.
+
+Matching strategy for auto-suggestion results:
+  1. Exact city match (station.city == query)
+  2. majorStn: true (the "All stations" aggregate entry for a city)
+  3. Partial city/name match
+  Highest score wins.
 """
 from datetime import datetime
 import httpx
@@ -9,12 +18,12 @@ _BASE = "https://cttrainsapi.confirmtkt.com"
 _HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
-    "ApiKey": "ct-web!2$",   # ct-web!2$
+    "ApiKey": "ct-web!2$",
     "CT-Token": "",
     "CT-Userkey": "",
     "ClientId": "ct-web",
     "Content-Type": "application/json",
-    "DeviceId": "7558c77e-71eb-423f-9575-5c3c9d399a19",
+    "DeviceId": "067d2368-0a5c-4372-abf7-fd33546f1dea",
     "Origin": "https://www.confirmtkt.com",
     "Referer": "https://www.confirmtkt.com/",
     "User-Agent": (
@@ -29,93 +38,93 @@ _HEADERS = {
     "Sec-Fetch-Site": "same-site",
 }
 
-# city/town name (lowercase) → Indian Railway station code
-STATION_CODE_MAP: dict[str, str | None] = {
-    # Major metros
-    "new delhi": "NDLS", "delhi": "NDLS", "old delhi": "DLI",
-    "mumbai": "CSTM", "mumbai csmt": "CSTM", "mumbai central": "BCT", "bandra terminus": "BDTS",
-    "kolkata": "HWH", "howrah": "HWH", "sealdah": "SDAH",
-    "bangalore": "SBC", "bengaluru": "SBC", "ksr bengaluru": "SBC",
-    "chennai": "MAS", "chennai central": "MAS", "chennai egmore": "MS",
-    "hyderabad": "SC", "secunderabad": "SC", "hyderabad deccan": "HYB",
-    # Tier-1 cities
-    "ahmedabad": "ADI", "pune": "PUNE", "jaipur": "JP",
-    "lucknow": "LKO", "charbagh": "LKO",
-    "bhopal": "BPL", "nagpur": "NGP", "patna": "PNBE",
-    "chandigarh": "CDG", "amritsar": "ASR", "ludhiana": "LDH",
-    "agra cantt": "AGC", "agra fort": "AF", "agra": "AGC",
-    "varanasi": "BSB", "bhubaneswar": "BBS",
-    "visakhapatnam": "VSKP", "vizag": "VSKP",
-    "kochi": "ERS", "ernakulam": "ERS",
-    "trivandrum": "TVC", "thiruvananthapuram": "TVC",
-    "coimbatore": "CBE", "madurai": "MDU",
-    "indore": "INDB", "surat": "ST", "vadodara": "BRC", "baroda": "BRC",
-    "rajkot": "RJT", "raipur": "R", "bilaspur": "BSP",
-    "guwahati": "GHY",
-    # North India
-    "dehradun": "DDN", "haridwar": "HW", "rishikesh": "RKSH",
-    "roorkee": "RK", "saharanpur": "SRE",
-    "meerut": "MTC", "aligarh": "ALJN",
-    "moradabad": "MB", "bareilly": "BE",
-    "kanpur": "CNB", "lucknow": "LKO",
-    "gorakhpur": "GKP", "allahabad": "PRYJ", "prayagraj": "PRYJ",
-    "gaya": "GAYA", "ranchi": "RNC",
-    "jamshedpur": "TATA", "tatanagar": "TATA", "dhanbad": "DHN",
-    "asansol": "ASN", "durgapur": "DGR", "kharagpur": "KGP",
-    "new jalpaiguri": "NJP", "siliguri": "NJP", "bagdogra": "NJP",
-    # Rajasthan
-    "jodhpur": "JU", "udaipur": "UDZ", "ajmer": "AII", "kota": "KOTA",
-    "bikaner": "BKN", "alwar": "AWR", "bharatpur": "BTE", "jaisalmer": "JSM",
-    "sawai madhopur": "SWM",
-    # Punjab / Haryana
-    "pathankot": "PTHK", "jammu": "JAT", "jammu tawi": "JAT",
-    "bathinda": "BTI", "ferozepur": "FZR", "ambala": "UMB",
-    # Himachal (limited rail)
-    "shimla": "SML", "kalka": "KLK", "solan": "SOL",
-    "kasauli": "KLK",  # nearest
-    "dharamshala": "PTHK", "mcleod ganj": "PTHK", "dalhousie": "PTHK",
-    # Hill stations / remote — no rail (return None so caller knows)
-    "manali": None, "kullu": None, "aut": None, "bhuntar": None, "kasol": None,
-    "kheerganga": None, "spiti": None, "lahaul": None, "pin valley": None,
-    "leh": None, "ladakh": None, "srinagar": None,
-    "darjeeling": "NJP", "gangtok": "NJP", "kalimpong": "NJP",
-    "shillong": "GHY",
-    # Central India
-    "jabalpur": "JBP", "katni": "KTE", "ujjain": "UJN", "indore": "INDB",
-    "gwalior": "GWL", "jhansi": "JHS", "ratlam": "RTM",
-    # South India
-    "mysore": "MYS", "mysuru": "MYS",
-    "mangalore": "MAQ", "mangaluru": "MAQ",
-    "hubli": "UBL", "hubballi": "UBL", "belgaum": "BGM", "belagavi": "BGM",
-    "vijayawada": "BZA", "tirupati": "TPTY", "guntur": "GNT",
-    "rajahmundry": "RJY", "nellore": "NLR", "warangal": "WL",
-    "tiruchirappalli": "TPJ", "trichy": "TPJ",
-    "thanjavur": "TJ", "salem": "SA", "erode": "ED", "tirunelveli": "TEN",
-    "coimbatore": "CBE", "vellore": "KPD",
-    "pondicherry": "PDY", "puducherry": "PDY",
-    # Goa
-    "goa": "MAO", "madgaon": "MAO", "margao": "MAO", "panaji": "MAO", "vasco": "VSG",
-    # Maharashtra
-    "aurangabad": "AWB", "nashik": "NK", "nashik road": "NK",
-    "kolhapur": "KOP", "solapur": "SUR",
-    # North-East
-    "dibrugarh": "DBRG", "jorhat": "JTTN",
-    "agartala": "AGTL", "imphal": None, "aizawl": None, "shillong": "GHY",
-}
+# In-memory cache populated by API calls only — no hardcoded values
+_STATION_CACHE: dict[str, str | None] = {}
 
 
-def city_to_station_code(city_name: str) -> str | None:
+def _pick_best_station(stations: list[dict], query: str) -> str | None:
     """
-    Map a city/place name to an Indian Railway station code.
-    Returns None if no rail connectivity (remote hill areas) or unknown.
+    Score each candidate station and return the best matching code.
+
+    Scoring:
+      +2.0  city exactly matches query (e.g. "Goa" for query "goa")
+      +1.0  city contains query or query contains city
+      +0.3  majorStn: true (the "All stations" aggregate entry)
+      +0.2  stationName contains query
+    Returns None if best score is 0 (no relevant match).
+    """
+    q = query.lower().strip()
+    best_code  = None
+    best_score = 0.0
+
+    for stn in stations:
+        city   = (stn.get("city")        or "").lower().strip()
+        name   = (stn.get("stationName") or "").lower().strip()
+        code   = stn.get("stationCode")  or ""
+        major  = bool(stn.get("majorStn"))
+
+        score = 0.0
+        if city == q:
+            score = 2.0
+        elif q in city or city in q:
+            score = 1.0
+        elif q in name:
+            score = 0.2
+
+        if major:
+            score += 0.3
+
+        if score > best_score:
+            best_score = score
+            best_code  = code
+
+    return best_code if best_score > 0 else None
+
+
+async def resolve_station_async(city_name: str) -> str | None:
+    """
+    Resolve city name → Indian Railway station code via ConfirmTKT v2 autosuggest.
+    Returns None if no matching station found (city has no rail connectivity).
+    Results cached in-memory after first call.
     """
     key = city_name.lower().strip()
-    if key in STATION_CODE_MAP:
-        return STATION_CODE_MAP[key]
-    for name, code in STATION_CODE_MAP.items():
-        if name and (name in key or key in name):
+    if key in _STATION_CACHE:
+        return _STATION_CACHE[key]
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(
+                f"{_BASE}/api/v2/trains/stations/auto-suggestion",
+                headers=_HEADERS,
+                params={
+                    "searchString": city_name,
+                    "sourceStnCode": "",
+                    "popularStnListLimit": 15,
+                    "preferredStnListLimit": 6,
+                    "channel": "mwebd",
+                    "language": "EN",
+                },
+            )
+        if r.status_code == 200:
+            stations = (r.json().get("data") or {}).get("stationList") or []
+            code = _pick_best_station(stations, city_name)
+            _STATION_CACHE[key] = code
+            if code:
+                print(f"[railway] autocomplete '{city_name}' → {code}")
+            else:
+                print(f"[railway] autocomplete '{city_name}' → no match (no rail connectivity)")
             return code
+    except Exception as e:
+        print(f"[railway] station autocomplete '{city_name}': {e}")
+
+    _STATION_CACHE[key] = None
     return None
+
+
+# Kept for callers that need a sync lookup — returns from cache only
+def city_to_station_code(city_name: str) -> str | None:
+    """Returns cached station code or None. Use resolve_station_async for fresh lookup."""
+    return _STATION_CACHE.get(city_name.lower().strip())
 
 
 async def search_trains(
@@ -162,64 +171,135 @@ async def search_trains(
             )
         r.raise_for_status()
         data = r.json()
+        # New API: response is {"data": {"trainList": [...]}}
+        # Old API: response is {"trainsList": [...]} or {"trains": [...]}
         trains_raw = (
-            data.get("trainsList")
+            (data.get("data") or {}).get("trainList")
+            or data.get("trainsList")
             or data.get("trains")
             or data.get("TrainList")
             or []
         )
-        return [_normalise_train(t) for t in trains_raw[:limit]]
+        return [_normalise_train(t, doj) for t in trains_raw[:limit]]
     except Exception as e:
         print(f"[railway] search {source_code}→{dest_code} on {doj}: {e}")
         return []
 
 
-def _normalise_train(t: dict) -> dict:
-    classes_raw = (
-        t.get("classesWithFare")
-        or t.get("availableClasses")
-        or t.get("classes")
-        or []
-    )
-    cheapest_fare: int | None = None
+def _normalise_train(t: dict, doj: str = "") -> dict:
+    """
+    Normalize a ConfirmTKT train entry.
+    doj: journey date in "DD-MM-YYYY" format (used for booking URL).
+
+    Each class entry in available_classes includes:
+      fare, availability, prediction (ConfirmTKT seat prediction),
+      prediction_status ("Confirm" / "RAC" / "WL"), prediction_pct (0-100).
+    """
+    avail_cache = t.get("availabilityCache") or {}
+    avl_classes = t.get("avlClasses") or t.get("avlClassesSorted") or []
+
+    cheapest_fare:  int | None = None
     cheapest_class: str | None = None
     available_classes = []
-    for c in classes_raw:
-        code = c.get("classCode") or c.get("code") or c.get("className")
-        fare = c.get("fare") or c.get("totalFare") or c.get("price")
-        seats = c.get("availableSeats") or c.get("available") or c.get("seatsAvailable")
-        available_classes.append({"code": code, "fare": fare, "available_seats": seats})
-        if fare and (cheapest_fare is None or fare < cheapest_fare):
-            cheapest_fare = fare
-            cheapest_class = code
 
-    duration_str = t.get("duration") or t.get("journeyDuration") or ""
-    duration_min = 0
-    if ":" in duration_str:
+    for cls_code in avl_classes:
+        ce = avail_cache.get(cls_code) or {}
+        fare_str     = ce.get("fare")
+        display      = ce.get("availabilityDisplayName") or ""   # e.g. "AVL 4", "WL 12"
+        availability = ce.get("availability") or display          # "AVAILABLE-0004"
+        prediction   = ce.get("prediction") or ce.get("predictionDisplayName") or ""
+        pred_status  = ce.get("confirmTktStatus") or ""           # "Confirm" / "RAC" / "WL"
+        pred_pct     = ce.get("predictionPercentage")             # 0-100
+
         try:
-            h, m = duration_str.split(":")[:2]
-            duration_min = int(h) * 60 + int(m)
+            fare = int(float(fare_str)) if fare_str else None
+        except Exception:
+            fare = None
+
+        seats = None
+        if "AVL" in display:
+            try:
+                seats = int(display.split()[-1])
+            except Exception:
+                pass
+
+        available_classes.append({
+            "code":              cls_code,
+            "fare":              fare,
+            "availability":      availability,
+            "display":           display,
+            "available_seats":   seats,
+            "prediction":        prediction,
+            "prediction_status": pred_status,
+            "prediction_pct":    pred_pct,
+        })
+        if fare and (cheapest_fare is None or fare < cheapest_fare):
+            cheapest_fare  = fare
+            cheapest_class = cls_code
+
+    # Fallback: old classesWithFare format
+    if not available_classes:
+        for c in (t.get("classesWithFare") or t.get("availableClasses") or []):
+            code = c.get("classCode") or c.get("code")
+            fare = c.get("fare") or c.get("totalFare")
+            try:
+                fare = int(fare) if fare else None
+            except Exception:
+                fare = None
+            available_classes.append({
+                "code": code, "fare": fare, "availability": None,
+                "display": None, "available_seats": None,
+                "prediction": None, "prediction_status": None, "prediction_pct": None,
+            })
+            if fare and (cheapest_fare is None or fare < cheapest_fare):
+                cheapest_fare  = fare
+                cheapest_class = code
+
+    _dur_raw = t.get("duration") or t.get("journeyDuration") or ""
+    duration_str = str(_dur_raw)
+    duration_min = 0
+    if isinstance(_dur_raw, int):
+        duration_min = _dur_raw
+    elif ":" in duration_str:
+        try:
+            parts = duration_str.split(":")
+            duration_min = int(parts[0]) * 60 + int(parts[1])
         except Exception:
             pass
 
+    from_code = t.get("fromStnCode") or t.get("sourceStationCode") or t.get("srcStnCode")
+    to_code   = t.get("toStnCode")   or t.get("destinationStationCode") or t.get("dstStnCode")
+    dep_time  = t.get("departureTime") or t.get("departure")
+    arr_time  = t.get("arrivalTime")   or t.get("arrival")
+
+    # ConfirmTKT booking URL: /rbooking/trains/from/{FROM}/to/{TO}/{DD-MM-YYYY}
+    booking_url = None
+    if from_code and to_code and doj:
+        booking_url = (
+            f"https://www.confirmtkt.com/rbooking/trains/"
+            f"from/{from_code}/to/{to_code}/{doj}"
+        )
+
     return {
-        "train_number": t.get("trainNumber") or t.get("trainNo") or t.get("train_number"),
-        "train_name": t.get("trainName") or t.get("name"),
-        "train_type": t.get("trainType") or t.get("type"),
-        "from_station_code": t.get("sourceStationCode") or t.get("fromStation") or t.get("srcStnCode"),
-        "from_station_name": t.get("sourceStationName") or t.get("srcStnName"),
-        "to_station_code": t.get("destinationStationCode") or t.get("toStation") or t.get("dstStnCode"),
-        "to_station_name": t.get("destinationStationName") or t.get("dstStnName"),
-        "departure_time": t.get("departureTime") or t.get("departure") or t.get("depTime"),
-        "arrival_time": t.get("arrivalTime") or t.get("arrival") or t.get("arrTime"),
-        "duration": duration_str,
-        "duration_min": duration_min,
-        "distance_km": t.get("distanceKm") or t.get("distance"),
-        "cheapest_fare": cheapest_fare,
+        "train_number":    t.get("trainNumber") or t.get("trainNo"),
+        "train_name":      t.get("trainName")   or t.get("name"),
+        "train_type":      t.get("trainType")   or t.get("type"),
+        "from_station_code": from_code,
+        "from_station_name": t.get("fromStnName") or t.get("sourceStationName"),
+        "to_station_code":   to_code,
+        "to_station_name":   t.get("toStnName") or t.get("destinationStationName"),
+        "departure_time": dep_time,
+        "arrival_time":   arr_time,
+        "duration":       duration_str,
+        "duration_min":   duration_min,
+        "distance_km":    t.get("distance") or t.get("distanceKm"),
+        "cheapest_fare":  cheapest_fare,
         "cheapest_class": cheapest_class,
         "available_classes": available_classes,
-        "running_days": t.get("runningDays") or t.get("daysOfRun") or [],
-        "pantry": t.get("pantryAvailable", False),
+        "running_days":   t.get("runningDays") or t.get("daysOfRun") or [],
+        "pantry":         t.get("hasPantry") or t.get("pantryAvailable", False),
+        "train_rating":   t.get("trainRating"),
+        "booking_url":    booking_url,
         "source": "confirmtkt",
     }
 

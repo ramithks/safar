@@ -1,22 +1,10 @@
 from fastapi import APIRouter
-from app.api.v1 import analyze, jobs, health
-from app.api.v1 import cities_feed, trips_feed, city, saved_plans, save_trip, plan_trip, plan_day_out
-from app.api.v1 import bulk_explore, community
+from app.api.v1.plan_trip.endpoint import router as plan_trip_router
+from app.api.v1.groups.endpoint import router as groups_router
+from app.api.v1.trips.endpoint import router as trips_router
 
 router = APIRouter(prefix="/api/v1")
 
-# ── Reel analysis (existing) ──────────────────────────────────────────────────
-router.include_router(analyze.router, tags=["reels"])
-router.include_router(jobs.router, tags=["jobs"])
-router.include_router(health.router, tags=["health"])
-
-# ── TravBuddy app routes ──────────────────────────────────────────────────────
-router.include_router(cities_feed.router, tags=["feeds"])
-router.include_router(trips_feed.router, tags=["feeds"])
-router.include_router(city.router, tags=["city"])
-router.include_router(saved_plans.router, tags=["plans"])
-router.include_router(save_trip.router, tags=["plans"])
-router.include_router(plan_trip.router, tags=["ai"])
-router.include_router(plan_day_out.router, tags=["ai"])
-router.include_router(bulk_explore.router, tags=["explore"])
-router.include_router(community.router, tags=["community"])
+router.include_router(plan_trip_router, tags=["ai"])
+router.include_router(groups_router)
+router.include_router(trips_router)

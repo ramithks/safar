@@ -2,13 +2,18 @@
 Booking.com Flights API integration.
 GET https://flights.booking.com/api/flights/
 
-This is the same API the booking.com website uses for flight search.
-No auth key needed — only a few stable custom headers.
-totalTime in the response is in SECONDS, not minutes.
+IATA resolution: EaseMyTrip autosuggest API.
+  POST https://www.easemytrip.com/api/Flight/GetAutoSuggestNew {"Prefix": "<city>"}
+  Response City field format: "New Delhi(DEL)" → extract 3-letter code.
+No hardcoded values — cache populated on first lookup.
 """
+import re as _re
+import httpx
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
-_BASE = "https://flights.booking.com/api/flights/"
+_BASE       = "https://flights.booking.com/api/flights/"
+_EMT_AUTOSUGGEST = "https://www.easemytrip.com/api/Flight/GetAutoSuggestNew"
+
 _HEADERS = {
     "accept": "*/*",
     "user-agent": (
@@ -17,96 +22,82 @@ _HEADERS = {
     ),
     "x-booking-affiliate-id": "304142",
     "x-flights-context-name": "search_results",
-    "x-flights-context-pos": "in",   # "in" = India point-of-sale for INR pricing
+    "x-flights-context-pos": "in",
     "x-requested-from": "clientFetch",
 }
 
-# Major Indian airports: city name variants → IATA code
-INDIA_AIRPORTS: dict[str, str] = {
-    "delhi": "DEL", "new delhi": "DEL", "indira gandhi": "DEL",
-    "mumbai": "BOM", "bombay": "BOM",
-    "bengaluru": "BLR", "bangalore": "BLR",
-    "hyderabad": "HYD",
-    "chennai": "MAA", "madras": "MAA",
-    "kolkata": "CCU", "calcutta": "CCU",
-    "ahmedabad": "AMD",
-    "pune": "PNQ",
-    "goa": "GOI", "dabolim": "GOI",
-    "kochi": "COK", "cochin": "COK",
-    "jaipur": "JAI",
-    "lucknow": "LKO",
-    "chandigarh": "IXC",
-    "amritsar": "ATQ",
-    "srinagar": "SXR",
-    "leh": "IXL", "ladakh": "IXL",
-    "dehradun": "DED",
-    "varanasi": "VNS",
-    "bhopal": "BHO",
-    "nagpur": "NAG",
-    "patna": "PAT",
-    "bhubaneswar": "BBI",
-    "guwahati": "GAU",
-    "coimbatore": "CJB",
-    "tiruchirappalli": "TRZ", "trichy": "TRZ",
-    "madurai": "IXM",
-    "visakhapatnam": "VTZ", "vizag": "VTZ",
-    "mangalore": "IXE",
-    "calicut": "CCJ", "kozhikode": "CCJ",
-    "imphal": "IMF",
-    "port blair": "IXZ",
-    "bagdogra": "IXB", "siliguri": "IXB",
-    "udaipur": "UDR",
-    "jodhpur": "JDH",
-    "jammu": "IXJ",
-    "indore": "IDR",
-    "raipur": "RPR",
-    "ranchi": "IXR",
-    # Himachal Pradesh
-    "kullu": "KUU", "bhuntar": "KUU", "kullu manali": "KUU", "manali": "KUU",
-    "shimla": "SLV",
-    "dharamshala": "DHM", "kangra": "DHM", "gaggal": "DHM", "mcleod ganj": "DHM",
-    # Additional metros & tier-2
-    "surat": "STV", "vadodara": "BDQ", "baroda": "BDQ",
-    "rajkot": "RAJ", "bhuj": "BHJ",
-    "hubli": "HBX", "hubballi": "HBX",
-    "belgaum": "IXG", "belagavi": "IXG",
-    "tirupati": "TIR", "mysore": "MYQ", "mysuru": "MYQ",
-    "aurangabad": "IXU", "nashik": "ISK", "kolhapur": "KLH",
-    "jaisalmer": "JSA", "bikaner": "BKB",
-    "gorakhpur": "GOP", "allahabad": "IXD", "prayagraj": "IXD",
-    "agra": "AGR", "gwalior": "GWL",
-    "dibrugarh": "DIB", "jorhat": "JRH", "silchar": "IXS",
-    "agartala": "IXA", "aizawl": "AJL",
-    "port blair": "IXZ", "andaman": "IXZ",
-    "dimapur": "DMU",
-}
+# In-memory cache populated by API calls only — no hardcoded values
+_IATA_CACHE: dict[str, str] = {}
 
 
-def city_to_iata(city: str) -> str | None:
-    """Best-effort city name → IATA code lookup."""
+async def resolve_iata(city: str) -> str | None:
+    """
+    Resolve city name → IATA code via EaseMyTrip autosuggest API.
+    Response City field format: "New Delhi(DEL)" — IATA extracted from parentheses.
+    Results cached in-memory after first call.
+    """
     key = city.lower().strip()
-    if key in INDIA_AIRPORTS:
-        return INDIA_AIRPORTS[key]
-    # partial match
-    for k, code in INDIA_AIRPORTS.items():
-        if k in key or key in k:
-            return code
+    if key in _IATA_CACHE:
+        return _IATA_CACHE[key]
+
+    try:
+        async with CurlAsyncSession(impersonate="chrome") as s:
+            r = await s.post(
+                _EMT_AUTOSUGGEST,
+                headers={
+                    "accept": "application/json, text/javascript, */*; q=0.01",
+                    "content-type": "application/json; charset=UTF-8",
+                    "origin": "https://www.easemytrip.com",
+                    "referer": "https://www.easemytrip.com/",
+                    "user-agent": _HEADERS["user-agent"],
+                    "x-requested-with": "XMLHttpRequest",
+                },
+                json={"Prefix": city},
+                timeout=8,
+            )
+        items = r.json() if isinstance(r.json(), list) else []
+        for item in items:
+            city_field = item.get("City") or ""   # e.g. "New Delhi(DEL)"
+            country    = (item.get("Country") or "").lower()
+            m = _re.search(r'\(([A-Z]{3})\)', city_field)
+            if m:
+                code = m.group(1)
+                # Prefer Indian airports; fall back to any
+                if country in ("india", "in"):
+                    _IATA_CACHE[key] = code
+                    print(f"[flights] IATA '{city}' → {code}")
+                    return code
+        # Second pass: accept any country
+        for item in items:
+            city_field = item.get("City") or ""
+            m = _re.search(r'\(([A-Z]{3})\)', city_field)
+            if m:
+                code = m.group(1)
+                _IATA_CACHE[key] = code
+                print(f"[flights] IATA '{city}' → {code}")
+                return code
+    except Exception as e:
+        print(f"[flights] IATA autocomplete '{city}': {e}")
+
+    _IATA_CACHE[key] = None
     return None
 
 
+# Sync wrapper — returns from cache only (use async resolve_iata for fresh lookup)
+def city_to_iata(city: str) -> str | None:
+    return _IATA_CACHE.get(city.lower().strip())
+
+
 async def search_flights(
-    from_airport: str,    # IATA code e.g. "DEL"
-    to_airport: str,      # IATA code e.g. "IXC"
-    depart_date: str,     # "YYYY-MM-DD"
+    from_airport: str,
+    to_airport: str,
+    depart_date: str,
     adults: int = 1,
     cabin_class: str = "ECONOMY",
     sort: str = "CHEAPEST",
     limit: int = 5,
 ) -> list[dict]:
-    """
-    Search one-way flights. Returns normalized list sorted by sort param.
-    sort: 'CHEAPEST' | 'FASTEST' | 'BEST'
-    """
+    """Search one-way flights. Returns normalized list sorted by sort param."""
     try:
         async with CurlAsyncSession(impersonate="chrome") as s:
             r = await s.get(
@@ -129,13 +120,13 @@ async def search_flights(
             )
         r.raise_for_status()
         offers = r.json().get("flightOffers") or []
-        return [_normalise_offer(o) for o in offers[:limit]]
+        return [_normalise_offer(o, depart_date, adults) for o in offers[:limit]]
     except Exception as e:
         print(f"[flights_booking] {from_airport}→{to_airport} on {depart_date}: {e}")
         return []
 
 
-def _normalise_offer(offer: dict) -> dict:
+def _normalise_offer(offer: dict, depart_date: str = "", adults: int = 1) -> dict:
     seg = (offer.get("segments") or [{}])[0]
     legs = seg.get("legs") or [{}]
     leg0 = legs[0]
@@ -148,21 +139,33 @@ def _normalise_offer(offer: dict) -> dict:
         v = price_bd.get(key) or {}
         return v.get("units")
 
-    total_sec = seg.get("totalTime") or 0  # response is in SECONDS
+    total_sec = seg.get("totalTime") or 0
     stops = len(legs) - 1
+
+    from_ap = (seg.get("departureAirport") or {}).get("code") or ""
+    to_ap   = (seg.get("arrivalAirport")   or {}).get("code") or ""
+    token   = offer.get("token") or ""
+    booking_url = None
+    if token and from_ap and to_ap and depart_date:
+        booking_url = (
+            f"https://flights.booking.com/flights/{from_ap}.AIRPORT-{to_ap}.AIRPORT/{token}/"
+            f"?type=ONEWAY&adults={adults}&cabinClass=ECONOMY&children="
+            f"&from={from_ap}.AIRPORT&to={to_ap}.AIRPORT"
+            f"&depart={depart_date}&sort=BEST&travelPurpose=leisure&aid=304142"
+        )
 
     return {
         "flight_number": f"{carrier_info.get('marketingCarrier', '')}{flight_info.get('flightNumber', '')}",
         "airline": carriers[0].get("name") if carriers else None,
         "airline_code": carriers[0].get("code") if carriers else None,
         "airline_logo": carriers[0].get("logo") if carriers else None,
-        "from_airport": (seg.get("departureAirport") or {}).get("code"),
-        "to_airport": (seg.get("arrivalAirport") or {}).get("code"),
+        "from_airport": from_ap,
+        "to_airport": to_ap,
         "from_city": (seg.get("departureAirport") or {}).get("cityName"),
         "to_city": (seg.get("arrivalAirport") or {}).get("cityName"),
-        "departure_time": seg.get("departureTime"),       # ISO datetime string
+        "departure_time": seg.get("departureTime"),
         "arrival_time": seg.get("arrivalTime"),
-        "duration_min": total_sec // 60,                  # converted from seconds
+        "duration_min": total_sec // 60,
         "stops": stops,
         "cabin_class": leg0.get("cabinClass", "ECONOMY"),
         "departure_terminal": leg0.get("departureTerminal"),
@@ -170,5 +173,6 @@ def _normalise_offer(offer: dict) -> dict:
         "price_base_fare": _amt("baseFare"),
         "price_tax": _amt("tax"),
         "currency": (price_bd.get("total") or {}).get("currencyCode", "INR"),
-        "booking_token": offer.get("token"),              # opaque token for booking URL
+        "booking_token": token,
+        "booking_url": booking_url,
     }

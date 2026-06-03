@@ -17,6 +17,7 @@ from app.services.bus.redbus import search_city as redbus_search_city, search_bu
 from app.services.bus.flixbus import search_city as flixbus_search_city, search_buses as flixbus_search_buses
 from app.services.flights import FlightService
 from app.services.railway import RailwayService
+from app.core.circuit_breaker import breaker_redbus, breaker_flixbus
 
 _flights = FlightService()
 _railway = RailwayService()
@@ -37,32 +38,55 @@ class TransportService:
         travelers: int = 1,
         limit: int = 8,
     ) -> dict:
-        """
-        Search buses: RedBus first, FlixBus fills gaps.
-        Returns {"buses": [...], "from_city_id": int, "to_city_id": int, "resolved": bool}
-        """
+        """Search buses: resolves city IDs then delegates to search_buses_direct."""
         from_id, to_id = await asyncio.gather(
             self.resolve_bus_city_id(origin),
             self.resolve_bus_city_id(destination),
         )
+        if not from_id or not to_id:
+            print(f"[buses] {origin!r}→{destination!r} | ✗ city not resolved")
+            return {"buses": [], "from_city_id": from_id, "to_city_id": to_id, "resolved": False}
+        return await self.search_buses_direct(from_id, to_id, origin, destination, date, travelers, limit)
 
+    async def search_buses_direct(
+        self,
+        from_id: int,
+        to_id: int,
+        origin: str,
+        destination: str,
+        date: str,
+        travelers: int = 1,
+        limit: int = 8,
+    ) -> dict:
+        """Search buses with pre-resolved RedBus city IDs — skips autocomplete."""
         redbus_buses: list[dict] = []
-        if from_id and to_id:
-            redbus_buses = await redbus_search_buses(
-                from_id, to_id, date, limit=limit,
-                from_city_name=origin, to_city_name=destination,
-            )
+        result = await breaker_redbus.call(
+            redbus_search_buses, from_id, to_id, date, limit=limit,
+            from_city_name=origin, to_city_name=destination, fallback=[],
+        )
+        redbus_buses = result or []
+        redbus_status = f"✓ {len(redbus_buses)}" if redbus_buses else "✗ 0 results"
 
         flixbus_buses: list[dict] = []
+        flixbus_status = "— skipped (RedBus sufficient)"
         if len(redbus_buses) < limit:
-            flixbus_buses = await self._flixbus_search(origin, destination, date, travelers, limit)
+            result = await breaker_flixbus.call(
+                self._flixbus_search, origin, destination, date, travelers, limit, fallback=[],
+            )
+            flixbus_buses = result or []
+            flixbus_status = f"✓ {len(flixbus_buses)}" if flixbus_buses else "✗ 0 results"
+
+        print(
+            f"[buses] {origin!r}→{destination!r} ({date}) | "
+            f"RedBus: {redbus_status} | FlixBus: {flixbus_status}"
+        )
 
         buses = redbus_buses + [b for b in flixbus_buses if b]
         return {
             "buses": buses[:limit],
             "from_city_id": from_id,
             "to_city_id": to_id,
-            "resolved": bool(from_id and to_id),
+            "resolved": True,
         }
 
     async def _flixbus_search(

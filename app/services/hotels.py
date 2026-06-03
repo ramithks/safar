@@ -5,16 +5,16 @@ Sources searched simultaneously:
   1. EaseMyTrip  — best for Indian domestic inventory, real prices
   2. Booking.com — widest global inventory, live prices
   3. Expedia     — offbeat/rural destinations
-  4. Google Places — fallback when all three fail (name/rating only, no live prices)
 
-Results from all successful sources are merged, deduplicated by name,
-and sorted so the richest (booking_url + price + photos) entries surface first.
+Results are filtered to hotels within max_distance_km of the destination,
+deduplicated by name, and sorted richest-first (booking_url + price + photos).
 """
 import asyncio
+import urllib.parse
 from app.services.easemytrip.hotels import search_hotels as emt_search_hotels
 from app.services.booking.hotels import search_hotels as booking_search_hotels
 from app.services.expedia.hotels import search_hotels as expedia_search_hotels
-from app.services.places import search_places
+from app.core.circuit_breaker import breaker_emt, breaker_booking, breaker_expedia
 
 _BUDGET_SORT_EMT = {
     "low":  "Price|ASC",
@@ -54,6 +54,7 @@ class HotelService:
         children: int = 0,
         budget: str = "mid",
         limit: int = 10,
+        max_distance_km: float = 20.0,
     ) -> dict:
         from datetime import datetime
         try:
@@ -66,21 +67,21 @@ class HotelService:
         exp_sort     = _BUDGET_SORT_EXPEDIA.get(budget, "RECOMMENDED")
         per_src      = max(6, limit)   # fetch slightly more per source so dedup has room
 
-        # Search all three sources simultaneously
+        # Search all three sources simultaneously (circuit-breaker-wrapped)
         emt_r, booking_r, expedia_r = await asyncio.gather(
-            emt_search_hotels(
-                destination, checkin, checkout,
+            breaker_emt.call(
+                emt_search_hotels, destination, checkin, checkout,
                 rooms=rooms, adults=adults, children=children,
-                limit=per_src, sort=emt_sort,
+                limit=per_src, sort=emt_sort, fallback=[],
             ),
-            booking_search_hotels(
-                destination, checkin, checkout,
+            breaker_booking.call(
+                booking_search_hotels, destination, checkin, checkout,
                 rooms=rooms, adults=adults, children=children,
-                sort=bkg_sort, limit=per_src,
+                sort=bkg_sort, limit=per_src, fallback=[],
             ),
-            expedia_search_hotels(
-                destination, checkin, checkout,
-                rooms=rooms, adults=adults, limit=per_src, sort=exp_sort,
+            breaker_expedia.call(
+                expedia_search_hotels, destination, checkin, checkout,
+                rooms=rooms, adults=adults, limit=per_src, sort=exp_sort, fallback=[],
             ),
             return_exceptions=True,
         )
@@ -88,52 +89,68 @@ class HotelService:
         all_hotels: list[dict] = []
         sources: list[str] = []
 
-        if emt_r and not isinstance(emt_r, Exception):
-            filtered = _filter_by_budget(emt_r, budget)
-            all_hotels.extend(filtered)
-            sources.append("easemytrip")
-            print(f"[hotels] easemytrip: {len(filtered)} results for '{destination}'")
-        else:
-            if isinstance(emt_r, Exception):
-                print(f"[hotels] easemytrip error: {emt_r}")
+        def _src_status(result, name: str) -> str:
+            if isinstance(result, Exception):
+                return f"✗ {str(result)[:120]}"
+            if result:
+                budget_filtered = _filter_by_budget(result, budget)
+                nearby = _filter_by_distance(budget_filtered, max_distance_km)
+                all_hotels.extend(nearby)
+                sources.append(name)
+                return f"✓ {len(nearby)} results"
+            return "✗ 0 results"
 
-        if booking_r and not isinstance(booking_r, Exception):
-            filtered = _filter_by_budget(booking_r, budget)
-            all_hotels.extend(filtered)
-            sources.append("booking")
-            print(f"[hotels] booking: {len(filtered)} results for '{destination}'")
-        else:
-            if isinstance(booking_r, Exception):
-                print(f"[hotels] booking error: {booking_r}")
+        emt_status     = _src_status(emt_r,     "easemytrip")
+        booking_status = _src_status(booking_r,  "booking")
+        expedia_status = _src_status(expedia_r,  "expedia")
 
-        if expedia_r and not isinstance(expedia_r, Exception):
-            filtered = _filter_by_budget(expedia_r, budget)
-            all_hotels.extend(filtered)
-            sources.append("expedia")
-            print(f"[hotels] expedia: {len(filtered)} results for '{destination}'")
-        else:
-            if isinstance(expedia_r, Exception):
-                print(f"[hotels] expedia error: {expedia_r}")
+        print(
+            f"[hotels] {destination!r} | "
+            f"EaseMyTrip: {emt_status} | "
+            f"Booking: {booking_status} | "
+            f"Expedia: {expedia_status}"
+        )
 
         if not all_hotels:
-            print(f"[hotels] all sources failed for '{destination}', falling back to Google Places")
-            gp_hotels = await self._google_places_fallback(destination, budget, nights)
-            return {"hotels": gp_hotels, "source": "google_places", "nights": nights}
+            return {"hotels": [], "source": "none", "nights": nights}
 
         deduped = _deduplicate_by_name(all_hotels)
+        hotels_with_map = [_add_map_url(h) for h in deduped[:limit]]
         return {
-            "hotels": deduped[:limit],
+            "hotels": hotels_with_map,
             "source": "+".join(sources),
             "nights": nights,
         }
 
-    async def _google_places_fallback(self, destination: str, budget: str, nights: int) -> list[dict]:
-        query = f"{_BUDGET_QUERY.get(budget, 'hotels')} in {destination}"
-        try:
-            results = await search_places(query)
-            return [_normalise_gp_hotel(p, nights) for p in results[:8]]
-        except Exception:
-            return []
+
+def _add_map_url(hotel: dict) -> dict:
+    """Inject a Google Maps search URL using hotel name and address."""
+    name    = hotel.get("name", "")
+    address = hotel.get("address") or hotel.get("location") or ""
+    query   = f"{name} {address}".strip() if address else name
+    hotel["map_url"] = (
+        f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(query)}"
+    )
+    return hotel
+
+
+def _filter_by_distance(hotels: list[dict], max_km: float) -> list[dict]:
+    """
+    Keep only hotels within max_km of the destination.
+    Hotels without a distance field are kept (benefit of doubt).
+    """
+    result = []
+    for h in hotels:
+        km = h.get("distance_km") or h.get("distanceKM")
+        if km is None:
+            result.append(h)
+        else:
+            try:
+                if float(km) <= max_km:
+                    result.append(h)
+            except Exception:
+                result.append(h)
+    return result
 
 
 def _filter_by_budget(hotels: list[dict], budget: str) -> list[dict]:
@@ -178,46 +195,3 @@ def _deduplicate_by_name(hotels: list[dict]) -> list[dict]:
     result = list(seen.values())
     result.sort(key=_richness, reverse=True)
     return result
-
-
-def _normalise_gp_hotel(place: dict, nights: int) -> dict:
-    geo = (place.get("geometry") or {}).get("location", {})
-    photos = place.get("photos") or []
-    photo_ref = (
-        photos[0].get("photo_reference") if photos and isinstance(photos[0], dict)
-        else place.get("photo_reference")
-    )
-    name = place.get("name", "")
-    query = f"{name} hotel booking".replace(" ", "+")
-    return {
-        "hotel_id": place.get("place_id"),
-        "name": name,
-        "category": "Hotel",
-        "star_rating": None,
-        "ta_rating": None,
-        "address": place.get("formatted_address"),
-        "distance_from_dest": None,
-        "distance_km": None,
-        "lat": geo.get("lat"),
-        "lon": geo.get("lng"),
-        "price_per_night": None,
-        "total_price": None,
-        "tax": None,
-        "discount": None,
-        "currency": "INR",
-        "nights": nights,
-        "checkin_time": None,
-        "checkout_time": None,
-        "is_breakfast_included": False,
-        "cancellation_policy": None,
-        "highlights": None,
-        "amenities": [],
-        "photos": [photo_ref] if photo_ref else [],
-        "booking_url": f"https://www.google.com/search?q={query}",
-        "is_sold_out": False,
-        "coupon_code": None,
-        "coupon_note": None,
-        "source": "google_places",
-        "google_rating": place.get("rating"),
-        "google_reviews": place.get("user_ratings_total"),
-    }

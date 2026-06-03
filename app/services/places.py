@@ -55,7 +55,7 @@ async def search_places(query: str, type_filter: str | None = None) -> list[dict
 async def get_place_details(place_id: str) -> dict | None:
     """Fetch place details (address, photos, hours, geometry, rating)."""
     key = _maps_key()
-    fields = "name,formatted_address,photos,opening_hours,geometry,rating,user_ratings_total,types"
+    fields = "name,formatted_address,photos,opening_hours,geometry,rating,user_ratings_total,types,website,formatted_phone_number"
     try:
         r = await _http_client.get(
             "https://maps.googleapis.com/maps/api/place/details/json",

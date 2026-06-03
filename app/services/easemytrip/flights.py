@@ -2,15 +2,16 @@
 EaseMyTrip Flights API integration.
 POST https://flightservice-node.easemytrip.com/AirAvail_Lights/AirBus_New
 
-Key facts:
-- TKN is a static frontend token — expiry not enforced server-side (same pattern as hotels).
-- _ query param is a ms-timestamp cache-buster; ngsw-bypass skips service worker.
-- Cabin: 0=Economy, 1=Business, 2=First, 3=Premium Economy
-- isDomestic: true  → only Indian IATA codes apply; set False for international.
-- Response key may be "AirSearchResult", "FlightDataList", or "d" (base64 blob).
-  _extract_flights() handles all three variants seen in the wild.
+Booking URL format (confirmed):
+  https://www.easemytrip.com/flight-search/listing
+    ?srch={IATA}-{CityName}-India|{IATA}-{CityName}-India|{DD/MM/YYYY}
+    &px={adults}-{children}-{infants}&cbn=0&ar=undefined
+    &isow=true&isdm=true&lang=en-us&IsDoubleSeat=false&CCODE=IN&curr=INR&apptype=B2C
 """
+import asyncio
+import re
 import time
+import urllib.parse
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
 _BASE = "https://flightservice-node.easemytrip.com/AirAvail_Lights/AirBus_New"
@@ -32,33 +33,119 @@ _HEADERS = {
     ),
 }
 
-# Static frontend token — replace if API starts returning 401/403.
-_TKN = "Q2QNfiowerLvVcQ4XoTWIRgbs/kAsa/uZaPKfw2pqQv7pN8ypf0EpmUdv9MMj/+t"
-
 _CABIN_CODE = {
     "economy": 0, "business": 1, "first": 2, "premium_economy": 3,
 }
-_CABIN_NAME = {v: k for k, v in _CABIN_CODE.items()}
 
+_AUTOSUGGEST_URL = "https://www.easemytrip.com/api/Flight/GetAutoSuggestNew"
+_AUTOSUGGEST_HEADERS = {
+    "accept": "application/json, text/javascript, */*; q=0.01",
+    "accept-language": "en-US,en;q=0.9",
+    "content-type": "application/json; charset=UTF-8",
+    "origin": "https://www.easemytrip.com",
+    "referer": "https://www.easemytrip.com/",
+    "sec-ch-ua": '"Chromium";v="148"', "sec-ch-ua-mobile": "?0",
+    "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
+    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/148.0.0.0 Safari/537.36",
+    "x-requested-with": "XMLHttpRequest",
+}
+
+# In-memory cache: IATA → (city_name_nospaces, country)
+_CITY_CACHE: dict[str, tuple[str, str]] = {}
+
+
+async def _resolve_iata_city(iata: str) -> tuple[str, str]:
+    """
+    Resolve IATA → (city_name, country) via EMT autosuggest.
+    City name has spaces removed to match listing URL format (e.g. "NewDelhi").
+    """
+    key = iata.upper()
+    if key in _CITY_CACHE:
+        return _CITY_CACHE[key]
+
+    try:
+        async with CurlAsyncSession(impersonate="chrome") as s:
+            r = await s.post(
+                _AUTOSUGGEST_URL, headers=_AUTOSUGGEST_HEADERS,
+                json={"Prefix": iata}, timeout=8,
+            )
+        items = r.json() if isinstance(r.json(), list) else []
+        for item in items:
+            city_field = item.get("City", "")   # e.g. "New Delhi(DEL)"
+            if f"({key})" in city_field:
+                city_name = item.get("CityName", key).strip().replace(" ", "")
+                country   = item.get("Country", "India").strip()
+                _CITY_CACHE[key] = (city_name, country)
+                return city_name, country
+    except Exception as e:
+        print(f"[emt_autosuggest] IATA '{iata}': {e}")
+
+    # Fallback: use IATA as city name
+    fallback = (key, "India")
+    _CITY_CACHE[key] = fallback
+    return fallback
+
+
+async def _build_listing_url(
+    from_iata: str,
+    to_iata: str,
+    depart_date: str,   # "YYYY-MM-DD"
+    adults: int = 1,
+    children: int = 0,
+    infants: int = 0,
+    cabin: int = 0,     # 0=Economy, 1=Business
+) -> str:
+    """
+    Build the EaseMyTrip flight listing deep-link URL.
+    srch format: {IATA}-{CityNoSpaces}-{Country}|{IATA}-{City}-{Country}|{DD/MM/YYYY}
+    City names resolved live via EMT autosuggest (cached).
+    """
+    try:
+        from datetime import datetime as _dt
+        date_fmt = _dt.strptime(depart_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        date_fmt = depart_date
+
+    (from_city, from_country), (to_city, to_country) = await asyncio.gather(
+        _resolve_iata_city(from_iata),
+        _resolve_iata_city(to_iata),
+    )
+
+    srch = (
+        f"{from_iata.upper()}-{from_city}-{from_country}"
+        f"|{to_iata.upper()}-{to_city}-{to_country}"
+        f"|{date_fmt}"
+    )
+    is_domestic = from_country == to_country
+
+    return (
+        "https://www.easemytrip.com/flight-search/listing"
+        f"?srch={urllib.parse.quote(srch, safe='')}"
+        f"&px={adults}-{children}-{infants}"
+        f"&cbn={cabin}"
+        f"&ar=undefined&isow=true"
+        f"&isdm={'true' if is_domestic else 'false'}"
+        f"&lang=en-us&IsDoubleSeat=false&CCODE=IN&curr=INR&apptype=B2C"
+    )
 
 
 async def search_flights(
-    from_airport: str,   # IATA e.g. "DEL"
-    to_airport: str,     # IATA e.g. "BOM"
-    depart_date: str,    # "YYYY-MM-DD"
+    from_airport: str,
+    to_airport: str,
+    depart_date: str,
     adults: int = 1,
     children: int = 0,
     infants: int = 0,
     cabin_class: str = "economy",
     limit: int = 5,
+    nonstop_only: bool = False,
 ) -> list[dict]:
-    """
-    Search one-way domestic flights on EaseMyTrip.
-    Returns a normalized list sorted by total fare ascending.
-    """
+    """Search one-way domestic flights on EaseMyTrip."""
     cabin_code = _CABIN_CODE.get(cabin_class.lower(), 0)
     ts = int(time.time() * 1000)
 
+    # No TKN needed — including it causes prices to be hidden at bundle level.
+    # Prices are at segment level (j[0].s[i].TF) regardless of TKN.
     payload = {
         "org": from_airport.upper(),
         "dept": to_airport.upper(),
@@ -88,9 +175,6 @@ async def search_flights(
         "IpAddress": "",
         "LoginKey": "",
         "UUID": "",
-        "TKN": _TKN,
-        "TraceId": "",
-        "queryname": "",
         "FareTypeUI": 0,
     }
 
@@ -105,132 +189,244 @@ async def search_flights(
             )
         r.raise_for_status()
         raw = r.json()
-        flights = _extract_flights(raw)
-        flights.sort(key=lambda f: f.get("price_total") or 999999)
+        listing_url = await _build_listing_url(from_airport, to_airport, depart_date, adults)
+        flights = _extract_flights(raw, from_airport, to_airport, depart_date, adults, listing_url)
+        if nonstop_only:
+            flights = [f for f in flights if (f.get("stops") or 0) == 0]
+        flights.sort(key=lambda f: (f.get("price_total") is None, f.get("price_total") or 999_999))
         return flights[:limit]
     except Exception as e:
         print(f"[emt_flights] {from_airport}→{to_airport} on {depart_date}: {e}")
         return []
 
 
-def _extract_flights(raw: dict) -> list[dict]:
+def _extract_flights(
+    raw: dict,
+    from_iata: str,
+    to_iata: str,
+    depart_date: str,
+    adults: int,
+    listing_url: str = "",
+) -> list[dict]:
     """
-    Handles multiple response shapes seen across EMT API versions.
-    Tries known top-level keys and returns an empty list on mismatch.
+    Handle both old and new EaseMyTrip response formats.
+
+    New format (2025+): flights in j[0].s[*].b[*], legs in dctFltDtl[str(idx)]
+    Old format: AirSearchResult.FlightDetails or FlightDataList.results
     """
-    # Shape 1: {"AirSearchResult": {"FlightDetails": [...]}}
+    # ── New format: j[0].s (segment bundles) ─────────────────────────────────
+    j = raw.get("j")
+    dct = raw.get("dctFltDtl") or {}
+    if j and dct:
+        return _parse_new_format(raw, from_iata, to_iata, depart_date, adults, listing_url)
+
+    # ── Old format: AirSearchResult ───────────────────────────────────────────
     result_block = raw.get("AirSearchResult") or {}
     items = result_block.get("FlightDetails") or result_block.get("FlightDetail") or []
     if items:
-        return [_normalise(f) for f in items]
+        return [_normalise_old(f, depart_date, from_iata, to_iata, adults, listing_url) for f in items]
 
-    # Shape 2: {"FlightDataList": {"results": [...]}}
     fdl = raw.get("FlightDataList") or {}
     items = fdl.get("results") or fdl.get("Results") or []
     if items:
-        return [_normalise(f) for f in items]
+        return [_normalise_old(f, depart_date, from_iata, to_iata, adults, listing_url) for f in items]
 
-    # Shape 3: flat array at top level
     if isinstance(raw, list):
-        return [_normalise(f) for f in raw]
-
-    # Shape 4: direct "data" wrapper
-    data = raw.get("data") or {}
-    if isinstance(data, dict):
-        items = data.get("FlightDetails") or data.get("results") or []
-        return [_normalise(f) for f in items]
+        return [_normalise_old(f, depart_date, from_iata, to_iata, adults, listing_url) for f in raw]
 
     return []
 
 
-def _normalise(f: dict) -> dict:
+def _parse_new_format(
+    raw: dict,
+    from_iata: str,
+    to_iata: str,
+    depart_date: str,
+    adults: int,
+    listing_url: str = "",
+) -> list[dict]:
     """
-    Normalize a single flight entry.
-    Field names: EMT uses both abbreviated (al, fn, oa, da) and verbose forms.
+    Parse the 2025+ EaseMyTrip format.
+    Flights live in j[0].s[*].b[*]; leg details in dctFltDtl[str(idx)].
+    Prices are not returned per-flight — booking URL still constructed.
     """
-    # Airline
-    airline_code = f.get("al") or f.get("AirlineCode") or f.get("airlineCode") or ""
-    airline_name = f.get("aln") or f.get("AirlineName") or f.get("airlineName") or airline_code
-    flight_no = f.get("fn") or f.get("FlightNo") or f.get("flightNo") or ""
+    j       = raw.get("j") or []
+    dct     = raw.get("dctFltDtl") or {}
+    d_field = raw.get("d") or {}
+
+    # Build internal_code → iata map from d field: {"DEL|HDO": 28, "GOI|GOX": 39}
+    internal_to_iata: dict[str, str] = {}
+    for key in d_field:
+        parts = key.split("|")
+        if len(parts) == 2:
+            iata_side, internal_side = parts
+            internal_to_iata[internal_side] = iata_side
+
+    def _resolve(code: str) -> str:
+        return internal_to_iata.get(code, code)
+
+    segments = (j[0].get("s") or []) if j else []
+
+    # Build booking URL base for EMT search page
+    emt_search_url = listing_url  # pre-built by caller
+
+    results: list[dict] = []
+    seen: set[str] = set()
+
+    for seg in segments:
+        bundle = (seg.get("b") or [{}])[0]
+        fl_indices = bundle.get("FL") or []
+        if not fl_indices:
+            continue
+
+        stp_raw = bundle.get("stp")
+        stops = int(stp_raw) if stp_raw is not None else (len(fl_indices) - 1)
+
+        first_leg = dct.get(str(fl_indices[0]))
+        last_leg  = dct.get(str(fl_indices[-1]))
+        if not first_leg:
+            continue
+
+        ac  = first_leg.get("AC", "")
+        fn  = first_leg.get("FN", "")
+        dedup_key = f"{ac}{fn}_{first_leg.get('DTM')}"
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        from_code = _resolve(first_leg.get("OG", ""))
+        to_code   = _resolve((last_leg or first_leg).get("DT", ""))
+
+        dep_date_raw = first_leg.get("DDT", "")
+        arr_date_raw = (last_leg or first_leg).get("ADT", "")
+        dep_time = first_leg.get("DTM", "")
+        arr_time = (last_leg or first_leg).get("ATM", "")
+
+        dep_dt = _parse_emt_datetime(dep_date_raw, dep_time)
+        arr_dt = _parse_emt_datetime(arr_date_raw, arr_time)
+
+        duration_str = bundle.get("JyTm") or first_leg.get("DUR") or ""
+        duration_min = _parse_dur(duration_str)
+
+        # Prices are at segment level, not bundle level
+        # STFA (Sub Total Fare Adult) from lstFr[0] is the canonical total price
+        lst_fr   = seg.get("lstFr") or []
+        stfa     = (lst_fr[0].get("STFA") if lst_fr else None)
+        base_fare = seg.get("AP")      # adult base fare
+        total_tax = seg.get("TT")      # total tax
+        total_fare = stfa or seg.get("TF")   # total = base + tax
+
+        results.append({
+            "flight_number": f"{ac}{fn}".strip(),
+            "airline": first_leg.get("FlightName") or ac,
+            "airline_code": ac,
+            "from_airport": from_code,
+            "to_airport": to_code,
+            "departure_date": dep_date_raw,
+            "departure_time": dep_dt,
+            "arrival_date": arr_date_raw,
+            "arrival_time": arr_dt,
+            "duration_min": duration_min,
+            "stops": stops,
+            "cabin_class": first_leg.get("CB", "ECONOMY"),
+            "seats_available": _safe_int(first_leg.get("SA")),
+            "baggage_kg": _safe_int(first_leg.get("BW")),
+            "price_total": _safe_int(total_fare),
+            "price_base_fare": _safe_int(base_fare),
+            "price_tax": _safe_int(total_tax),
+            "currency": "INR",
+            "booking_url": emt_search_url,
+            "source": "easemytrip",
+        })
+
+    return results
+
+
+def _parse_emt_datetime(date_str: str, time_str: str) -> str | None:
+    """Convert 'Mon-15Jun2026' + '18:40' → ISO-like string."""
+    try:
+        from datetime import datetime as _dt
+        # EMT date formats seen: "Mon-15Jun2026"
+        cleaned = re.sub(r"^[A-Za-z]{3}-", "", date_str)  # strip "Mon-"
+        d = _dt.strptime(cleaned, "%d%b%Y")
+        h, m = time_str.split(":")
+        return d.replace(hour=int(h), minute=int(m)).isoformat()
+    except Exception:
+        return f"{date_str}T{time_str}" if date_str and time_str else None
+
+
+def _parse_dur(s: str) -> int | None:
+    """Parse '02h 35m', '2:35' etc. → minutes."""
+    if not s:
+        return None
+    h = re.search(r"(\d+)\s*h", s)
+    m = re.search(r"(\d+)\s*m", s)
+    if h or m:
+        return (int(h.group(1)) * 60 if h else 0) + (int(m.group(1)) if m else 0)
+    if ":" in s:
+        parts = s.split(":")
+        try:
+            return int(parts[0]) * 60 + int(parts[1])
+        except Exception:
+            pass
+    return None
+
+
+def _safe_int(v) -> int | None:
+    try:
+        return int(v) if v is not None and v != "" else None
+    except Exception:
+        return None
+
+
+def _normalise_old(f: dict, depart_date: str, from_iata: str, to_iata: str, adults: int, listing_url: str = "") -> dict:
+    """Normalize old EaseMyTrip response format (pre-2025)."""
+    airline_code = f.get("al") or f.get("AirlineCode") or ""
+    airline_name = f.get("aln") or f.get("AirlineName") or airline_code
+    flight_no    = f.get("fn") or f.get("FlightNo") or ""
     if flight_no and airline_code and not flight_no.startswith(airline_code):
         flight_no = f"{airline_code}-{flight_no}"
 
-    # Route
-    origin = f.get("oa") or f.get("org") or f.get("Origin") or f.get("SrcAirport") or ""
-    dest = f.get("da") or f.get("dept") or f.get("Dest") or f.get("DstAirport") or ""
-    departure_time = f.get("dt") or f.get("DeptTime") or f.get("departureTime") or ""
-    arrival_time = f.get("at") or f.get("ArrTime") or f.get("arrivalTime") or ""
-    dep_date = f.get("dd") or f.get("DeptDate") or f.get("departureDate") or ""
-    arr_date = f.get("ad") or f.get("ArrDate") or f.get("arrivalDate") or ""
+    origin = f.get("oa") or f.get("org") or f.get("Origin") or from_iata
+    dest   = f.get("da") or f.get("dept") or f.get("Dest") or to_iata
+    dep_time = f.get("dt") or f.get("DeptTime") or ""
+    arr_time = f.get("at") or f.get("ArrTime") or ""
 
-    # Duration — stored as minutes (int) or "H:MM" string
-    dur_raw = f.get("dur") or f.get("Duration") or f.get("duration") or 0
-    duration_min = _parse_duration(dur_raw)
+    dur_raw = f.get("dur") or f.get("Duration") or 0
+    duration_min = _parse_dur(str(dur_raw)) if dur_raw else None
 
-    # Stops — "s" field or nested segments
-    stops = f.get("s") or f.get("stops") or f.get("StopCount") or 0
-    fg = f.get("fg") or []
-    if isinstance(fg, list) and len(fg) > 1:
-        stops = len(fg) - 1
-
-    # Fare — nested "f" block or flat fields
     fare_block = f.get("f") or {}
     if not fare_block:
-        fare_block = {
-            "bf": f.get("bf") or f.get("BaseFare") or 0,
-            "tax": f.get("tax") or f.get("Tax") or 0,
-            "tf": f.get("tf") or f.get("TotalFare") or f.get("totalFare") or 0,
-            "disc": f.get("disc") or f.get("Discount") or 0,
-        }
+        fare_block = {"bf": f.get("bf") or 0, "tax": f.get("tax") or 0, "tf": f.get("tf") or 0}
 
-    base_fare = fare_block.get("bf") or fare_block.get("BaseFare") or 0
-    tax = fare_block.get("tax") or fare_block.get("Tax") or 0
-    total = fare_block.get("tf") or fare_block.get("TotalFare") or (base_fare + tax) or None
-    discount = fare_block.get("disc") or fare_block.get("Discount") or 0
+    base  = fare_block.get("bf") or 0
+    tax   = fare_block.get("tax") or 0
+    total = fare_block.get("tf") or (base + tax) or None
 
-    cabin_code = f.get("cc") or f.get("CabinClass") or 0
-    cabin = _CABIN_NAME.get(cabin_code, "economy") if isinstance(cabin_code, int) else str(cabin_code)
+    try:
+        from datetime import datetime as _dt
+        d = _dt.strptime(depart_date, "%Y-%m-%d")
+        date_fmt = d.strftime("%d-%b-%Y")
+    except Exception:
+        date_fmt = depart_date
 
     return {
         "flight_number": flight_no,
         "airline": airline_name,
         "airline_code": airline_code,
-        "from_airport": origin.upper(),
-        "to_airport": dest.upper(),
-        "departure_date": dep_date,
-        "departure_time": departure_time,
-        "arrival_date": arr_date,
-        "arrival_time": arrival_time,
+        "from_airport": str(origin).upper(),
+        "to_airport": str(dest).upper(),
+        "departure_time": dep_time,
+        "arrival_time": arr_time,
         "duration_min": duration_min,
-        "stops": stops,
-        "cabin_class": cabin,
-        "price_base_fare": int(base_fare) if base_fare else None,
+        "stops": f.get("s") or f.get("stops") or 0,
+        "cabin_class": "economy",
+        "price_base_fare": int(base) if base else None,
         "price_tax": int(tax) if tax else None,
         "price_total": int(total) if total else None,
-        "discount": int(discount) if discount else None,
         "currency": "INR",
-        "seats_available": f.get("sa") or f.get("SeatsAvailable") or None,
-        "is_refundable": bool(f.get("refund") or f.get("IsRefundable") or f.get("isRefundable")),
+        "seats_available": f.get("sa") or f.get("SeatsAvailable"),
+        "is_refundable": bool(f.get("refund") or f.get("IsRefundable")),
+        "booking_url": listing_url,
         "source": "easemytrip",
     }
-
-
-def _parse_duration(raw) -> int | None:
-    """Parse duration from int (minutes), 'H:MM', or 'HH:MM:SS' string."""
-    if isinstance(raw, int) and raw > 0:
-        return raw
-    if not raw:
-        return None
-    s = str(raw).strip()
-    parts = s.split(":")
-    try:
-        if len(parts) == 2:
-            return int(parts[0]) * 60 + int(parts[1])
-        if len(parts) == 3:
-            return int(parts[0]) * 60 + int(parts[1])
-    except Exception:
-        pass
-    try:
-        return int(s)
-    except Exception:
-        return None
