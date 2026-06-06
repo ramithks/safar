@@ -6,9 +6,21 @@ Usage:
     async def endpoint(user = Depends(require_user)):
         return {"user_id": user.id}
 """
+import logging
 from fastapi import Header, HTTPException, status
 from app.config import settings
-from supabase import create_client
+from supabase import create_client, Client
+
+logger = logging.getLogger(__name__)
+
+_supabase_client: Client | None = None
+
+
+def _get_auth_client() -> Client:
+    global _supabase_client
+    if _supabase_client is None:
+        _supabase_client = create_client(settings.supabase_url, settings.supabase_anon_key)
+    return _supabase_client
 
 
 async def require_user(authorization: str = Header(...)):
@@ -25,12 +37,13 @@ async def require_user(authorization: str = Header(...)):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Auth not configured")
 
     try:
-        client = create_client(settings.supabase_url, settings.supabase_anon_key)
+        client = _get_auth_client()
         result = client.auth.get_user(token)
         if not result or not result.user:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
         return result.user
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Token verification failed: {type(e).__name__}: {e}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token verification failed")

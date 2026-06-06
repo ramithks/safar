@@ -4,8 +4,11 @@ RedBus API integration — city suggestion + bus search.
 City suggestion: GET /rpw/api/citySuggestion?search=<name>&limit=10
 Bus search:      POST /rpw/api/searchResults  (query params + JSON filter body)
 """
+import logging
 from datetime import datetime
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
+
+logger = logging.getLogger(__name__)
 
 _BASE = "https://www.redbus.in"
 _HEADERS = {
@@ -61,11 +64,19 @@ async def search_city(name: str) -> list[dict]:
             for d in docs
         ]
     except Exception as e:
-        print(f"[redbus] city search '{name}': {e}")
+        logger.warning("[redbus] city search %r: %s", name, e)
         return []
 
 
 _CITY_SLUG_CACHE: dict[int, str] = {}   # city_id → url-slug (populated from search results)
+
+
+_SORT_MAP = {
+    # RedBus sort codes: 0=departure, 1=arrival, 2=price, 3=rating, 4=seats
+    "departure": 0,
+    "price":     2,
+    "rating":    3,
+}
 
 
 async def search_buses(
@@ -75,6 +86,7 @@ async def search_buses(
     limit: int = 10,
     from_city_name: str = "",
     to_city_name: str = "",
+    sort: str = "departure",   # "departure" | "price" | "rating"
 ) -> list[dict]:
     """
     Search buses between two RedBus city IDs.
@@ -95,7 +107,7 @@ async def search_buses(
                     "fromCity": from_city_id, "toCity": to_city_id,
                     "DOJ": doj, "limit": limit, "offset": 0,
                     "meta": "true", "groupId": 0, "sectionId": 0,
-                    "sort": 0, "sortOrder": 0,
+                    "sort": _SORT_MAP.get(sort, 0), "sortOrder": 0,
                     "from": "initialLoad", "getUuid": "true",
                     "bT": 1, "isFilterApplied": "false",
                 },
@@ -109,7 +121,7 @@ async def search_buses(
         search_url = _build_search_url(from_city_id, to_city_id, doj, from_city_name, to_city_name)
         return [_normalise_inventory(inv, search_url) for inv in inventories[:limit]]
     except Exception as e:
-        print(f"[redbus] bus search {from_city_id}→{to_city_id} on {doj}: {e}")
+        logger.warning("[redbus] bus search %s→%s on %s: %s", from_city_id, to_city_id, doj, e)
         return []
 
 
@@ -154,6 +166,7 @@ def _normalise_inventory(inv: dict, search_url: str = "") -> dict:
         "bp_id": (inv.get("locationSearchParams") or {}).get("bpId"),
         "dp_id": (inv.get("locationSearchParams") or {}).get("dpId"),
         "booking_url": search_url,
+        "source": "redbus",
     }
 
 

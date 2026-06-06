@@ -1,3 +1,5 @@
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.deps.auth import require_user
@@ -14,22 +16,37 @@ from . import service
 router = APIRouter(prefix="/groups", tags=["groups"])
 
 
+def _group_id(group_id: UUID) -> str:
+    return str(group_id)
+
+
+def _message_id(message_id: UUID) -> str:
+    return str(message_id)
+
+
+def _expense_id(expense_id: UUID) -> str:
+    return str(expense_id)
+
+
 # ── Groups ────────────────────────────────────────────────────────────────────
 
 @router.post("", status_code=201)
 async def create_group(body: CreateGroupRequest, user=Depends(require_user)):
-    return service.create_group(
-        user_id=user.id,
-        name=body.name,
-        destination=body.destination,
-        trip_id=body.trip_id,
-        display_name=body.display_name,
-    )
+    try:
+        return service.create_group(
+            user_id=user.id,
+            name=body.name,
+            destination=body.destination,
+            trip_id=body.trip_id,
+            display_name=body.display_name,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/{group_id}")
-async def get_group(group_id: str, user=Depends(require_user)):
-    group = service.get_group(group_id, user.id)
+async def get_group(group_id: UUID, user=Depends(require_user)):
+    group = service.get_group(str(group_id), user.id)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
     return group
@@ -46,26 +63,29 @@ async def join_group(invite_code: str, body: JoinGroupRequest, user=Depends(requ
 # ── Messages ──────────────────────────────────────────────────────────────────
 
 @router.get("/{group_id}/messages")
-async def list_messages(group_id: str, limit: int = 50, offset: int = 0, user=Depends(require_user)):
-    return {"messages": service.list_messages(group_id, limit, offset)}
+async def list_messages(group_id: UUID, limit: int = 50, offset: int = 0, user=Depends(require_user)):
+    return {"messages": service.list_messages(str(group_id), limit, offset)}
 
 
 @router.post("/{group_id}/messages", status_code=201)
-async def send_message(group_id: str, body: SendMessageRequest, user=Depends(require_user)):
-    return service.send_message(
-        group_id=group_id,
-        user_id=user.id,
-        sender_name=body.sender_name,
-        text=body.text,
-        msg_type=body.type,
-        poll_data=body.poll_data,
-    )
+async def send_message(group_id: UUID, body: SendMessageRequest, user=Depends(require_user)):
+    try:
+        return service.send_message(
+            group_id=str(group_id),
+            user_id=user.id,
+            sender_name=body.sender_name,
+            text=body.text,
+            msg_type=body.type,
+            poll_data=body.poll_data,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/{group_id}/messages/{message_id}/vote")
-async def vote_poll(group_id: str, message_id: str, body: VotePollRequest, user=Depends(require_user)):
+async def vote_poll(group_id: UUID, message_id: UUID, body: VotePollRequest, user=Depends(require_user)):
     try:
-        return service.vote_poll(group_id, message_id, body.option_id, user.id, body.voter_name)
+        return service.vote_poll(str(group_id), str(message_id), body.option_id, user.id, body.voter_name)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -73,34 +93,37 @@ async def vote_poll(group_id: str, message_id: str, body: VotePollRequest, user=
 # ── Expenses ──────────────────────────────────────────────────────────────────
 
 @router.get("/{group_id}/expenses")
-async def list_expenses(group_id: str, user=Depends(require_user)):
-    return service.list_expenses(group_id)
+async def list_expenses(group_id: UUID, user=Depends(require_user)):
+    return service.list_expenses(str(group_id))
 
 
 @router.post("/{group_id}/expenses", status_code=201)
-async def add_expense(group_id: str, body: AddExpenseRequest, user=Depends(require_user)):
-    return service.add_expense(
-        group_id=group_id,
-        user_id=user.id,
-        title=body.title,
-        amount=body.amount,
-        paid_by=body.paid_by,
-        split_between=body.split_between,
-        category=body.category,
-        date=body.date,
-    )
+async def add_expense(group_id: UUID, body: AddExpenseRequest, user=Depends(require_user)):
+    try:
+        return service.add_expense(
+            group_id=str(group_id),
+            user_id=user.id,
+            title=body.title,
+            amount=body.amount,
+            paid_by=body.paid_by,
+            split_between=body.split_between,
+            category=body.category,
+            date=body.date,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/{group_id}/expenses/{expense_id}", status_code=204)
-async def delete_expense(group_id: str, expense_id: str, user=Depends(require_user)):
-    service.delete_expense(group_id, expense_id, user.id)
+async def delete_expense(group_id: UUID, expense_id: UUID, user=Depends(require_user)):
+    service.delete_expense(str(group_id), str(expense_id), user.id)
 
 
 # ── AI ────────────────────────────────────────────────────────────────────────
 
 @router.post("/{group_id}/ai")
-async def ai_assist(group_id: str, body: AiAssistRequest, user=Depends(require_user)):
-    group = service.get_group(group_id, user.id)
+async def ai_assist(group_id: UUID, body: AiAssistRequest, user=Depends(require_user)):
+    group = service.get_group(str(group_id), user.id)
     destination = group.get("destination") if group else None
-    answer = await service.ai_assist(group_id, body.query, destination)
+    answer = await service.ai_assist(str(group_id), body.query, destination)
     return {"answer": answer}

@@ -2,7 +2,6 @@ import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
-from app.db.client import get_db
 from app.deps.auth import require_user
 import app.storage.gcs as gcs
 from .models import (
@@ -114,7 +113,7 @@ async def upload_trip_file(
     user=Depends(require_user),
 ):
     """
-    Upload any file (image or PDF) to Supabase Storage.
+    Upload any file (image or PDF) to Google Cloud Storage.
     Returns { url, path, filename } — store the `url` and pass it when
     creating a booking or document.
     """
@@ -123,11 +122,10 @@ async def upload_trip_file(
     safe_name = (file.filename or "upload").replace(" ", "_")
     path = f"trips/{trip_id}/{user.id}/{uuid.uuid4()}_{safe_name}"
 
-    db = get_db()
     try:
-        url = supabase_storage.upload_bytes(db, path, content, content_type)
+        url = gcs.upload_bytes(path, content, content_type)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Storage upload failed: {e}")
+        raise HTTPException(status_code=500, detail=f"GCS upload failed: {e}")
 
     return {"url": url, "path": path, "filename": safe_name}
 

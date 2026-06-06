@@ -79,5 +79,15 @@ class Settings(BaseSettings):
     razorpay_key_secret: Optional[str] = None
     razorpay_webhook_secret: Optional[str] = None
 
+    # Booking.com affiliate ID (used in flight search headers + booking URLs)
+    booking_affiliate_id: str = "304142"
+
+    # ConfirmTKT — Indian Railway API credentials
+    confirmtkt_api_key: str = "ct-web!2$"
+    confirmtkt_device_id: str = "067d2368-0a5c-4372-abf7-fd33546f1dea"
+
+    # CORS — comma-separated list of allowed origins, or "*" for all
+    allowed_origins: str = "*"
+
 
 settings = Settings()

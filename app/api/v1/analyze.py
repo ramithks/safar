@@ -39,7 +39,7 @@ async def analyze_reel(request: Request, body: AnalyzeReelRequest):
                     metadata=body.metadata,
                 )
         except Exception as e:
-            logger.warning(f"Cache check failed, processing fresh: {e}")
+            logger.error("Cache check failed, processing fresh: %s: %s", type(e).__name__, e, exc_info=True)
 
     # ── No cache — enqueue fresh processing ──────────────────────────────────
     job_id = f"job_{ULID()}"

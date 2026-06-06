@@ -9,9 +9,12 @@ Key facts confirmed from live testing:
 - Hotels are in the "htllist" key of the response.
 - tPr = total price for stay; prc = price per night; tax = tax amount.
 """
+import logging
 import uuid
 from datetime import date, datetime
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
+
+logger = logging.getLogger(__name__)
 
 _BASE = "https://hotelservice.easemytrip.com/api/HotelService/HotelListIdWiseNew"
 _HEADERS = {
@@ -122,11 +125,11 @@ async def search_hotels(
         r.raise_for_status()
         data = r.json()
         if data.get("error"):
-            print(f"[easemytrip] API error for '{city_name}': {data['error']}")
+            logger.warning("[easemytrip] API error for %r: %s", city_name, data["error"])
             return []
         return [_normalise_hotel(h, checkin, checkout) for h in (data.get("htllist") or [])]
     except Exception as e:
-        print(f"[easemytrip] hotel search '{city_name}' {checkin}→{checkout}: {e}")
+        logger.warning("[easemytrip] hotel search %r %s→%s: %s", city_name, checkin, checkout, e)
         return []
 
 

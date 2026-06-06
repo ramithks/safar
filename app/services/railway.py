@@ -11,32 +11,40 @@ Matching strategy for auto-suggestion results:
   3. Partial city/name match
   Highest score wins.
 """
+import logging
 from datetime import datetime
 import httpx
 
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
 _BASE = "https://cttrainsapi.confirmtkt.com"
-_HEADERS = {
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "ApiKey": "ct-web!2$",
-    "CT-Token": "",
-    "CT-Userkey": "",
-    "ClientId": "ct-web",
-    "Content-Type": "application/json",
-    "DeviceId": "067d2368-0a5c-4372-abf7-fd33546f1dea",
-    "Origin": "https://www.confirmtkt.com",
-    "Referer": "https://www.confirmtkt.com/",
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
-    ),
-    "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"macOS"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-site",
-}
+
+
+def _build_headers() -> dict:
+    return {
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "ApiKey": settings.confirmtkt_api_key,
+        "CT-Token": "",
+        "CT-Userkey": "",
+        "ClientId": "ct-web",
+        "Content-Type": "application/json",
+        "DeviceId": settings.confirmtkt_device_id,
+        "Origin": "https://www.confirmtkt.com",
+        "Referer": "https://www.confirmtkt.com/",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+        ),
+        "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+    }
 
 # In-memory cache populated by API calls only — no hardcoded values
 _STATION_CACHE: dict[str, str | None] = {}
@@ -95,7 +103,7 @@ async def resolve_station_async(city_name: str) -> str | None:
         async with httpx.AsyncClient(timeout=8.0) as client:
             r = await client.get(
                 f"{_BASE}/api/v2/trains/stations/auto-suggestion",
-                headers=_HEADERS,
+                headers=_build_headers(),
                 params={
                     "searchString": city_name,
                     "sourceStnCode": "",
@@ -110,12 +118,12 @@ async def resolve_station_async(city_name: str) -> str | None:
             code = _pick_best_station(stations, city_name)
             _STATION_CACHE[key] = code
             if code:
-                print(f"[railway] autocomplete '{city_name}' → {code}")
+                logger.info("[railway] autocomplete '%s' → %s", city_name, code)
             else:
-                print(f"[railway] autocomplete '{city_name}' → no match (no rail connectivity)")
+                logger.info("[railway] autocomplete '%s' → no match (no rail connectivity)", city_name)
             return code
     except Exception as e:
-        print(f"[railway] station autocomplete '{city_name}': {e}")
+        logger.warning("[railway] station autocomplete '%s': %s", city_name, e)
 
     _STATION_CACHE[key] = None
     return None
@@ -150,7 +158,7 @@ async def search_trains(
         async with httpx.AsyncClient(timeout=20.0) as client:
             r = await client.get(
                 f"{_BASE}/api/v1/trains/search",
-                headers=_HEADERS,
+                headers=_build_headers(),
                 params={
                     "sourceStationCode": source_code,
                     "destinationStationCode": dest_code,
@@ -182,7 +190,7 @@ async def search_trains(
         )
         return [_normalise_train(t, doj) for t in trains_raw[:limit]]
     except Exception as e:
-        print(f"[railway] search {source_code}→{dest_code} on {doj}: {e}")
+        logger.warning("[railway] search %s→%s on %s: %s", source_code, dest_code, doj, e)
         return []
 
 
@@ -306,9 +314,6 @@ def _normalise_train(t: dict, doj: str = "") -> dict:
 
 class RailwayService:
     """Indian Railway search via ConfirmTKT — India-only domestic routes."""
-
-    def city_to_code(self, city_name: str) -> str | None:
-        return city_to_station_code(city_name)
 
     async def search(
         self,

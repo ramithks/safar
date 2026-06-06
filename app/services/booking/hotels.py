@@ -18,11 +18,16 @@ Key confirmed response paths (live-tested 2026-05-30):
   results[].policies.showFreeCancellation
   Photo CDN: https://cf.bstatic.com + relativeUrl  (includes ?k=HASH)
 """
+import logging
 import re
 import time
 import base64
 import secrets
 import json as _json
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 try:
     from curl_cffi.requests import AsyncSession as CurlAsyncSession
@@ -58,7 +63,7 @@ _GQL_HEADERS = {
     "apollographql-client-name": "b-search-web-searchresults",
     "apollographql-client-version": "aYSHeUCR",
     "x-booking-context-action-name": "searchresults_irene",
-    "x-booking-context-aid": "304142",
+    "x-booking-context-aid": settings.booking_affiliate_id,
     "x-booking-site-type-id": "1",
     "x-booking-topic": "capla_browser_b-search-web-searchresults",
 }
@@ -69,7 +74,7 @@ _AUTOCOMPLETE_GQL_HEADERS = {
     "apollographql-client-version": "PDRKZEQM",
     "x-booking-context-action": "index",
     "x-booking-context-action-name": "index",
-    "x-booking-context-aid": "304142",
+    "x-booking-context-aid": settings.booking_affiliate_id,
     "x-booking-site-type-id": "1",
     "x-booking-topic": "capla_browser_b-index-lp-web-mfe",
     "referer": "https://www.booking.com/",
@@ -207,7 +212,7 @@ async def resolve_dest_id(city_name: str) -> tuple[int | None, str, str]:
                     dest_type = dest["destType"]
                     label = (item.get("displayInfo") or {}).get("title") or city_name
                     _DEST_CACHE[key] = (dest_id, dest_type)
-                    print(f"[booking_hotels] resolved '{city_name}' → destId={dest_id} ({dest_type}: {label})")
+                    logger.debug(f"[booking_hotels] resolved '{city_name}' → destId={dest_id} ({dest_type}: {label})")
                     return dest_id, label, dest_type
         if results:
             dest = (results[0].get("destination") or {})
@@ -219,45 +224,32 @@ async def resolve_dest_id(city_name: str) -> tuple[int | None, str, str]:
                 _DEST_CACHE[key] = (dest_id, dest_type)
                 return dest_id, label, dest_type
     except Exception as e:
-        print(f"[booking_hotels] AutoComplete '{city_name}': {e}")
+        logger.debug(f"[booking_hotels] AutoComplete '{city_name}': {e}")
 
     return None, city_name, "CITY"
 
 
-async def search_hotels(
-    city_name: str,
+async def _run_fullsearch(
+    dest_id: int,
+    dest_type: str,
+    city_canonical: str,
     checkin: str,
     checkout: str,
-    rooms: int = 1,
-    adults: int = 2,
-    children: int = 0,
-    sort: str | None = None,
-    limit: int = 10,
-    offset: int = 0,
+    rooms: int,
+    adults: int,
+    children: int,
+    sort: str | None,
+    limit: int,
+    offset: int,
+    nights: int,
 ) -> list[dict]:
-    """
-    Search hotels on Booking.com. Returns a normalized list.
-    Requires curl_cffi (bypasses AWS WAF with Chrome impersonation).
-    """
-    if not _CURL_AVAILABLE:
-        print("[booking_hotels] curl_cffi not installed — pip install curl-cffi")
-        return []
-
-    dest_id, city_canonical, dest_type = await resolve_dest_id(city_name)
-    if dest_id is None:
-        for variant in [f"{city_name} India", f"{city_name} Himachal Pradesh", f"{city_name} Uttarakhand"]:
-            dest_id, city_canonical, dest_type = await resolve_dest_id(variant)
-            if dest_id is not None:
-                print(f"[booking_hotels] resolved '{city_name}' via fallback '{variant}'")
-                break
-    if dest_id is None:
-        print(f"[booking_hotels] could not resolve destId for '{city_name}' — skipping")
-        return []
-
-    pageview_id = secrets.token_hex(8)
+    """Execute a single Booking.com FullSearch GraphQL query. Returns normalised list."""
     dest_type_lower = dest_type.lower()
+    pageview_id = secrets.token_hex(8)
 
-    # URL query params matching real browser requests (required for pricing)
+    # Booking.com caps meaningful results around 25 per page; sending more causes empty responses.
+    rows = min(limit, 25)
+
     gql_url = (
         f"{_GRAPHQL_URL}"
         f"?ss={city_canonical.replace(' ', '+')}"
@@ -278,13 +270,11 @@ async def search_hotels(
         f"&group_adults={adults}&no_rooms={rooms}&group_children={children}"
         f"&lang=en-us&aid=304142"
     )
-
     gql_headers = {
         **_GQL_HEADERS,
         "x-booking-pageview-id": pageview_id,
         "referer": referer,
     }
-
     payload = {
         "operationName": "FullSearch",
         "variables": {
@@ -322,7 +312,7 @@ async def search_hotels(
                 "showAparthotelAsHotel": True,
                 "needsRoomsMatch": False,
                 "optionalFeatures": {"forceArpExperiments": True, "testProperties": False},
-                "pagination": {"rowsPerPage": limit, "offset": offset},
+                "pagination": {"rowsPerPage": rows, "offset": offset},
                 "rawQueryForSession": raw_query,
                 "referrerBlock": {"blockName": "searchbox"},
                 "sbCalendarOpen": False,
@@ -357,14 +347,14 @@ async def search_hotels(
             )
 
         if resp.status_code != 200:
-            print(f"[booking_hotels] HTTP {resp.status_code} for '{city_name}'")
+            logger.info(f"[booking_hotels] HTTP {resp.status_code} for '{city_canonical}' (destType={dest_type})")
             return []
 
         data = resp.json()
         errors = data.get("errors") or []
         if errors:
             msgs = [e.get("message", "") for e in errors[:2]]
-            print(f"[booking_hotels] GraphQL errors: {msgs}")
+            logger.info(f"[booking_hotels] GraphQL errors for '{city_canonical}' ({dest_type}): {msgs}")
 
         results = (
             (data.get("data") or {})
@@ -373,21 +363,87 @@ async def search_hotels(
             .get("results") or []
         )
 
-        from datetime import datetime
-        try:
-            nights = (
-                datetime.strptime(checkout, "%Y-%m-%d") - datetime.strptime(checkin, "%Y-%m-%d")
-            ).days
-        except Exception:
-            nights = 1
-
-        hotels = [_normalise(r, checkin, checkout, nights) for r in results[:limit]]
-        print(f"[booking_hotels] '{city_name}' ({dest_type}): ✓ {len(hotels)} results")
-        return hotels
+        return [_normalise(r, checkin, checkout, nights) for r in results]
 
     except Exception as e:
-        print(f"[booking_hotels] search '{city_name}' {checkin}→{checkout}: {e}")
+        logger.debug(f"[booking_hotels] _run_fullsearch '{city_canonical}' ({dest_type}): {e}")
         return []
+
+
+async def search_hotels(
+    city_name: str,
+    checkin: str,
+    checkout: str,
+    rooms: int = 1,
+    adults: int = 2,
+    children: int = 0,
+    sort: str | None = None,
+    limit: int = 10,
+    offset: int = 0,
+) -> list[dict]:
+    """
+    Search hotels on Booking.com. Returns a normalized list.
+    Tries CITY destType first; retries as REGION then DISTRICT when results are empty.
+    Requires curl_cffi (bypasses AWS WAF with Chrome impersonation).
+    """
+    if not _CURL_AVAILABLE:
+        logger.warning("[booking_hotels] curl_cffi not installed — pip install curl-cffi")
+        return []
+
+    dest_id, city_canonical, dest_type = await resolve_dest_id(city_name)
+    if dest_id is None:
+        for variant in [
+            f"{city_name} India",
+            f"{city_name} Himachal Pradesh",
+            f"{city_name} Uttarakhand",
+            f"{city_name} Rajasthan",
+            f"{city_name} Goa",
+            f"{city_name} Kerala",
+        ]:
+            dest_id, city_canonical, dest_type = await resolve_dest_id(variant)
+            if dest_id is not None:
+                logger.info(f"[booking_hotels] resolved '{city_name}' via variant '{variant}'")
+                break
+    if dest_id is None:
+        logger.info(f"[booking_hotels] could not resolve destId for '{city_name}' — skipping")
+        return []
+
+    from datetime import datetime as _dt
+    try:
+        nights = (_dt.strptime(checkout, "%Y-%m-%d") - _dt.strptime(checkin, "%Y-%m-%d")).days
+    except Exception:
+        nights = 1
+
+    # First attempt with the resolved destType
+    hotels = await _run_fullsearch(
+        dest_id, dest_type, city_canonical,
+        checkin, checkout, rooms, adults, children,
+        sort, limit, offset, nights,
+    )
+
+    # If empty, retry with the other destTypes — some cities are indexed differently
+    if not hotels:
+        for fallback_type in ("CITY", "REGION", "DISTRICT"):
+            if fallback_type == dest_type:
+                continue
+            logger.info(
+                f"[booking_hotels] '{city_name}': 0 results as {dest_type}, "
+                f"retrying as {fallback_type}"
+            )
+            hotels = await _run_fullsearch(
+                dest_id, fallback_type, city_canonical,
+                checkin, checkout, rooms, adults, children,
+                sort, limit, offset, nights,
+            )
+            if hotels:
+                logger.info(
+                    f"[booking_hotels] '{city_name}': ✓ {len(hotels)} results "
+                    f"as {fallback_type} (was {dest_type})"
+                )
+                break
+
+    logger.info(f"[booking_hotels] '{city_name}' ({dest_type}): {'✓ ' + str(len(hotels)) if hotels else '✗ 0'} results")
+    return hotels
 
 
 def _normalise(r: dict, checkin: str, checkout: str, nights: int) -> dict:

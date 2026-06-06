@@ -1,215 +1,268 @@
 ================================================================
   TRAVBUDDY BACKEND
-  Instagram Reel → Location Timeline Pipeline
 ================================================================
+
+A FastAPI backend for AI-powered trip planning and Instagram
+Reel → location timeline extraction.
 
 STACK
 -----
-  FastAPI + Celery + Redis
-  yt-dlp (video download)
-  PySceneDetect + OpenCV (scene detection + frame extraction)
-  Gemini 2.5 Flash (location identification via vision AI)
-  pHash deduplication (imagehash)
+  FastAPI (async, Python 3.11+)
+  Supabase (Postgres + Auth)
+  Vertex AI / Gemini (route planning, itinerary generation)
+  Google Places API (activity enrichment)
+  RedBus, IRCTC, Booking.com, EaseMyTrip, Expedia (live transport/hotel)
+  Rate limiting via SlowAPI
 
 
-----------------------------------------------------------------
-  PREREQUISITES
-----------------------------------------------------------------
+================================================================
+  PROJECT STRUCTURE
+================================================================
 
-  1. Python 3.11+
-  2. Redis running on localhost:6379
-  3. yt-dlp installed globally:  pip install yt-dlp
-  4. ffmpeg installed:            brew install ffmpeg
+  app/
+    api/v1/
+      plan_trip/          ← Core trip planner (main feature)
+        endpoint.py         POST /api/v1/plan
+        plan.py             Orchestrates journey + itinerary in parallel
+        journey.py          Multi-leg transport planner (bus/train/flight)
+        orchestrator.py     Day-by-day itinerary generator (Gemini + Places)
+        hydration.py        Google Places enrichment (3-tier, low API cost)
+        confidence.py       Per-activity confidence scoring (anti-hallucination)
+        validation.py       Route validation + trip health checks
+        budget.py           Detailed budget breakdown (5 categories)
+        helpers.py          Pure utility functions, currency config
+        models.py           Pydantic request/response models
+        stream.py           SSE streaming variant of the plan endpoint
 
-  Start Redis (if not already running):
-    brew services start redis
-    -- or --
-    redis-server
+      trips/              ← Saved trips CRUD
+      groups/             ← Travel groups / communities
+      discover/           ← Destination discovery
+      search/             ← Search endpoint
+      onboarding/         ← User onboarding
+      users/              ← User profile
+      reels/              ← Instagram Reel → location timeline
+
+    services/
+      transport.py          RedBus bus search
+      flights.py            Flight search aggregator
+      hotels.py             Hotel search aggregator
+      railway.py            IRCTC train search
+      places.py             Google Places API helpers
+      vertex.py             Vertex AI / Gemini helpers
+      booking/              Booking.com integration
+      easemytrip/           EaseMyTrip integration
+      expedia/              Expedia integration
+      bus/                  RedBus + FlixBus
+
+    pipeline/             ← Instagram Reel analysis pipeline
+    core/                 ← Circuit breaker, rate limiter, SSE, timing
+    db/                   ← Supabase client
+    deps/                 ← FastAPI dependencies (auth)
+    config.py             ← All settings (env vars)
+    main.py               ← FastAPI app factory
 
 
-----------------------------------------------------------------
+================================================================
   SETUP
-----------------------------------------------------------------
+================================================================
 
-  cd travbuddy_backend
+  1. Create virtual environment
+     python -m venv venv
+     source venv/bin/activate
 
-  # Create and activate virtual environment
-  python -m venv venv
-  source venv/bin/activate
+  2. Install dependencies
+     pip install -r requirements.txt
 
-  # Install dependencies
-  pip install -r requirements.txt
+  3. Set environment variables (create a .env file)
+     SUPABASE_URL=...
+     SUPABASE_SERVICE_ROLE_KEY=...
+     GOOGLE_MAPS_API_KEY=...
+     GOOGLE_CLOUD_PROJECT=...     (for Vertex AI / Gemini)
+     REDBUS_API_KEY=...
+     BOOKING_API_KEY=...
+     EASEMYTRIP_API_KEY=...
+     EXPEDIA_API_KEY=...
+     SENTRY_DSN=...               (optional)
 
-  # Create .env file
-  cp .env.example .env
-  # Then edit .env and set GEMINI_API_KEY
+  4. Run the server
+     uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
-
-----------------------------------------------------------------
-  .env FILE
-----------------------------------------------------------------
-
-  GEMINI_API_KEY=your_gemini_api_key_here
-  REDIS_URL=redis://localhost:6379/0
-  LOG_LEVEL=INFO
-
-  # Optional — only needed if you want Places API enrichment
-  # GOOGLE_MAPS_API_KEY=your_maps_key
+  API docs:  http://localhost:8000/docs
 
 
-----------------------------------------------------------------
-  RUNNING THE APP
-----------------------------------------------------------------
+================================================================
+  CORE ENDPOINT: POST /api/v1/plan
+================================================================
 
-  You need TWO terminals:
+  Plans a complete trip in a single call: transport (going + return)
+  plus a day-by-day itinerary, all running in parallel.
 
-  Terminal 1 — Start FastAPI server:
-    source venv/bin/activate
-    uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-  Terminal 2 — Start Celery worker:
-    source venv/bin/activate
-    celery -A app.workers.celery_app.celery_app worker --loglevel=info --concurrency=2
-
-  API is now live at:  http://localhost:8000
-  API docs (Swagger):  http://localhost:8000/docs
-
-
-----------------------------------------------------------------
-  ACCESS FROM PHYSICAL DEVICE (same WiFi)
-----------------------------------------------------------------
-
-  Find your Mac's local IP:
-    ipconfig getifaddr en0
-
-  Then use that IP instead of localhost:
-    http://192.168.x.x:8000
-
-
-----------------------------------------------------------------
-  CURL EXAMPLES
-----------------------------------------------------------------
-
-  1. SUBMIT A REEL FOR PROCESSING
-  --------------------------------
-  curl -X POST http://localhost:8000/api/v1/reels/analyze \
-    -H "Content-Type: application/json" \
-    -d '{
-      "reel_url": "https://www.instagram.com/reel/ABC123/"
-    }'
-
-  Response:
+  REQUEST BODY
+  ------------
   {
-    "job_id": "job_01HXZ...",
-    "status": "queued",
-    "poll_url": "http://localhost:8000/api/v1/reels/jobs/job_01HXZ...",
-    "stream_url": "http://localhost:8000/api/v1/reels/jobs/job_01HXZ.../stream"
+    "origin":          "Delhi",
+    "destination":     "Goa",
+    "departure_date":  "2025-02-14",
+    "days":            5,
+    "travelers":       2,
+    "budget":          "mid",       // "low" | "mid" | "high"
+    "interests":       ["beach", "food"],
+    "transport_modes": [],          // [] = Gemini picks best mode
+    "return_date":     null,        // auto-computed if omitted
+    "stay_nights":     null         // defaults to days - 1
   }
 
+  RESPONSE SHAPE
+  --------------
+  {
+    // Itinerary (from Gemini + Google Places)
+    "trip_name":             "...",
+    "destination":           "Goa",
+    "destination_description": "...",
+    "days": [
+      {
+        "day": 1,
+        "theme": "...",
+        "activities": [
+          {
+            "title":            "Baga Beach",
+            "type":             "attraction",
+            "confidence_score": 0.92,    // 0–1 anti-hallucination score
+            "rating":           4.3,
+            "user_ratings_total": 18000,
+            "lat": 15.55, "lng": 73.75,
+            "maps_url":         "...",
+            "photo_url":        "...",
+            "opening_hours":    [...],
+            "time":             "09:00 AM",
+            "duration":         "2h"
+          }
+        ]
+      }
+    ],
+    "trip_quality": {
+      "score":       85,            // 0–100 health score
+      "issues":      [...],         // duplicates, overload detected
+      "warnings":    [...],         // closed attractions, etc.
+      "auto_fixed":  2              // activities removed by auto-fix
+    },
+    "trip_intelligence": {
+      "pace":                   "Moderate",
+      "budget_fit_score":       92,
+      "travel_efficiency_score": 88,
+      "avg_walking_distance_km": 1.4
+    },
 
-  2. CHECK JOB STATUS (POLLING)
-  ------------------------------
-  curl http://localhost:8000/api/v1/reels/jobs/JOB_ID
+    // Transport — going journey
+    "going": {
+      "flights": { "items": [...], "recommended": {...} },
+      "buses":   { "items": [...], "recommended": {...} },
+      "trains":  { "items": [...], "recommended": {...} },
+      "journey_options": {
+        "cheapest": {
+          "mode": "train", "cost_per_person": 850,
+          "duration_display": "18h", "description": "Rajdhani Express"
+        },
+        "fastest": {
+          "mode": "flight", "cost_per_person": 4500,
+          "duration_display": "1h 30m", "description": "IndiGo 6E-123"
+        },
+        "balanced": {
+          "mode": "flight", "cost_per_person": 3200,
+          "duration_display": "2h", "description": "Air India AI-456"
+        }
+      },
+      "legs":    [...],             // each leg has validation: {valid, confidence, issues}
+      "hotels":  { "items": [...], "recommended": {...} }
+    },
 
-  Response includes:
-  - status: queued | processing | completed | failed
-  - progress.percent_complete: 0-100
-  - progress.stage: current pipeline stage
+    // Transport — return journey
+    "return": { ... },
 
+    // Detailed budget (5 categories)
+    "budget_breakdown": {
+      "transport":  8000,
+      "stay":       6000,
+      "food":       6000,
+      "activities": 4000,
+      "misc":       1400,
+      "total":      25400,
+      "per_person": 12700,
+      "hotel_per_night": 2000,
+      "currency":   "₹"
+    },
 
-  3. GET FINAL RESULT (once status = "completed")
-  ------------------------------------------------
-  curl http://localhost:8000/api/v1/reels/jobs/JOB_ID/result
+    "cost_breakdown":    { ... },   // live transport cost detail
+    "origin":            "Delhi",
+    "departure_date":    "2025-02-14",
+    "return_date":       "2025-02-19",
+    "travelers":         2,
+    "budget":            "mid"
+  }
 
-  Returns full timeline with:
-  - place.name — location name from Gemini AI
-  - place.google_maps_url — Google Maps search link
-  - place.address — city, country
-  - place.coordinates — lat/lng
-  - frame_thumbnail_b64 — extracted video frame as base64 JPEG
-  - timestamp_start_seconds / timestamp_end_seconds
-
-
-  4. STREAM LIVE PROGRESS (Server-Sent Events)
-  ---------------------------------------------
-  curl -N http://localhost:8000/api/v1/reels/jobs/JOB_ID/stream
-
-  Emits events as they happen:
-    event: stage_start   → pipeline stage began
-    event: stage_complete → stage finished with duration
-    event: location_found → a place was identified (live!)
-    event: completed      → job done, total_locations count
-    event: failed         → job failed with error
-
-
-  5. HEALTH CHECK
-  ---------------
-  curl http://localhost:8000/health
-
-
-  6. FULL EXAMPLE (submit → wait → get result)
-  ---------------------------------------------
-  # Step 1: Submit
-  JOB=$(curl -s -X POST http://localhost:8000/api/v1/reels/analyze \
-    -H "Content-Type: application/json" \
-    -d '{"reel_url": "https://www.instagram.com/reel/DNqRBwnTxae/"}' \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
-
-  echo "Job ID: $JOB"
-
-  # Step 2: Poll until done
-  watch -n 2 "curl -s http://localhost:8000/api/v1/reels/jobs/$JOB | python3 -m json.tool"
-
-  # Step 3: Get result
-  curl -s http://localhost:8000/api/v1/reels/jobs/$JOB/result | python3 -m json.tool
+  Rate limit: 10 requests / hour / IP
 
 
-----------------------------------------------------------------
-  PIPELINE STAGES
-----------------------------------------------------------------
+================================================================
+  ANTI-HALLUCINATION FEATURES
+================================================================
 
-  1. Download       — yt-dlp (gallery-dl / instaloader fallback)
-  2. Scene Detection — PySceneDetect (ContentDetector)
-  3. Frame Extraction — OpenCV mid-scene frames + pHash dedup
-  4. Vision Analysis — Gemini 2.5 Flash identifies each location
-  5. Timeline Build  — merge duplicate locations by name
+  1. CONFIDENCE SCORES (per activity)
+     Each activity gets confidence_score: 0.0–1.0
+     Signals: Google Places verified (+0.40), rating (+0.30),
+              review count log-scale (+0.20), opening hours (+0.10)
+     Activities below 0.30 are dropped (day keeps min 2).
 
-  Typical processing time: 20-45 seconds per reel
-  Cost: ~$0.001 per reel (Gemini tokens only)
+  2. ROUTE VALIDATION (per transport leg)
+     Each leg gets validation: {valid, confidence, issues, warnings}
+     Checks: airport IATA resolved, station code resolved, bus stop
+     found, live data returned, duration realistic for distance+mode.
+
+  3. TRIP HEALTH CHECKS
+     Detects: duplicate attractions (fuzzy match > 80%), activity
+     overload (> 4/day), currently-closed places.
+     Auto-fix: removes duplicates, caps to 4/day by confidence rank.
+
+  4. GEMINI HUB ROUTING
+     Prompt enforces intermediate hub routing for indirect routes
+     (e.g. Bhiwani → Delhi → Haridwar, not a fake direct train leg).
 
 
-----------------------------------------------------------------
-  DEDUPLICATION BEHAVIOUR
-----------------------------------------------------------------
+================================================================
+  INSTAGRAM REEL PIPELINE: POST /api/v1/reels/analyze
+================================================================
 
-  If a reel is filmed entirely at one café (e.g. 10 scene cuts,
-  same location), all frames resolve to the same place name and
-  get merged into ONE timeline segment spanning the full video.
-  The highest-confidence frame is kept as the thumbnail.
+  Extracts a location timeline from a public Instagram Reel.
+
+  Stages:
+    1. Download       — yt-dlp (gallery-dl / instaloader fallback)
+    2. Scene Detection — PySceneDetect (ContentDetector)
+    3. Frame Extraction — OpenCV + pHash deduplication
+    4. Vision Analysis — Gemini vision (location identification)
+    5. Timeline Build  — merge duplicate locations
+
+  Cost: ~$0.001 per reel | Time: 20–45 seconds
+
+  Endpoints:
+    POST /api/v1/reels/analyze         → { job_id, poll_url, stream_url }
+    GET  /api/v1/reels/jobs/{id}       → { status, progress }
+    GET  /api/v1/reels/jobs/{id}/result → full location timeline
+    GET  /api/v1/reels/jobs/{id}/stream → SSE live progress
 
 
-----------------------------------------------------------------
-  TROUBLESHOOTING
-----------------------------------------------------------------
+================================================================
+  RATE LIMITS
+================================================================
 
-  "Requested format is not available" (yt-dlp)
-    → Fixed in code. Uses wide format fallback chain.
+  /api/v1/plan     — 10 requests / hour / IP
+  All other routes — standard (no explicit limit unless noted)
 
-  "403 / login redirect" (gallery-dl / instaloader)
-    → Expected for authenticated-only reels. yt-dlp handles most
-      public reels without cookies.
 
-  "Expecting value" on Gemini response
-    → Gemini 2.5 Flash is a thinking model — response has thought
-      tokens in parts[0]. Code reads last non-thought part.
+================================================================
+  HEALTH CHECK
+================================================================
 
-  "Places API REQUEST_DENIED"
-    → Places API is disabled by default (cost = $0). Pipeline
-      runs fine with Gemini-only data.
-
-  Worker not picking up jobs
-    → Make sure Redis is running: redis-cli ping  →  PONG
-    → Make sure worker and server use same .env / REDIS_URL
+  GET /health  →  { status: "ok", version: "..." }
 
 
 ================================================================

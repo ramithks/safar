@@ -7,13 +7,23 @@ Optimisations:
   result already contains geometry, photo_reference, address and rating.
 """
 import httpx
+import logging
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 # ── Shared HTTP client ────────────────────────────────────────────────────────
 _http_client = httpx.AsyncClient(
     timeout=10.0,
     limits=httpx.Limits(max_connections=30, max_keepalive_connections=15),
 )
+
+
+def _mask(s: str) -> str:
+    """Mask the last 28 chars of a key — keeps prefix visible for debugging."""
+    if not s or len(s) < 8:
+        return "***"
+    return s[:6] + "*****"
 
 
 def _maps_key() -> str:
@@ -48,7 +58,7 @@ async def search_places(query: str, type_filter: str | None = None) -> list[dict
             for p in data.get("results", [])
         ][:5]
     except Exception as e:
-        print(f"[places] search_places error for '{query}': {e}")
+        logger.warning("[places] search_places error for %r: %s", query, type(e).__name__)
         return []
 
 
@@ -64,7 +74,7 @@ async def get_place_details(place_id: str) -> dict | None:
         r.raise_for_status()
         return r.json().get("result")
     except Exception as e:
-        print(f"[places] get_place_details error for {place_id}: {e}")
+        logger.warning("[places] get_place_details error for %s: %s", place_id, type(e).__name__)
         return None
 
 
@@ -85,8 +95,8 @@ async def enrich_venue(venue: dict, location: str) -> dict:
     """
     Enrich a venue dict with real place_id, lat/lng, photo_url, address, opening_hours.
     Uses a single textsearch call (no extra get_place_details round-trip).
+    Photo URL is a proxy path — the Google API key is never exposed to the frontend.
     """
-    key = _maps_key()
     try:
         places = await search_places(f"{venue['name']} {location}")
         place = places[0] if places else None
@@ -106,11 +116,7 @@ async def enrich_venue(venue: dict, location: str) -> dict:
             if place_id
             else (f"https://maps.google.com/?q={lat},{lng}" if lat and lng else None)
         )
-        photo_url_str = (
-            f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=600&photo_reference={photo_ref}&key={key}"
-            if photo_ref
-            else None
-        )
+        photo_url_str = f"/api/v1/images/{photo_ref}" if photo_ref else None
 
         return {
             **venue,
@@ -124,14 +130,24 @@ async def enrich_venue(venue: dict, location: str) -> dict:
             "maps_url": maps_url,
         }
     except Exception as e:
-        print(f"[places] enrich_venue error for '{venue.get('name')}': {e}")
+        logger.warning("[places] enrich_venue error for %r: %s", venue.get("name"), type(e).__name__)
         return venue
 
 
-def photo_url(photo_reference: str, maxwidth: int = 800) -> str:
-    """Build a Google Places photo URL."""
+def _google_photo_url(photo_reference: str, maxwidth: int = 800) -> str:
+    """Build a Google Places photo URL (server-side only — never send to frontend)."""
     key = _maps_key()
     return f"https://maps.googleapis.com/maps/api/place/photo?maxwidth={maxwidth}&photo_reference={photo_reference}&key={key}"
+
+
+def photo_url(photo_reference: str, maxwidth: int = 800) -> str:
+    """Deprecated alias — use photo_proxy_path() for frontend, _google_photo_url() server-side."""
+    return _google_photo_url(photo_reference, maxwidth)
+
+
+def photo_proxy_path(photo_reference: str) -> str:
+    """Return a proxy path for a photo reference — safe to send to the frontend."""
+    return f"/api/v1/images/{photo_reference}"
 
 
 def extract_hero_image(itinerary: dict, maps_key: str | None = None) -> str | None:
@@ -140,8 +156,9 @@ def extract_hero_image(itinerary: dict, maps_key: str | None = None) -> str | No
         return None
     if itinerary.get("hero_image_url"):
         return itinerary["hero_image_url"]
-    if itinerary.get("destination_photo_ref") and maps_key:
-        return f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photoreference={itinerary['destination_photo_ref']}&key={maps_key}"
+    ref = itinerary.get("cover_photo_ref") or itinerary.get("destination_photo_ref")
+    if ref:
+        return f"/api/v1/images/{ref}"
     for day in itinerary.get("days", []):
         for act in day.get("activities", []):
             if act.get("image_url"):
@@ -151,6 +168,6 @@ def extract_hero_image(itinerary: dict, maps_key: str | None = None) -> str | No
                 p = photos[0]
                 if isinstance(p, str) and p.startswith("http"):
                     return p
-                if isinstance(p, str) and maps_key:
-                    return f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photoreference={p}&key={maps_key}"
+                if isinstance(p, str):
+                    return f"/api/v1/images/{p}"
     return None

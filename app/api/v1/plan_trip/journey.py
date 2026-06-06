@@ -8,6 +8,7 @@ Phase 2b — Build search tasks using pre-resolved IDs (no re-resolution inside 
 Phase 2c — Run all searches + flight alternatives + hotels in parallel.
 """
 import asyncio
+import logging
 import urllib.parse
 from datetime import datetime, timedelta
 
@@ -19,8 +20,6 @@ from app.services.transport import TransportService
 from app.services.hotels import HotelService
 from app.services.flights import FlightService
 from app.services.railway import RailwayService, city_to_station_code, resolve_station_async
-from app.services.booking.flights import search_flights as booking_search_flights
-from app.services.easemytrip.flights import search_flights as emt_search_flights
 
 from .models import PlanJourneyRequest
 from .helpers import (
@@ -30,56 +29,14 @@ from .helpers import (
     with_retry,
     clean_city,
 )
+from .validation import validate_route
+
+logger = logging.getLogger(__name__)
 
 _transport = TransportService()
 _hotels    = HotelService()
 _flights   = FlightService()
 _railway   = RailwayService()
-
-
-# ── Transport alternatives (trains + flights) ────────────────────────────────
-
-async def _search_train_alternatives(
-    origin: str,
-    destination: str,
-    date: str,
-    travelers: int,
-    limit: int = 5,
-) -> dict:
-    """
-    Search trains between overall origin → destination as an alternative mode.
-    Returns {} if no rail connectivity.
-    """
-    from_code, to_code = await asyncio.gather(
-        resolve_station_async(origin),
-        resolve_station_async(destination),
-    )
-    if not from_code or not to_code:
-        return {}
-    result = await _railway.search(origin, destination, date,
-                                   from_code=from_code, to_code=to_code, limit=limit)
-    return result
-
-
-async def _search_flight_alternatives(
-    from_iata: str, to_iata: str, date: str, travelers: int, limit: int = 4,
-) -> list[dict]:
-    if not from_iata or not to_iata or not date:
-        return []
-    booking_r, emt_r = await asyncio.gather(
-        with_retry(booking_search_flights, from_iata, to_iata, date, adults=travelers, limit=limit + 2, fallback=[]),
-        with_retry(emt_search_flights,     from_iata, to_iata, date, adults=travelers, limit=limit + 2, fallback=[]),
-    )
-    seen: set[str] = set()
-    merged: list[dict] = []
-    for f in (booking_r or []) + (emt_r or []):
-        key = (f.get("flight_number") or "") + str(f.get("departure_time") or "")
-        if key and key in seen:
-            continue
-        seen.add(key)
-        merged.append(f)
-    merged.sort(key=lambda f: f.get("price_total") or 999_999)
-    return merged[:limit]
 
 
 # ── Gemini route planner ──────────────────────────────────────────────────────
@@ -105,21 +62,35 @@ Travelers: {body.travelers} | Budget: {budget} ({symbol})
 TASK: Plan the complete, practical door-to-door journey from {body.origin} to {body.destination}.
 
 CRITICAL RULES:
-1. Always break into logical legs — include intermediate hubs for remote destinations.
-   Example: Delhi → Sharnagh = [Delhi→Aut by overnight bus, Aut→Sharnagh by shared cab]
-   Example: Delhi → Kasol = [Delhi→Bhuntar by bus, Bhuntar→Kasol by shared cab]
-   NEVER make a single leg for a route that requires an intermediate hub.
-2. TRAIN legs: exact Indian Railway station codes (NDLS, PNBE, CDG etc.)
-   Only suggest train where rail exists — Manali, Leh, Spiti, Kasol, Sharnagh have NO railway.
-3. BUS legs: mention operator (HRTC, RSRTC, Volvo) and boarding point.
-   Use the largest nearby city that has bus connectivity as origin/destination in search_params.
-4. FLIGHT legs: include airport IATA codes (DEL, BOM, IXL etc.)
-5. Cab/shared_cab/auto: realistic local fares, needs_live_search=false.
+1. Break into logical legs — include intermediate hubs for remote destinations.
+   Example: Delhi→Shangarh = [Delhi→Aut by overnight bus] + [Aut→Shangarh by shared cab]
+   Example: Delhi→Kasol = [Delhi→Bhuntar by bus] + [Bhuntar→Kasol by shared cab]
+   NEVER make a single direct leg where an intermediate hub is required.
+2. TRAIN legs: Only suggest train where rail connectivity exists.
+   Small hill towns (Manali, Leh, Kasol, Shangarh, Spiti, Tirthan Valley) have NO railway.
+   For smaller cities, route via the nearest major city with a station:
+   - North India: New Delhi, Old Delhi, Hazrat Nizamuddin
+   - Uttarakhand: Haridwar, Dehradun
+   - Punjab/HP: Chandigarh, Ambala
+   - South India: Chennai, Bangalore, Hyderabad
+   Example: Bhiwani→Haridwar = [Bhiwani→New Delhi by train] + [New Delhi→Haridwar by train]
+3. BUS legs: Use the largest nearby city with bus connectivity as origin/destination.
+   If the destination itself is a well-known bus hub, use it directly — do NOT route via a smaller
+   nearby district/town.
+   Known HP/Uttarakhand bus hubs: Dharamshala (NOT Kangra), Manali, Shimla, Dehradun, Haridwar, Rishikesh.
+   Example: Delhi→Dharamshala is a valid direct bus leg. Do NOT use Delhi→Kangra.
+4. FLIGHT legs: Only include if an airport exists reasonably close to origin/destination.
+5. Cab/shared_cab/auto/walk: needs_live_search=false.
 6. International: set is_international=true, provide complete visa guidance.
-7. Cost estimates in {currency.upper()} ({symbol}).
-8. needs_live_search=true ONLY for bus/train/flight.
-9. search_params origin/destination must be BARE city names — NO state/country suffix.
+7. needs_live_search=true ONLY for bus/train/flight.
+8. search_params origin/destination must be BARE city names — NO state/country suffix.
    CORRECT: "origin": "Aut"   WRONG: "origin": "Aut, Himachal Pradesh"
+9. COMPLETE PIPELINE: Every journey MUST have first-mile and last-mile legs.
+   - FIRST LEG: auto/cab/metro from user's location → departure station/bus stand
+   - LAST LEG: shared_cab/cab/auto from arrival point → accommodation area (needs_live_search: false)
+10. NEVER output station codes (NDLS, HW, BNW, CDG), IATA codes (DEL, KUU, IXC),
+    or operator names (HRTC, IndiGo). Output ONLY city/place names.
+    The system resolves all codes and operators automatically.
 
 Return ONLY valid JSON (no markdown):
 {{
@@ -134,33 +105,22 @@ Return ONLY valid JSON (no markdown):
   "journey_summary": "2-3 sentence narrative",
   "total_distance_km": 0,
   "total_duration_approx": "Xh Ym",
-  "total_estimated_cost": 0,
   "best_time_to_depart": "specific departure advice",
   "packing_tips": ["tip 1", "tip 2"],
-  "flight_search": {{"from_iata": "DEL", "to_iata": "KUU", "route_note": "..."}},
   "legs": [
     {{
       "leg": 1,
-      "from": "exact place name",
-      "to": "exact place name",
+      "from": "City or place name",
+      "to": "City or place name",
       "mode": "bus|train|flight|cab|shared_cab|auto|metro|walk|ferry",
-      "operator_hint": "HRTC / Volvo / IndiGo / local taxi",
-      "departure_time_approx": "22:00 or Flexible or Overnight",
       "duration_approx": "Xh Ym",
       "distance_km": 0,
-      "estimated_cost_per_person": 0,
-      "booking_channel": "RedBus / IRCTC / counter / local stand",
       "tips": "one practical tip",
-      "notes": "important detail",
       "needs_live_search": true,
       "search_params": {{
         "origin": "bare city name",
         "destination": "bare city name",
-        "mode_type": "bus|train|flight",
-        "from_station_code": "NDLS",
-        "to_station_code": "CDG",
-        "from_iata": null,
-        "to_iata": null
+        "mode_type": "bus|train|flight"
       }}
     }}
   ]
@@ -173,7 +133,7 @@ Return ONLY valid JSON (no markdown):
     try:
         return extract_json(raw)
     except Exception as e:
-        print(f"[journey] Gemini route parse error: {e}")
+        logger.debug(f"[journey] Gemini route parse error: {e}")
         return {}
 
 
@@ -344,29 +304,29 @@ def _compute_live_costs(
         live_fare = _live_fare_for_leg(leg)
         leg_key = f"leg{leg.get('leg', '?')}_{leg.get('mode', '?')}"
         if live_fare is not None:
-            leg["estimated_cost_per_person"] = live_fare
+            leg["fare_per_person"] = live_fare
             leg["cost_source"] = "live"
             transport_per_person += live_fare
             breakdown[leg_key] = live_fare
         else:
-            # Keep Gemini estimate (cab, shared_cab, walk, etc.)
-            est = leg.get("estimated_cost_per_person") or 0
-            leg["cost_source"] = "estimated"
-            transport_per_person += est
-            breakdown[leg_key] = est
+            leg["cost_source"] = "no_live_data"
 
-    # Hotel cost from live data
+    # Hotel cost from live data.
+    # hotel_per_night is the room rate — shared across travelers, not per person.
     hotel_per_night: int | None = None
     hotel_total = 0
+    hotel_pp = 0
     if hotel_result and not isinstance(hotel_result, Exception):
         hotels = hotel_result.get("hotels") or []
         priced = [h.get("price_per_night") for h in hotels if h.get("price_per_night")]
         if priced:
             hotel_per_night = min(priced)
             hotel_total = hotel_per_night * stay_nights
-            breakdown["hotel"] = hotel_total
+            hotel_pp = hotel_total // max(travelers, 1)  # share room cost across group
+            breakdown["hotel_total"] = hotel_total
+            breakdown["hotel_per_person"] = hotel_pp
 
-    total_per_person = transport_per_person + hotel_total
+    total_per_person = transport_per_person + hotel_pp
     total_trip = total_per_person * travelers
 
     return {
@@ -374,11 +334,12 @@ def _compute_live_costs(
         "transport_per_person": transport_per_person,
         "hotel_per_night": hotel_per_night,
         "hotel_total": hotel_total,
+        "hotel_per_person": hotel_pp,
         "total_for_all_travelers": total_trip,
         "travelers": travelers,
         "stay_nights": stay_nights,
         "breakdown": breakdown,
-        "source": "live+estimated",
+        "source": "live",
     }
 
 
@@ -397,28 +358,66 @@ def _enrich_buses_with_maps(buses: list[dict]) -> list[dict]:
     return buses
 
 
-def _pick_recommended_bus(buses: list[dict], budget: str) -> dict | None:
+def _pick_recommended_bus(buses: list[dict], budget: str) -> dict | None:  # noqa: ARG001
     """
-    Pick bus that arrives closest to 11:00 AM (checkin time).
-    Among equally-close arrivals, prefer cheaper options for low budget.
+    Composite scoring: 0.30 price + 0.25 rating + 0.20 arrival_time + 0.15 seats + 0.10 amenities.
+    Arrival score peaks in the 10 AM–2 PM window (ideal for hotel check-in).
     Returns a shallow copy with is_recommended=True.
     """
     if not buses:
         return None
-    target_minutes = 11 * 60   # 11:00 AM in minutes from midnight
-    scored: list[tuple[int, int | float, dict]] = []
-    for bus in buses:
-        arrival = bus.get("arrival", "")
-        fare = bus.get("fare_discounted") or bus.get("fare_original") or 999_999
-        try:
-            arr_dt = datetime.strptime(arrival, "%Y-%m-%d %H:%M:%S")
-            diff = abs(arr_dt.hour * 60 + arr_dt.minute - target_minutes)
-        except Exception:
-            diff = 999_999
-        scored.append((diff, fare if budget == "low" else 0, bus))
 
-    scored.sort(key=lambda x: (x[0], x[1]))
-    pick = dict(scored[0][2])
+    fares = [b.get("fare_discounted") or b.get("fare_original") or 0 for b in buses]
+    valid_fares = [f for f in fares if f > 0]
+    min_fare = min(valid_fares) if valid_fares else 1
+    max_fare = max(valid_fares) if valid_fares else 1
+
+    ratings = [float(b.get("rating") or 0) for b in buses]
+    max_rating = max(ratings) if any(r > 0 for r in ratings) else 1
+
+    def _arrival_score(bus: dict) -> float:
+        s = bus.get("arrival", "")
+        try:
+            arr_dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+            arr_min = arr_dt.hour * 60 + arr_dt.minute
+            ideal = 11 * 60 + 30  # 11:30 AM
+            diff = abs(arr_min - ideal)
+            return max(0.0, 1.0 - diff / 300)  # decays to 0 at 5 h from ideal
+        except Exception:
+            return 0.5
+
+    seats_list = [min(b.get("available_seats") or 0, 10) for b in buses]
+    max_seats = max(seats_list) if any(s > 0 for s in seats_list) else 1
+
+    def _amenities(bus: dict) -> int:
+        items = bus.get("amenities") or bus.get("facilities") or []
+        return len(items) if isinstance(items, list) else 0
+    max_am = max(_amenities(b) for b in buses) or 1
+
+    best_score = -1.0
+    best_bus: dict | None = None
+    for i, bus in enumerate(buses):
+        fare = fares[i]
+        price_score  = (max_fare - fare) / (max_fare - min_fare) if max_fare > min_fare else 1.0
+        rating_score = ratings[i] / max_rating
+        arr_score    = _arrival_score(bus)
+        seats_score  = seats_list[i] / max_seats
+        am_score     = _amenities(bus) / max_am
+
+        total = (
+            0.30 * price_score
+            + 0.25 * rating_score
+            + 0.20 * arr_score
+            + 0.15 * seats_score
+            + 0.10 * am_score
+        )
+        if total > best_score:
+            best_score = total
+            best_bus = bus
+
+    if not best_bus:
+        return None
+    pick = dict(best_bus)
     pick["is_recommended"] = True
     return pick
 
@@ -456,11 +455,12 @@ def _pick_recommended_flight(flights: list[dict], budget: str) -> dict | None:
 
 # ── Main handler ──────────────────────────────────────────────────────────────
 
-async def run_plan_journey(body: PlanJourneyRequest, user_id: str) -> dict:
+async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict | None = None) -> dict:
     db = get_db()
     safe_budget = body.budget if body.budget in ("low", "mid", "high") else "mid"
 
-    profile = await asyncio.get_event_loop().run_in_executor(None, fetch_user_profile, db, user_id)
+    if profile is None:
+        profile = await asyncio.get_event_loop().run_in_executor(None, fetch_user_profile, db, user_id)
     currency_code = (profile.get("currency") or "inr").lower()
     ci = CURRENCY_CONFIG.get(currency_code) or CURRENCY_CONFIG["inr"]
     symbol = ci["symbol"]
@@ -500,19 +500,13 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str) -> dict:
             _enqueue("bus", o, _transport.resolve_bus_city_id, o)
             _enqueue("bus", d, _transport.resolve_bus_city_id, d)
         elif mode in ("train", "railway"):
-            if not sp.get("from_station_code"):
-                _enqueue("train", o, resolve_station_async, o)
-            if not sp.get("to_station_code"):
-                _enqueue("train", d, resolve_station_async, d)
+            # Gemini no longer outputs station codes — always resolve from city name
+            _enqueue("train", o, resolve_station_async, o)
+            _enqueue("train", d, resolve_station_async, d)
         elif mode == "flight":
-            if not sp.get("from_iata"):
-                _enqueue("flight", o, _flights.resolve_iata, o)
-            if not sp.get("to_iata"):
-                _enqueue("flight", d, _flights.resolve_iata, d)
-
-    # Always resolve IATA for overall origin/destination (flight alternatives panel)
-    _enqueue("flight", body.origin,      _flights.resolve_iata, body.origin)
-    _enqueue("flight", body.destination, _flights.resolve_iata, body.destination)
+            # Gemini no longer outputs IATA codes — always resolve from city name
+            _enqueue("flight", o, _flights.resolve_iata, o)
+            _enqueue("flight", d, _flights.resolve_iata, d)
 
     if _resolve_coros:
         _resolve_results = await asyncio.gather(*_resolve_coros, return_exceptions=True)
@@ -524,11 +518,17 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str) -> dict:
         resolved[k] = None if isinstance(v, Exception) else v
 
     # Log pre-resolution results
-    print(f"\n[plan_journey] ── {body.origin} → {body.destination} ──")
-    print(f"  Autocomplete: {len(resolved)} identifiers resolved")
-    for k, v in resolved.items():
-        prefix, city = k.split("|", 1)
-        print(f"    [{prefix}] {city!r} → {v or '✗ not found'}")
+    resolved_lines = "  ".join(
+        f"[{k.split('|')[0]}] {k.split('|')[1]!r} → {v or '✗'}"
+        for k, v in resolved.items()
+    )
+    logger.info(
+        "[journey] %s → %s | resolved %d ids: %s",
+        body.origin, body.destination, len(resolved), resolved_lines,
+    )
+
+    # ── Validate legs against resolved identifiers (anti-hallucination) ───────
+    validate_route(legs, resolved)
 
     # ── Phase 2b: Build search tasks using pre-resolved IDs ───────────────────
     live_meta: list[tuple[int, str]] = []
@@ -552,6 +552,7 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str) -> dict:
                 live_coros.append(with_retry(
                     _transport.search_buses_direct,
                     from_id, to_id, origin_s, dest_s, departure_date, body.travelers,
+                    budget=safe_budget,
                     fallback={"buses": [], "resolved": False},
                 ))
             else:
@@ -562,8 +563,8 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str) -> dict:
                 )
 
         elif mode in ("train", "railway"):
-            from_code = sp.get("from_station_code") or resolved.get(f"train|{origin_s.lower()}")
-            to_code   = sp.get("to_station_code")   or resolved.get(f"train|{dest_s.lower()}")
+            from_code = resolved.get(f"train|{origin_s.lower()}")
+            to_code   = resolved.get(f"train|{dest_s.lower()}")
             # Fall back to cache (populated by phase 2a resolve_station_async)
             if not from_code:
                 from_code = city_to_station_code(origin_s)
@@ -584,8 +585,8 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str) -> dict:
                 leg["live_search_note"] = "No railway station found for this segment"
 
         elif mode == "flight":
-            from_iata = sp.get("from_iata") or resolved.get(f"flight|{origin_s.lower()}")
-            to_iata   = sp.get("to_iata")   or resolved.get(f"flight|{dest_s.lower()}")
+            from_iata = resolved.get(f"flight|{origin_s.lower()}")
+            to_iata   = resolved.get(f"flight|{dest_s.lower()}")
             if from_iata and to_iata:
                 # Persist back so booking URL builder has the codes
                 sp["from_iata"] = from_iata
@@ -605,54 +606,39 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str) -> dict:
                 )
 
     # ── Phase 2c: Flight alternatives + hotels at FINAL destination ───────────
-    fs = route_plan.get("flight_search") or {}
-    flight_from_iata = (
-        fs.get("from_iata")
-        or resolved.get(f"flight|{body.origin.lower()}")
-        or ""
-    )
-    flight_to_iata = (
-        fs.get("to_iata")
-        or resolved.get(f"flight|{body.destination.lower()}")
-        or ""
-    )
-    flight_alt_coro = (
-        _search_flight_alternatives(flight_from_iata, flight_to_iata, departure_date, body.travelers)
-        if departure_date and flight_from_iata and flight_to_iata else None
-    )
-
-    # Train alternatives — always searched for origin→destination regardless of Gemini's mode choice
-    train_alt_coro = (
-        _search_train_alternatives(body.origin, body.destination, departure_date, body.travelers)
-        if departure_date else None
-    )
-
+    # ── Phase 2c: hotel at destination (only extra search beyond per-leg) ────────
     hotel_coro = None
     checkin = checkout = None
-    if departure_date:
+    if body.stay_nights > 0 and departure_date:
         try:
+            from datetime import datetime as _dt
+            import math as _math
             checkin  = (datetime.fromisoformat(departure_date) + timedelta(days=1)).strftime("%Y-%m-%d")
             checkout = (datetime.fromisoformat(departure_date) + timedelta(days=1 + body.stay_nights)).strftime("%Y-%m-%d")
-            hotel_coro = with_retry(
-                _hotels.search, body.destination, checkin, checkout,
-                adults=body.travelers, budget=safe_budget,
-                fallback={"hotels": [], "source": "none"},
-            )
+            ci_dt = _dt.strptime(checkin, "%Y-%m-%d")
+            co_dt = _dt.strptime(checkout, "%Y-%m-%d")
+            if co_dt <= ci_dt:
+                logger.warning("[journey] Hotel skipped: checkout %s <= checkin %s", checkout, checkin)
+                hotel_coro = None
+            elif (co_dt - ci_dt).days > 30:
+                logger.warning("[journey] Hotel skipped: stay > 30 nights (%d)", (co_dt - ci_dt).days)
+                hotel_coro = None
+            else:
+                # Real rooms needed: 2 travelers share 1 room, round up for odd group sizes
+                rooms_needed = max(1, _math.ceil(body.travelers / 2))
+                hotel_coro = with_retry(
+                    _hotels.search, body.destination, checkin, checkout,
+                    adults=body.travelers, rooms=rooms_needed, budget=safe_budget,
+                    fallback={"hotels": [], "source": "none"},
+                )
         except Exception:
             hotel_coro = None
 
-    extra_coros = [c for c in [flight_alt_coro, train_alt_coro, hotel_coro] if c]
+    extra_coros = [hotel_coro] if hotel_coro else []
     all_results = await asyncio.gather(*(live_coros + extra_coros), return_exceptions=True) if (live_coros + extra_coros) else []
 
     transport_results = all_results[: len(live_coros)]
-    extras = list(all_results[len(live_coros):])
-
-    ei = 0
-    flight_alt_result = extras[ei] if flight_alt_coro and ei < len(extras) else None
-    if flight_alt_coro: ei += 1
-    train_alt_result  = extras[ei] if train_alt_coro  and ei < len(extras) else None
-    if train_alt_coro:  ei += 1
-    hotel_result      = extras[ei] if hotel_coro      and ei < len(extras) else None
+    hotel_result      = all_results[len(live_coros)] if hotel_coro and len(all_results) > len(live_coros) else None
 
     # Inject live data into legs + enrich buses with Maps links
     _rec_bus:    dict | None = None
@@ -705,10 +691,7 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str) -> dict:
 
     # ── Recompute cost + duration from live data ──────────────────────────────
     live_costs = _compute_live_costs(legs, hotel_result, body.stay_nights, body.travelers)
-    route_plan["total_estimated_cost"]   = live_costs["total_per_person"]
-    route_plan["cost_per_person"]        = live_costs["total_per_person"]
-    route_plan["cost_for_all_travelers"] = live_costs["total_for_all_travelers"]
-    route_plan["cost_breakdown"]         = live_costs
+    route_plan["cost_breakdown"] = live_costs
 
     live_duration = _compute_live_duration(legs)
     if live_duration:
@@ -718,40 +701,6 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str) -> dict:
     route_plan["legs"] = legs
     route_plan["currency"] = symbol
     route_plan["has_real_data"] = any(leg.get("has_live_data") for leg in legs)
-
-    fa_flights = flight_alt_result if flight_alt_result and not isinstance(flight_alt_result, Exception) else []
-    # Mark recommended in flight alternatives too
-    fa_rec = _pick_recommended_flight(fa_flights, safe_budget)
-    if fa_rec:
-        for f in fa_flights:
-            if f.get("flight_number") == fa_rec.get("flight_number") and f.get("departure_time") == fa_rec.get("departure_time"):
-                f["is_recommended"] = True
-        if not _rec_flight:
-            _rec_flight = fa_rec
-
-    route_plan["flight_alternatives"] = {
-        "from_iata": flight_from_iata,
-        "to_iata": flight_to_iata,
-        "route_note": fs.get("route_note", ""),
-        "flights": fa_flights,
-        "best_pick": fa_rec,
-    }
-
-    if train_alt_result and not isinstance(train_alt_result, Exception):
-        trains_alt = train_alt_result.get("trains") or []
-        if trains_alt:
-            # Mark cheapest train
-            cheapest = min(trains_alt, key=lambda t: t.get("cheapest_fare") or 999_999)
-            cheapest["is_recommended"] = True
-            if not _rec_train:
-                _rec_train = dict(cheapest)
-        route_plan["train_alternatives"] = {
-            "from_station": train_alt_result.get("from_code"),
-            "to_station":   train_alt_result.get("to_code"),
-            "trains": trains_alt,
-            "best_pick": dict(cheapest) if trains_alt else None,
-            "note": "Direct trains — may have long journey time vs flight.",
-        }
 
     _rec_hotel: dict | None = None
     if hotel_result and not isinstance(hotel_result, Exception):
@@ -767,7 +716,7 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str) -> dict:
             "checkin": checkin,
             "checkout": checkout,
             "nights": body.stay_nights,
-            "hotels": ranked[:8],
+            "hotels": ranked[:20],
             "top_pick": _rec_hotel,
         }
 
@@ -779,33 +728,210 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str) -> dict:
         "train": _rec_train,
         "flight": _rec_flight,
         "note": (
-            "Bus picked for ~11 AM arrival (hotel checkin). "
-            "Hotel and transport sorted by your budget tier."
+            "Bus scored by: 30% price, 25% rating, 20% arrival time, "
+            "15% availability, 10% amenities. Hotel sorted by budget tier."
         ),
     }
 
+    # ── Build fastest/cheapest/balanced journey options ───────────────────────
+    route_plan["journey_options"] = _build_journey_options(route_plan, body.travelers)
+
     # Summary log
-    _fa = route_plan.get("flight_alternatives") or {}
-    _ta = route_plan.get("train_alternatives") or {}
     _h  = route_plan.get("destination_hotels")
     live_hits  = sum(1 for leg in legs if leg.get("has_live_data"))
     live_total = sum(1 for leg in legs if leg.get("needs_live_search"))
-    print(
-        f"  Gemini:    ✓ {len(legs)}-leg route | {route_plan.get('total_duration_approx')}\n"
-        f"  Live data: {live_hits}/{live_total} legs resolved"
+    leg_lines = " | ".join(
+        f"Leg{leg.get('leg')}[{leg.get('mode')}] "
+        + (f"✓ {len((leg.get('live_data') or {}).get('buses') or (leg.get('live_data') or {}).get('trains') or (leg.get('live_data') or {}).get('flights') or [])}"
+           if leg.get("has_live_data") else ("✗" if leg.get("needs_live_search") else "n/a"))
+        for leg in legs
     )
-    for leg in legs:
-        ld = leg.get("live_data") or {}
-        count = len(ld.get("buses") or ld.get("trains") or ld.get("flights") or [])
-        needs = leg.get("needs_live_search")
-        status = f"✓ {count}" if leg.get("has_live_data") else ("✗ 0" if needs else "— n/a")
-        note = leg.get("live_search_note", "")
-        print(f"    Leg {leg.get('leg')} [{leg.get('mode')}] {leg.get('from')} → {leg.get('to')}: {status}{' (' + note + ')' if note else ''}")
-    print(
-        f"  Flights:   {len(_fa.get('flights') or [])} alts ({_fa.get('from_iata')} → {_fa.get('to_iata')})\n"
-        f"  Trains:    {len(_ta.get('trains') or [])} alts ({_ta.get('from_station')} → {_ta.get('to_station')})\n"
-        f"  Hotels:    {(_h['source'] + ' | ' + str(len(_h.get('hotels') or [])) + ' @ ' + _h.get('destination','?')) if _h else '✗ none'}\n"
-        f"──────────────────────────────────────────────────────────"
+    hotel_info = f"{_h['source']}|{len(_h.get('hotels') or [])}@{_h.get('destination','?')}" if _h else "none"
+    logger.info(
+        "[journey] %s→%s | %d legs (%s) | live:%d/%d | hotels:%s",
+        body.origin, body.destination, len(legs),
+        route_plan.get("total_duration_approx", "?"),
+        live_hits, live_total, hotel_info,
     )
+    logger.debug("[journey] legs: %s", leg_lines)
 
     return route_plan
+
+
+# ── Journey options: fastest / cheapest / balanced ────────────────────────────
+
+def _fmt_duration(minutes: int) -> str:
+    if minutes >= 999_999:
+        return "Unknown"
+    h, m = divmod(minutes, 60)
+    return f"{h}h {m}m" if m else f"{h}h"
+
+
+def _bus_duration_min(bus: dict) -> int:
+    dep, arr = bus.get("departure"), bus.get("arrival")
+    if dep and arr:
+        try:
+            d = datetime.strptime(dep, "%Y-%m-%d %H:%M:%S")
+            a = datetime.strptime(arr, "%Y-%m-%d %H:%M:%S")
+            if a < d:
+                a += timedelta(days=1)
+            return int((a - d).total_seconds() / 60)
+        except Exception:
+            pass
+    return 999_999
+
+
+def _option_block(c: dict, tag: str, label: str) -> dict:
+    return {
+        "tag": tag,
+        "label": label,
+        "mode": c["mode"],
+        "description": c["description"],
+        "cost_per_person": c["cost_per_person"],
+        "total_cost": c["total_cost"],
+        "duration_min": c["duration_min"],
+        "duration_display": _fmt_duration(c["duration_min"]),
+        "operator": c["operator"],
+        "booking_url": c.get("booking_url"),
+        "from_iata": c.get("from_iata"),
+        "to_iata": c.get("to_iata"),
+        "from_code": c.get("from_code"),
+        "to_code": c.get("to_code"),
+    }
+
+
+def _build_journey_options(journey_result: dict, travelers: int) -> dict:
+    """
+    Produce fastest/cheapest/balanced options from per-leg live data.
+    Only compares modes that Gemini actually planned and that have live data.
+    """
+    bus_items: list[dict] = []
+    train_items: list[dict] = []
+    flight_items: list[dict] = []
+
+    for leg in (journey_result.get("legs") or []):
+        if not leg.get("has_live_data"):
+            continue
+        mode = leg.get("mode", "").lower()
+        ld = leg.get("live_data") or {}
+        if mode == "bus":
+            bus_items.extend(ld.get("buses") or [])
+        elif mode in ("train", "railway"):
+            train_items.extend(ld.get("trains") or [])
+        elif mode == "flight":
+            flight_items.extend(ld.get("flights") or [])
+
+    candidates: list[dict] = []
+
+    if flight_items:
+        f = min(flight_items, key=lambda x: x.get("price_total") or 999_999)
+        candidates.append({
+            "mode": "flight",
+            "cost_per_person": f.get("price_total") or 0,
+            "total_cost": (f.get("price_total") or 0) * travelers,
+            "duration_min": f.get("duration_min") or 999_999,
+            "operator": f.get("airline") or "Flight",
+            "description": f"{f.get('airline', 'Flight')} {f.get('flight_number', '')}".strip(),
+            "booking_url": f.get("booking_url"),
+        })
+
+    if train_items:
+        t = min(train_items, key=lambda x: x.get("cheapest_fare") or 999_999)
+        candidates.append({
+            "mode": "train",
+            "cost_per_person": t.get("cheapest_fare") or 0,
+            "total_cost": (t.get("cheapest_fare") or 0) * travelers,
+            "duration_min": t.get("duration_min") or 999_999,
+            "operator": t.get("train_name") or "Train",
+            "description": f"{t.get('train_name', 'Train')} ({t.get('train_number', '')})".strip(" ()"),
+            "booking_url": None,
+        })
+
+    if bus_items:
+        b = min(bus_items, key=lambda x: x.get("fare_discounted") or x.get("fare_original") or 999_999)
+        candidates.append({
+            "mode": "bus",
+            "cost_per_person": b.get("fare_discounted") or b.get("fare_original") or 0,
+            "total_cost": (b.get("fare_discounted") or b.get("fare_original") or 0) * travelers,
+            "duration_min": _bus_duration_min(b),
+            "operator": b.get("operator") or "Bus",
+            "description": f"{b.get('operator', 'Bus')} — {b.get('bus_type', '')}".strip(" —"),
+            "booking_url": b.get("booking_url"),
+        })
+
+    if not candidates:
+        return {}
+
+    # When only one transport mode has live data, differentiate within that mode's items
+    # so cheapest/fastest/balanced show meaningfully different options.
+    if len(candidates) == 1:
+        sole_mode = candidates[0]["mode"]
+        pool: list[dict] = (
+            bus_items    if sole_mode == "bus"    else
+            train_items  if sole_mode == "train"  else
+            flight_items
+        )
+        if len(pool) >= 2:
+            def _fare(x: dict) -> int:
+                return x.get("fare_discounted") or x.get("fare_original") or x.get("cheapest_fare") or x.get("price_total") or 999_999
+
+            cheapest_item = min(pool, key=_fare)
+            fastest_item  = min(pool, key=lambda x: (
+                _bus_duration_min(x) if sole_mode == "bus" else
+                x.get("duration_min") or 999_999
+            ))
+
+            def _balance_score(x: dict) -> float:
+                f = _fare(x)
+                d = _bus_duration_min(x) if sole_mode == "bus" else x.get("duration_min") or 999_999
+                max_f = max(_fare(i) for i in pool) or 1
+                max_d = max((_bus_duration_min(i) if sole_mode == "bus" else i.get("duration_min") or 999_999) for i in pool) or 1
+                return (1 - f / max_f) * 0.50 + (1 - min(d, 999_998) / max_d) * 0.50
+
+            balanced_item = max(pool, key=_balance_score)
+
+            def _bus_to_candidate(b: dict) -> dict:
+                fare = _fare(b)
+                return {
+                    "mode": sole_mode,
+                    "cost_per_person": fare,
+                    "total_cost": fare * travelers,
+                    "duration_min": (
+                        _bus_duration_min(b) if sole_mode == "bus" else b.get("duration_min") or 999_999
+                    ),
+                    "operator": (
+                        b.get("operator") or b.get("train_name") or b.get("airline") or sole_mode.title()
+                    ),
+                    "description": (
+                        f"{b.get('operator', '')} — {b.get('bus_type', '')}".strip(" —")
+                        if sole_mode == "bus" else
+                        f"{b.get('train_name', '')} ({b.get('train_number', '')})".strip(" ()")
+                        if sole_mode == "train" else
+                        f"{b.get('airline', '')} {b.get('flight_number', '')}".strip()
+                    ),
+                    "booking_url": b.get("booking_url"),
+                }
+
+            return {
+                "cheapest": _option_block(_bus_to_candidate(cheapest_item), "cheapest", "Lowest price option"),
+                "fastest":  _option_block(_bus_to_candidate(fastest_item),  "fastest",  "Shortest travel time"),
+                "balanced": _option_block(_bus_to_candidate(balanced_item), "balanced", "Best mix of time and cost"),
+            }
+
+    cheapest = min(candidates, key=lambda x: x.get("cost_per_person") or 999_999)
+    fastest  = min(candidates, key=lambda x: x.get("duration_min") or 999_999)
+
+    max_cost = max(c["cost_per_person"] for c in candidates) or 1
+    max_dur  = max(c["duration_min"] for c in candidates) or 1
+    for c in candidates:
+        c["_balance"] = (
+            (1 - c["cost_per_person"] / max_cost) * 0.5
+            + (1 - min(c["duration_min"], 999_998) / max_dur) * 0.5
+        )
+    balanced = max(candidates, key=lambda x: x.get("_balance", 0))
+
+    return {
+        "cheapest": _option_block(cheapest, "cheapest", "Best value for money"),
+        "fastest":  _option_block(fastest,  "fastest",  "Saves the most time"),
+        "balanced": _option_block(balanced,  "balanced", "Best mix of time and cost"),
+    }

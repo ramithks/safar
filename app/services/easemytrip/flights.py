@@ -9,10 +9,13 @@ Booking URL format (confirmed):
     &isow=true&isdm=true&lang=en-us&IsDoubleSeat=false&CCODE=IN&curr=INR&apptype=B2C
 """
 import asyncio
+import logging
 import re
 import time
 import urllib.parse
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
+
+logger = logging.getLogger(__name__)
 
 _BASE = "https://flightservice-node.easemytrip.com/AirAvail_Lights/AirBus_New"
 _HEADERS = {
@@ -78,7 +81,7 @@ async def _resolve_iata_city(iata: str) -> tuple[str, str]:
                 _CITY_CACHE[key] = (city_name, country)
                 return city_name, country
     except Exception as e:
-        print(f"[emt_autosuggest] IATA '{iata}': {e}")
+        logger.warning("[emt_autosuggest] IATA %r: %s", iata, e)
 
     # Fallback: use IATA as city name
     fallback = (key, "India")
@@ -196,7 +199,7 @@ async def search_flights(
         flights.sort(key=lambda f: (f.get("price_total") is None, f.get("price_total") or 999_999))
         return flights[:limit]
     except Exception as e:
-        print(f"[emt_flights] {from_airport}→{to_airport} on {depart_date}: {e}")
+        logger.warning("[emt_flights] %s→%s on %s: %s", from_airport, to_airport, depart_date, e)
         return []
 
 

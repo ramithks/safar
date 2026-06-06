@@ -13,11 +13,14 @@ Usage:
     result = await svc.search_all("Delhi", "Manali", "2026-06-15", travelers=2)
 """
 import asyncio
+import logging
 from app.services.bus.redbus import search_city as redbus_search_city, search_buses as redbus_search_buses
 from app.services.bus.flixbus import search_city as flixbus_search_city, search_buses as flixbus_search_buses
 from app.services.flights import FlightService
 from app.services.railway import RailwayService
 from app.core.circuit_breaker import breaker_redbus, breaker_flixbus
+
+logger = logging.getLogger(__name__)
 
 _flights = FlightService()
 _railway = RailwayService()
@@ -44,7 +47,7 @@ class TransportService:
             self.resolve_bus_city_id(destination),
         )
         if not from_id or not to_id:
-            print(f"[buses] {origin!r}→{destination!r} | ✗ city not resolved")
+            logger.warning("[buses] %r→%r | city not resolved", origin, destination)
             return {"buses": [], "from_city_id": from_id, "to_city_id": to_id, "resolved": False}
         return await self.search_buses_direct(from_id, to_id, origin, destination, date, travelers, limit)
 
@@ -57,12 +60,15 @@ class TransportService:
         date: str,
         travelers: int = 1,
         limit: int = 8,
+        budget: str = "mid",
     ) -> dict:
         """Search buses with pre-resolved RedBus city IDs — skips autocomplete."""
+        # Low budget: sort by price to surface cheapest options first
+        bus_sort = "price" if budget == "low" else "departure"
         redbus_buses: list[dict] = []
         result = await breaker_redbus.call(
             redbus_search_buses, from_id, to_id, date, limit=limit,
-            from_city_name=origin, to_city_name=destination, fallback=[],
+            from_city_name=origin, to_city_name=destination, sort=bus_sort, fallback=[],
         )
         redbus_buses = result or []
         redbus_status = f"✓ {len(redbus_buses)}" if redbus_buses else "✗ 0 results"
@@ -76,10 +82,7 @@ class TransportService:
             flixbus_buses = result or []
             flixbus_status = f"✓ {len(flixbus_buses)}" if flixbus_buses else "✗ 0 results"
 
-        print(
-            f"[buses] {origin!r}→{destination!r} ({date}) | "
-            f"RedBus: {redbus_status} | FlixBus: {flixbus_status}"
-        )
+        logger.info("[buses] %r→%r (%s) | RedBus:%s FlixBus:%s", origin, destination, date, redbus_status, flixbus_status)
 
         buses = redbus_buses + [b for b in flixbus_buses if b]
         return {

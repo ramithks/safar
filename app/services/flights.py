@@ -11,6 +11,7 @@ Usage:
     # Pass from_iata/to_iata to skip re-resolution when pre-resolved upstream.
 """
 import asyncio
+import logging
 from app.services.booking.flights import (
     search_flights as booking_search_flights,
     resolve_iata,
@@ -18,6 +19,8 @@ from app.services.booking.flights import (
 )
 from app.services.easemytrip.flights import search_flights as emt_search_flights
 from app.core.circuit_breaker import breaker_booking, breaker_emt
+
+logger = logging.getLogger(__name__)
 
 
 async def _noop(value):
@@ -60,20 +63,28 @@ class FlightService:
                 "to_iata": to_iata, "resolved": False,
             }
 
-        booking_r, emt_r = await asyncio.gather(
-            breaker_booking.call(
-                booking_search_flights, from_iata, to_iata, date,
-                adults=adults, cabin_class=cabin_class, sort=sort, limit=limit,
-                fallback=[],
-            ),
-            breaker_emt.call(
-                emt_search_flights, from_iata, to_iata, date,
-                adults=adults, cabin_class=cabin_class.lower(), limit=limit,
-                nonstop_only=nonstop_only,
-                fallback=[],
-            ),
-            return_exceptions=True,
-        )
+        fetch_limit = min(limit * 3, 50)
+        try:
+            booking_r, emt_r = await asyncio.wait_for(
+                asyncio.gather(
+                    breaker_booking.call(
+                        booking_search_flights, from_iata, to_iata, date,
+                        adults=adults, cabin_class=cabin_class, sort=sort, limit=fetch_limit,
+                        fallback=[],
+                    ),
+                    breaker_emt.call(
+                        emt_search_flights, from_iata, to_iata, date,
+                        adults=adults, cabin_class=cabin_class.lower(), limit=fetch_limit,
+                        nonstop_only=nonstop_only,
+                        fallback=[],
+                    ),
+                    return_exceptions=True,
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[flights] search timeout for %s→%s on %s", from_iata, to_iata, date)
+            booking_r, emt_r = [], []
 
         def _src_status(result) -> tuple[list, str]:
             if isinstance(result, Exception):
@@ -83,10 +94,7 @@ class FlightService:
         booking_flights, booking_status = _src_status(booking_r)
         emt_flights,     emt_status     = _src_status(emt_r)
 
-        print(
-            f"[flights] {from_iata}→{to_iata} ({date}) | "
-            f"Booking: {booking_status} | EaseMyTrip: {emt_status}"
-        )
+        logger.info("[flights] %s→%s (%s) | Booking:%s EMT:%s", from_iata, to_iata, date, booking_status, emt_status)
 
         seen: set[str] = set()
         merged: list[dict] = []
@@ -104,7 +112,7 @@ class FlightService:
         merged.sort(key=lambda f: (f.get("price_total") is None, f.get("price_total") or 999_999))
 
         return {
-            "flights": merged[:limit],
+            "flights": merged,
             "from_iata": from_iata,
             "to_iata": to_iata,
             "resolved": True,

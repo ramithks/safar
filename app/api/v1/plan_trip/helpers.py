@@ -3,11 +3,12 @@ Pure utility functions and constants for trip planning.
 No FastAPI / Supabase dependencies — safe to import anywhere.
 """
 import asyncio
+import logging
 import math
 import random
 from datetime import datetime
 
-from app.config import settings
+logger = logging.getLogger(__name__)
 
 # ── Currency config ────────────────────────────────────────────────────────────
 CURRENCY_CONFIG: dict[str, dict] = {
@@ -23,47 +24,98 @@ CURRENCY_CONFIG: dict[str, dict] = {
 
 
 # ── Deterministic field filling ───────────────────────────────────────────────
-_COST_DEFAULTS: dict[str, dict] = {
-    "usd": {"food": 15,  "attraction": 10,  "nightlife": 40,   "experience": 25,  "hotel": 120},
-    "eur": {"food": 13,  "attraction": 8,   "nightlife": 35,   "experience": 22,  "hotel": 100},
-    "gbp": {"food": 12,  "attraction": 7,   "nightlife": 30,   "experience": 20,  "hotel": 90 },
-    "inr": {"food": 600, "attraction": 300, "nightlife": 1200, "experience": 900, "hotel": 4000},
-    "jpy": {"food": 1500,"attraction": 800, "nightlife": 4000, "experience": 2500,"hotel": 15000},
-    "aud": {"food": 22,  "attraction": 15,  "nightlife": 55,   "experience": 35,  "hotel": 160},
-    "aed": {"food": 55,  "attraction": 30,  "nightlife": 120,  "experience": 80,  "hotel": 400},
-    "sgd": {"food": 20,  "attraction": 12,  "nightlife": 50,   "experience": 30,  "hotel": 150},
-}
 _DURATION_MINS: dict[str, int] = {
     "Museum": 90, "Temple": 45, "Landmark": 60, "Park": 75, "Cafe": 60,
     "Restaurant": 75, "Street Food": 30, "Beach": 120, "Market": 60,
-    "Viewpoint": 30, "Bar": 90, "Rooftop": 60, "Gallery": 75, "Mall": 90,
+    "Viewpoint": 45, "Bar": 90, "Rooftop": 75, "Gallery": 75, "Mall": 90,
+    "Trek": 180, "Waterfall": 60, "Hiking": 150, "Camping": 120,
 }
-_TIME_SLOTS = ["09:00 AM", "11:00 AM", "01:00 PM", "03:30 PM", "06:00 PM", "08:00 PM"]
+
+# Category + best_time → ideal start minute from midnight.
+# best_time is Gemini's field: "Morning" | "Afternoon" | "Evening" | "Anytime"
+_CATEGORY_IDEAL_START: dict[str, dict[str, int]] = {
+    "Viewpoint":   {"Morning": 6*60,    "Afternoon": 14*60, "Evening": 17*60+30, "Anytime": 8*60},
+    "Trek":        {"Morning": 6*60,    "Afternoon": 11*60, "Evening": 6*60,     "Anytime": 7*60},
+    "Hiking":      {"Morning": 6*60,    "Afternoon": 11*60, "Evening": 6*60,     "Anytime": 7*60},
+    "Waterfall":   {"Morning": 8*60,    "Afternoon": 11*60, "Evening": 8*60,     "Anytime": 9*60},
+    "Beach":       {"Morning": 7*60,    "Afternoon": 14*60, "Evening": 17*60,    "Anytime": 9*60},
+    "Park":        {"Morning": 7*60,    "Afternoon": 15*60, "Evening": 17*60,    "Anytime": 9*60},
+    "Temple":      {"Morning": 6*60,    "Afternoon": 11*60, "Evening": 17*60,    "Anytime": 8*60},
+    "Museum":      {"Morning": 10*60,   "Afternoon": 14*60, "Evening": 10*60,    "Anytime": 10*60},
+    "Gallery":     {"Morning": 10*60,   "Afternoon": 14*60, "Evening": 10*60,    "Anytime": 11*60},
+    "Landmark":    {"Morning": 9*60,    "Afternoon": 14*60, "Evening": 16*60,    "Anytime": 10*60},
+    "Cafe":        {"Morning": 8*60,    "Afternoon": 13*60, "Evening": 18*60,    "Anytime": 12*60},
+    "Restaurant":  {"Morning": 8*60,    "Afternoon": 13*60, "Evening": 19*60,    "Anytime": 13*60},
+    "Street Food": {"Morning": 8*60,    "Afternoon": 12*60, "Evening": 18*60,    "Anytime": 12*60},
+    "Market":      {"Morning": 9*60,    "Afternoon": 14*60, "Evening": 17*60,    "Anytime": 10*60},
+    "Mall":        {"Morning": 11*60,   "Afternoon": 14*60, "Evening": 17*60,    "Anytime": 12*60},
+    "Rooftop":     {"Morning": 10*60,   "Afternoon": 16*60, "Evening": 18*60,    "Anytime": 18*60},
+    "Bar":         {"Morning": 20*60,   "Afternoon": 20*60, "Evening": 20*60,    "Anytime": 20*60},
+    "Camping":     {"Morning": 7*60,    "Afternoon": 15*60, "Evening": 18*60,    "Anytime": 10*60},
+}
+
+_DEFAULT_IDEAL_MIN: dict[str, int] = {
+    "Morning": 9*60, "Afternoon": 13*60, "Evening": 17*60, "Anytime": 10*60,
+}
 
 
-def fill_deterministic_fields(days: list[dict], currency: str, budget: str) -> None:
+def _ideal_start_min(act: dict) -> int:
+    cat = act.get("category", "")
+    best = (act.get("best_time") or "Anytime").strip().title()
+    lookup = _CATEGORY_IDEAL_START.get(cat)
+    if lookup:
+        return lookup.get(best) or lookup.get("Anytime") or _DEFAULT_IDEAL_MIN.get(best, 10*60)
+    return _DEFAULT_IDEAL_MIN.get(best, 10*60)
+
+
+VALID_ACTIVITY_TYPES = {"attraction", "food", "experience", "shopping", "nightlife", "transport"}
+
+
+def normalise_activity_type(t: str | None) -> str:
+    if not t:
+        return "attraction"
+    t = t.lower().strip()
+    return t if t in VALID_ACTIVITY_TYPES else "attraction"
+
+
+def fill_deterministic_fields(days: list[dict], currency: str, budget: str) -> None:  # noqa: ARG001
+    """Fill duration_min and type. Time is NOT assigned here — call assign_activity_times() after route sort."""
+    for day in days:
+        for act in (day.get("activities") or []):
+            if not act.get("duration_min"):
+                act["duration_min"] = _DURATION_MINS.get(act.get("category", ""), 60)
+            act["type"] = normalise_activity_type(act.get("type"))
+
+
+def assign_activity_times(days: list[dict]) -> None:
     """
-    Fill time, duration, and estimated_cost deterministically.
-    Gemini no longer outputs these — system controls them.
+    Assign deterministic HH:MM start_time to every activity.
+    Uses category + best_time lookup — viewpoints get dawn/dusk, cafes get lunch, treks get early morning.
+    Sorts activities within each day by ideal time (time-correctness > route order).
+    Must be called AFTER nearest_neighbor_sort.
     """
-    costs = _COST_DEFAULTS.get(currency.lower(), _COST_DEFAULTS["usd"])
-    mult = {"low": 0.6, "mid": 1.0, "high": 2.2}.get(budget, 1.0)
+    BUFFER_MIN = 30
 
     for day in days:
-        slot = 0
-        for act in (day.get("activities") or []):
-            if not act.get("time"):
-                act["time"] = _TIME_SLOTS[min(slot, len(_TIME_SLOTS) - 1)]
-            slot += 1
+        activities = day.get("activities") or []
+        if not activities:
+            continue
 
-            if not act.get("duration"):
-                mins = _DURATION_MINS.get(act.get("category", ""), 60)
-                h, m = divmod(mins, 60)
-                act["duration"] = f"{h}h {m}m" if h and m else (f"{h}h" if h else f"{m} mins")
+        # Sort by ideal start time so schedule flows naturally through the day
+        activities = sorted(activities, key=_ideal_start_min)
 
-            if not act.get("estimated_cost"):
-                base = costs.get(act.get("type", ""), costs["attraction"])
-                act["estimated_cost"] = round(base * mult)
+        prev_end_min = 0
+        for act in activities:
+            ideal = _ideal_start_min(act)
+            start_min = ideal if prev_end_min == 0 else max(ideal, prev_end_min + BUFFER_MIN)
+            start_min = max(start_min, 5 * 60)   # never before 05:00
+            start_min = min(start_min, 22 * 60)  # never after 22:00
+            h, m = divmod(start_min, 60)
+            act["start_time"] = f"{h:02d}:{m:02d}"
+            duration = act.get("duration_min") or _DURATION_MINS.get(act.get("category", ""), 60)
+            prev_end_min = start_min + duration
+
+        day["activities"] = activities
 
 
 # ── Geo helpers ───────────────────────────────────────────────────────────────
@@ -106,11 +158,12 @@ async def with_retry(coro_fn, *args, max_retries: int = 2, base_delay: float = 1
             return await coro_fn(*args, **kwargs)
         except Exception as e:
             if attempt == max_retries:
-                print(f"[retry] {getattr(coro_fn, '__name__', '?')} failed after {max_retries + 1}x: {e}")
+                logger.warning("[retry] %s failed after %dx: %s", getattr(coro_fn, "__name__", "?"), max_retries + 1, e)
                 return fallback
             delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
             await asyncio.sleep(delay)
     return fallback
+
 
 
 # ── Misc ──────────────────────────────────────────────────────────────────────
@@ -148,15 +201,6 @@ def compute_trip_intelligence(itinerary: dict, budget: str, days: int, ceiling_p
     avg_acts = sum(acts_per_day) / max(len(day_plans), 1)
     pace = "Relaxed" if avg_acts <= 2.5 else "Moderate" if avg_acts <= 4.5 else "Packed"
 
-    total_cost = sum(a.get("estimated_cost") or 0 for d in day_plans for a in (d.get("activities") or []))
-    ceiling = (ceiling_per_day.get(budget) or ceiling_per_day.get("mid") or 500) * days
-    # Under budget = 100% (good). Over budget = penalised proportionally.
-    if total_cost <= ceiling:
-        budget_fit = 100
-    else:
-        overshoot = (total_cost - ceiling) / max(ceiling, 1)
-        budget_fit = max(0, round((1 - overshoot) * 100))
-
     total_dist, dist_count = 0.0, 0
     for d in day_plans:
         acts = [a for a in (d.get("activities") or []) if a.get("lat") and a.get("lng")]
@@ -165,6 +209,14 @@ def compute_trip_intelligence(itinerary: dict, budget: str, days: int, ceiling_p
             dist_count += 1
     avg_walking = round(total_dist / max(dist_count, 1) * 10) / 10
     travel_eff = max(0, min(100, round(100 - (avg_walking - 1) * 10)))
+    if travel_eff >= 90:
+        eff_reason = "Activities clustered in the same neighborhood — minimal transit"
+    elif travel_eff >= 70:
+        eff_reason = "Activities spread across 2–3 nearby areas — light commuting"
+    elif travel_eff >= 50:
+        eff_reason = "Activities span multiple neighborhoods — plan for transit time"
+    else:
+        eff_reason = "Activities are spread across the city — expect significant travel between spots"
 
     cat_counts: dict[str, int] = {}
     for d in day_plans:
@@ -180,11 +232,10 @@ def compute_trip_intelligence(itinerary: dict, budget: str, days: int, ceiling_p
     }
     return {
         "pace": pace,
-        "budget_fit_score": budget_fit,
         "travel_efficiency_score": travel_eff,
+        "travel_efficiency_reason": eff_reason,
         "avg_walking_distance_km": avg_walking,
         "top_category": top_cat,
-        "total_estimated_cost": total_cost,
         "ai_summary": summary_map.get(pace, "A perfectly curated journey awaits"),
     }
 
@@ -192,10 +243,12 @@ def compute_trip_intelligence(itinerary: dict, budget: str, days: int, ceiling_p
 def rank_hotels(hotels: list[dict]) -> list[dict]:
     def _score(h: dict) -> float:
         review = float(h.get("review_score") or h.get("ta_rating") or h.get("star_rating") or 0)
-        price = float(h.get("price_per_night") or h.get("estimated_price_per_night") or 0)
+        price = float(h.get("price_per_night") or 0)
         price_eff = min(1.0, 10000 / price) if price > 0 else 0.5
         return review * 0.6 + price_eff * 10 * 0.4
     return sorted(hotels, key=_score, reverse=True)
+
+
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -210,40 +263,9 @@ def fetch_user_profile(db, user_id: str) -> dict:
 def fetch_memory_context(db, user_id: str, destination: str | None) -> str:
     try:
         trips_r = db.table("trips").select("destination").eq("user_id", user_id).order("created_at", desc=True).limit(5).execute()
-        graph_r = db.table("user_preference_graph").select("*").eq("user_id", user_id).maybe_single().execute()
         past = list({t["destination"] for t in (trips_r.data or []) if t.get("destination")})[:3]
-        graph = graph_r.data
-        if not graph and not past:
+        if not past:
             return ""
-        parts = []
-        if past:
-            parts.append(f"Previously visited: {', '.join(past)}")
-        if graph:
-            vw = graph.get("vibe_weights") or {}
-            top_vibe = max(vw, key=lambda k: vw[k]) if vw else "balanced"
-            parts.append(f"Dominant travel vibe: {top_vibe}")
-            if graph.get("budget_behavior"):
-                parts.append(f"Budget behavior: {graph['budget_behavior']}")
-            if graph.get("pace_preference"):
-                parts.append(f"Pace preference: {graph['pace_preference']}")
-            fp = graph.get("food_preference") or {}
-            top_food = sorted(fp, key=lambda k: -fp[k])[:2]
-            if top_food:
-                parts.append(f"Prefers: {' and '.join(top_food)} food experiences")
-            if destination and graph.get("destination_affinity", {}).get(destination):
-                parts.append(f"Affinity for {destination}: {graph['destination_affinity'][destination]}/100")
-        return f"\n\nUSER MEMORY & PREFERENCES:\n{'. '.join(parts)}.\nPersonalize accordingly."
+        return f"\n\nUSER MEMORY & PREFERENCES:\nPreviously visited: {', '.join(past)}.\nPersonalize accordingly."
     except Exception:
         return ""
-
-
-def pick_city_id(cities: list[dict]) -> int | None:
-    if not cities:
-        return None
-    for c in cities:
-        if c.get("type") == "CITY":
-            return c["id"]
-    for c in cities:
-        if c.get("type") == "AREA":
-            return c["id"]
-    return cities[0]["id"] if cities else None

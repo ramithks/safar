@@ -7,24 +7,33 @@ IATA resolution: EaseMyTrip autosuggest API.
   Response City field format: "New Delhi(DEL)" → extract 3-letter code.
 No hardcoded values — cache populated on first lookup.
 """
+import logging
 import re as _re
 import httpx
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+)
+
 _BASE       = "https://flights.booking.com/api/flights/"
 _EMT_AUTOSUGGEST = "https://www.easemytrip.com/api/Flight/GetAutoSuggestNew"
 
-_HEADERS = {
-    "accept": "*/*",
-    "user-agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
-    ),
-    "x-booking-affiliate-id": "304142",
-    "x-flights-context-name": "search_results",
-    "x-flights-context-pos": "in",
-    "x-requested-from": "clientFetch",
-}
+
+def _build_headers() -> dict:
+    return {
+        "accept": "*/*",
+        "user-agent": _UA,
+        "x-booking-affiliate-id": settings.booking_affiliate_id,
+        "x-flights-context-name": "search_results",
+        "x-flights-context-pos": "in",
+        "x-requested-from": "clientFetch",
+    }
 
 # In-memory cache populated by API calls only — no hardcoded values
 _IATA_CACHE: dict[str, str] = {}
@@ -49,7 +58,7 @@ async def resolve_iata(city: str) -> str | None:
                     "content-type": "application/json; charset=UTF-8",
                     "origin": "https://www.easemytrip.com",
                     "referer": "https://www.easemytrip.com/",
-                    "user-agent": _HEADERS["user-agent"],
+                    "user-agent": _UA,
                     "x-requested-with": "XMLHttpRequest",
                 },
                 json={"Prefix": city},
@@ -65,7 +74,7 @@ async def resolve_iata(city: str) -> str | None:
                 # Prefer Indian airports; fall back to any
                 if country in ("india", "in"):
                     _IATA_CACHE[key] = code
-                    print(f"[flights] IATA '{city}' → {code}")
+                    logger.info("[flights] IATA '%s' → %s", city, code)
                     return code
         # Second pass: accept any country
         for item in items:
@@ -74,10 +83,10 @@ async def resolve_iata(city: str) -> str | None:
             if m:
                 code = m.group(1)
                 _IATA_CACHE[key] = code
-                print(f"[flights] IATA '{city}' → {code}")
+                logger.info("[flights] IATA '%s' → %s", city, code)
                 return code
     except Exception as e:
-        print(f"[flights] IATA autocomplete '{city}': {e}")
+        logger.warning("[flights] IATA autocomplete '%s': %s", city, e)
 
     _IATA_CACHE[key] = None
     return None
@@ -102,7 +111,7 @@ async def search_flights(
         async with CurlAsyncSession(impersonate="chrome") as s:
             r = await s.get(
                 _BASE,
-                headers=_HEADERS,
+                headers=_build_headers(),
                 params={
                     "type": "ONEWAY",
                     "adults": adults,
@@ -113,7 +122,7 @@ async def search_flights(
                     "depart": depart_date,
                     "sort": sort,
                     "travelPurpose": "leisure",
-                    "aid": "304142",
+                    "aid": settings.booking_affiliate_id,
                     "enableVI": "1",
                 },
                 timeout=20,
@@ -122,7 +131,7 @@ async def search_flights(
         offers = r.json().get("flightOffers") or []
         return [_normalise_offer(o, depart_date, adults) for o in offers[:limit]]
     except Exception as e:
-        print(f"[flights_booking] {from_airport}→{to_airport} on {depart_date}: {e}")
+        logger.warning("[flights_booking] %s→%s on %s: %s", from_airport, to_airport, depart_date, e)
         return []
 
 
@@ -151,7 +160,7 @@ def _normalise_offer(offer: dict, depart_date: str = "", adults: int = 1) -> dic
             f"https://flights.booking.com/flights/{from_ap}.AIRPORT-{to_ap}.AIRPORT/{token}/"
             f"?type=ONEWAY&adults={adults}&cabinClass=ECONOMY&children="
             f"&from={from_ap}.AIRPORT&to={to_ap}.AIRPORT"
-            f"&depart={depart_date}&sort=BEST&travelPurpose=leisure&aid=304142"
+            f"&depart={depart_date}&sort=BEST&travelPurpose=leisure&aid={settings.booking_affiliate_id}"
         )
 
     return {

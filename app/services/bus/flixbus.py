@@ -8,8 +8,11 @@ Endpoints:
 FlixBus operates in Europe and select markets. Indian routes may return no results
 depending on FlixBus's current coverage in India.
 """
+import logging
 from datetime import datetime
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
+
+logger = logging.getLogger(__name__)
 
 _AUTOCOMPLETE_URL = "https://global.api.flixbus.com/search/autocomplete/cities"
 _SEARCH_URL = "https://global.api.flixbus.com/search/service/v4/search"
@@ -76,7 +79,7 @@ async def search_city(name: str, country: str = "in") -> list[dict]:
             if c.get("id") or c.get("city_id")
         ]
     except Exception as e:
-        print(f"[flixbus] city search '{name}': {e}")
+        logger.warning("[flixbus] city search %r: %s", name, e)
         return []
 
 
@@ -95,7 +98,7 @@ async def search_buses(
     try:
         dep_date = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
     except ValueError as e:
-        print(f"[flixbus] bad date: {e}")
+        logger.warning("[flixbus] bad date: %s", e)
         return []
 
     try:
@@ -123,10 +126,10 @@ async def search_buses(
         trips = data.get("trips") or []
         results = [_normalise(t) for t in trips[:limit] if t.get("status") == "available"]
         if results:
-            print(f"[flixbus] {from_city_id}→{to_city_id}: {len(results)} buses found")
+            logger.debug("[flixbus] %s→%s: %d buses found", from_city_id, to_city_id, len(results))
         return results
     except Exception as e:
-        print(f"[flixbus] bus search {from_city_id}→{to_city_id} on {date}: {e}")
+        logger.warning("[flixbus] bus search %s→%s on %s: %s", from_city_id, to_city_id, date, e)
         return []
 
 

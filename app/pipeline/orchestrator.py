@@ -5,6 +5,7 @@ tracks progress, and emits SSE events.
 import asyncio
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -21,7 +22,6 @@ from app.models.response import (
 from app.pipeline.deduplicator import deduplicate_frames
 from app.pipeline.downloader import DownloadError, download_video_async
 from app.pipeline.frame_extractor import extract_frames, get_video_metadata
-from app.pipeline.places_client import EnrichmentResult
 from app.pipeline.scene_detector import detect_scenes
 from app.pipeline.vision_client import VisionResult, analyze_frames, parse_caption
 
@@ -32,7 +32,6 @@ PIPELINE_STAGES = [
     "frame_extraction",
     "scene_detection",
     "vision_analysis",
-    "places_enrichment",
 ]
 
 
@@ -165,13 +164,12 @@ async def run_pipeline(
             None, extract_frames, video_path, scenes, frames_dir
         )
 
+        # Cap candidates before dedup so we don't dedup the entire video worth of frames
+        candidates = raw_frames[: settings.max_unique_frames * 3]
         unique_frames = await asyncio.get_event_loop().run_in_executor(
-            None, deduplicate_frames, raw_frames
+            None, deduplicate_frames, candidates
         )
-
-        # Cap to max_unique_frames
-        if len(unique_frames) > settings.max_unique_frames:
-            unique_frames = unique_frames[:settings.max_unique_frames]
+        unique_frames = unique_frames[: settings.max_unique_frames]
 
         # ── Upload frames to GCS ─────────────────────────────────────────────────
         if settings.gcs_bucket_name:
@@ -241,13 +239,8 @@ async def run_pipeline(
                 metadata,
             )
 
-        # ── Stage 5: Places Enrichment (skipped — Gemini data is sufficient) ────
-        enriched_pairs: list[tuple[VisionResult, EnrichmentResult]] = [
-            (vr, EnrichmentResult(primary=None)) for vr in confident_results
-        ]
-
         # ── Assemble timeline ────────────────────────────────────────────────────
-        timeline = _build_timeline(enriched_pairs, ctx, frame_gcs_urls)
+        timeline = _build_timeline(confident_results, ctx, frame_gcs_urls)
 
         # Cap to max_locations
         timeline = timeline[:ctx.max_locations]
@@ -317,18 +310,20 @@ async def run_pipeline(
         _cleanup(work_dir)
 
 
+_NORMALIZE_RE = re.compile(r"[^\w\s]")
+
+
 def _normalize_name(name: str) -> str:
     """Lowercase + strip punctuation for place name dedup comparison."""
-    import re
-    return re.sub(r"[^\w\s]", "", name.lower()).strip()
+    return _NORMALIZE_RE.sub("", name.lower()).strip()
 
 
 def _build_timeline(
-    enriched_pairs: list[tuple[VisionResult, EnrichmentResult]],
+    vision_results: list[VisionResult],
     ctx: PipelineContext,
     frame_gcs_urls: Optional[dict[str, str]] = None,
 ) -> list[LocationSegment]:
-    """Convert enriched vision results into a deduplicated, ordered timeline.
+    """Convert vision results into a deduplicated, ordered timeline.
 
     Dedup strategy: normalize place name (lowercase, no punctuation).
     If the same place appears in multiple frames, merge into one segment
@@ -342,11 +337,10 @@ def _build_timeline(
     seen_names: dict[str, int] = {}
     timeline: list[LocationSegment] = []
 
-    for vr, enrichment in enriched_pairs:
-        place = enrichment.primary
+    for vr in vision_results:
+        place = None
 
-        # Build PlaceDetail from Gemini fields when Places API is not used
-        if not place and vr.landmark_name:
+        if vr.landmark_name:
             place = PlaceDetail(
                 place_id=f"gemini_{vr.frame.scene_index}",
                 name=vr.landmark_name,
@@ -410,7 +404,7 @@ def _build_timeline(
             frame_thumbnail_url=gcs_url,
             place=place,
             maps_search_url=vr.maps_search_url,
-            nearby_suggestions=enrichment.suggestions,
+            nearby_suggestions=[],
             vision_context=VisionContext(
                 scene_description=vr.scene_description,
                 visual_cues=vr.visual_cues,

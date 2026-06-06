@@ -11,8 +11,11 @@ Optimisations:
 """
 import asyncio
 import json
+import logging
 import random
 import time
+
+logger = logging.getLogger(__name__)
 import httpx
 from functools import lru_cache
 from google.oauth2 import service_account
@@ -133,7 +136,7 @@ async def vertex_generate(
             base = float(retry_after) if retry_after else base_delay * (2 ** attempt)
             jitter = random.uniform(0, base * 0.3)   # ±30% jitter to spread retries
             delay = min(base + jitter, 120.0)         # cap at 2 minutes
-            print(f"[vertex] {r.status_code} rate limit — retry {attempt + 1}/{max_attempts - 1} in {delay:.1f}s")
+            logger.warning("[vertex] %s rate limit — retry %d/%d in %.1fs", r.status_code, attempt + 1, max_attempts - 1, delay)
             await asyncio.sleep(delay)
             continue
         r.raise_for_status()

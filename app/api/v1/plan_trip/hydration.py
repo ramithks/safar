@@ -9,18 +9,16 @@ Strategy (3 tiers):
 Result: ~80% fewer Places API calls vs the old per-activity approach.
 """
 import asyncio
+import logging
 from difflib import SequenceMatcher
 
 from app.services.places import search_places, get_place_details
-from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _sim(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
-
-
-def _maps_key() -> str:
-    return settings.google_maps_api_key or ""
 
 
 # ── Apply helpers ─────────────────────────────────────────────────────────────
@@ -36,7 +34,6 @@ def _apply(act: dict, place: dict) -> None:
     pid = place.get("place_id") or act.get("place_id")
     lat = geo.get("lat")
     lng = geo.get("lng")
-    key = _maps_key()
 
     act["place_id"]  = pid
     act["lat"]       = lat
@@ -50,11 +47,7 @@ def _apply(act: dict, place: dict) -> None:
         f"https://www.google.com/maps/place/?q=place_id:{pid}" if pid
         else (f"https://maps.google.com/?q={lat},{lng}" if lat and lng else None)
     )
-    act["photo_url"] = (
-        f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=800"
-        f"&photo_reference={photo_ref}&key={key}"
-        if photo_ref and key else None
-    )
+    act["photo_url"] = f"/api/v1/images/{photo_ref}" if photo_ref else None
     act.setdefault("opening_hours", [])
     act.setdefault("open_now", None)
     act.setdefault("website", None)
@@ -84,7 +77,7 @@ async def _hydrate_day_batch(day: dict, destination: str) -> None:
             seen = {c["place_id"] for c in candidates}
             candidates += [c for c in extra if c["place_id"] not in seen]
     except Exception as e:
-        print(f"[hydration] day {day.get('day')} batch failed: {e}")
+        logger.warning("[hydration] day %s batch failed: %s", day.get("day"), e)
         candidates = []
 
     for act in (day.get("activities") or []):
@@ -140,6 +133,6 @@ async def batch_hydrate_days(days: list[dict], destination: str, place_lookup: d
                 tier1_count += 1
 
     tier2_days = [d for d in days if any(not a.get("lat") for a in (d.get("activities") or []))]
-    print(f"[hydration] Tier1 free hits: {tier1_count} | Tier2 batch days: {len(tier2_days)}")
+    logger.debug("[hydration] Tier1 free hits: %d | Tier2 batch days: %d", tier1_count, len(tier2_days))
 
     await asyncio.gather(*[_hydrate_day_batch(d, destination) for d in tier2_days])

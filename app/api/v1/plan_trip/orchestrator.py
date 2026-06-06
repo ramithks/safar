@@ -2,10 +2,13 @@
 plan_trip orchestration — all business logic, no HTTP/SSE concerns.
 
 run_plan_trip() returns the full itinerary dict.
-Callers (endpoint.py for JSON, stream.py for SSE) call this and handle delivery.
+Caller: endpoint.py (POST /plan-trip).
 """
 import asyncio
+import logging
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 from fastapi import HTTPException
 
@@ -21,11 +24,16 @@ from .helpers import (
     fetch_user_profile,
     fetch_memory_context,
     fill_deterministic_fields,
+    assign_activity_times,
     nearest_neighbor_sort,
     compute_trip_intelligence,
     with_retry,
 )
 from .hydration import batch_hydrate_days
+from .validation import (
+    annotate_confidence, filter_low_confidence,
+    trip_health_check, auto_fix_trip,
+)
 
 # ── Gemini prompt ─────────────────────────────────────────────────────────────
 # Gemini outputs ONLY narrative fields. System fills time/duration/cost.
@@ -55,6 +63,12 @@ RULES:
 - must_try: actual dish/drink name for food activities, else null.
 - Do NOT output: time, estimated_cost, duration, lat, lng, address, rating.
   The system fills these automatically.
+- best_time must be precise — the system uses it to assign visit times:
+  "Morning" = before noon | "Afternoon" = noon–5 PM | "Evening" = after 5 PM | "Anytime" = flexible.
+  Sunset viewpoints MUST be "Evening". Dawn/sunrise viewpoints MUST be "Morning". Treks MUST be "Morning".
+- Category diversity: spread across Nature (Viewpoint/Trek/Waterfall/Beach/Park), Culture (Museum/Temple/Landmark/Gallery), Food (Cafe/Restaurant/Street Food), Nightlife (Bar/Rooftop). NEVER use the same category more than twice across the whole trip.
+- No revisit days. Every day must have genuinely different experiences. Day {days} should feel as fresh as Day 1.
+- If it is a hill/village destination, do NOT suggest clubs, nightclubs, or urban nightlife. Use local cafes and stargazing instead.
 
 Return ONLY valid JSON (no markdown):
 {{
@@ -71,7 +85,7 @@ Return ONLY valid JSON (no markdown):
         {{
           "title": "exact place name",
           "type": "attraction|food|nightlife|experience",
-          "category": "Cafe|Museum|Landmark|Park|Street Food|Viewpoint|Beach|Bar|Temple|Market|Restaurant",
+          "category": "Cafe|Museum|Landmark|Park|Street Food|Viewpoint|Beach|Bar|Temple|Market|Restaurant|Rooftop|Gallery|Trek|Waterfall|Camping",
           "source": "google_places|ai_suggested",
           "place_id": "string or null",
           "best_time": "Morning|Afternoon|Evening|Anytime",
@@ -85,22 +99,28 @@ Return ONLY valid JSON (no markdown):
 }}"""
 
 
-async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace | None = None) -> dict:
+async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace | None = None, profile: dict | None = None) -> dict:
     db = get_db()
     safe_budget = body.budget if body.budget in ("low", "mid", "high") else "mid"
     date_ctx = build_date_context(body.start_date, body.end_date, body.destination)
 
     # ── Phase 1: profile + places + memory (parallel) ─────────────────────────
     async with (trace.track("phase1_parallel") if trace else _noop()):
-        (profile,), (candidates, memory_ctx) = await asyncio.gather(
-            asyncio.gather(
-                asyncio.get_event_loop().run_in_executor(None, fetch_user_profile, db, user_id),
-            ),
-            asyncio.gather(
+        if profile is None:
+            (profile,), (candidates, memory_ctx) = await asyncio.gather(
+                asyncio.gather(
+                    asyncio.get_event_loop().run_in_executor(None, fetch_user_profile, db, user_id),
+                ),
+                asyncio.gather(
+                    with_retry(discover_places, body.destination, fallback={}),
+                    asyncio.get_event_loop().run_in_executor(None, fetch_memory_context, db, user_id, body.destination),
+                ),
+            )
+        else:
+            candidates, memory_ctx = await asyncio.gather(
                 with_retry(discover_places, body.destination, fallback={}),
                 asyncio.get_event_loop().run_in_executor(None, fetch_memory_context, db, user_id, body.destination),
-            ),
-        )
+            )
 
     currency_code = (profile.get("currency") or "usd").lower()
     ci = CURRENCY_CONFIG.get(currency_code) or CURRENCY_CONFIG["usd"]
@@ -136,6 +156,7 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
         result = {
             "trip_name": f"{body.days} Days in {body.destination}",
             "destination": body.destination,
+            "cover_photo_ref": dest_photo_ref,
             "currency": symbol,
             "days": [],
             "include_itinerary": False,
@@ -165,9 +186,7 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
         raise HTTPException(502, "AI trip generation failed after retries")
     ai_json = extract_json(raw)
 
-    ai_json["destination_photo_ref"] = dest_photo_ref
-    if dest_photo_ref:
-        ai_json["image"] = dest_photo_ref
+    ai_json["cover_photo_ref"] = dest_photo_ref
 
     # ── Phase 4: fill deterministic fields BEFORE hydration ───────────────────
     fill_deterministic_fields(ai_json.get("days") or [], currency_code, safe_budget)
@@ -176,10 +195,29 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
     async with (trace.track("phase5_enrichment") if trace else _noop()):
         await batch_hydrate_days(ai_json.get("days") or [], body.destination, place_lookup)
 
+    # ── Confidence scoring ────────────────────────────────────────────────────
+    days = ai_json.get("days") or []
+    annotate_confidence(days)
+    dropped = filter_low_confidence(days)
+    if dropped:
+        logger.debug("[plan_trip] Dropped %d low-confidence activities: %s", len(dropped), dropped)
+
+    # ── Trip health check + auto-fix ─────────────────────────────────────────
+    health = trip_health_check(days)
+    fixed  = auto_fix_trip(days)
+    ai_json["trip_quality"] = {**health, "auto_fixed": fixed}
+    if health["issues"]:
+        logger.debug("[plan_trip] Health issues fixed: %s", health["issues"])
+
     # ── Route optimisation per day ─────────────────────────────────────────────
-    for day in (ai_json.get("days") or []):
+    for day in days:
         if day.get("activities") and len(day["activities"]) >= 2:
             day["activities"] = nearest_neighbor_sort(day["activities"])
+
+    # ── Deterministic time assignment — must run AFTER route sort ─────────────
+    # Sorts activities by category+best_time window: viewpoints at dawn/dusk,
+    # cafes at lunch, treks at early morning. Time-correctness > route order.
+    assign_activity_times(days)
 
     ai_json["currency"] = symbol
     ai_json["trip_intelligence"] = compute_trip_intelligence(ai_json, safe_budget, body.days, ci["ceiling"])
@@ -187,14 +225,13 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
     # ── Summary log ───────────────────────────────────────────────────────────
     _ti = ai_json.get("trip_intelligence") or {}
     acts_total = sum(len(d.get("activities") or []) for d in (ai_json.get("days") or []))
-    print(
-        f"\n[plan_trip] ── {body.destination} ({body.days}d, {safe_budget}) ──\n"
-        f"  Gemini:     ✓ {acts_total} activities across {body.days} days\n"
-        f"  Pace: {_ti.get('pace')} | Budget fit: {_ti.get('budget_fit_score')}%\n"
-        f"──────────────────────────────────────────────────────────────────"
+    logger.info(
+        "[plan_trip] %s (%dd, %s) | %d activities | Pace: %s | Efficiency: %s%%",
+        body.destination, body.days, safe_budget,
+        acts_total, _ti.get("pace"), _ti.get("travel_efficiency_score"),
     )
     if trace:
-        print(trace.summary())
+        logger.debug(trace.summary())
 
     # ── Phase 6: DB writes (fire-and-forget) ──────────────────────────────────
     asyncio.create_task(_db_writes(db, user_id, body, ai_json))
@@ -206,29 +243,17 @@ async def _db_writes(db, user_id: str, body: PlanTripRequest, itinerary: dict) -
     try:
         trip_start = datetime.fromisoformat(body.start_date) if body.start_date else datetime.now()
         trip_end = datetime.fromisoformat(body.end_date) if body.end_date else trip_start + timedelta(days=body.days)
-        await asyncio.gather(
-            asyncio.get_event_loop().run_in_executor(None, lambda: (
-                db.table("user_searches").insert({
-                    "user_id": user_id,
-                    "destination": body.destination,
-                    "days": body.days,
-                    "num_travelers": body.travelers,
-                    "budget": body.budget,
-                    "interests": body.interests,
-                    "search_params": body.model_dump(),
-                }).execute()
-            )),
-            asyncio.get_event_loop().run_in_executor(None, lambda: (
+        if not body.skip_user_trips:
+            await asyncio.get_event_loop().run_in_executor(None, lambda: (
                 db.table("internal_trip_logs").insert({
                     "user_id": user_id,
                     "destination": body.destination,
                     "days": body.days,
                     "itinerary_data": itinerary,
                 }).execute()
-            )) if not body.skip_user_trips else asyncio.sleep(0),
-        )
+            ))
     except Exception as e:
-        print(f"[plan_trip] DB write error (non-fatal): {e}")
+        logger.warning("[plan_trip] DB write error (non-fatal): %s", e)
 
 
 from contextlib import asynccontextmanager

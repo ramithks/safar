@@ -4,17 +4,18 @@ Hotel aggregator service — parallel multi-source search.
 Sources searched simultaneously:
   1. EaseMyTrip  — best for Indian domestic inventory, real prices
   2. Booking.com — widest global inventory, live prices
-  3. Expedia     — offbeat/rural destinations
 
 Results are filtered to hotels within max_distance_km of the destination,
 deduplicated by name, and sorted richest-first (booking_url + price + photos).
 """
 import asyncio
+import logging
 import urllib.parse
 from app.services.easemytrip.hotels import search_hotels as emt_search_hotels
+
+logger = logging.getLogger(__name__)
 from app.services.booking.hotels import search_hotels as booking_search_hotels
-from app.services.expedia.hotels import search_hotels as expedia_search_hotels
-from app.core.circuit_breaker import breaker_emt, breaker_booking, breaker_expedia
+from app.core.circuit_breaker import breaker_emt, breaker_booking
 
 _BUDGET_SORT_EMT = {
     "low":  "Price|ASC",
@@ -26,21 +27,28 @@ _BUDGET_SORT_BOOKING = {
     "mid":  None,
     "high": "class",
 }
-_BUDGET_SORT_EXPEDIA = {
-    "low":  "PRICE_LOW_TO_HIGH",
-    "mid":  "RECOMMENDED",
-    "high": "REVIEW_RELEVANT",
-}
 _BUDGET_QUERY = {
     "low":  "budget affordable hotels homestay",
     "mid":  "mid-range 3-star hotels",
     "high": "luxury 5-star hotels resort",
 }
 
+# Per-night price thresholds for soft budget filtering, by currency
+_BUDGET_PRICE_RANGE: dict[str, dict[str, tuple[int, int]]] = {
+    "inr": {"low": (0, 2500),   "mid": (1000, 10000),  "high": (5000, 999_999)},
+    "usd": {"low": (0, 60),     "mid": (40,   200),    "high": (120,  999_999)},
+    "eur": {"low": (0, 55),     "mid": (35,   180),    "high": (100,  999_999)},
+    "gbp": {"low": (0, 50),     "mid": (30,   160),    "high": (90,   999_999)},
+    "jpy": {"low": (0, 8000),   "mid": (5000, 25000),  "high": (15000,999_999)},
+    "aud": {"low": (0, 90),     "mid": (60,   250),    "high": (150,  999_999)},
+    "aed": {"low": (0, 220),    "mid": (120,  600),    "high": (350,  999_999)},
+    "sgd": {"low": (0, 80),     "mid": (50,   220),    "high": (120,  999_999)},
+}
+
 
 class HotelService:
     """
-    Unified hotel search: EaseMyTrip + Booking.com + Expedia in parallel.
+    Unified hotel search: EaseMyTrip + Booking.com in parallel.
     Merges, deduplicates, and returns the richest combined list.
     """
 
@@ -55,6 +63,7 @@ class HotelService:
         budget: str = "mid",
         limit: int = 10,
         max_distance_km: float = 20.0,
+        currency_code: str = "inr",
     ) -> dict:
         from datetime import datetime
         try:
@@ -62,13 +71,11 @@ class HotelService:
         except Exception:
             nights = 1
 
-        emt_sort     = _BUDGET_SORT_EMT.get(budget, "Popular|DESC")
-        bkg_sort     = _BUDGET_SORT_BOOKING.get(budget)
-        exp_sort     = _BUDGET_SORT_EXPEDIA.get(budget, "RECOMMENDED")
-        per_src      = max(6, limit)   # fetch slightly more per source so dedup has room
+        emt_sort = _BUDGET_SORT_EMT.get(budget, "Popular|DESC")
+        bkg_sort = _BUDGET_SORT_BOOKING.get(budget)
+        per_src  = max(limit * 2, 20)
 
-        # Search all three sources simultaneously (circuit-breaker-wrapped)
-        emt_r, booking_r, expedia_r = await asyncio.gather(
+        emt_r, booking_r = await asyncio.gather(
             breaker_emt.call(
                 emt_search_hotels, destination, checkin, checkout,
                 rooms=rooms, adults=adults, children=children,
@@ -79,10 +86,6 @@ class HotelService:
                 rooms=rooms, adults=adults, children=children,
                 sort=bkg_sort, limit=per_src, fallback=[],
             ),
-            breaker_expedia.call(
-                expedia_search_hotels, destination, checkin, checkout,
-                rooms=rooms, adults=adults, limit=per_src, sort=exp_sort, fallback=[],
-            ),
             return_exceptions=True,
         )
 
@@ -91,31 +94,26 @@ class HotelService:
 
         def _src_status(result, name: str) -> str:
             if isinstance(result, Exception):
-                return f"✗ {str(result)[:120]}"
-            if result:
-                budget_filtered = _filter_by_budget(result, budget)
-                nearby = _filter_by_distance(budget_filtered, max_distance_km)
-                all_hotels.extend(nearby)
-                sources.append(name)
-                return f"✓ {len(nearby)} results"
-            return "✗ 0 results"
+                return f"✗ error"
+            if not result:
+                return "✗ 0"
+            raw = len(result)
+            budget_filtered = _filter_by_budget(result, budget, currency_code)
+            nearby = _filter_by_distance(budget_filtered, max_distance_km)
+            all_hotels.extend(nearby)
+            sources.append(name)
+            return f"✓ {len(nearby)}/{raw}"
 
-        emt_status     = _src_status(emt_r,     "easemytrip")
-        booking_status = _src_status(booking_r,  "booking")
-        expedia_status = _src_status(expedia_r,  "expedia")
+        emt_status     = _src_status(emt_r,    "easemytrip")
+        booking_status = _src_status(booking_r, "booking")
 
-        print(
-            f"[hotels] {destination!r} | "
-            f"EaseMyTrip: {emt_status} | "
-            f"Booking: {booking_status} | "
-            f"Expedia: {expedia_status}"
-        )
+        logger.info("[hotels] %r | EaseMyTrip: %s | Booking: %s", destination, emt_status, booking_status)
 
         if not all_hotels:
             return {"hotels": [], "source": "none", "nights": nights}
 
         deduped = _deduplicate_by_name(all_hotels)
-        hotels_with_map = [_add_map_url(h) for h in deduped[:limit]]
+        hotels_with_map = [_add_map_url(h) for h in deduped]
         return {
             "hotels": hotels_with_map,
             "source": "+".join(sources),
@@ -153,14 +151,15 @@ def _filter_by_distance(hotels: list[dict], max_km: float) -> list[dict]:
     return result
 
 
-def _filter_by_budget(hotels: list[dict], budget: str) -> list[dict]:
-    """Soft filter — prefer hotels in the budget tier, but never return empty."""
-    if budget == "low":
-        filtered = [h for h in hotels if (h.get("price_per_night") or 0) <= 2500]
-    elif budget == "high":
-        filtered = [h for h in hotels if (h.get("price_per_night") or 0) >= 5000]
-    else:
-        filtered = [h for h in hotels if 1000 <= (h.get("price_per_night") or 0) <= 10000]
+def _filter_by_budget(hotels: list[dict], budget: str, currency_code: str = "inr") -> list[dict]:
+    """
+    Soft filter — prefer hotels in the budget tier, but never return empty.
+    Thresholds are currency-aware so USD/EUR searches aren't filtered by INR values.
+    """
+    safe_code = (currency_code or "inr").lower()
+    ranges = _BUDGET_PRICE_RANGE.get(safe_code) or _BUDGET_PRICE_RANGE["inr"]
+    lo, hi = ranges.get(budget, ranges["mid"])
+    filtered = [h for h in hotels if lo <= (h.get("price_per_night") or 0) <= hi]
     return filtered if filtered else hotels
 
 

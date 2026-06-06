@@ -1,0 +1,218 @@
+"""
+GET    /api/v1/users/profile              →  full user profile
+PUT    /api/v1/users/profile              →  update profile fields
+GET    /api/v1/users/stats                →  trip count, upcoming trips
+GET    /api/v1/users/trips                →  user's saved trips list
+GET    /api/v1/users/trips/{id}           →  single trip
+PUT    /api/v1/users/trips/{id}           →  update trip itinerary
+DELETE /api/v1/users/trips/{id}           →  delete trip
+GET    /api/v1/users/trips/{id}/journey   →  transport/journey data for a trip
+"""
+import logging
+from datetime import date
+
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from app.api.v1.onboarding.endpoint import generate_home_feed
+from pydantic import BaseModel
+
+from app.deps.auth import require_user
+from app.db.client import get_db
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/users", tags=["users"])
+
+
+class UpdateProfileRequest(BaseModel):
+    full_name: str | None = None
+    bio: str | None = None
+    city: str | None = None
+    country: str | None = None
+    phone_number: str | None = None
+    vibes: list[str] | None = None
+    social_links: dict | None = None
+    preferences: dict | None = None
+
+
+@router.get("/profile")
+async def get_profile(user=Depends(require_user)):
+    try:
+        db = get_db()
+        res = (
+            db.table("profiles")
+            .select("full_name, avatar_url, bio, username, phone_number, preferences, created_at, social_links, city, country, vibes, age, gender, onboarding_completed")
+            .eq("id", str(user.id))
+            .maybe_single()
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        return res.data
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[users] get_profile error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch profile")
+
+
+@router.put("/profile")
+async def update_profile(
+    body: UpdateProfileRequest,
+    background_tasks: BackgroundTasks,
+    user=Depends(require_user),
+):
+    db = get_db()
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not updates:
+        return {"status": "ok"}
+    try:
+        db.table("profiles").update(updates).eq("id", str(user.id)).execute()
+
+        # If location is updated, trigger generating a fresh home feed for this user
+        if "city" in updates or "country" in updates:
+            profile_res = (
+                db.table("profiles")
+                .select("city, country, vibes, preferences")
+                .eq("id", str(user.id))
+                .maybe_single()
+                .execute()
+            )
+            if profile_res and profile_res.data:
+                profile_data = profile_res.data
+                city_val = profile_data.get("city")
+                country_val = profile_data.get("country")
+                
+                if city_val and country_val:
+                    preferences = profile_data.get("preferences") or {}
+                    vibes = profile_data.get("vibes") or []
+                    all_vibes = list(set(vibes + preferences.get("interests", []) + preferences.get("styles", [])))
+
+                    background_tasks.add_task(
+                        generate_home_feed,
+                        str(user.id),
+                        city_val,
+                        country_val,
+                        all_vibes,
+                    )
+
+        return {"status": "ok"}
+    except Exception as exc:
+        logger.error("[users] update_profile error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to update profile")
+
+
+@router.get("/stats")
+async def get_stats(user=Depends(require_user)):
+    try:
+        db = get_db()
+        today = date.today().isoformat()
+
+        total_res = (
+            db.table("trips")
+            .select("id", count="exact")
+            .eq("user_id", str(user.id))
+            .execute()
+        )
+        total = total_res.count or 0
+
+        upcoming_res = (
+            db.table("trips")
+            .select("id")
+            .eq("user_id", str(user.id))
+            .gte("start_date", today)
+            .execute()
+        )
+        upcoming = len(upcoming_res.data or [])
+
+        return {
+            "trips_planned": total,
+            "upcoming_trips": upcoming,
+        }
+    except Exception as exc:
+        logger.warning("[users] get_stats error: %s", exc)
+        return {"trips_planned": 0, "upcoming_trips": 0}
+
+
+@router.get("/trips")
+async def get_saved_trips(user=Depends(require_user)):
+    try:
+        db = get_db()
+        res = (
+            db.table("trips")
+            .select("*")
+            .eq("user_id", str(user.id))
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception as exc:
+        logger.warning("[users] get_trips error: %s", exc)
+        return []
+
+
+@router.get("/trips/{trip_id}")
+async def get_trip_by_id(trip_id: str, user=Depends(require_user)):
+    try:
+        db = get_db()
+        res = (
+            db.table("trips")
+            .select("*")
+            .eq("id", trip_id)
+            .eq("user_id", str(user.id))
+            .maybe_single()
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Trip not found")
+        return res.data
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("[users] get_trip_by_id error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch trip")
+
+
+class UpdateTripItineraryRequest(BaseModel):
+    itinerary_data: dict
+
+
+@router.put("/trips/{trip_id}")
+async def update_trip_itinerary(trip_id: str, body: UpdateTripItineraryRequest, user=Depends(require_user)):
+    db = get_db()
+    try:
+        db.table("trips").update({"itinerary_data": body.itinerary_data}).eq("id", trip_id).eq("user_id", str(user.id)).execute()
+        return {"status": "ok"}
+    except Exception as exc:
+        logger.error("[users] update_trip_itinerary error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to update trip")
+
+
+@router.get("/trips/{trip_id}/journey")
+async def get_trip_journey(trip_id: str, user=Depends(require_user)):
+    try:
+        db = get_db()
+        res = (
+            db.table("trip_journey")
+            .select("*")
+            .eq("trip_id", trip_id)
+            .eq("user_id", str(user.id))
+            .maybe_single()
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Journey not found")
+        return res.data
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("[users] get_trip_journey error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch journey")
+
+
+@router.delete("/trips/{trip_id}", status_code=204)
+async def delete_trip(trip_id: str, user=Depends(require_user)):
+    db = get_db()
+    try:
+        db.table("trips").delete().eq("id", trip_id).eq("user_id", str(user.id)).execute()
+    except Exception as exc:
+        logger.error("[users] delete_trip error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to delete trip")

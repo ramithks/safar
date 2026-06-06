@@ -6,8 +6,11 @@ States: closed → open (after N failures) → half-open (after timeout) → clo
 Module-level singletons are shared across the process lifetime so failure
 counts persist across requests (the whole point of a circuit breaker).
 """
+import logging
 import time
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 
 class CircuitBreaker:
@@ -32,13 +35,13 @@ class CircuitBreaker:
 
     async def call(self, coro_fn: Callable, *args, fallback: Any = None, **kwargs) -> Any:
         if self.state == "open":
-            print(f"[circuit] {self.name} OPEN — skipping call, returning fallback")
+            logger.warning("[circuit] %s OPEN — skipping call, returning fallback", self.name)
             return fallback
 
         try:
             result = await coro_fn(*args, **kwargs)
             if self._state == "half-open":
-                print(f"[circuit] {self.name} RECOVERED → closed")
+                logger.info("[circuit] %s RECOVERED → closed", self.name)
                 self._state = "closed"
                 self._failures = 0
             return result
@@ -49,9 +52,9 @@ class CircuitBreaker:
                 prev = self._state
                 self._state = "open"
                 if prev != "open":
-                    print(f"[circuit] {self.name} OPENED after {self._failures} failures: {e}")
+                    logger.error("[circuit] %s OPENED after %d failures: %s", self.name, self._failures, e)
             else:
-                print(f"[circuit] {self.name} failure {self._failures}/{self._threshold}: {e}")
+                logger.warning("[circuit] %s failure %d/%d: %s", self.name, self._failures, self._threshold, e)
             return fallback
 
 
@@ -59,7 +62,6 @@ class CircuitBreaker:
 breaker_gemini   = CircuitBreaker("Gemini",     failure_threshold=2, recovery_timeout=30.0)
 breaker_places   = CircuitBreaker("Places",     failure_threshold=3, recovery_timeout=60.0)
 breaker_booking  = CircuitBreaker("Booking",    failure_threshold=2, recovery_timeout=120.0)
-breaker_expedia  = CircuitBreaker("Expedia",    failure_threshold=2, recovery_timeout=120.0)
 breaker_emt      = CircuitBreaker("EaseMyTrip", failure_threshold=3, recovery_timeout=60.0)
 breaker_redbus   = CircuitBreaker("RedBus",     failure_threshold=3, recovery_timeout=60.0)
 breaker_flixbus  = CircuitBreaker("FlixBus",    failure_threshold=3, recovery_timeout=60.0)

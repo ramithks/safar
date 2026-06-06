@@ -11,9 +11,12 @@ import structlog
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 from app.api.v1.router import router
 from app.config import settings
+from app.core.limiter import limiter
 
 # ── Sentry — must init before FastAPI() to capture startup errors ───────────────
 if settings.sentry_dsn:
@@ -35,6 +38,10 @@ logging.basicConfig(
     level=settings.log_level,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
+# httpx logs every request URL at INFO — that exposes API keys in plain text.
+# Keep WARNING+ (connection errors, timeouts) but drop the URL lines.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -69,9 +76,12 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )

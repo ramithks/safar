@@ -1,9 +1,12 @@
 """
 Group service — Supabase CRUD + Gemini AI for trip squads.
 """
+import logging
 import secrets
 from app.db.client import get_db
 from app.services.vertex import vertex_generate
+
+logger = logging.getLogger(__name__)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -53,13 +56,18 @@ def create_group(user_id: str, name: str, destination: str | None, trip_id: str 
 
 def get_group(group_id: str, user_id: str) -> dict | None:
     db = _db()
-    res = db.table("trip_groups").select("*").eq("id", group_id).maybe_single().execute()
+    # Single query with embedded members — avoids N+1
+    res = (
+        db.table("trip_groups")
+        .select("*, group_members(*)")
+        .eq("id", group_id)
+        .maybe_single()
+        .execute()
+    )
     if not res.data:
         return None
-    group = res.data
-
-    members_res = db.table("group_members").select("*").eq("group_id", group_id).execute()
-    members = members_res.data or []
+    group = dict(res.data)
+    members = group.pop("group_members", None) or []
 
     my = next((m for m in members if m["user_id"] == user_id), None)
     return {
@@ -291,5 +299,6 @@ Instructions:
     try:
         raw = await vertex_generate(prompt, timeout=30.0)
         return (raw or "I'm here to help! Ask me anything about your trip.").strip()
-    except Exception:
+    except Exception as e:
+        logger.error(f"AI assist failed for group {group_id}: {type(e).__name__}: {e}", exc_info=True)
         return "Sorry, I couldn't process that right now. Try again in a moment."
