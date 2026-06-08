@@ -15,10 +15,26 @@ def _db():
     return get_db()
 
 
+def _one_or_none(query) -> dict | None:
+    """Run a query expected to match 0-1 rows and return the row (or None).
+
+    Deliberately avoids `.maybe_single()`: PostgREST replies 204 No Content when
+    zero rows match a single-object request, and postgrest-py 1.0.2 raises
+    `APIError({'message': 'Missing response', 'code': '204', ...})` for that
+    response instead of returning `data=None`. Using `.limit(1)` on a normal
+    list query sidesteps the bug entirely.
+    """
+    res = query.limit(1).execute()
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
 def _require_member(db, group_id: str, user_id: str):
     """Raise ValueError if user is not a group member."""
-    res = db.table("group_members").select("id").eq("group_id", group_id).eq("user_id", user_id).maybe_single().execute()
-    if not res.data:
+    row = _one_or_none(
+        db.table("group_members").select("id").eq("group_id", group_id).eq("user_id", user_id)
+    )
+    if not row:
         raise ValueError("Not a group member")
 
 
@@ -42,31 +58,51 @@ def create_group(user_id: str, name: str, destination: str | None, trip_id: str 
         "group_id": group_id,
         "user_id": user_id,
         "display_name": display_name,
-        "role": "leader",
+        "role": "admin",
     }).execute()
 
     return {
         **group,
-        "role": "leader",
+        "role": "admin",
         "is_member": True,
         "member_count": 1,
-        "members": [{"user_id": user_id, "display_name": display_name, "role": "leader"}],
+        "members": [{"user_id": user_id, "display_name": display_name, "role": "admin"}],
+    }
+
+
+def get_group_by_trip_id(trip_id: str, user_id: str) -> dict | None:
+    db = _db()
+    row = _one_or_none(
+        db.table("trip_groups")
+        .select("*, group_members(*)")
+        .eq("trip_id", trip_id)
+        .order("created_at", desc=True)
+    )
+    if not row:
+        return None
+    group = dict(row)
+    members = group.pop("group_members", None) or []
+    my = next((m for m in members if m["user_id"] == user_id), None)
+    return {
+        **group,
+        "members": members,
+        "member_count": len(members),
+        "role": my["role"] if my else None,
+        "is_member": my is not None,
     }
 
 
 def get_group(group_id: str, user_id: str) -> dict | None:
     db = _db()
     # Single query with embedded members — avoids N+1
-    res = (
+    row = _one_or_none(
         db.table("trip_groups")
         .select("*, group_members(*)")
         .eq("id", group_id)
-        .maybe_single()
-        .execute()
     )
-    if not res.data:
+    if not row:
         return None
-    group = dict(res.data)
+    group = dict(row)
     members = group.pop("group_members", None) or []
 
     my = next((m for m in members if m["user_id"] == user_id), None)
@@ -81,14 +117,16 @@ def get_group(group_id: str, user_id: str) -> dict | None:
 
 def join_group(invite_code: str, user_id: str, display_name: str) -> dict:
     db = _db()
-    res = db.table("trip_groups").select("*").eq("invite_code", invite_code).maybe_single().execute()
-    if not res.data:
+    group_row = _one_or_none(db.table("trip_groups").select("*").eq("invite_code", invite_code))
+    if not group_row:
         raise ValueError("Invalid invite code")
-    group_id = res.data["id"]
+    group_id = group_row["id"]
 
     # Idempotent — return existing membership if already joined
-    existing = db.table("group_members").select("id").eq("group_id", group_id).eq("user_id", user_id).maybe_single().execute()
-    if not existing.data:
+    existing = _one_or_none(
+        db.table("group_members").select("id").eq("group_id", group_id).eq("user_id", user_id)
+    )
+    if not existing:
         db.table("group_members").insert({
             "group_id": group_id,
             "user_id": user_id,
@@ -138,18 +176,16 @@ def send_message(
 
 def vote_poll(group_id: str, message_id: str, option_id: str, user_id: str, voter_name: str) -> dict:
     db = _db()
-    res = (
+    row = _one_or_none(
         db.table("group_messages")
         .select("*")
         .eq("id", message_id)
         .eq("group_id", group_id)
-        .maybe_single()
-        .execute()
     )
-    if not res.data:
+    if not row:
         raise ValueError("Message not found")
 
-    poll = dict(res.data.get("poll_data") or {})
+    poll = dict(row.get("poll_data") or {})
     options = poll.get("options") or []
 
     # One vote per person — remove from all then add to chosen

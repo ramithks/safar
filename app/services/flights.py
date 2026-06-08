@@ -42,7 +42,6 @@ class FlightService:
         adults: int = 1,
         cabin_class: str = "ECONOMY",
         sort: str = "CHEAPEST",
-        limit: int = 5,
         from_iata: str | None = None,
         to_iata: str | None = None,
         nonstop_only: bool = False,
@@ -63,18 +62,17 @@ class FlightService:
                 "to_iata": to_iata, "resolved": False,
             }
 
-        fetch_limit = min(limit * 3, 50)
         try:
             booking_r, emt_r = await asyncio.wait_for(
                 asyncio.gather(
                     breaker_booking.call(
                         booking_search_flights, from_iata, to_iata, date,
-                        adults=adults, cabin_class=cabin_class, sort=sort, limit=fetch_limit,
+                        adults=adults, cabin_class=cabin_class, sort=sort,
                         fallback=[],
                     ),
                     breaker_emt.call(
                         emt_search_flights, from_iata, to_iata, date,
-                        adults=adults, cabin_class=cabin_class.lower(), limit=fetch_limit,
+                        adults=adults, cabin_class=cabin_class.lower(),
                         nonstop_only=nonstop_only,
                         fallback=[],
                     ),

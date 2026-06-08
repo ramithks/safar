@@ -40,24 +40,44 @@ def _collect_bus_items(legs: list[dict], rec: dict | None) -> dict:
 
 
 def _collect_train_items(legs: list[dict], rec: dict | None) -> dict | None:
-    """Aggregate per-leg train results. Returns None if no train legs."""
+    """
+    Aggregate per-leg train results. Returns None if no train data at all.
+
+    Includes both legs Gemini planned as "train" (live_data) and legs planned
+    as bus/flight that also got a train alternative search (train_alternative)
+    — so e.g. a Delhi→Guwahati flight leg still surfaces its train options
+    instead of only the Bhiwani→Delhi segment.
+    """
     seg: list[dict] = []
     for leg in legs:
-        if leg.get("mode", "").lower() not in ("train", "railway"):
-            continue
-        if not leg.get("has_live_data"):
-            continue
-        ld = leg.get("live_data") or {}
-        sp = leg.get("search_params") or {}
-        items = ld.get("trains") or []
-        if items:
-            seg.append({
-                "from": leg.get("from"),
-                "to": leg.get("to"),
-                "from_code": sp.get("from_station_code") or ld.get("from_code"),
-                "to_code": sp.get("to_station_code") or ld.get("to_code"),
-                "items": items,
-            })
+        mode = leg.get("mode", "").lower()
+        is_train_leg = mode in ("train", "railway")
+
+        if is_train_leg and leg.get("has_live_data"):
+            ld = leg.get("live_data") or {}
+            sp = leg.get("search_params") or {}
+            items = ld.get("trains") or []
+            if items:
+                seg.append({
+                    "from": leg.get("from"),
+                    "to": leg.get("to"),
+                    "from_code": sp.get("from_station_code") or ld.get("from_code"),
+                    "to_code": sp.get("to_station_code") or ld.get("to_code"),
+                    "items": items,
+                })
+        elif not is_train_leg:
+            alt = leg.get("train_alternative") or {}
+            items = alt.get("trains") or []
+            if items:
+                seg.append({
+                    "from": leg.get("from"),
+                    "to": leg.get("to"),
+                    "from_code": alt.get("from_code"),
+                    "to_code": alt.get("to_code"),
+                    "items": items,
+                    "is_alternative": True,
+                    "planned_mode": mode,
+                })
     if not seg:
         return None
     if len(seg) == 1:
@@ -102,6 +122,10 @@ def _shape_journey(j: dict, include_hotels: bool = False) -> dict:
 
     if trains_block:
         block["trains"] = trains_block
+
+    train_journey = j.get("train_journey")
+    if train_journey:
+        block["train_journey"] = train_journey
 
     if flights_block:
         block["flights"] = flights_block

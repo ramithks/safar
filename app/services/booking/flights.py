@@ -104,7 +104,6 @@ async def search_flights(
     adults: int = 1,
     cabin_class: str = "ECONOMY",
     sort: str = "CHEAPEST",
-    limit: int = 5,
 ) -> list[dict]:
     """Search one-way flights. Returns normalized list sorted by sort param."""
     try:
@@ -129,7 +128,7 @@ async def search_flights(
             )
         r.raise_for_status()
         offers = r.json().get("flightOffers") or []
-        return [_normalise_offer(o, depart_date, adults) for o in offers[:limit]]
+        return [_normalise_offer(o, depart_date, adults) for o in offers]
     except Exception as e:
         logger.warning("[flights_booking] %s→%s on %s: %s", from_airport, to_airport, depart_date, e)
         return []

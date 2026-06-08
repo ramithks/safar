@@ -119,7 +119,7 @@ async def search_buses(
         inventories = data.get("inventories") or []
         # Build a search-level booking URL for this route+date
         search_url = _build_search_url(from_city_id, to_city_id, doj, from_city_name, to_city_name)
-        return [_normalise_inventory(inv, search_url) for inv in inventories[:limit]]
+        return [_normalise_inventory(inv, search_url) for inv in inventories]
     except Exception as e:
         logger.warning("[redbus] bus search %s→%s on %s: %s", from_city_id, to_city_id, doj, e)
         return []

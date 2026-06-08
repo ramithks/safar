@@ -422,6 +422,18 @@ def _pick_recommended_bus(buses: list[dict], budget: str) -> dict | None:  # noq
     return pick
 
 
+def _train_has_departed(train: dict, departure_date: str) -> bool:
+    """True if this train's scheduled departure on departure_date is already in the past."""
+    dep_str = (train.get("departure_time") or "").strip()
+    if not dep_str or not departure_date:
+        return False
+    try:
+        dep_dt = datetime.strptime(f"{departure_date} {dep_str}", "%Y-%m-%d %H:%M")
+        return dep_dt < datetime.now()
+    except Exception:
+        return False
+
+
 def _pick_recommended_hotel(hotels: list[dict], budget: str) -> dict | None:
     """
     Pick best hotel matching the user's budget tier.
@@ -508,6 +520,13 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
             _enqueue("flight", o, _flights.resolve_iata, o)
             _enqueue("flight", d, _flights.resolve_iata, d)
 
+        # Also resolve train stations for non-train intercity legs (bus/flight),
+        # so we can search a train alternative for that segment too — needed to
+        # bundle a complete door-to-door all-train journey option.
+        if mode in ("bus", "flight"):
+            _enqueue("train", o, resolve_station_async, o)
+            _enqueue("train", d, resolve_station_async, d)
+
     if _resolve_coros:
         _resolve_results = await asyncio.gather(*_resolve_coros, return_exceptions=True)
     else:
@@ -533,6 +552,12 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
     # ── Phase 2b: Build search tasks using pre-resolved IDs ───────────────────
     live_meta: list[tuple[int, str]] = []
     live_coros: list = []
+
+    # Train-alternative searches for non-train intercity legs (bus/flight) —
+    # lets us bundle a complete door-to-door all-train journey alongside
+    # whatever modes Gemini actually planned.
+    train_alt_meta: list[int] = []
+    train_alt_coros: list = []
 
     for i, leg in enumerate(legs):
         if not leg.get("needs_live_search") or not departure_date:
@@ -605,6 +630,20 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
                     f"{origin_s if not from_iata else dest_s}"
                 )
 
+        # Fetch a train alternative for this segment too (bus/flight legs only) —
+        # so a complete all-train journey can be bundled even when Gemini chose
+        # a different mode for this particular hop.
+        if mode in ("bus", "flight"):
+            alt_from_code = resolved.get(f"train|{origin_s.lower()}") or city_to_station_code(origin_s)
+            alt_to_code   = resolved.get(f"train|{dest_s.lower()}") or city_to_station_code(dest_s)
+            if alt_from_code and alt_to_code:
+                train_alt_meta.append(i)
+                train_alt_coros.append(with_retry(
+                    _railway.search, origin_s, dest_s, departure_date,
+                    from_code=alt_from_code, to_code=alt_to_code,
+                    fallback={"trains": [], "resolved": False},
+                ))
+
     # ── Phase 2c: Flight alternatives + hotels at FINAL destination ───────────
     # ── Phase 2c: hotel at destination (only extra search beyond per-leg) ────────
     hotel_coro = None
@@ -634,11 +673,24 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
         except Exception:
             hotel_coro = None
 
-    extra_coros = [hotel_coro] if hotel_coro else []
+    extra_coros = train_alt_coros + ([hotel_coro] if hotel_coro else [])
     all_results = await asyncio.gather(*(live_coros + extra_coros), return_exceptions=True) if (live_coros + extra_coros) else []
 
     transport_results = all_results[: len(live_coros)]
-    hotel_result      = all_results[len(live_coros)] if hotel_coro and len(all_results) > len(live_coros) else None
+    train_alt_results = all_results[len(live_coros): len(live_coros) + len(train_alt_coros)]
+    hotel_idx = len(live_coros) + len(train_alt_coros)
+    hotel_result = all_results[hotel_idx] if hotel_coro and len(all_results) > hotel_idx else None
+
+    # Stash train-alternative results on their legs (tagged for departure status)
+    for task_idx, leg_idx in enumerate(train_alt_meta):
+        if task_idx >= len(train_alt_results):
+            break
+        result = train_alt_results[task_idx]
+        if isinstance(result, Exception):
+            continue
+        for t in (result.get("trains") or []):
+            t["departed"] = _train_has_departed(t, departure_date)
+        legs[leg_idx]["train_alternative"] = result
 
     # Inject live data into legs + enrich buses with Maps links
     _rec_bus:    dict | None = None
@@ -675,10 +727,14 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
 
         elif mode_type == "train":
             trains = result.get("trains") or []
-            if trains and not _rec_train:
-                _rec_train = dict(trains[0])
+            for t in trains:
+                t["departed"] = _train_has_departed(t, departure_date)
+            upcoming = [t for t in trains if not t["departed"]]
+            pool = upcoming or trains
+            if pool and not _rec_train:
+                _rec_train = dict(pool[0])
                 _rec_train["is_recommended"] = True
-                trains[0]["is_recommended"] = True
+                pool[0]["is_recommended"] = True
 
         legs[leg_idx]["live_data"] = result
         has = bool(
@@ -736,6 +792,11 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
     # ── Build fastest/cheapest/balanced journey options ───────────────────────
     route_plan["journey_options"] = _build_journey_options(route_plan, body.travelers)
 
+    # ── Bundle a complete door-to-door all-train journey (if feasible) ────────
+    train_journey = _build_train_journey_bundle(legs, body.travelers)
+    if train_journey:
+        route_plan["train_journey"] = train_journey
+
     # Summary log
     _h  = route_plan.get("destination_hotels")
     live_hits  = sum(1 for leg in legs if leg.get("has_live_data"))
@@ -756,6 +817,72 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
     logger.debug("[journey] legs: %s", leg_lines)
 
     return route_plan
+
+
+def _build_train_journey_bundle(legs: list[dict], travelers: int) -> dict | None:
+    """
+    Stitch the per-segment train options (live_data for train-mode legs,
+    train_alternative for bus/flight-mode legs) into one door-to-door
+    all-train itinerary, so the user can see/compare a complete train journey
+    even when Gemini mixed modes (e.g. train + flight) across segments.
+
+    Returns None when the journey has no intercity legs at all.
+    """
+    segments: list[dict] = []
+    total_fare = 0
+    total_duration = 0
+    feasible = True
+
+    for leg in legs:
+        if not leg.get("needs_live_search"):
+            continue
+        mode = leg.get("mode", "").lower()
+        if mode in ("train", "railway"):
+            trains = (leg.get("live_data") or {}).get("trains") or []
+        else:
+            trains = (leg.get("train_alternative") or {}).get("trains") or []
+
+        upcoming = [t for t in trains if not t.get("departed")]
+        pool = upcoming or trains
+        pick = pool[0] if pool else None
+
+        seg: dict = {"from": leg.get("from"), "to": leg.get("to"), "available": bool(pick)}
+        if pick:
+            fare = pick.get("cheapest_fare") or 0
+            dur  = pick.get("duration_min") or 0
+            total_fare     += fare
+            total_duration += dur
+            seg.update({
+                "train_number":   pick.get("train_number"),
+                "train_name":     pick.get("train_name"),
+                "from_station":   pick.get("from_station_name"),
+                "to_station":     pick.get("to_station_name"),
+                "departure_time": pick.get("departure_time"),
+                "arrival_time":   pick.get("arrival_time"),
+                "duration_min":   dur,
+                "cheapest_fare":  fare,
+                "booking_url":    pick.get("booking_url"),
+            })
+        else:
+            feasible = False
+        segments.append(seg)
+
+    if not segments:
+        return None
+
+    return {
+        "feasible": feasible,
+        "segments": segments,
+        "total_fare_per_person": total_fare,
+        "total_cost": total_fare * travelers,
+        "total_duration_min": total_duration,
+        "total_duration_display": _fmt_duration(total_duration) if total_duration else None,
+        "note": (
+            "Complete door-to-door journey using trains for every intercity segment."
+            if feasible else
+            "Some segments have no train connectivity — shown for comparison only."
+        ),
+    }
 
 
 # ── Journey options: fastest / cheapest / balanced ────────────────────────────

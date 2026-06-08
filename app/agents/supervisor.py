@@ -329,13 +329,7 @@ async def supervisor_run(body: PlanRequest, user_id: str) -> dict:
         "applied" if intervention else "none",
     )
 
-    # ── Phase 5: DB writes (fire-and-forget) ──────────────────────────────────
-    asyncio.create_task(_save_trip(user_id, body, merged, end_date))
-
-    return merged
-
-
-async def _save_trip(user_id: str, body: PlanRequest, merged: dict, end_date: str | None) -> None:
+    # ── Phase 5: DB writes — save trip synchronously to get trip_id ─────────────
     try:
         db = get_db()
         loop = asyncio.get_event_loop()
@@ -363,9 +357,22 @@ async def _save_trip(user_id: str, body: PlanRequest, merged: dict, end_date: st
         ))
 
         trip_id = (trip_row.data or [{}])[0].get("id")
-        if not trip_id:
+        if trip_id:
+            merged["trip_id"] = trip_id
+            asyncio.create_task(_save_trip_journey(user_id, body, merged, end_date, trip_id))
+        else:
             logger.warning("[supervisor] Auto-save: trips insert returned no id")
-            return
+
+    except Exception as e:
+        logger.warning("[supervisor] Failed to auto-save trip: %s", e)
+
+    return merged
+
+
+async def _save_trip_journey(user_id: str, body: PlanRequest, merged: dict, end_date: str | None, trip_id: str) -> None:
+    try:
+        db = get_db()
+        loop = asyncio.get_event_loop()
 
         def _to_numeric(v):
             try:

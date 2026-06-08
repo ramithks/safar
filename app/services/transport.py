@@ -39,7 +39,7 @@ class TransportService:
         destination: str,
         date: str,
         travelers: int = 1,
-        limit: int = 8,
+        limit: int = 30,
     ) -> dict:
         """Search buses: resolves city IDs then delegates to search_buses_direct."""
         from_id, to_id = await asyncio.gather(
@@ -59,7 +59,7 @@ class TransportService:
         destination: str,
         date: str,
         travelers: int = 1,
-        limit: int = 8,
+        limit: int = 30,
         budget: str = "mid",
     ) -> dict:
         """Search buses with pre-resolved RedBus city IDs — skips autocomplete."""
@@ -77,7 +77,7 @@ class TransportService:
         flixbus_status = "— skipped (RedBus sufficient)"
         if len(redbus_buses) < limit:
             result = await breaker_flixbus.call(
-                self._flixbus_search, origin, destination, date, travelers, limit, fallback=[],
+                self._flixbus_search, origin, destination, date, travelers, fallback=[],
             )
             flixbus_buses = result or []
             flixbus_status = f"✓ {len(flixbus_buses)}" if flixbus_buses else "✗ 0 results"
@@ -86,14 +86,14 @@ class TransportService:
 
         buses = redbus_buses + [b for b in flixbus_buses if b]
         return {
-            "buses": buses[:limit],
+            "buses": buses,
             "from_city_id": from_id,
             "to_city_id": to_id,
             "resolved": True,
         }
 
     async def _flixbus_search(
-        self, origin: str, destination: str, date: str, travelers: int, limit: int
+        self, origin: str, destination: str, date: str, travelers: int
     ) -> list[dict]:
         from_cities, to_cities = await asyncio.gather(
             flixbus_search_city(origin),
@@ -103,7 +103,7 @@ class TransportService:
         to_id   = to_cities[0]["id"]   if to_cities   else None
         if not from_id or not to_id:
             return []
-        return await flixbus_search_buses(from_id, to_id, date, adults=travelers, limit=limit)
+        return await flixbus_search_buses(from_id, to_id, date, adults=travelers)
 
     async def search_trains(
         self,
@@ -112,7 +112,6 @@ class TransportService:
         date: str,
         from_code: str | None = None,
         to_code: str | None = None,
-        limit: int = 5,
     ) -> dict:
         """
         Search Indian trains via ConfirmTKT.
@@ -121,7 +120,7 @@ class TransportService:
         """
         return await _railway.search(
             origin, destination, date,
-            from_code=from_code, to_code=to_code, limit=limit,
+            from_code=from_code, to_code=to_code,
         )
 
     async def search_flights(self, origin: str, destination: str, date: str, **kwargs) -> dict:

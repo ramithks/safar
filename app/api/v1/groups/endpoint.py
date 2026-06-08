@@ -44,6 +44,14 @@ async def create_group(body: CreateGroupRequest, user=Depends(require_user)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/by-trip/{trip_id}")
+async def get_group_by_trip(trip_id: str, user=Depends(require_user)):
+    group = service.get_group_by_trip_id(trip_id, user.id)
+    if not group:
+        raise HTTPException(status_code=404, detail="No group found for this trip")
+    return group
+
+
 @router.get("/{group_id}")
 async def get_group(group_id: UUID, user=Depends(require_user)):
     group = service.get_group(str(group_id), user.id)

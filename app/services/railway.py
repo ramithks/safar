@@ -139,7 +139,6 @@ async def search_trains(
     source_code: str,
     dest_code: str,
     date: str,           # "YYYY-MM-DD" or "DD-MM-YYYY"
-    limit: int = 5,
 ) -> list[dict]:
     """
     Search trains between two station codes via ConfirmTKT.
@@ -188,7 +187,7 @@ async def search_trains(
             or data.get("TrainList")
             or []
         )
-        return [_normalise_train(t, doj) for t in trains_raw[:limit]]
+        return [_normalise_train(t, doj) for t in trains_raw]
     except Exception as e:
         logger.warning("[railway] search %s→%s on %s: %s", source_code, dest_code, doj, e)
         return []
@@ -322,7 +321,6 @@ class RailwayService:
         date: str,
         from_code: str | None = None,
         to_code: str | None = None,
-        limit: int = 5,
     ) -> dict:
         """
         Search trains between two cities. Caller can provide station codes directly
@@ -339,7 +337,7 @@ class RailwayService:
                 "note": "No railway station found — this area may not have rail connectivity",
             }
 
-        trains = await search_trains(fc, tc or "", date, limit=limit)
+        trains = await search_trains(fc, tc or "", date)
         return {
             "trains": trains,
             "from_code": fc,

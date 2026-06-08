@@ -124,7 +124,7 @@ async def search_buses(
         r.raise_for_status()
         data = r.json()
         trips = data.get("trips") or []
-        results = [_normalise(t) for t in trips[:limit] if t.get("status") == "available"]
+        results = [_normalise(t) for t in trips if t.get("status") == "available"]
         if results:
             logger.debug("[flixbus] %s→%s: %d buses found", from_city_id, to_city_id, len(results))
         return results

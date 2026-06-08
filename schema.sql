@@ -93,11 +93,12 @@ CREATE TABLE IF NOT EXISTS public.trip_groups (
 );
 
 CREATE TABLE IF NOT EXISTS public.group_members (
-  id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  group_id  uuid REFERENCES public.trip_groups(id) ON DELETE CASCADE,
-  user_id   uuid REFERENCES auth.users(id) ON DELETE CASCADE,
-  role      text DEFAULT 'member',
-  joined_at timestamptz DEFAULT now()
+  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  group_id     uuid REFERENCES public.trip_groups(id) ON DELETE CASCADE,
+  user_id      uuid REFERENCES auth.users(id) ON DELETE CASCADE,
+  display_name text,
+  role         text DEFAULT 'member' CHECK (role IN ('admin', 'member')),
+  joined_at    timestamptz DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS public.group_messages (
@@ -280,6 +281,31 @@ CREATE TABLE IF NOT EXISTS public.user_home_feed (
   items        jsonb NOT NULL DEFAULT '[]',
   generated_at timestamptz DEFAULT now()
 );
+
+-- ============================================================
+-- AUTH TRIGGERS
+-- ============================================================
+
+-- Auto-create a profiles row whenever a new user signs up via Supabase Auth.
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+  INSERT INTO public.profiles (id, email, full_name, avatar_url)
+  VALUES (
+    new.id,
+    new.email,
+    new.raw_user_meta_data->>'full_name',
+    new.raw_user_meta_data->>'avatar_url'
+  )
+  ON CONFLICT (id) DO NOTHING;
+  RETURN new;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
 
 -- ============================================================
 -- ROW LEVEL SECURITY

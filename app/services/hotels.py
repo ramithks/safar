@@ -73,7 +73,7 @@ class HotelService:
 
         emt_sort = _BUDGET_SORT_EMT.get(budget, "Popular|DESC")
         bkg_sort = _BUDGET_SORT_BOOKING.get(budget)
-        per_src  = max(limit * 2, 20)
+        per_src  = max(limit * 2, 30)
 
         emt_r, booking_r = await asyncio.gather(
             breaker_emt.call(

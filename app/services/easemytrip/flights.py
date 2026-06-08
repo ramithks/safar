@@ -140,7 +140,6 @@ async def search_flights(
     children: int = 0,
     infants: int = 0,
     cabin_class: str = "economy",
-    limit: int = 5,
     nonstop_only: bool = False,
 ) -> list[dict]:
     """Search one-way domestic flights on EaseMyTrip."""
@@ -197,7 +196,7 @@ async def search_flights(
         if nonstop_only:
             flights = [f for f in flights if (f.get("stops") or 0) == 0]
         flights.sort(key=lambda f: (f.get("price_total") is None, f.get("price_total") or 999_999))
-        return flights[:limit]
+        return flights
     except Exception as e:
         logger.warning("[emt_flights] %s→%s on %s: %s", from_airport, to_airport, depart_date, e)
         return []
