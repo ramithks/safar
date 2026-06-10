@@ -45,10 +45,17 @@ class GenerateFeedRequest(BaseModel):
 
 
 async def _attach_image(item: dict, query: str) -> dict:
-    """Look up a destination photo via Google Places and attach it as a proxy URL."""
+    """Look up a destination photo via Google Places and attach it as a proxy URL.
+
+    Biases toward "tourist attraction" results so the photo represents the
+    destination itself, falling back to a plain search if that yields nothing.
+    Picks the first result that actually has a photo, not just result[0].
+    """
     try:
-        places = await search_places(query)
-        photo_ref = places[0]["photo_reference"] if places else None
+        places = await search_places(query, "tourist attraction")
+        if not any(p.get("photo_reference") for p in places):
+            places = await search_places(query)
+        photo_ref = next((p["photo_reference"] for p in places if p.get("photo_reference")), None)
         item["image_url"] = photo_proxy_path(photo_ref) if photo_ref else None
     except Exception as exc:
         logger.warning("[onboarding] image lookup failed for %r: %s", query, type(exc).__name__)
@@ -130,10 +137,10 @@ async def generate_home_feed(user_id: str, city: str, country: str, vibes: list[
         # Parse, image-enrich (Places lookups run concurrently across all items in both
         # feeds) and upsert both feed types in parallel — independent end-to-end.
         await asyncio.gather(
-            _store_feed(db, user_id, "weekend_plans", weekend_raw, lambda p: f"{p.get('title')} {city}", now),
+            _store_feed(db, user_id, "weekend_plans", weekend_raw, lambda p: f"{p.get('title')}, {country}", now),
             _store_feed(
                 db, user_id, "vibe_trips", vibe_raw,
-                lambda t: f"{t.get('title')} {t.get('destination')} {t.get('country')}", now,
+                lambda t: f"{t.get('destination')}, {t.get('country')}", now,
             ),
         )
 
