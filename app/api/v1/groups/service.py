@@ -1,6 +1,7 @@
 """
 Group service — Supabase CRUD + Gemini AI for trip squads.
 """
+import asyncio
 import logging
 import secrets
 from app.db.client import get_db
@@ -30,12 +31,17 @@ def _one_or_none(query) -> dict | None:
 
 
 def _require_member(db, group_id: str, user_id: str):
-    """Raise ValueError if user is not a group member."""
+    """Raise PermissionError if user is not a group member.
+
+    Every message/expense/AI operation must call this: queries here run on the
+    service-role client, which bypasses RLS, so this check is the only thing
+    stopping any authenticated user from reading another group's data.
+    """
     row = _one_or_none(
         db.table("group_members").select("id").eq("group_id", group_id).eq("user_id", user_id)
     )
     if not row:
-        raise ValueError("Not a group member")
+        raise PermissionError("Not a group member")
 
 
 # ── Groups ────────────────────────────────────────────────────────────────────
@@ -83,6 +89,8 @@ def get_group_by_trip_id(trip_id: str, user_id: str) -> dict | None:
     group = dict(row)
     members = group.pop("group_members", None) or []
     my = next((m for m in members if m["user_id"] == user_id), None)
+    if my is None:
+        group.pop("invite_code", None)
     return {
         **group,
         "members": members,
@@ -106,6 +114,9 @@ def get_group(group_id: str, user_id: str) -> dict | None:
     members = group.pop("group_members", None) or []
 
     my = next((m for m in members if m["user_id"] == user_id), None)
+    if my is None:
+        # Non-members get a join-preview only — never the invite code
+        group.pop("invite_code", None)
     return {
         **group,
         "members": members,
@@ -139,8 +150,9 @@ def join_group(invite_code: str, user_id: str, display_name: str) -> dict:
 
 # ── Messages ──────────────────────────────────────────────────────────────────
 
-def list_messages(group_id: str, limit: int = 50, offset: int = 0) -> list[dict]:
+def list_messages(group_id: str, user_id: str, limit: int = 50, offset: int = 0) -> list[dict]:
     db = _db()
+    _require_member(db, group_id, user_id)
     res = (
         db.table("group_messages")
         .select("*")
@@ -161,6 +173,7 @@ def send_message(
     poll_data: dict | None = None,
 ) -> dict:
     db = _db()
+    _require_member(db, group_id, user_id)
     payload: dict = {
         "group_id": group_id,
         "user_id": user_id,
@@ -176,6 +189,7 @@ def send_message(
 
 def vote_poll(group_id: str, message_id: str, option_id: str, user_id: str, voter_name: str) -> dict:
     db = _db()
+    _require_member(db, group_id, user_id)
     row = _one_or_none(
         db.table("group_messages")
         .select("*")
@@ -204,8 +218,9 @@ def vote_poll(group_id: str, message_id: str, option_id: str, user_id: str, vote
 
 # ── Expenses ──────────────────────────────────────────────────────────────────
 
-def list_expenses(group_id: str) -> dict:
+def list_expenses(group_id: str, user_id: str) -> dict:
     db = _db()
+    _require_member(db, group_id, user_id)
     res = (
         db.table("group_expenses")
         .select("*")
@@ -269,6 +284,7 @@ def add_expense(
     date: str,
 ) -> dict:
     db = _db()
+    _require_member(db, group_id, user_id)
     res = db.table("group_expenses").insert({
         "group_id": group_id,
         "title": title,
@@ -289,26 +305,29 @@ def delete_expense(group_id: str, expense_id: str, user_id: str) -> None:
 
 # ── AI Assistant ──────────────────────────────────────────────────────────────
 
-async def ai_assist(group_id: str, query: str, destination: str | None) -> str:
-    db = _db()
+async def ai_assist(group_id: str, user_id: str, query: str, destination: str | None) -> str:
+    def _gather_context() -> tuple[list[dict], list[dict]]:
+        db = _db()
+        _require_member(db, group_id, user_id)
 
-    msgs_res = (
-        db.table("group_messages")
-        .select("sender_name, text, type, created_at")
-        .eq("group_id", group_id)
-        .order("created_at", desc=True)
-        .limit(15)
-        .execute()
-    )
-    messages = list(reversed(msgs_res.data or []))
+        msgs_res = (
+            db.table("group_messages")
+            .select("sender_name, text, type, created_at")
+            .eq("group_id", group_id)
+            .order("created_at", desc=True)
+            .limit(15)
+            .execute()
+        )
+        exp_res = (
+            db.table("group_expenses")
+            .select("title, amount, paid_by, split_between, category")
+            .eq("group_id", group_id)
+            .execute()
+        )
+        return list(reversed(msgs_res.data or [])), exp_res.data or []
 
-    exp_res = (
-        db.table("group_expenses")
-        .select("title, amount, paid_by, split_between, category")
-        .eq("group_id", group_id)
-        .execute()
-    )
-    expenses = exp_res.data or []
+    # Sync supabase calls — keep them off the event loop
+    messages, expenses = await asyncio.to_thread(_gather_context)
     total_spent = sum(float(e["amount"]) for e in expenses)
 
     chat_ctx = "\n".join(f"{m['sender_name']}: {m['text']}" for m in messages) or "No messages yet."

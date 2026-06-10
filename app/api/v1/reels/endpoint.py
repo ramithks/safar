@@ -46,7 +46,7 @@ class SaveReelRequest(BaseModel):
 
 
 @router.get("/saved")
-async def get_saved_reels(user=Depends(require_user)):
+def get_saved_reels(user=Depends(require_user)):
     try:
         db = get_db()
         res = (
@@ -63,7 +63,7 @@ async def get_saved_reels(user=Depends(require_user)):
 
 
 @router.get("/developing")
-async def get_developing_reels(user=Depends(require_user)):
+def get_developing_reels(user=Depends(require_user)):
     try:
         db = get_db()
         res = (
@@ -82,7 +82,7 @@ async def get_developing_reels(user=Depends(require_user)):
 
 
 @router.post("/save", status_code=201)
-async def save_reel(body: SaveReelRequest, user=Depends(require_user)):
+def save_reel(body: SaveReelRequest, user=Depends(require_user)):
     db = get_db()
     try:
         res = (
@@ -115,7 +115,7 @@ async def save_reel(body: SaveReelRequest, user=Depends(require_user)):
 
 
 @router.post("/{reel_id}/like")
-async def toggle_like(reel_id: str, user=Depends(require_user)):
+def toggle_like(reel_id: str, user=Depends(require_user)):
     db = get_db()
     try:
         res = (

@@ -1,7 +1,9 @@
+import asyncio
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app.core.limiter import limiter
 from app.deps.auth import require_user
 from .models import (
     CreateGroupRequest,
@@ -15,23 +17,16 @@ from . import service
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
-
-def _group_id(group_id: UUID) -> str:
-    return str(group_id)
-
-
-def _message_id(message_id: UUID) -> str:
-    return str(message_id)
-
-
-def _expense_id(expense_id: UUID) -> str:
-    return str(expense_id)
+# NOTE: routes here are plain `def`, not `async def` — the supabase client is
+# synchronous, so FastAPI runs these in its threadpool instead of blocking the
+# event loop. Only ai_assist stays async (it awaits Vertex).
+# PermissionError from service._require_member is mapped to 403 in main.py.
 
 
 # ── Groups ────────────────────────────────────────────────────────────────────
 
 @router.post("", status_code=201)
-async def create_group(body: CreateGroupRequest, user=Depends(require_user)):
+def create_group(body: CreateGroupRequest, user=Depends(require_user)):
     try:
         return service.create_group(
             user_id=user.id,
@@ -45,7 +40,7 @@ async def create_group(body: CreateGroupRequest, user=Depends(require_user)):
 
 
 @router.get("/by-trip/{trip_id}")
-async def get_group_by_trip(trip_id: str, user=Depends(require_user)):
+def get_group_by_trip(trip_id: str, user=Depends(require_user)):
     group = service.get_group_by_trip_id(trip_id, user.id)
     if not group:
         raise HTTPException(status_code=404, detail="No group found for this trip")
@@ -53,7 +48,7 @@ async def get_group_by_trip(trip_id: str, user=Depends(require_user)):
 
 
 @router.get("/{group_id}")
-async def get_group(group_id: UUID, user=Depends(require_user)):
+def get_group(group_id: UUID, user=Depends(require_user)):
     group = service.get_group(str(group_id), user.id)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
@@ -61,7 +56,7 @@ async def get_group(group_id: UUID, user=Depends(require_user)):
 
 
 @router.post("/join/{invite_code}")
-async def join_group(invite_code: str, body: JoinGroupRequest, user=Depends(require_user)):
+def join_group(invite_code: str, body: JoinGroupRequest, user=Depends(require_user)):
     try:
         return service.join_group(invite_code, user.id, body.display_name)
     except ValueError as e:
@@ -71,12 +66,12 @@ async def join_group(invite_code: str, body: JoinGroupRequest, user=Depends(requ
 # ── Messages ──────────────────────────────────────────────────────────────────
 
 @router.get("/{group_id}/messages")
-async def list_messages(group_id: UUID, limit: int = 50, offset: int = 0, user=Depends(require_user)):
-    return {"messages": service.list_messages(str(group_id), limit, offset)}
+def list_messages(group_id: UUID, limit: int = 50, offset: int = 0, user=Depends(require_user)):
+    return {"messages": service.list_messages(str(group_id), user.id, limit, offset)}
 
 
 @router.post("/{group_id}/messages", status_code=201)
-async def send_message(group_id: UUID, body: SendMessageRequest, user=Depends(require_user)):
+def send_message(group_id: UUID, body: SendMessageRequest, user=Depends(require_user)):
     try:
         return service.send_message(
             group_id=str(group_id),
@@ -91,7 +86,7 @@ async def send_message(group_id: UUID, body: SendMessageRequest, user=Depends(re
 
 
 @router.post("/{group_id}/messages/{message_id}/vote")
-async def vote_poll(group_id: UUID, message_id: UUID, body: VotePollRequest, user=Depends(require_user)):
+def vote_poll(group_id: UUID, message_id: UUID, body: VotePollRequest, user=Depends(require_user)):
     try:
         return service.vote_poll(str(group_id), str(message_id), body.option_id, user.id, body.voter_name)
     except ValueError as e:
@@ -101,12 +96,12 @@ async def vote_poll(group_id: UUID, message_id: UUID, body: VotePollRequest, use
 # ── Expenses ──────────────────────────────────────────────────────────────────
 
 @router.get("/{group_id}/expenses")
-async def list_expenses(group_id: UUID, user=Depends(require_user)):
-    return service.list_expenses(str(group_id))
+def list_expenses(group_id: UUID, user=Depends(require_user)):
+    return service.list_expenses(str(group_id), user.id)
 
 
 @router.post("/{group_id}/expenses", status_code=201)
-async def add_expense(group_id: UUID, body: AddExpenseRequest, user=Depends(require_user)):
+def add_expense(group_id: UUID, body: AddExpenseRequest, user=Depends(require_user)):
     try:
         return service.add_expense(
             group_id=str(group_id),
@@ -123,15 +118,16 @@ async def add_expense(group_id: UUID, body: AddExpenseRequest, user=Depends(requ
 
 
 @router.delete("/{group_id}/expenses/{expense_id}", status_code=204)
-async def delete_expense(group_id: UUID, expense_id: UUID, user=Depends(require_user)):
+def delete_expense(group_id: UUID, expense_id: UUID, user=Depends(require_user)):
     service.delete_expense(str(group_id), str(expense_id), user.id)
 
 
 # ── AI ────────────────────────────────────────────────────────────────────────
 
 @router.post("/{group_id}/ai")
-async def ai_assist(group_id: UUID, body: AiAssistRequest, user=Depends(require_user)):
-    group = service.get_group(str(group_id), user.id)
+@limiter.limit("30/hour")  # Vertex call — cap per-user spend
+async def ai_assist(request: Request, group_id: UUID, body: AiAssistRequest, user=Depends(require_user)):
+    group = await asyncio.to_thread(service.get_group, str(group_id), user.id)
     destination = group.get("destination") if group else None
-    answer = await service.ai_assist(str(group_id), body.query, destination)
+    answer = await service.ai_assist(str(group_id), user.id, body.query, destination)
     return {"answer": answer}

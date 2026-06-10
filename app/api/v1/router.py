@@ -9,9 +9,11 @@ from app.api.v1.users.endpoint import router as users_router
 from app.api.v1.users.folders import router as folders_router
 from app.api.v1.reels.endpoint import router as reels_router
 from app.api.v1.images import router as images_router
+from app.api.v1.health import router as health_router
 
 router = APIRouter(prefix="/api/v1")
 
+router.include_router(health_router, tags=["health"])
 router.include_router(plan_trip_router, tags=["ai"])
 router.include_router(groups_router)
 router.include_router(trips_router)

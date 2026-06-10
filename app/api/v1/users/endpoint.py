@@ -24,7 +24,7 @@ router = APIRouter(prefix="/users", tags=["users"])
 
 
 @router.get("/stats")
-async def get_stats(user=Depends(require_user)):
+def get_stats(user=Depends(require_user)):
     try:
         db = get_db()
         today = date.today().isoformat()
@@ -56,7 +56,7 @@ async def get_stats(user=Depends(require_user)):
 
 
 @router.get("/trips")
-async def get_saved_trips(user=Depends(require_user)):
+def get_saved_trips(user=Depends(require_user)):
     try:
         db = get_db()
         res = (
@@ -73,7 +73,7 @@ async def get_saved_trips(user=Depends(require_user)):
 
 
 @router.get("/trips/{trip_id}")
-async def get_trip_by_id(trip_id: str, user=Depends(require_user)):
+def get_trip_by_id(trip_id: str, user=Depends(require_user)):
     try:
         db = get_db()
         res = (
@@ -99,7 +99,7 @@ class UpdateTripItineraryRequest(BaseModel):
 
 
 @router.put("/trips/{trip_id}")
-async def update_trip_itinerary(trip_id: str, body: UpdateTripItineraryRequest, user=Depends(require_user)):
+def update_trip_itinerary(trip_id: str, body: UpdateTripItineraryRequest, user=Depends(require_user)):
     db = get_db()
     try:
         db.table("trips").update({"itinerary_data": body.itinerary_data}).eq("id", trip_id).eq("user_id", str(user.id)).execute()
@@ -110,7 +110,7 @@ async def update_trip_itinerary(trip_id: str, body: UpdateTripItineraryRequest, 
 
 
 @router.get("/trips/{trip_id}/journey")
-async def get_trip_journey(trip_id: str, user=Depends(require_user)):
+def get_trip_journey(trip_id: str, user=Depends(require_user)):
     try:
         db = get_db()
         res = (
@@ -132,7 +132,7 @@ async def get_trip_journey(trip_id: str, user=Depends(require_user)):
 
 
 @router.delete("/trips/{trip_id}", status_code=204)
-async def delete_trip(trip_id: str, user=Depends(require_user)):
+def delete_trip(trip_id: str, user=Depends(require_user)):
     db = get_db()
     try:
         db.table("trips").delete().eq("id", trip_id).eq("user_id", str(user.id)).execute()

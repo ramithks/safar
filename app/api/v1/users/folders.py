@@ -31,7 +31,7 @@ class AddItemRequest(BaseModel):
 
 
 @router.get("")
-async def list_folders(user=Depends(require_user)):
+def list_folders(user=Depends(require_user)):
     try:
         db = get_db()
         folders_res = (
@@ -68,7 +68,7 @@ async def list_folders(user=Depends(require_user)):
 
 
 @router.post("", status_code=201)
-async def create_folder(body: CreateFolderRequest, user=Depends(require_user)):
+def create_folder(body: CreateFolderRequest, user=Depends(require_user)):
     allowed_types = {"trips", "nights", "reels", "mixed"}
     if body.item_type not in allowed_types:
         raise HTTPException(status_code=422, detail=f"item_type must be one of {allowed_types}")
@@ -95,7 +95,7 @@ async def create_folder(body: CreateFolderRequest, user=Depends(require_user)):
 
 
 @router.delete("/{folder_id}", status_code=204)
-async def delete_folder(folder_id: str, user=Depends(require_user)):
+def delete_folder(folder_id: str, user=Depends(require_user)):
     db = get_db()
     try:
         db.table("saved_folders").delete().eq("id", folder_id).eq("user_id", str(user.id)).execute()
@@ -105,7 +105,7 @@ async def delete_folder(folder_id: str, user=Depends(require_user)):
 
 
 @router.get("/{folder_id}/items")
-async def list_folder_items(folder_id: str, user=Depends(require_user)):
+def list_folder_items(folder_id: str, user=Depends(require_user)):
     db = get_db()
     try:
         # Verify ownership
@@ -136,7 +136,7 @@ async def list_folder_items(folder_id: str, user=Depends(require_user)):
 
 
 @router.post("/{folder_id}/items", status_code=201)
-async def add_item(folder_id: str, body: AddItemRequest, user=Depends(require_user)):
+def add_item(folder_id: str, body: AddItemRequest, user=Depends(require_user)):
     db = get_db()
     try:
         folder_res = (
@@ -171,7 +171,7 @@ async def add_item(folder_id: str, body: AddItemRequest, user=Depends(require_us
 
 
 @router.delete("/{folder_id}/items/{item_id}", status_code=204)
-async def remove_item(folder_id: str, item_id: str, user=Depends(require_user)):
+def remove_item(folder_id: str, item_id: str, user=Depends(require_user)):
     db = get_db()
     try:
         folder_res = (

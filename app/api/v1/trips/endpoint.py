@@ -22,7 +22,7 @@ router = APIRouter(prefix="/trips/{trip_id}", tags=["trips"])
 # ── Reels ─────────────────────────────────────────────────────────────────────
 
 @router.post("/reels/init", status_code=201)
-async def init_reel_upload(trip_id: str, body: InitReelUploadRequest, user=Depends(require_user)):
+def init_reel_upload(trip_id: str, body: InitReelUploadRequest, user=Depends(require_user)):
     """Step 1: Create record + get signed GCS PUT URL for a trip video reel."""
     return service.init_reel_upload(
         trip_id=trip_id,
@@ -35,7 +35,7 @@ async def init_reel_upload(trip_id: str, body: InitReelUploadRequest, user=Depen
 
 
 @router.post("/reels/{reel_id}/confirm")
-async def confirm_reel_upload(trip_id: str, reel_id: str, body: ConfirmReelRequest, user=Depends(require_user)):
+def confirm_reel_upload(trip_id: str, reel_id: str, body: ConfirmReelRequest, user=Depends(require_user)):
     """Step 2: After client PUT to GCS, mark reel as uploaded and make it public."""
     try:
         return service.confirm_reel_upload(trip_id, reel_id, user.id, body.duration)
@@ -44,24 +44,24 @@ async def confirm_reel_upload(trip_id: str, reel_id: str, body: ConfirmReelReque
 
 
 @router.get("/reels")
-async def list_reels(trip_id: str, user=Depends(require_user)):
+def list_reels(trip_id: str, user=Depends(require_user)):
     return {"reels": service.list_reels(trip_id, user.id)}
 
 
 @router.delete("/reels/{reel_id}", status_code=204)
-async def delete_reel(trip_id: str, reel_id: str, user=Depends(require_user)):
+def delete_reel(trip_id: str, reel_id: str, user=Depends(require_user)):
     service.delete_reel(trip_id, reel_id, user.id)
 
 
 # ── Bookings ──────────────────────────────────────────────────────────────────
 
 @router.get("/bookings")
-async def list_bookings(trip_id: str, user=Depends(require_user)):
+def list_bookings(trip_id: str, user=Depends(require_user)):
     return {"bookings": service.list_bookings(trip_id, user.id)}
 
 
 @router.post("/bookings", status_code=201)
-async def create_booking(trip_id: str, body: CreateBookingRequest, user=Depends(require_user)):
+def create_booking(trip_id: str, body: CreateBookingRequest, user=Depends(require_user)):
     return service.create_booking(
         trip_id=trip_id,
         user_id=user.id,
@@ -77,7 +77,7 @@ async def create_booking(trip_id: str, body: CreateBookingRequest, user=Depends(
 
 
 @router.patch("/bookings/{booking_id}")
-async def update_booking(trip_id: str, booking_id: str, body: UpdateBookingRequest, user=Depends(require_user)):
+def update_booking(trip_id: str, booking_id: str, body: UpdateBookingRequest, user=Depends(require_user)):
     try:
         return service.update_booking(trip_id, booking_id, user.id, body.model_dump())
     except ValueError as e:
@@ -85,18 +85,18 @@ async def update_booking(trip_id: str, booking_id: str, body: UpdateBookingReque
 
 
 @router.delete("/bookings/{booking_id}", status_code=204)
-async def delete_booking(trip_id: str, booking_id: str, user=Depends(require_user)):
+def delete_booking(trip_id: str, booking_id: str, user=Depends(require_user)):
     service.delete_booking(trip_id, booking_id, user.id)
 
 
 @router.post("/bookings/{booking_id}/upload-url")
-async def init_booking_file_upload(trip_id: str, booking_id: str, body: InitBookingFileRequest, user=Depends(require_user)):
+def init_booking_file_upload(trip_id: str, booking_id: str, body: InitBookingFileRequest, user=Depends(require_user)):
     """Get a signed URL to attach a confirmation file (PDF / screenshot) to a booking."""
     return service.init_booking_file_upload(trip_id, booking_id, user.id, body.filename, body.content_type)
 
 
 @router.post("/bookings/{booking_id}/confirm-file")
-async def confirm_booking_file(trip_id: str, booking_id: str, user=Depends(require_user)):
+def confirm_booking_file(trip_id: str, booking_id: str, user=Depends(require_user)):
     """After uploading the file to GCS, call this to make it public and update the booking record."""
     try:
         return service.confirm_booking_file(trip_id, booking_id, user.id)
@@ -133,7 +133,7 @@ async def upload_trip_file(
 # ── Documents ─────────────────────────────────────────────────────────────────
 
 @router.post("/documents/create", status_code=201)
-async def create_document_direct(trip_id: str, body: CreateDocumentDirectRequest, user=Depends(require_user)):
+def create_document_direct(trip_id: str, body: CreateDocumentDirectRequest, user=Depends(require_user)):
     """
     Create a document record using a file URL already uploaded via /files/upload.
     Simpler alternative to the GCS init/confirm flow.
@@ -149,7 +149,7 @@ async def create_document_direct(trip_id: str, body: CreateDocumentDirectRequest
 
 
 @router.post("/documents/init", status_code=201)
-async def init_document_upload(trip_id: str, body: InitDocumentUploadRequest, user=Depends(require_user)):
+def init_document_upload(trip_id: str, body: InitDocumentUploadRequest, user=Depends(require_user)):
     """Step 1: Create record + get signed GCS PUT URL for a travel document."""
     return service.init_document_upload(
         trip_id=trip_id,
@@ -162,7 +162,7 @@ async def init_document_upload(trip_id: str, body: InitDocumentUploadRequest, us
 
 
 @router.post("/documents/{doc_id}/confirm")
-async def confirm_document_upload(trip_id: str, doc_id: str, body: ConfirmDocumentRequest, user=Depends(require_user)):
+def confirm_document_upload(trip_id: str, doc_id: str, body: ConfirmDocumentRequest, user=Depends(require_user)):
     """Step 2: After client PUT to GCS, mark document as uploaded and make it public."""
     try:
         return service.confirm_document_upload(trip_id, doc_id, user.id)
@@ -171,11 +171,11 @@ async def confirm_document_upload(trip_id: str, doc_id: str, body: ConfirmDocume
 
 
 @router.get("/documents")
-async def list_documents(trip_id: str, user=Depends(require_user)):
+def list_documents(trip_id: str, user=Depends(require_user)):
     return {"documents": service.list_documents(trip_id, user.id)}
 
 
 @router.delete("/documents/{doc_id}", status_code=204)
-async def delete_document(trip_id: str, doc_id: str, user=Depends(require_user)):
+def delete_document(trip_id: str, doc_id: str, user=Depends(require_user)):
     """Delete document record and remove file from GCS."""
     service.delete_document(trip_id, doc_id, user.id)

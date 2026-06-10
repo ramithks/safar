@@ -16,6 +16,6 @@ async def plan(request: Request, body: PlanRequest, user=Depends(require_user)):
     Unified planner — transport + activity itinerary + hotels in one call.
     Runs journey + itinerary agents in parallel via SupervisorAgent,
     which applies budget intervention and constraint validation before returning.
-    Rate limited to 10 requests per hour per IP.
+    Rate limited to 10 requests per hour per user (per IP when unauthenticated).
     """
     return await supervisor_run(body, user.id)

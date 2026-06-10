@@ -23,7 +23,8 @@ if settings.sentry_dsn:
     sentry_sdk.init(
         dsn=settings.sentry_dsn,
         environment=settings.app_env,
-        send_default_pii=True,
+        # No request bodies / user IPs in Sentry — errors still carry stack traces
+        send_default_pii=False,
         traces_sample_rate=settings.sentry_traces_sample_rate,
         profiles_sample_rate=settings.sentry_profiles_sample_rate,
     )
@@ -89,7 +90,16 @@ app.add_middleware(
 app.include_router(router)
 
 
-# ── Global exception handler ─────────────────────────────────────────────────────
+# ── Exception handlers ───────────────────────────────────────────────────────────
+@app.exception_handler(PermissionError)
+async def permission_error_handler(request: Request, exc: PermissionError):
+    # Raised by service-layer authorization checks (e.g. group membership)
+    return JSONResponse(
+        status_code=403,
+        content={"detail": str(exc) or "Forbidden"},
+    )
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {exc}", exc_info=True)

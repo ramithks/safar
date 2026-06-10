@@ -12,8 +12,9 @@ Why this exists:
   the frontend a clean, key-free URL to use for img src.
 """
 import httpx
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 from app.config import settings
+from app.core.limiter import limiter
 
 router = APIRouter()
 
@@ -31,7 +32,12 @@ _CACHE_HEADER = "public, max-age=604800, immutable"
 
 
 @router.get("/images/{photo_reference}", include_in_schema=False)
-async def proxy_place_photo(photo_reference: str, maxwidth: int = 800) -> Response:
+# Unauthenticated (URLs go straight into <Image> tags), so the rate limit is
+# the only thing standing between the public internet and our Places quota.
+# shared_limit + scope: one bucket per client across ALL photo references —
+# plain limit() would bucket per-path, giving each reference its own 120/min.
+@limiter.shared_limit("120/minute", scope="place_images")
+async def proxy_place_photo(request: Request, photo_reference: str, maxwidth: int = 800) -> Response:
     """
     Proxy a Google Places photo by reference.
 

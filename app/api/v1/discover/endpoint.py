@@ -17,7 +17,7 @@ router = APIRouter(prefix="/discover", tags=["discover"])
 
 
 @router.get("/weekend-plans")
-async def get_weekend_plans(user=Depends(require_user)):
+def get_weekend_plans(user=Depends(require_user)):
     try:
         db = get_db()
         res = (
@@ -35,7 +35,7 @@ async def get_weekend_plans(user=Depends(require_user)):
 
 
 @router.get("/vibe-trips")
-async def get_vibe_trips(user=Depends(require_user)):
+def get_vibe_trips(user=Depends(require_user)):
     try:
         db = get_db()
         res = (

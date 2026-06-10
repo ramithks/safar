@@ -25,4 +25,7 @@ RUN mkdir -p /tmp/travbuddy/places_cache
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --workers 4: multiple processes so one slow request can't stall the API.
+# --proxy-headers + --forwarded-allow-ips: trust X-Forwarded-For from Traefik,
+#   otherwise every client shares Traefik's IP and per-IP rate limits break.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--proxy-headers", "--forwarded-allow-ips", "*"]
