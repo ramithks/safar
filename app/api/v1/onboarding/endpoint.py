@@ -1,9 +1,12 @@
 """
 POST /api/v1/onboarding/generate-feed
   Fires background Gemini generation for personalized weekend plans + vibe
-  trips, stored in user_home_feed. The client writes profile fields straight
-  to Supabase (RLS-protected); this endpoint exists only because the AI
-  generation needs server-side credentials.
+  trips, stored in user_home_feed. Each item is then enriched with an
+  `image_url` (a /api/v1/images/{photo_reference} proxy path) looked up via
+  the Google Places API — the frontend never sees the Maps API key.
+  The client writes profile fields straight to Supabase (RLS-protected);
+  this endpoint exists only because the AI generation needs server-side
+  credentials.
 
 Required Supabase table (create once in dashboard):
 
@@ -29,6 +32,7 @@ from pydantic import BaseModel
 from app.deps.auth import require_user
 from app.db.client import get_db
 from app.services.vertex import vertex_generate
+from app.services.places import search_places, photo_proxy_path
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/onboarding", tags=["onboarding"])
@@ -38,6 +42,42 @@ class GenerateFeedRequest(BaseModel):
     city: str
     country: str
     vibes: list[str] = []
+
+
+async def _attach_image(item: dict, query: str) -> dict:
+    """Look up a destination photo via Google Places and attach it as a proxy URL."""
+    try:
+        places = await search_places(query)
+        photo_ref = places[0]["photo_reference"] if places else None
+        item["image_url"] = photo_proxy_path(photo_ref) if photo_ref else None
+    except Exception as exc:
+        logger.warning("[onboarding] image lookup failed for %r: %s", query, type(exc).__name__)
+        item["image_url"] = None
+    return item
+
+
+async def _attach_images(items: list[dict], query_fn) -> list[dict]:
+    """Concurrently enrich each item with an `image_url` from Google Places."""
+    return list(await asyncio.gather(*(_attach_image(item, query_fn(item)) for item in items)))
+
+
+async def _store_feed(db, user_id: str, feed_type: str, raw, query_fn, now: str) -> None:
+    """Parse a Gemini JSON array, enrich items with images, and upsert — all concurrently."""
+    if isinstance(raw, Exception):
+        logger.warning("[onboarding] %s Gemini error: %s", feed_type, raw)
+        return
+    try:
+        items = json.loads(raw) if isinstance(raw, str) else raw
+        if not (isinstance(items, list) and items):
+            return
+        items = await _attach_images(items, query_fn)
+        db.table("user_home_feed").upsert(
+            {"user_id": user_id, "feed_type": feed_type, "items": items, "generated_at": now},
+            on_conflict="user_id,feed_type",
+        ).execute()
+        logger.info("[onboarding] Stored %d %s for %s", len(items), feed_type, user_id[:8])
+    except Exception as exc:
+        logger.warning("[onboarding] Parse %s failed: %s", feed_type, exc)
 
 
 async def generate_home_feed(user_id: str, city: str, country: str, vibes: list[str]) -> None:
@@ -51,8 +91,11 @@ async def generate_home_feed(user_id: str, city: str, country: str, vibes: list[
             f"from {city}, {country} that can be done in 2-3 days. "
             f"Include a diverse mix: hill stations, beaches, heritage sites, nature escapes, "
             f"adventure spots, spiritual places. "
+            f"Each trip must be to a SINGLE city/town only — never combine multiple places "
+            f"(e.g. use \"Shimla\" or \"Manali\", not \"Shimla & Manali\" or \"Shimla, Manali\"), "
+            f"since our trip planner currently supports planning for one destination city at a time. "
             f"Return a JSON array of exactly 12 objects with these keys: "
-            f"id (kebab-case slug), title (short destination name), duration (\"2 Days\" or \"3 Days\"), "
+            f"id (kebab-case slug), title (single destination city/town name only, no combos), duration (\"2 Days\" or \"3 Days\"), "
             f"cost (budget range per person, e.g. \"₹2,500–4,500\"), rating (float 4.0-4.9), "
             f"distance (travel time from {city}, e.g. \"5h drive\"), "
             f"category (one of: Mountains|Beaches|Heritage|Nature|Adventure|Spiritual|Lakes|Desert|City). "
@@ -64,8 +107,11 @@ async def generate_home_feed(user_id: str, city: str, country: str, vibes: list[
             f"based on these travel vibes: {vibe_str}. The traveler is from {country}. "
             f"Exactly 5 must be national trips within {country}. "
             f"Exactly 5 must be international trips across different regions (Asia, Europe, Americas, Africa/Oceania). "
+            f"Each trip must center on a SINGLE named city only — never a region, area, or combo of "
+            f"places (e.g. use \"Kochi\" or \"Munnar\", not \"Kerala Backwaters\" or \"Shimla & Manali\"), "
+            f"since our trip planner currently supports planning for one destination city at a time. "
             f"Return a JSON array of exactly 10 objects with these keys: "
-            f"id (kebab-case slug), title (evocative trip title), destination (city/region), country, "
+            f"id (kebab-case slug), title (evocative trip title), destination (single city name only, no region/combo), country, "
             f"is_international (boolean), duration (\"3 Days\"/\"5 Days\"/\"7 Days\"), "
             f"budget (\"Budget-Friendly\"|\"Mid Budget\"|\"Premium\"|\"Luxury\"), "
             f"vibes (array of 2-3 strings from the input list), "
@@ -81,33 +127,15 @@ async def generate_home_feed(user_id: str, city: str, country: str, vibes: list[
 
         now = datetime.now(timezone.utc).isoformat()
 
-        if not isinstance(weekend_raw, Exception):
-            try:
-                plans = json.loads(weekend_raw) if isinstance(weekend_raw, str) else weekend_raw
-                if isinstance(plans, list) and plans:
-                    db.table("user_home_feed").upsert(
-                        {"user_id": user_id, "feed_type": "weekend_plans", "items": plans, "generated_at": now},
-                        on_conflict="user_id,feed_type",
-                    ).execute()
-                    logger.info("[onboarding] Stored %d weekend plans for %s", len(plans), user_id[:8])
-            except Exception as exc:
-                logger.warning("[onboarding] Parse weekend plans failed: %s", exc)
-        else:
-            logger.warning("[onboarding] Weekend plans Gemini error: %s", weekend_raw)
-
-        if not isinstance(vibe_raw, Exception):
-            try:
-                trips = json.loads(vibe_raw) if isinstance(vibe_raw, str) else vibe_raw
-                if isinstance(trips, list) and trips:
-                    db.table("user_home_feed").upsert(
-                        {"user_id": user_id, "feed_type": "vibe_trips", "items": trips, "generated_at": now},
-                        on_conflict="user_id,feed_type",
-                    ).execute()
-                    logger.info("[onboarding] Stored %d vibe trips for %s", len(trips), user_id[:8])
-            except Exception as exc:
-                logger.warning("[onboarding] Parse vibe trips failed: %s", exc)
-        else:
-            logger.warning("[onboarding] Vibe trips Gemini error: %s", vibe_raw)
+        # Parse, image-enrich (Places lookups run concurrently across all items in both
+        # feeds) and upsert both feed types in parallel — independent end-to-end.
+        await asyncio.gather(
+            _store_feed(db, user_id, "weekend_plans", weekend_raw, lambda p: f"{p.get('title')} {city}", now),
+            _store_feed(
+                db, user_id, "vibe_trips", vibe_raw,
+                lambda t: f"{t.get('title')} {t.get('destination')} {t.get('country')}", now,
+            ),
+        )
 
     except Exception as exc:
         logger.error("[onboarding] _generate_home_feed crashed: %s", exc)
