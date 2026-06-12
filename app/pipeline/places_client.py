@@ -27,14 +27,16 @@ from app.models.response import (
 logger = logging.getLogger(__name__)
 
 # Essentials + rating fields only ($5/1k base, rating bumps to Pro at $17/1k)
+# NOTE: the googlemaps lib expects SINGULAR field names here ("photo", "type",
+# "address_component") even though the API response uses plural keys.
 PLACE_DETAIL_FIELDS = [
     "place_id",
     "name",
     "formatted_address",
-    "address_components",
+    "address_component",
     "geometry",
-    "types",
-    "photos",
+    "type",
+    "photo",
     "url",
     "rating",
     "user_ratings_total",
@@ -114,13 +116,36 @@ def _lookup(
     if not gmaps:
         return EnrichmentResult(primary=None)
 
-    if vision.lat is not None and vision.lng is not None:
-        # Nearby Search — returns primary + suggestions in one call
-        return _nearby_lookup(gmaps, vision.lat, vision.lng, primary_cache)
-    elif vision.landmark_name:
-        # Text Search fallback (no coordinates from Gemini)
+    # Verification semantics: the NAME is what Gemini identified, so Text
+    # Search by name+city confirms that exact venue. Gemini's coordinates can
+    # drift hundreds of metres — a Nearby Search there returns whatever is
+    # most prominent in the area, which may be a different venue entirely.
+    if vision.landmark_name:
         query = " ".join(p for p in [vision.landmark_name, vision.city, vision.country] if p)
-        return _text_lookup(gmaps, query, primary_cache)
+        result = _text_lookup(gmaps, query, primary_cache)
+        if result.primary:
+            # Top up suggestions from a Nearby Search around the VERIFIED coords
+            # (lightweight cards straight from the Nearby response — no Details calls)
+            if not result.suggestions and result.primary.coordinates:
+                try:
+                    response = gmaps.places_nearby(
+                        location=(result.primary.coordinates.lat, result.primary.coordinates.lng),
+                        radius=NEARBY_RADIUS,
+                        rank_by="prominence",
+                        language="en",
+                    )
+                    result.suggestions = [
+                        _parse_nearby_result(r)
+                        for r in response.get("results", [])
+                        if r.get("place_id") and r["place_id"] != result.primary.place_id
+                    ][:MAX_SUGGESTIONS]
+                except Exception as e:
+                    logger.debug(f"Suggestion top-up failed: {e}")
+            return result
+
+    if vision.lat is not None and vision.lng is not None:
+        # Fallback: no name match — see what's actually at those coordinates
+        return _nearby_lookup(gmaps, vision.lat, vision.lng, primary_cache)
 
     return EnrichmentResult(primary=None)
 

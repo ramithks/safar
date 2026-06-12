@@ -52,6 +52,11 @@ _BACKOFF_MAX_SECONDS = 8
 MAX_RETRIES = 4                  # up to 4 retries across all regions
 GEMINI_TIMEOUT_SECONDS = 90     # batch call can take longer; allow 90s
 
+# Frames per Gemini call. One giant batch risks output-token truncation
+# (max_output_tokens=8192) — a truncated JSON array used to silently zero out
+# the ENTIRE reel. Chunks also isolate failures to a few frames.
+VISION_BATCH_SIZE = 6
+
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
 _BATCH_SYSTEM_PROMPT = """\
@@ -193,8 +198,12 @@ def _build_batch_prompt(
         "If a frame shows a person, generic food with no establishment visible, "
         "a private home, or you genuinely cannot identify a specific named venue — "
         "set name=null and confidence=0.0. "
-        "Use Google Search to verify every place you identify. "
-        "Be precise about the exact branch/location."
+        "MANDATORY: use Google Search to verify EVERY place before returning it. "
+        "A place may only be returned if the search confirms it exists on the "
+        "internet (official page, Google Maps listing, reviews, or articles); "
+        "if you cannot find it online, return name=null and confidence=0.0 "
+        "instead of guessing. Be precise about the exact branch/location, and "
+        "always fill place_type with the most specific matching category."
     )
     parts.append(_JSON_SCHEMA)
     return "\n\n".join(parts)
@@ -244,13 +253,16 @@ def analyze_frames(
         logger.error("GCP_PROJECT not set — vision analysis disabled")
         return [VisionResult(frame=f) for f in frames]
 
-    prompt = _build_batch_prompt(len(frames), caption_ctx)
-    logger.info(
-        f"Batch Gemini call: {len(frames)} frames, "
-        f"caption_ctx={'yes' if caption_ctx else 'no'}"
-    )
-
-    final = _run_batch_with_retry(frames, prompt)
+    # Chunk frames so a single truncated/failed response can't zero the whole reel
+    final: list[VisionResult] = []
+    for start in range(0, len(frames), VISION_BATCH_SIZE):
+        chunk = frames[start: start + VISION_BATCH_SIZE]
+        prompt = _build_batch_prompt(len(chunk), caption_ctx)
+        logger.info(
+            f"Gemini batch {start // VISION_BATCH_SIZE + 1}: {len(chunk)} frames, "
+            f"caption_ctx={'yes' if caption_ctx else 'no'}"
+        )
+        final.extend(_run_batch_with_retry(chunk, prompt))
 
     # Two-pass consensus requery — only when caption gave us no city context
     if not (caption_ctx and (caption_ctx.city or caption_ctx.place_hints)):

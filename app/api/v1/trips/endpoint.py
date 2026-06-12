@@ -1,4 +1,6 @@
 import uuid
+import urllib.parse
+import re
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
@@ -7,6 +9,7 @@ import app.storage.gcs as gcs
 from .models import (
     InitReelUploadRequest,
     ConfirmReelRequest,
+    AttachSavedReelRequest,
     CreateBookingRequest,
     UpdateBookingRequest,
     InitBookingFileRequest,
@@ -53,6 +56,26 @@ def delete_reel(trip_id: str, reel_id: str, user=Depends(require_user)):
     service.delete_reel(trip_id, reel_id, user.id)
 
 
+# ── Saved-reel attachments (library reels linked to this trip) ────────────────
+
+@router.get("/saved-reels")
+def list_attached_saved_reels(trip_id: str, user=Depends(require_user)):
+    return {"reels": service.list_attached_saved_reels(trip_id, user.id)}
+
+
+@router.post("/saved-reels", status_code=201)
+def attach_saved_reel(trip_id: str, body: AttachSavedReelRequest, user=Depends(require_user)):
+    try:
+        return service.attach_saved_reel(trip_id, user.id, body.reel_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.delete("/saved-reels/{reel_id}", status_code=204)
+def detach_saved_reel(trip_id: str, reel_id: str, user=Depends(require_user)):
+    service.detach_saved_reel(trip_id, user.id, reel_id)
+
+
 # ── Bookings ──────────────────────────────────────────────────────────────────
 
 @router.get("/bookings")
@@ -73,6 +96,8 @@ def create_booking(trip_id: str, body: CreateBookingRequest, user=Depends(requir
         status=body.status,
         price=body.price,
         price_unit=body.price_unit,
+        attachment_url=body.attachment_url,
+        attachment_name=body.attachment_name,
     )
 
 
@@ -106,6 +131,16 @@ def confirm_booking_file(trip_id: str, booking_id: str, user=Depends(require_use
 
 # ── File upload (Supabase Storage) ───────────────────────────────────────────
 
+def _sanitize_filename(filename: str) -> str:
+    # Decode percent-encoded spaces and characters
+    decoded = urllib.parse.unquote(filename)
+    # Replace spaces with underscores
+    with_underscores = decoded.replace(" ", "_")
+    # Keep only alphanumeric, dots, underscores, and hyphens
+    sanitized = re.sub(r"[^\w\.\-]", "", with_underscores)
+    return sanitized or "upload"
+
+
 @router.post("/files/upload", status_code=200)
 async def upload_trip_file(
     trip_id: str,
@@ -119,7 +154,7 @@ async def upload_trip_file(
     """
     content = await file.read()
     content_type = file.content_type or "application/octet-stream"
-    safe_name = (file.filename or "upload").replace(" ", "_")
+    safe_name = _sanitize_filename(file.filename or "upload")
     path = f"trips/{trip_id}/{user.id}/{uuid.uuid4()}_{safe_name}"
 
     try:

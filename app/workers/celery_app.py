@@ -45,13 +45,24 @@ def analyze_reel_task(
 ):
     """
     Celery task that runs the full pipeline.
-    Stores progress and result in Redis so the API can serve them.
+    Stores progress and result in Redis (API polling) and mirrors job state
+    into the Supabase `reel_jobs` table (app's developing-reels feed).
     """
     from app.pipeline.orchestrator import run_pipeline, PipelineEvent
-    from app.workers.job_store import update_job_progress, store_job_result
+    from app.workers.job_store import update_job_progress, store_job_result, _get_redis
 
-    # Mark job as processing
+    # Idempotency guard: with acks_late a worker crash redelivers the task —
+    # never re-run a job that already started (each run costs Gemini/Places $).
+    try:
+        claimed = _get_redis().set(f"job:{job_id}:claimed", "1", nx=True, ex=3600)
+        if not claimed:
+            logger.warning(f"Job {job_id} already claimed by another run — skipping redelivery")
+            return {"job_id": job_id, "status": "duplicate"}
+    except Exception as e:
+        logger.warning(f"Idempotency check unavailable for {job_id} (continuing): {e}")
+
     update_job_progress(job_id, stage="download", percent=0)
+    _update_supabase_job(job_id, status="processing", progress=0)
 
     events_buffer: list[dict] = []
 
@@ -59,20 +70,78 @@ def analyze_reel_task(
         events_buffer.append({"type": event.event_type, "data": event.data})
         _handle_progress_event(job_id, event)
 
-    # Run the async pipeline in a sync context
-    result = asyncio.get_event_loop().run_until_complete(
-        run_pipeline(
-            job_id=job_id,
-            reel_url=reel_url,
-            options=options,
-            metadata=metadata,
-            user_id=user_id,
-            on_event=on_event,
+    try:
+        result = asyncio.run(
+            run_pipeline(
+                job_id=job_id,
+                reel_url=reel_url,
+                options=options,
+                metadata=metadata,
+                user_id=user_id,
+                on_event=on_event,
+            )
         )
-    )
+    except Exception as e:
+        logger.exception(f"Pipeline crashed for {job_id}: {e}")
+        _update_supabase_job(job_id, status="failed", error_message=str(e)[:500])
+        raise
 
     store_job_result(job_id, result, events_buffer)
+    _finalize_supabase_job(job_id, result)
     return {"job_id": job_id, "status": result.status}
+
+
+def _update_supabase_job(job_id: str, **fields):
+    """Mirror job state into the reel_jobs table; never fail the pipeline over it."""
+    from app.config import settings
+    if not (settings.supabase_url and settings.supabase_service_key):
+        return
+    try:
+        from app.storage.supabase_client import update_reel_job
+        update_reel_job(job_id, **fields)
+    except Exception as e:
+        logger.warning(f"reel_jobs mirror update failed for {job_id}: {e}")
+
+
+def _finalize_supabase_job(job_id: str, result):
+    """Write final status + display fields (title/thumbnail/video/category) to reel_jobs."""
+    from collections import Counter
+
+    fields: dict = {"progress": 100, "status": result.status}
+
+    if result.status == "completed":
+        first_place = next(
+            (seg.place.name for seg in result.timeline if seg.place and seg.place.name),
+            None,
+        )
+        fields["title"] = result.summary.dominant_city or first_place or "Imported Reel"
+        fields["thumbnail_url"] = next(
+            (seg.frame_thumbnail_url for seg in result.timeline if seg.frame_thumbnail_url),
+            None,
+        )
+        fields["video_url"] = result.reel.video_url
+        # Dominant place category drives the app's "Plan trip" CTA
+        # (shown for tourist places, hidden for cafes/restaurants/etc.)
+        categories = Counter(
+            seg.place.category for seg in result.timeline
+            if seg.place and seg.place.category
+        )
+        if categories:
+            fields["place_category"] = categories.most_common(1)[0][0]
+    elif result.error:
+        fields["error_message"] = result.error.message[:500]
+
+    _update_supabase_job(job_id, **fields)
+
+    # Completed reels land in the app's Recent Reels automatically
+    if result.status == "completed":
+        from app.config import settings
+        if settings.supabase_url and settings.supabase_service_key:
+            try:
+                from app.storage.supabase_client import auto_save_completed_job
+                auto_save_completed_job(job_id)
+            except Exception as e:
+                logger.warning(f"saved_reels auto-save failed for {job_id}: {e}")
 
 
 def _handle_progress_event(job_id: str, event):
@@ -92,6 +161,8 @@ def _handle_progress_event(job_id: str, event):
         if stage in stage_order:
             idx, pct = stage_order[stage]
             update_job_progress(job_id, stage=stage, percent=pct)
+            # Mirror to reel_jobs — only on stage transitions (~5 writes/job)
+            _update_supabase_job(job_id, status="processing", progress=pct)
 
     elif event.event_type == "completed":
         update_job_progress(job_id, stage="completed", percent=100)

@@ -39,7 +39,9 @@ services:
 
   worker:
     build: .
-    command: celery -A app.workers.celery_app.celery_app worker --loglevel=info --concurrency=1
+    # Pipeline work is I/O-bound (download, GCS, Gemini, Places) — concurrency 4
+    # lets multiple reels process in parallel. Override with CELERY_CONCURRENCY.
+    command: celery -A app.workers.celery_app.celery_app worker --loglevel=info --concurrency=${CELERY_CONCURRENCY:-4}
     environment:
       - REDIS_URL=redis://redis:6379/0
       - TEMP_DIR=/tmp/travbuddy

@@ -5,7 +5,7 @@ from typing import Optional, Any
 class AnalyzeOptions(BaseModel):
     min_confidence: float = 0.60
     max_locations: int = 20
-    enrich_places: bool = False
+    enrich_places: bool = True   # verify Gemini results against Google Places
     include_frames: bool = True
     webhook_url: Optional[str] = None
     webhook_secret: Optional[str] = None
@@ -29,7 +29,6 @@ class AnalyzeOptions(BaseModel):
 
 class AnalyzeReelRequest(BaseModel):
     reel_url: str
-    user_id: Optional[str] = None   # Supabase auth user UUID — sent by frontend
     options: AnalyzeOptions = AnalyzeOptions()
     metadata: Optional[dict[str, Any]] = None
 

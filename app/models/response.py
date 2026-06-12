@@ -95,6 +95,7 @@ class ReelInfo(BaseModel):
     frame_count: Optional[int] = None
     processed_at: Optional[datetime] = None
     caption: Optional[str] = None
+    video_url: Optional[str] = None  # GCS copy of the downloaded video
 
 
 class ProcessingStats(BaseModel):
@@ -136,6 +137,9 @@ class JobStatusResponse(BaseModel):
     estimated_completion_at: Optional[datetime] = None
     error: Optional[ErrorDetail] = None
     metadata: Optional[dict[str, Any]] = None
+    # Full ReelResult dict, included once status == completed so the client
+    # can skip the extra /result round-trip.
+    result: Optional[dict[str, Any]] = None
 
 
 class AnalyzeReelResponse(BaseModel):

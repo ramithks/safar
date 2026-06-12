@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS public.trip_bookings (
   file_gcs_path text,
   file_gcs_url  text,
   has_file      boolean DEFAULT false,
+  attachment_name text,
   created_at    timestamptz DEFAULT now()
 );
 
@@ -187,14 +188,28 @@ CREATE TABLE IF NOT EXISTS public.reel_scans (
 CREATE TABLE IF NOT EXISTS public.reel_jobs (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id       uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  job_id        text,                          -- pipeline job id (job_<ULID>), shared across users on cache hits
   source_url    text,
   source_title  text,
   title         text,
   thumbnail_url text,
+  video_url     text,
   status        text NOT NULL DEFAULT 'pending',
   progress      integer DEFAULT 0,
-  created_at    timestamptz DEFAULT now()
+  error_message text,
+  created_at    timestamptz DEFAULT now(),
+  updated_at    timestamptz DEFAULT now(),
+  UNIQUE (user_id, job_id)
 );
+CREATE INDEX IF NOT EXISTS reel_jobs_job_id_idx ON public.reel_jobs (job_id);
+
+-- Migration for deployments that created reel_jobs before the pipeline wrote to it:
+--   ALTER TABLE public.reel_jobs ADD COLUMN IF NOT EXISTS job_id text;
+--   ALTER TABLE public.reel_jobs ADD COLUMN IF NOT EXISTS video_url text;
+--   ALTER TABLE public.reel_jobs ADD COLUMN IF NOT EXISTS error_message text;
+--   ALTER TABLE public.reel_jobs ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
+--   ALTER TABLE public.reel_jobs ADD CONSTRAINT reel_jobs_user_job_unique UNIQUE (user_id, job_id);
+--   CREATE INDEX IF NOT EXISTS reel_jobs_job_id_idx ON public.reel_jobs (job_id);
 
 CREATE TABLE IF NOT EXISTS public.saved_reels (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -203,11 +218,27 @@ CREATE TABLE IF NOT EXISTS public.saved_reels (
   title         text NOT NULL,
   category      text NOT NULL,
   thumbnail_url text DEFAULT '',
+  video_url     text DEFAULT '',
   description   text DEFAULT '',
   vibes         text[] DEFAULT '{}',
   is_liked      boolean DEFAULT false,
   created_at    timestamptz DEFAULT now()
 );
+
+-- Migration for existing deployments:
+--   ALTER TABLE public.saved_reels ADD COLUMN IF NOT EXISTS video_url text DEFAULT '';
+
+-- Saved-library reels attached to a trip (applied 2026-06-12 as migration
+-- trip_saved_reels_attachments). trip_id is text to match trip_reels.
+CREATE TABLE IF NOT EXISTS public.trip_saved_reels (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  trip_id    text NOT NULL,
+  reel_id    uuid NOT NULL REFERENCES public.saved_reels(id) ON DELETE CASCADE,
+  created_at timestamptz DEFAULT now(),
+  UNIQUE (user_id, trip_id, reel_id)
+);
+CREATE INDEX IF NOT EXISTS trip_saved_reels_user_trip_idx ON public.trip_saved_reels (user_id, trip_id);
 
 CREATE TABLE IF NOT EXISTS public.trip_journey (
   id                      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -324,6 +355,7 @@ ALTER TABLE public.trip_reels        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.reel_scans        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.reel_jobs         ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.saved_reels       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.trip_saved_reels  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.trip_journey       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.saved_folders      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.folder_items       ENABLE ROW LEVEL SECURITY;
@@ -376,6 +408,9 @@ CREATE POLICY "reel_jobs_own" ON public.reel_jobs FOR ALL USING (auth.uid() = us
 
 -- saved_reels
 CREATE POLICY "saved_reels_own" ON public.saved_reels FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+
+-- trip_saved_reels
+CREATE POLICY "trip_saved_reels_own" ON public.trip_saved_reels FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
 -- trip_journey
 CREATE POLICY "trip_journey_crud_own" ON public.trip_journey FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);

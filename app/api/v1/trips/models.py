@@ -15,6 +15,10 @@ class ConfirmReelRequest(BaseModel):
     duration: Optional[str] = None      # e.g. "0:45"
 
 
+class AttachSavedReelRequest(BaseModel):
+    reel_id: str                        # saved_reels.id to attach to this trip
+
+
 # ── Bookings ───────────────────────────────────────────────────────────────────
 
 class CreateBookingRequest(BaseModel):

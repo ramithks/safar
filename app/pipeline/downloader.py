@@ -114,6 +114,23 @@ def _extract_shortcode(url: str) -> Optional[str]:
     return None
 
 
+def extract_shortcode(url: str) -> Optional[str]:
+    """Public alias: pull the post shortcode out of any Instagram URL variant."""
+    return _extract_shortcode(url)
+
+
+def canonical_reel_url(url: str) -> Optional[str]:
+    """
+    Normalize any Instagram reel/post URL variant (/reel/ vs /reels/, share
+    query params, trailing slashes) to one canonical form so caching and
+    dedup keys match across submissions of the same content.
+    """
+    shortcode = _extract_shortcode(url)
+    if not shortcode:
+        return None
+    return f"https://www.instagram.com/reel/{shortcode}/"
+
+
 def _jitter_sleep():
     """Short random delay to reduce rate-limit risk."""
     delay = random.uniform(1.0, 3.0)

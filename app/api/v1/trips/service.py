@@ -5,6 +5,8 @@ files hosted on GCS via signed PUT URLs.
 import logging
 import uuid
 from datetime import datetime, timezone, timedelta
+import urllib.parse
+import re
 
 from app.db.client import get_db
 from app.config import settings
@@ -27,6 +29,16 @@ def _gcs_ready() -> bool:
     return bool(settings.gcs_bucket_name)
 
 
+def _sanitize_filename(filename: str) -> str:
+    # Decode percent-encoded spaces and characters
+    decoded = urllib.parse.unquote(filename)
+    # Replace spaces with underscores
+    with_underscores = decoded.replace(" ", "_")
+    # Keep only alphanumeric, dots, underscores, and hyphens
+    sanitized = re.sub(r"[^\w\.\-]", "", with_underscores)
+    return sanitized or "upload"
+
+
 # ── Reels ─────────────────────────────────────────────────────────────────────
 
 def init_reel_upload(trip_id: str, user_id: str, title: str, category: str, filename: str, content_type: str) -> dict:
@@ -35,7 +47,7 @@ def init_reel_upload(trip_id: str, user_id: str, title: str, category: str, file
     The client PUTs the video to the signed URL, then calls confirm_reel_upload.
     """
     reel_id = str(uuid.uuid4())
-    safe_name = filename.replace(" ", "_")
+    safe_name = _sanitize_filename(filename)
     blob_path = f"trips/{trip_id}/reels/{reel_id}/{safe_name}"
 
     signed_url = None
@@ -135,6 +147,62 @@ def delete_reel(trip_id: str, reel_id: str, user_id: str) -> None:
     db.table("trip_reels").delete().eq("id", reel_id).eq("trip_id", trip_id).eq("user_id", user_id).execute()
 
 
+# ── Saved-reel attachments ────────────────────────────────────────────────────
+# Links reels from the user's saved_reels library to a trip (trip_saved_reels
+# join table) — distinct from trip_reels, which holds GCS-uploaded videos.
+
+def list_attached_saved_reels(trip_id: str, user_id: str) -> list[dict]:
+    """Attached saved_reels rows, newest attachment first."""
+    db = _db()
+    links = (
+        db.table("trip_saved_reels")
+        .select("reel_id, created_at")
+        .eq("trip_id", trip_id)
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    reel_ids = [l["reel_id"] for l in (links.data or [])]
+    if not reel_ids:
+        return []
+
+    reels = (
+        db.table("saved_reels")
+        .select("*")
+        .eq("user_id", user_id)
+        .in_("id", reel_ids)
+        .execute()
+    )
+    by_id = {r["id"]: r for r in (reels.data or [])}
+    return [by_id[rid] for rid in reel_ids if rid in by_id]
+
+
+def attach_saved_reel(trip_id: str, user_id: str, reel_id: str) -> dict:
+    db = _db()
+    owned = (
+        db.table("saved_reels")
+        .select("id")
+        .eq("id", reel_id)
+        .eq("user_id", user_id)
+        .maybe_single()
+        .execute()
+    )
+    if not owned.data:
+        raise ValueError("Reel not found")
+
+    db.table("trip_saved_reels").upsert(
+        {"trip_id": trip_id, "user_id": user_id, "reel_id": reel_id},
+        on_conflict="user_id,trip_id,reel_id",
+        ignore_duplicates=True,
+    ).execute()
+    return {"attached": True, "reel_id": reel_id}
+
+
+def detach_saved_reel(trip_id: str, user_id: str, reel_id: str) -> None:
+    db = _db()
+    db.table("trip_saved_reels").delete().eq("trip_id", trip_id).eq("user_id", user_id).eq("reel_id", reel_id).execute()
+
+
 # ── Bookings ──────────────────────────────────────────────────────────────────
 
 def create_booking(trip_id: str, user_id: str, **fields) -> dict:
@@ -198,7 +266,7 @@ def delete_booking(trip_id: str, booking_id: str, user_id: str) -> None:
 
 
 def init_booking_file_upload(trip_id: str, booking_id: str, user_id: str, filename: str, content_type: str) -> dict:
-    safe_name = filename.replace(" ", "_")
+    safe_name = _sanitize_filename(filename)
     blob_path = f"trips/{trip_id}/bookings/{booking_id}/{safe_name}"
 
     signed_url = None
@@ -263,7 +331,7 @@ def confirm_booking_file(trip_id: str, booking_id: str, user_id: str) -> dict:
 
 def init_document_upload(trip_id: str, user_id: str, name: str, category: str, filename: str, content_type: str) -> dict:
     doc_id = str(uuid.uuid4())
-    safe_name = filename.replace(" ", "_")
+    safe_name = _sanitize_filename(filename)
     blob_path = f"trips/{trip_id}/documents/{doc_id}/{safe_name}"
 
     signed_url = None

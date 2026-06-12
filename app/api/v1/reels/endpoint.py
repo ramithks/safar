@@ -1,8 +1,10 @@
 """
 GET  /api/v1/reels/saved          →  user's saved reels
-GET  /api/v1/reels/developing     →  reels being processed (reel_jobs)
-POST /api/v1/reels/save           →  save a reel from a job
 POST /api/v1/reels/{reel_id}/like →  toggle like on saved reel
+
+Completed pipeline jobs are auto-saved into saved_reels (see
+app.storage.supabase_client.auto_save_completed_job) — there is no manual
+save step.
 
 Required Supabase tables (create in dashboard):
 
@@ -27,22 +29,12 @@ Required Supabase tables (create in dashboard):
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
 
 from app.deps.auth import require_user
 from app.db.client import get_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/reels", tags=["reels"])
-
-
-class SaveReelRequest(BaseModel):
-    job_id: str
-    category: str
-    title: str
-    image: str = ""
-    description: str = ""
-    vibes: list[str] = []
 
 
 @router.get("/saved")
@@ -60,58 +52,6 @@ def get_saved_reels(user=Depends(require_user)):
     except Exception as exc:
         logger.warning("[reels] get_saved error: %s", exc)
         return []
-
-
-@router.get("/developing")
-def get_developing_reels(user=Depends(require_user)):
-    try:
-        db = get_db()
-        res = (
-            db.table("reel_jobs")
-            .select("*")
-            .eq("user_id", str(user.id))
-            .in_("status", ["pending", "processing", "completed"])
-            .order("created_at", desc=True)
-            .limit(10)
-            .execute()
-        )
-        return res.data or []
-    except Exception as exc:
-        logger.warning("[reels] get_developing error: %s", exc)
-        return []
-
-
-@router.post("/save", status_code=201)
-def save_reel(body: SaveReelRequest, user=Depends(require_user)):
-    db = get_db()
-    try:
-        res = (
-            db.table("saved_reels")
-            .insert({
-                "user_id": str(user.id),
-                "job_id": body.job_id,
-                "title": body.title,
-                "category": body.category,
-                "thumbnail_url": body.image,
-                "description": body.description or "Discovered with TravBuddy AI.",
-                "vibes": body.vibes or ["AI Curated"],
-                "is_liked": False,
-            })
-            .select()
-            .single()
-            .execute()
-        )
-
-        # Mark job as saved so it leaves the developing queue
-        try:
-            db.table("reel_jobs").update({"status": "saved"}).eq("id", body.job_id).eq("user_id", str(user.id)).execute()
-        except Exception:
-            pass
-
-        return res.data
-    except Exception as exc:
-        logger.error("[reels] save_reel error: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to save reel")
 
 
 @router.post("/{reel_id}/like")

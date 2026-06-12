@@ -94,6 +94,7 @@ async def run_pipeline(
     pipeline_start = time.time()
     video_gcs_url: Optional[str] = None
     frame_gcs_urls: dict[str, str] = {}
+    video_upload_future: Optional[asyncio.Future] = None
 
     try:
         # ── Stage 1: Download ────────────────────────────────────────────────────
@@ -131,16 +132,12 @@ async def run_pipeline(
                 metadata=metadata,
             )
 
-        # ── Upload video to GCS ──────────────────────────────────────────────────
+        # ── Upload video to GCS (in background — URL not needed until result assembly) ──
         if settings.gcs_bucket_name:
-            try:
-                from app.storage.gcs import upload_video as gcs_upload_video
-                video_gcs_url = await asyncio.get_event_loop().run_in_executor(
-                    None, gcs_upload_video, job_id, video_path, settings.gcs_bucket_name
-                )
-                emit("stage_complete", {"stage": "upload_video", "gcs_url": video_gcs_url})
-            except Exception as e:
-                logger.warning(f"GCS video upload failed: {e}")
+            from app.storage.gcs import upload_video as gcs_upload_video
+            video_upload_future = asyncio.get_event_loop().run_in_executor(
+                None, gcs_upload_video, job_id, video_path, settings.gcs_bucket_name
+            )
 
         # ── Stage 2: Scene Detection ─────────────────────────────────────────────
         emit("stage_start", {"stage": "scene_detection", "message": "Detecting scene changes..."})
@@ -239,8 +236,60 @@ async def run_pipeline(
                 metadata,
             )
 
+        # ── Stage 5: Places verification ─────────────────────────────────────────
+        # Gemini names places; Google Places confirms they exist and supplies
+        # canonical coordinates/addresses. Unverifiable places get downgraded
+        # (and drop out if they fall below the confidence floor).
+        enrichment_map: dict[int, object] = {}
+        if ctx.enrich_places:
+            from app.pipeline.places_client import enrich_with_places, _get_client as _places_available
+
+            if _places_available() is not None:
+                emit("stage_start", {
+                    "stage": "places_enrichment",
+                    "message": f"Verifying {len(confident_results)} places with Google Places...",
+                })
+                t = time.time()
+
+                pairs = await asyncio.get_event_loop().run_in_executor(
+                    None, enrich_with_places, confident_results
+                )
+                ctx.inc_api("places", len(confident_results))
+
+                verified: list = []
+                for vr, er in pairs:
+                    if er.primary:
+                        enrichment_map[id(vr)] = er
+                        verified.append(vr)
+                    else:
+                        # Couldn't corroborate — downgrade rather than trust blindly
+                        vr.confidence *= 0.7
+                        if vr.confidence >= ctx.min_confidence:
+                            verified.append(vr)
+                        else:
+                            logger.info(
+                                f"Dropping unverifiable place '{vr.landmark_name}' "
+                                f"(downgraded to {vr.confidence:.2f})"
+                            )
+
+                emit("stage_complete", {
+                    "stage": "places_enrichment",
+                    "duration_ms": int((time.time() - t) * 1000),
+                    "verified": len(enrichment_map),
+                    "dropped": len(confident_results) - len(verified),
+                })
+                confident_results = verified
+
+                if not confident_results:
+                    return _no_results(
+                        job_id, reel_url, duration_seconds, len(unique_frames),
+                        "LOW_VISUAL_QUALITY",
+                        "Locations were detected but none could be matched to a known place.",
+                        metadata,
+                    )
+
         # ── Assemble timeline ────────────────────────────────────────────────────
-        timeline = _build_timeline(confident_results, ctx, frame_gcs_urls)
+        timeline = _build_timeline(confident_results, ctx, frame_gcs_urls, enrichment_map)
 
         # Cap to max_locations
         timeline = timeline[:ctx.max_locations]
@@ -252,6 +301,15 @@ async def run_pipeline(
                 "Locations were detected but none could be matched to a known place.",
                 metadata,
             )
+
+        # ── Collect background video upload ─────────────────────────────────────
+        if video_upload_future is not None:
+            try:
+                video_gcs_url = await video_upload_future
+                emit("stage_complete", {"stage": "upload_video", "gcs_url": video_gcs_url})
+            except Exception as e:
+                logger.warning(f"GCS video upload failed: {e}")
+            video_upload_future = None
 
         # ── Summary ──────────────────────────────────────────────────────────────
         summary = _build_summary(timeline)
@@ -273,6 +331,7 @@ async def run_pipeline(
                 frame_count=len(unique_frames),
                 processed_at=datetime.now(timezone.utc),
                 caption=download_result.caption,
+                video_url=video_gcs_url,
             ),
             summary=summary,
             timeline=timeline,
@@ -306,6 +365,13 @@ async def run_pipeline(
         return result
 
     finally:
+        # Don't delete the work dir while the background upload may still be
+        # reading the video file (early-return paths skip the await above)
+        if video_upload_future is not None:
+            try:
+                await video_upload_future
+            except Exception as e:
+                logger.warning(f"GCS video upload failed: {e}")
         # Always clean up temp files
         _cleanup(work_dir)
 
@@ -318,19 +384,40 @@ def _normalize_name(name: str) -> str:
     return _NORMALIZE_RE.sub("", name.lower()).strip()
 
 
+def _thumb_b64(frame_path: str, max_px: int = 480, quality: int = 70) -> Optional[str]:
+    """
+    Downscaled base64 JPEG fallback for when GCS isn't configured.
+    Bounds payload size so result rows don't balloon into multi-MB jsonb.
+    """
+    import base64
+    import io
+    try:
+        from PIL import Image
+        img = Image.open(frame_path)
+        img.thumbnail((max_px, max_px))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=quality)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        return None
+
+
 def _build_timeline(
     vision_results: list[VisionResult],
     ctx: PipelineContext,
     frame_gcs_urls: Optional[dict[str, str]] = None,
+    enrichment_map: Optional[dict[int, object]] = None,
 ) -> list[LocationSegment]:
     """Convert vision results into a deduplicated, ordered timeline.
+
+    Places-verified results use the canonical PlaceDetail from Google Places
+    (real place_id, coordinates, address, rating, photos). Unverified ones
+    fall back to Gemini's data.
 
     Dedup strategy: normalize place name (lowercase, no punctuation).
     If the same place appears in multiple frames, merge into one segment
     spanning the full time range and keep the highest-confidence thumbnail.
     """
-    import base64
-    import re
     from app.models.response import Coordinates, PlaceAddress
 
     # name_key → index in timeline (for merging duplicates)
@@ -339,8 +426,16 @@ def _build_timeline(
 
     for vr in vision_results:
         place = None
+        suggestions: list = []
+        maps_url = vr.maps_search_url
+        enrichment = (enrichment_map or {}).get(id(vr))
 
-        if vr.landmark_name:
+        if enrichment is not None and getattr(enrichment, "primary", None):
+            # Verified: canonical Places data wins over Gemini's guess
+            place = enrichment.primary
+            suggestions = list(getattr(enrichment, "suggestions", []) or [])
+            maps_url = place.google_maps_url or vr.maps_search_url
+        elif vr.landmark_name:
             place = PlaceDetail(
                 place_id=f"gemini_{vr.frame.scene_index}",
                 name=vr.landmark_name,
@@ -360,7 +455,8 @@ def _build_timeline(
                 types=["point_of_interest"],
             )
 
-        # Deduplicate by normalized place name
+        # Deduplicate by normalized place name (canonical name when verified,
+        # so "Café Torte" and "Torte by Kusha Kapila" merge once Places agrees)
         name_key = _normalize_name(place.name) if place and place.name else None
         if name_key and name_key in seen_names:
             # Merge: extend the existing segment's time range
@@ -376,21 +472,11 @@ def _build_timeline(
                 existing.confidence = vr.confidence
                 existing.frame_thumbnail_url = (frame_gcs_urls or {}).get(vr.frame.frame_path)
                 if not existing.frame_thumbnail_url:
-                    try:
-                        with open(vr.frame.frame_path, "rb") as f:
-                            existing.frame_thumbnail_b64 = base64.b64encode(f.read()).decode("utf-8")
-                    except Exception:
-                        pass
+                    existing.frame_thumbnail_b64 = _thumb_b64(vr.frame.frame_path)
             continue
 
         gcs_url = (frame_gcs_urls or {}).get(vr.frame.frame_path)
-        frame_b64 = None
-        if not gcs_url:
-            try:
-                with open(vr.frame.frame_path, "rb") as f:
-                    frame_b64 = base64.b64encode(f.read()).decode("utf-8")
-            except Exception:
-                pass
+        frame_b64 = None if gcs_url else _thumb_b64(vr.frame.frame_path)
 
         segment = LocationSegment(
             segment_id=f"seg_{len(timeline) + 1:03d}",
@@ -403,8 +489,8 @@ def _build_timeline(
             frame_thumbnail_b64=frame_b64,
             frame_thumbnail_url=gcs_url,
             place=place,
-            maps_search_url=vr.maps_search_url,
-            nearby_suggestions=[],
+            maps_search_url=maps_url,
+            nearby_suggestions=suggestions,
             vision_context=VisionContext(
                 scene_description=vr.scene_description,
                 visual_cues=vr.visual_cues,
