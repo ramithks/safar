@@ -4,6 +4,7 @@ Vertex AI / Gemini helper.
 Authenticates using a service account JSON string (GOOGLE_SERVICE_ACCOUNT_JSON env var),
 then calls the Vertex AI generateContent REST API directly.
 
+
 Optimisations:
 - Token is cached for 55 minutes (tokens are valid 1 hour) — avoids a Google OAuth
   round-trip on every request.
