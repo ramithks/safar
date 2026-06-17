@@ -26,7 +26,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.deps.auth import require_user
@@ -151,14 +151,14 @@ async def generate_home_feed(user_id: str, city: str, country: str, vibes: list[
 @router.post("/generate-feed")
 async def generate_feed(
     body: GenerateFeedRequest,
-    background_tasks: BackgroundTasks,
     user=Depends(require_user),
 ):
-    background_tasks.add_task(
-        generate_home_feed,
+    """Generate, image-enrich, and store the home feed, returning 200 only
+    after weekend_plans and vibe_trips have been upserted."""
+    await generate_home_feed(
         str(user.id),
         body.city,
         body.country,
         body.vibes,
     )
-    return {"status": "ok", "generating": True}
+    return {"status": "ok", "generating": False}
