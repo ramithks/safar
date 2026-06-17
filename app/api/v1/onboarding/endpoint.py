@@ -87,6 +87,34 @@ async def _store_feed(db, user_id: str, feed_type: str, raw, query_fn, now: str)
         logger.warning("[onboarding] Parse %s failed: %s", feed_type, exc)
 
 
+async def _generate_with_retry(prompt: str, *, attempts: int = 3, per_attempt_timeout: float = 12.0):
+    """Call Gemini, retrying if a single attempt doesn't return within 12s.
+
+    Each attempt is capped at `per_attempt_timeout` seconds (wall-clock). If it
+    times out — or otherwise fails — we retry up to `attempts` times before
+    giving up and re-raising the last error.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return await asyncio.wait_for(
+                vertex_generate(
+                    prompt,
+                    response_mime_type="application/json",
+                    temperature=0.7,
+                    timeout=per_attempt_timeout,
+                ),
+                timeout=per_attempt_timeout,
+            )
+        except Exception as exc:  # includes asyncio.TimeoutError — retry on any failure
+            last_exc = exc
+            logger.warning(
+                "[onboarding] Gemini attempt %d/%d failed (%s) — retrying",
+                attempt + 1, attempts, type(exc).__name__,
+            )
+    raise last_exc if last_exc else RuntimeError("generation failed")
+
+
 async def generate_home_feed(user_id: str, city: str, country: str, vibes: list[str]) -> None:
     """Background: call Gemini for weekend plans + vibe trips, upsert into user_home_feed."""
     try:
@@ -127,8 +155,8 @@ async def generate_home_feed(user_id: str, city: str, country: str, vibes: list[
         )
 
         weekend_raw, vibe_raw = await asyncio.gather(
-            vertex_generate(weekend_prompt, response_mime_type="application/json", temperature=0.7, timeout=60.0),
-            vertex_generate(vibe_prompt, response_mime_type="application/json", temperature=0.7, timeout=60.0),
+            _generate_with_retry(weekend_prompt),
+            _generate_with_retry(vibe_prompt),
             return_exceptions=True,
         )
 
