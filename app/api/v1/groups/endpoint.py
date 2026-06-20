@@ -47,6 +47,15 @@ def get_group_by_trip(trip_id: str, user=Depends(require_user)):
     return group
 
 
+@router.get("/preview/{invite_code}")
+def preview_group(invite_code: str, user=Depends(require_user)):
+    """Preview a group from its invite code (for the join bottom sheet)."""
+    group = service.get_group_preview(invite_code, user.id)
+    if not group:
+        raise HTTPException(status_code=404, detail="Invalid or expired invite link")
+    return group
+
+
 @router.get("/{group_id}")
 def get_group(group_id: UUID, user=Depends(require_user)):
     group = service.get_group(str(group_id), user.id)

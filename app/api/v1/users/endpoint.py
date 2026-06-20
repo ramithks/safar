@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from app.deps.auth import require_user
 from app.db.client import get_db
+from app.api.v1.access import can_access_trip
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/users", tags=["users"])
@@ -81,12 +82,13 @@ def get_trip_by_id(trip_id: str, user=Depends(require_user)):
             .select("*")
             .eq("id", trip_id)
             .eq("user_id", str(user.id))
-            .maybe_single()
+            .limit(1)
             .execute()
         )
-        if not res.data:
+        rows = (res.data if res else None) or []
+        if not rows:
             raise HTTPException(status_code=404, detail="Trip not found")
-        return res.data
+        return rows[0]
     except HTTPException:
         raise
     except Exception as exc:
@@ -113,17 +115,39 @@ def update_trip_itinerary(trip_id: str, body: UpdateTripItineraryRequest, user=D
 def get_trip_journey(trip_id: str, user=Depends(require_user)):
     try:
         db = get_db()
+        uid = str(user.id)
+
+        # Fast path: the requester's own journey row (trip creator / personal trip).
         res = (
             db.table("trip_journey")
             .select("*")
             .eq("trip_id", trip_id)
-            .eq("user_id", str(user.id))
-            .maybe_single()
+            .eq("user_id", uid)
+            .limit(1)
             .execute()
         )
-        if not res.data:
+        rows = (res.data if res else None) or []
+        if rows:
+            return rows[0]
+
+        # Shared trip: a group member sees the trip's journey, which was created
+        # by the trip owner. Journey is trip-level data, so it's safe to return
+        # once we've confirmed the requester can access the trip.
+        if not can_access_trip(trip_id, uid, db):
             raise HTTPException(status_code=404, detail="Journey not found")
-        return res.data
+
+        res = (
+            db.table("trip_journey")
+            .select("*")
+            .eq("trip_id", trip_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = (res.data if res else None) or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="Journey not found")
+        return rows[0]
     except HTTPException:
         raise
     except Exception as exc:

@@ -10,6 +10,7 @@ import re
 
 from app.db.client import get_db
 from app.config import settings
+from app.api.v1.access import can_access_trip
 import app.storage.gcs as gcs
 
 logger = logging.getLogger(__name__)
@@ -119,11 +120,13 @@ def confirm_reel_upload(trip_id: str, reel_id: str, user_id: str, duration: str 
 
 def list_reels(trip_id: str, user_id: str) -> list[dict]:
     db = _db()
+    # Shared with the squad: any group member sees the trip's reels.
+    if not can_access_trip(trip_id, user_id, db):
+        return []
     res = (
         db.table("trip_reels")
         .select("*")
         .eq("trip_id", trip_id)
-        .eq("user_id", user_id)
         .order("created_at", desc=False)
         .execute()
     )
@@ -152,13 +155,18 @@ def delete_reel(trip_id: str, reel_id: str, user_id: str) -> None:
 # join table) — distinct from trip_reels, which holds GCS-uploaded videos.
 
 def list_attached_saved_reels(trip_id: str, user_id: str) -> list[dict]:
-    """Attached saved_reels rows, newest attachment first."""
+    """Attached saved_reels rows, newest attachment first.
+
+    Shared with the squad: any group member sees reels attached to the trip by
+    anyone, not just their own attachments.
+    """
     db = _db()
+    if not can_access_trip(trip_id, user_id, db):
+        return []
     links = (
         db.table("trip_saved_reels")
         .select("reel_id, created_at")
         .eq("trip_id", trip_id)
-        .eq("user_id", user_id)
         .order("created_at", desc=True)
         .execute()
     )
@@ -169,7 +177,6 @@ def list_attached_saved_reels(trip_id: str, user_id: str) -> list[dict]:
     reels = (
         db.table("saved_reels")
         .select("*")
-        .eq("user_id", user_id)
         .in_("id", reel_ids)
         .execute()
     )
@@ -222,11 +229,13 @@ def create_booking(trip_id: str, user_id: str, **fields) -> dict:
 
 def list_bookings(trip_id: str, user_id: str) -> list[dict]:
     db = _db()
+    # Shared with the squad: any group member sees the trip's bookings.
+    if not can_access_trip(trip_id, user_id, db):
+        return []
     res = (
         db.table("trip_bookings")
         .select("*")
         .eq("trip_id", trip_id)
-        .eq("user_id", user_id)
         .order("created_at", desc=False)
         .execute()
     )
@@ -418,11 +427,13 @@ def create_document_direct(trip_id: str, user_id: str, name: str, category: str,
 
 def list_documents(trip_id: str, user_id: str) -> list[dict]:
     db = _db()
+    # Shared with the squad: any group member sees the trip's documents.
+    if not can_access_trip(trip_id, user_id, db):
+        return []
     res = (
         db.table("trip_documents")
         .select("*")
         .eq("trip_id", trip_id)
-        .eq("user_id", user_id)
         .order("created_at", desc=False)
         .execute()
     )

@@ -126,6 +126,35 @@ def get_group(group_id: str, user_id: str) -> dict | None:
     }
 
 
+def get_group_preview(invite_code: str, user_id: str) -> dict | None:
+    """Lightweight group preview resolved from an invite code.
+
+    Powers the join bottom sheet the user sees after tapping an invite link,
+    *before* they commit to joining. Never leaks the invite_code. `is_member`
+    lets the client skip straight into the group if they already joined.
+    """
+    db = _db()
+    row = _one_or_none(
+        db.table("trip_groups")
+        .select("id, name, destination, trip_id, created_at, group_members(display_name, role, user_id)")
+        .eq("invite_code", invite_code)
+    )
+    if not row:
+        return None
+    group = dict(row)
+    members = group.pop("group_members", None) or []
+    is_member = any(m.get("user_id") == user_id for m in members)
+    return {
+        "id": group["id"],
+        "name": group.get("name"),
+        "destination": group.get("destination"),
+        "trip_id": group.get("trip_id"),
+        "member_count": len(members),
+        "members": [{"display_name": m.get("display_name"), "role": m.get("role")} for m in members],
+        "is_member": is_member,
+    }
+
+
 def join_group(invite_code: str, user_id: str, display_name: str) -> dict:
     db = _db()
     group_row = _one_or_none(db.table("trip_groups").select("*").eq("invite_code", invite_code))
