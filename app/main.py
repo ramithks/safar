@@ -19,15 +19,18 @@ from app.config import settings
 from app.core.limiter import limiter
 
 # ── Sentry — must init before FastAPI() to capture startup errors ───────────────
-if settings.sentry_dsn:
-    sentry_sdk.init(
-        dsn=settings.sentry_dsn,
-        environment=settings.app_env,
-        # No request bodies / user IPs in Sentry — errors still carry stack traces
-        send_default_pii=False,
-        traces_sample_rate=settings.sentry_traces_sample_rate,
-        profiles_sample_rate=settings.sentry_profiles_sample_rate,
-    )
+# DSN is pinned here; SENTRY_DSN env var overrides if set.
+_SENTRY_DSN = (
+    settings.sentry_dsn
+    or "https://fe1488d1895bed2fc5f0435e4df3d136@o4511167749029888.ingest.us.sentry.io/4511325237346304"
+)
+sentry_sdk.init(
+    dsn=_SENTRY_DSN,
+    environment=settings.app_env,
+    send_default_pii=True,           # capture request headers + user IPs
+    traces_sample_rate=settings.sentry_traces_sample_rate,
+    profiles_sample_rate=settings.sentry_profiles_sample_rate,
+)
 
 # ── Logging setup ────────────────────────────────────────────────────────────────
 structlog.configure(
@@ -102,7 +105,12 @@ async def permission_error_handler(request: Request, exc: PermissionError):
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    logger.error(
+        "Unhandled exception on %s %s: %s",
+        request.method, request.url.path, exc,
+        exc_info=True,
+    )
+    sentry_sdk.capture_exception(exc)
     return JSONResponse(
         status_code=500,
         content={
@@ -123,3 +131,9 @@ async def root():
         "docs": "/docs",
         "health": "/api/v1/health",
     }
+
+
+@app.get("/sentry-debug")
+async def trigger_error():
+    """Intentionally raises ZeroDivisionError to verify Sentry is capturing errors + transactions."""
+    division_by_zero = 1 / 0

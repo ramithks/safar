@@ -24,8 +24,10 @@ Required Supabase table (create once in dashboard):
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
 
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -72,12 +74,18 @@ async def _store_feed(db, user_id: str, feed_type: str, raw, query_fn, now: str)
     """Parse a Gemini JSON array, enrich items with images, and upsert — all concurrently."""
     if isinstance(raw, Exception):
         logger.warning("[onboarding] %s Gemini error: %s", feed_type, raw)
+        sentry_sdk.capture_exception(raw)
         return
     try:
         items = json.loads(raw) if isinstance(raw, str) else raw
         if not (isinstance(items, list) and items):
             return
+        t_img = time.perf_counter()
         items = await _attach_images(items, query_fn)
+        logger.info(
+            "[onboarding] %s image enrichment done: %d items in %.1fs",
+            feed_type, len(items), time.perf_counter() - t_img,
+        )
         db.table("user_home_feed").upsert(
             {"user_id": user_id, "feed_type": feed_type, "items": items, "generated_at": now},
             on_conflict="user_id,feed_type",
@@ -85,6 +93,7 @@ async def _store_feed(db, user_id: str, feed_type: str, raw, query_fn, now: str)
         logger.info("[onboarding] Stored %d %s for %s", len(items), feed_type, user_id[:8])
     except Exception as exc:
         logger.warning("[onboarding] Parse %s failed: %s", feed_type, exc)
+        sentry_sdk.capture_exception(exc)
 
 
 async def _generate_with_retry(prompt: str, *, attempts: int = 3, per_attempt_timeout: float = 12.0):
@@ -117,6 +126,9 @@ async def _generate_with_retry(prompt: str, *, attempts: int = 3, per_attempt_ti
 
 async def generate_home_feed(user_id: str, city: str, country: str, vibes: list[str]) -> None:
     """Background: call Gemini for weekend plans + vibe trips, upsert into user_home_feed."""
+    uid_short = user_id[:8]
+    t0 = time.perf_counter()
+    logger.info("[onboarding] START user=%s city=%s, %s vibes=%s", uid_short, city, country, vibes)
     try:
         db = get_db()
         vibe_str = ", ".join(vibes) if vibes else "Adventure, Nature, Culture"
@@ -154,10 +166,18 @@ async def generate_home_feed(user_id: str, city: str, country: str, vibes: list[
             f"Return ONLY the JSON array, no explanation."
         )
 
+        logger.info("[onboarding] Calling Gemini (parallel) for user=%s", uid_short)
+        t_gemini = time.perf_counter()
         weekend_raw, vibe_raw = await asyncio.gather(
             _generate_with_retry(weekend_prompt),
             _generate_with_retry(vibe_prompt),
             return_exceptions=True,
+        )
+        logger.info(
+            "[onboarding] Gemini responded in %.1fs for user=%s | weekend_ok=%s vibe_ok=%s",
+            time.perf_counter() - t_gemini, uid_short,
+            not isinstance(weekend_raw, Exception),
+            not isinstance(vibe_raw, Exception),
         )
 
         now = datetime.now(timezone.utc).isoformat()
@@ -172,8 +192,18 @@ async def generate_home_feed(user_id: str, city: str, country: str, vibes: list[
             ),
         )
 
+        logger.info(
+            "[onboarding] DONE user=%s city=%s total=%.1fs",
+            uid_short, city, time.perf_counter() - t0,
+        )
+
     except Exception as exc:
-        logger.error("[onboarding] _generate_home_feed crashed: %s", exc)
+        logger.error(
+            "[onboarding] FAILED user=%s city=%s elapsed=%.1fs error=%s",
+            uid_short, city, time.perf_counter() - t0, exc,
+            exc_info=True,
+        )
+        sentry_sdk.capture_exception(exc)
 
 
 @router.post("/generate-feed")
@@ -183,10 +213,19 @@ async def generate_feed(
 ):
     """Generate, image-enrich, and store the home feed, returning 200 only
     after weekend_plans and vibe_trips have been upserted."""
-    await generate_home_feed(
-        str(user.id),
-        body.city,
-        body.country,
-        body.vibes,
+    logger.info(
+        "[onboarding] /generate-feed called user=%s city=%s, %s vibes=%s",
+        str(user.id)[:8], body.city, body.country, body.vibes,
     )
+    try:
+        await generate_home_feed(
+            str(user.id),
+            body.city,
+            body.country,
+            body.vibes,
+        )
+    except Exception as exc:
+        logger.error("[onboarding] generate_feed unhandled: %s", exc, exc_info=True)
+        sentry_sdk.capture_exception(exc)
+        raise HTTPException(status_code=500, detail="Feed generation failed.") from exc
     return {"status": "ok", "generating": False}
