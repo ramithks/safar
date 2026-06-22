@@ -14,6 +14,14 @@ class Settings(BaseSettings):
     # Vertex AI — Gemini 2.5 Flash via Vertex (uses ADC / service account)
     gcp_project: Optional[str] = None
     gcp_location: str = "us-central1"
+    # Fallback regions tried (in order) when the primary region returns 429/503.
+    # Each Vertex region has its own quota, so rotating spreads load and lets a
+    # rate-limited request retry immediately against a fresh region instead of
+    # sleeping through a long backoff. Comma-separated; primary is always first.
+    gcp_locations: str = (
+        "us-central1,us-east1,us-east4,us-east5,us-west1,us-west4,"
+        "us-south1,northamerica-northeast1,europe-west1,europe-west4,asia-southeast1"
+    )
     # Path to a service account JSON key; leave unset to use ADC
     google_application_credentials: Optional[str] = None
 

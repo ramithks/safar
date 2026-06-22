@@ -73,7 +73,8 @@ async def _attach_images(items: list[dict], query_fn) -> list[dict]:
 async def _store_feed(db, user_id: str, feed_type: str, raw, query_fn, now: str) -> None:
     """Parse a Gemini JSON array, enrich items with images, and upsert — all concurrently."""
     if isinstance(raw, Exception):
-        logger.warning("[onboarding] %s Gemini error: %s", feed_type, raw)
+        # TimeoutError et al. stringify to "" — log the type so the cause is visible.
+        logger.warning("[onboarding] %s Gemini error: %s: %s", feed_type, type(raw).__name__, raw)
         sentry_sdk.capture_exception(raw)
         return
     try:
@@ -96,12 +97,17 @@ async def _store_feed(db, user_id: str, feed_type: str, raw, query_fn, now: str)
         sentry_sdk.capture_exception(exc)
 
 
-async def _generate_with_retry(prompt: str, *, attempts: int = 3, per_attempt_timeout: float = 12.0):
-    """Call Gemini, retrying if a single attempt doesn't return within 12s.
+async def _generate_with_retry(prompt: str, *, attempts: int = 2, per_attempt_timeout: float = 45.0):
+    """Call Gemini, retrying if a single attempt doesn't finish in time.
 
-    Each attempt is capped at `per_attempt_timeout` seconds (wall-clock). If it
-    times out — or otherwise fails — we retry up to `attempts` times before
-    giving up and re-raising the last error.
+    Gemini 2.5 Flash legitimately needs ~10-40s for a 10-12 item structured
+    generation, so the wall-clock cap is generous — too tight a cap (the old
+    12s) just killed requests that were about to succeed. vertex_generate now
+    rotates regions internally on 429/503, so a single attempt absorbs rate
+    limits; this layer only retries genuine timeouts / connection errors.
+
+    Each attempt is capped at `per_attempt_timeout` seconds (wall-clock). On
+    failure we retry up to `attempts` times before re-raising the last error.
     """
     last_exc: Exception | None = None
     for attempt in range(attempts):
@@ -113,7 +119,9 @@ async def _generate_with_retry(prompt: str, *, attempts: int = 3, per_attempt_ti
                     temperature=0.7,
                     timeout=per_attempt_timeout,
                 ),
-                timeout=per_attempt_timeout,
+                # Slightly looser than the inner per-request timeout so httpx's
+                # own timeout fires first with a cleaner error when it can.
+                timeout=per_attempt_timeout + 5,
             )
         except Exception as exc:  # includes asyncio.TimeoutError — retry on any failure
             last_exc = exc

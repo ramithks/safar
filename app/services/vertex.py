@@ -27,6 +27,22 @@ from app.config import settings
 MODEL_NAME = "gemini-2.5-flash"
 _SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
+
+def _regions() -> list[str]:
+    """Ordered list of Vertex regions to try: primary first, then fallbacks.
+
+    Each region has independent quota, so on a 429/503 we switch to the next
+    region and retry immediately rather than sleeping through a backoff in a
+    region that's already saturated. Deduped, order preserved.
+    """
+    primary = (settings.gcp_location or "us-central1").strip()
+    extra = [r.strip() for r in (settings.gcp_locations or "").split(",") if r.strip()]
+    ordered: list[str] = []
+    for region in [primary, *extra]:
+        if region and region not in ordered:
+            ordered.append(region)
+    return ordered
+
 # ── Shared HTTP client ────────────────────────────────────────────────────────
 _http_client = httpx.AsyncClient(
     timeout=180.0,
@@ -97,7 +113,7 @@ async def vertex_generate(
       - a list    → passed as-is (role/parts format)
     """
     token, project_id = _get_access_token()
-    location = settings.gcp_location or "us-central1"
+    regions = _regions()
 
     if isinstance(contents, str):
         contents = [{"role": "user", "parts": [{"text": contents}]}]
@@ -116,30 +132,42 @@ async def vertex_generate(
         gc["maxOutputTokens"] = max_output_tokens
     body["generationConfig"] = gc
 
-    url = (
-        f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}"
-        f"/locations/{location}/publishers/google/models/{model}:generateContent"
-    )
-
-    # Retry with exponential backoff on 429 / 503
-    max_attempts = 6
+    # Retry on 429/503 by rotating through regions. While fresh regions remain
+    # in the current cycle we switch almost instantly (tiny jitter only); once
+    # every region has been tried we fall back to exponential backoff before
+    # cycling again. This keeps a rate-limited call from blocking on long sleeps
+    # in a single saturated region (which was blowing the supervisor's budget).
+    n_regions = len(regions)
+    max_attempts = max(6, n_regions + 2)
     base_delay = 5.0
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
     for attempt in range(max_attempts):
-        r = await _http_client.post(
-            url,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=body,
-            timeout=timeout,
+        location = regions[attempt % n_regions]
+        url = (
+            f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}"
+            f"/locations/{location}/publishers/google/models/{model}:generateContent"
         )
+        r = await _http_client.post(url, headers=headers, json=body, timeout=timeout)
+
         if r.status_code in (429, 503) and attempt < max_attempts - 1:
-            # Honour Retry-After header if present, otherwise exponential backoff + jitter
-            retry_after = r.headers.get("Retry-After")
-            base = float(retry_after) if retry_after else base_delay * (2 ** attempt)
-            jitter = random.uniform(0, base * 0.3)   # ±30% jitter to spread retries
-            delay = min(base + jitter, 120.0)         # cap at 2 minutes
-            logger.warning("[vertex] %s rate limit — retry %d/%d in %.1fs", r.status_code, attempt + 1, max_attempts - 1, delay)
+            next_location = regions[(attempt + 1) % n_regions]
+            cycle = (attempt + 1) // n_regions   # how many times we've wrapped the region list
+            if cycle == 0 and n_regions > 1:
+                # Fresh region still available — switch over near-instantly.
+                delay = random.uniform(0.2, 0.8)
+            else:
+                # Exhausted the region list (or only one region) — back off.
+                retry_after = r.headers.get("Retry-After")
+                base = float(retry_after) if retry_after else base_delay * (2 ** (cycle - 1))
+                delay = min(base + random.uniform(0, base * 0.3), 60.0)
+            logger.warning(
+                "[vertex] %s in %s — switching to %s (attempt %d/%d) in %.1fs",
+                r.status_code, location, next_location, attempt + 1, max_attempts, delay,
+            )
             await asyncio.sleep(delay)
             continue
+
         r.raise_for_status()
         break
 
