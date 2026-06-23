@@ -156,3 +156,4 @@ cython_debug/
 # Claude / AI tools
 .claude/
 coolify.env
+.env.bak.492016

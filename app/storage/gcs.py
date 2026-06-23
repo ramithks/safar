@@ -8,6 +8,8 @@ import os
 from datetime import timedelta
 from functools import lru_cache
 
+import sentry_sdk
+
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -147,6 +149,10 @@ def upload_frames(job_id: str, frame_paths: list[str], bucket_name: str) -> dict
             url_map[path] = url
         except Exception as e:
             logger.warning(f"Failed to upload frame {path}: {e}")
+            # Surface to Sentry — these are silently swallowed otherwise, so a
+            # systemic failure (e.g. missing bucket IAM → 403) went unnoticed.
+            sentry_sdk.set_context("frame_upload", {"job_id": job_id, "path": path})
+            sentry_sdk.capture_exception(e)
     return url_map
 
 

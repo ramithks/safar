@@ -17,20 +17,10 @@ from slowapi.errors import RateLimitExceeded
 from app.api.v1.router import router
 from app.config import settings
 from app.core.limiter import limiter
+from app.observability import init_sentry
 
 # ── Sentry — must init before FastAPI() to capture startup errors ───────────────
-# DSN is pinned here; SENTRY_DSN env var overrides if set.
-_SENTRY_DSN = (
-    settings.sentry_dsn
-    or "https://fe1488d1895bed2fc5f0435e4df3d136@o4511167749029888.ingest.us.sentry.io/4511325237346304"
-)
-sentry_sdk.init(
-    dsn=_SENTRY_DSN,
-    environment=settings.app_env,
-    send_default_pii=True,           # capture request headers + user IPs
-    traces_sample_rate=settings.sentry_traces_sample_rate,
-    profiles_sample_rate=settings.sentry_profiles_sample_rate,
-)
+init_sentry("api")
 
 # ── Logging setup ────────────────────────────────────────────────────────────────
 structlog.configure(

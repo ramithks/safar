@@ -17,6 +17,7 @@ import logging
 from types import SimpleNamespace
 
 import jwt
+import sentry_sdk
 from fastapi import Header, HTTPException, status
 from supabase import create_client, Client
 
@@ -102,6 +103,9 @@ async def require_user(authorization: str = Header(...)):
             user = await asyncio.to_thread(_verify_remote, token)
         if user is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+        # Tag Sentry events with the Supabase user so issues are traceable back
+        # to a specific user/row in Supabase.
+        sentry_sdk.set_user({"id": str(user.id), "email": getattr(user, "email", None)})
         return user
     except HTTPException:
         raise

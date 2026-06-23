@@ -8,7 +8,9 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import sentry_sdk
 from celery import Celery
+from celery.signals import celeryd_init, worker_process_init
 
 from app.config import settings
 
@@ -19,6 +21,23 @@ celery_app = Celery(
     broker=settings.redis_url,
     backend=settings.redis_url,
 )
+
+
+# ── Sentry ────────────────────────────────────────────────────────────────────
+# Initialize Sentry only when running AS a worker — not on mere import (the API
+# imports this module to enqueue tasks and must keep its own "api" Sentry init).
+# celeryd_init covers the main worker process; worker_process_init covers each
+# forked prefork child so every task-executing process reports to Sentry.
+@celeryd_init.connect
+def _sentry_celeryd_init(**_kwargs):
+    from app.observability import init_sentry
+    init_sentry("worker")
+
+
+@worker_process_init.connect
+def _sentry_worker_process_init(**_kwargs):
+    from app.observability import init_sentry
+    init_sentry("worker")
 
 celery_app.conf.update(
     task_serializer="json",
@@ -50,6 +69,14 @@ def analyze_reel_task(
     """
     from app.pipeline.orchestrator import run_pipeline, PipelineEvent
     from app.workers.job_store import update_job_progress, store_job_result, _get_redis
+
+    # Tag Sentry with the Supabase user + job so worker errors are traceable to a
+    # specific user/row. Set on the global scope because the pipeline offloads
+    # work (e.g. frame uploads) to executor threads that don't inherit the
+    # task's scope; the worker runs one task at a time so there's no cross-talk.
+    _scope = sentry_sdk.get_global_scope()
+    _scope.set_tag("job_id", job_id)
+    _scope.set_user({"id": user_id} if user_id else None)
 
     # Idempotency guard: with acks_late a worker crash redelivers the task —
     # never re-run a job that already started (each run costs Gemini/Places $).
