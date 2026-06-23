@@ -23,11 +23,15 @@ from typing import Optional
 
 from google import genai
 from google.genai import types
+from google.oauth2 import service_account
 
 from app.config import settings
 from app.pipeline.frame_extractor import ExtractedFrame
 
 logger = logging.getLogger(__name__)
+
+# Scope required for Vertex AI predict calls.
+_VERTEX_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
 GEMINI_MODEL = "gemini-2.5-flash"
 
@@ -276,19 +280,43 @@ def analyze_frames(
 # ── Region client management ───────────────────────────────────────────────────
 
 
+def _load_sa_credentials() -> Optional[service_account.Credentials]:
+    """Build credentials from GOOGLE_SERVICE_ACCOUNT_JSON, or None to use ADC.
+
+    The genai SDK otherwise falls back to Application Default Credentials
+    (GOOGLE_APPLICATION_CREDENTIALS), which can point at a stale key for a
+    different GCP project and cause 403 PERMISSION_DENIED. Pinning to the
+    explicit SA JSON keeps a single source of truth with vertex.py.
+    """
+    raw = (settings.google_service_account_json or "").strip()
+    if not raw:
+        return None
+    sa = json.loads(raw)
+    # Env var managers (Coolify, Docker, etc.) often store literal \n instead of
+    # real newlines; the RSA signer requires actual newlines in the PEM key.
+    if isinstance(sa.get("private_key"), str):
+        sa["private_key"] = sa["private_key"].replace("\\n", "\n")
+    return service_account.Credentials.from_service_account_info(
+        sa, scopes=_VERTEX_SCOPES
+    )
+
+
 def _get_client(location: str) -> genai.Client:
     """Return (or create) a cached Vertex AI client for the given location."""
     if location not in _region_clients:
         if not settings.gcp_project:
             raise RuntimeError("GCP_PROJECT is not set — required for Vertex AI")
+        creds = _load_sa_credentials()
         _region_clients[location] = genai.Client(
             vertexai=True,
             project=settings.gcp_project,
             location=location,
+            credentials=creds,
         )
+        sa_email = getattr(creds, "service_account_email", None) or "ADC"
         logger.info(
             f"Vertex AI client initialised (project={settings.gcp_project}, "
-            f"location={location})"
+            f"location={location}, identity={sa_email})"
         )
     return _region_clients[location]
 
