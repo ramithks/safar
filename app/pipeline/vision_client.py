@@ -19,6 +19,7 @@ import time
 import urllib.parse
 from collections import Counter
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Optional
 
 from google import genai
@@ -46,7 +47,8 @@ VALID_PLACE_TYPES = {
 # Try asia-south1 first (closest to India), then the global endpoint, then
 # us-central1 as last resort.  Each client is lazily created and cached.
 _REGION_CHAIN = ["asia-south1", "global", "us-central1"]
-_region_clients: dict[str, genai.Client] = {}
+# genai clients cached per (project, location).
+_region_clients: dict[tuple[str, str], genai.Client] = {}
 
 # ── Retry / backoff config ─────────────────────────────────────────────────────
 # Exponential: 1 → 2 → 4 → 8 seconds between attempts.
@@ -56,10 +58,14 @@ _BACKOFF_MAX_SECONDS = 8
 MAX_RETRIES = 4                  # up to 4 retries across all regions
 GEMINI_TIMEOUT_SECONDS = 90     # batch call can take longer; allow 90s
 
-# Frames per Gemini call. One giant batch risks output-token truncation
-# (max_output_tokens=8192) — a truncated JSON array used to silently zero out
-# the ENTIRE reel. Chunks also isolate failures to a few frames.
-VISION_BATCH_SIZE = 6
+# Frames per Gemini call. Set high enough to fit a WHOLE reel (max_unique_frames
+# caps it at ~10) in ONE call: fewest requests (lowest 429/RPM risk), one billed
+# grounding session (lowest cost), and the model sees every frame together so it
+# can dedupe the same place across frames and lock a single city (best accuracy).
+# The historical reason to chunk was output-token truncation, but the compact
+# 9-field per-frame schema is only ~120 tokens/frame (~1.2k for 10 frames), which
+# fits comfortably under max_output_tokens once thinking is accounted for.
+VISION_BATCH_SIZE = 12
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
@@ -257,13 +263,20 @@ def analyze_frames(
         logger.error("GCP_PROJECT not set — vision analysis disabled")
         return [VisionResult(frame=f) for f in frames]
 
-    # Chunk frames so a single truncated/failed response can't zero the whole reel
+    # One call per reel: VISION_BATCH_SIZE covers a whole reel, so this loop is a
+    # single iteration in practice. It still chunks defensively for the unlikely
+    # case of more frames than the batch size, isolating a failure to one chunk
+    # instead of zeroing the entire reel.
+    chunks = [
+        frames[start: start + VISION_BATCH_SIZE]
+        for start in range(0, len(frames), VISION_BATCH_SIZE)
+    ]
+
     final: list[VisionResult] = []
-    for start in range(0, len(frames), VISION_BATCH_SIZE):
-        chunk = frames[start: start + VISION_BATCH_SIZE]
+    for idx, chunk in enumerate(chunks):
         prompt = _build_batch_prompt(len(chunk), caption_ctx)
         logger.info(
-            f"Gemini batch {start // VISION_BATCH_SIZE + 1}: {len(chunk)} frames, "
+            f"Gemini batch {idx + 1}/{len(chunks)}: {len(chunk)} frames, "
             f"caption_ctx={'yes' if caption_ctx else 'no'}"
         )
         final.extend(_run_batch_with_retry(chunk, prompt))
@@ -280,15 +293,23 @@ def analyze_frames(
 # ── Region client management ───────────────────────────────────────────────────
 
 
-def _load_sa_credentials() -> Optional[service_account.Credentials]:
-    """Build credentials from GOOGLE_SERVICE_ACCOUNT_JSON, or None to use ADC.
+@dataclass
+class _VertexAccount:
+    """One Vertex project + its credentials. Tried in order; fallback used on 429."""
+    name: str                                          # "primary" / "fallback" (logs)
+    project: str
+    credentials: Optional[service_account.Credentials]
+    identity: str                                      # SA email or "ADC" (logs)
 
-    The genai SDK otherwise falls back to Application Default Credentials
-    (GOOGLE_APPLICATION_CREDENTIALS), which can point at a stale key for a
-    different GCP project and cause 403 PERMISSION_DENIED. Pinning to the
-    explicit SA JSON keeps a single source of truth with vertex.py.
+
+def _creds_from_json(raw: Optional[str]) -> Optional[service_account.Credentials]:
+    """Parse a service-account JSON string into scoped credentials, or None for ADC.
+
+    Pinning explicit credentials (instead of letting the genai SDK fall back to
+    GOOGLE_APPLICATION_CREDENTIALS) avoids using a stale key for the wrong project,
+    which surfaces as 403 PERMISSION_DENIED.
     """
-    raw = (settings.google_service_account_json or "").strip()
+    raw = (raw or "").strip()
     if not raw:
         return None
     sa = json.loads(raw)
@@ -301,24 +322,55 @@ def _load_sa_credentials() -> Optional[service_account.Credentials]:
     )
 
 
-def _get_client(location: str) -> genai.Client:
-    """Return (or create) a cached Vertex AI client for the given location."""
-    if location not in _region_clients:
-        if not settings.gcp_project:
-            raise RuntimeError("GCP_PROJECT is not set — required for Vertex AI")
-        creds = _load_sa_credentials()
-        _region_clients[location] = genai.Client(
-            vertexai=True,
+@lru_cache(maxsize=1)
+def _get_accounts() -> list[_VertexAccount]:
+    """Ordered Vertex accounts to try. Primary first; fallback only on 429.
+
+    Primary  = GCP_PROJECT + GOOGLE_SERVICE_ACCOUNT_JSON (new account, $300 credit).
+    Fallback = VERTEX_FALLBACK_PROJECT + VERTEX_FALLBACK_SERVICE_ACCOUNT_JSON
+               (old account with higher quota). Omitted when those are unset.
+    """
+    accounts: list[_VertexAccount] = []
+
+    if settings.gcp_project:
+        creds = _creds_from_json(settings.google_service_account_json)
+        accounts.append(_VertexAccount(
+            name="primary",
             project=settings.gcp_project,
-            location=location,
             credentials=creds,
+            identity=getattr(creds, "service_account_email", None) or "ADC",
+        ))
+
+    if settings.vertex_fallback_project and settings.vertex_fallback_service_account_json:
+        fb = _creds_from_json(settings.vertex_fallback_service_account_json)
+        accounts.append(_VertexAccount(
+            name="fallback",
+            project=settings.vertex_fallback_project,
+            credentials=fb,
+            identity=getattr(fb, "service_account_email", None) or "ADC",
+        ))
+
+    if not accounts:
+        raise RuntimeError("GCP_PROJECT is not set — required for Vertex AI")
+    return accounts
+
+
+def _get_client(account: _VertexAccount, location: str) -> genai.Client:
+    """Return (or create) a cached Vertex AI client for an account + location."""
+    key = (account.project, location)
+    if key not in _region_clients:
+        _region_clients[key] = genai.Client(
+            vertexai=True,
+            project=account.project,
+            location=location,
+            credentials=account.credentials,
         )
-        sa_email = getattr(creds, "service_account_email", None) or "ADC"
         logger.info(
-            f"Vertex AI client initialised (project={settings.gcp_project}, "
-            f"location={location}, identity={sa_email})"
+            f"Vertex AI client initialised (account={account.name}, "
+            f"project={account.project}, location={location}, "
+            f"identity={account.identity})"
         )
-    return _region_clients[location]
+    return _region_clients[key]
 
 
 # ── Exponential backoff helper ─────────────────────────────────────────────────
@@ -344,8 +396,12 @@ def _run_batch_with_retry(
 ) -> list[VisionResult]:
     """
     Send all frames in one batch Gemini call.
-    Regional fallback: asia-south1 → global → us-central1.
-    Exponential backoff: 1s → 2s → 4s → 8s between attempts.
+
+    Fallback order: primary account (regions asia-south1 → global → us-central1),
+    then — only when rate-limited — the fallback account across the same regions.
+    On a 429 we switch to the next region/account INSTANTLY (no backoff sleep),
+    because each region/project has independent quota, so waiting adds latency
+    for nothing. A short backoff is used only for genuinely transient errors.
     """
     # Load all frame images once
     image_bytes_list: list[bytes] = []
@@ -357,41 +413,57 @@ def _run_batch_with_retry(
             logger.warning(f"Frame {frame.scene_index}: could not read image: {e}")
             image_bytes_list.append(b"")  # placeholder so indices stay aligned
 
-    # Attempt across regions with exponential backoff
-    region_idx = 0
-    attempt = 0
+    # Ordered attempt plan: every account across the region chain. Primary's
+    # regions come first (uses the $300 credit); the fallback account's regions
+    # are reached only after the primary keeps returning 429.
+    plan: list[tuple[_VertexAccount, str]] = [
+        (account, location)
+        for account in _get_accounts()
+        for location in _REGION_CHAIN
+    ]
 
-    while attempt <= MAX_RETRIES:
-        location = _REGION_CHAIN[min(region_idx, len(_REGION_CHAIN) - 1)]
-
+    transient_retries = 0
+    for idx, (account, location) in enumerate(plan):
         try:
-            client = _get_client(location)
-            results = _call_gemini_batch(client, location, frames, image_bytes_list, prompt)
-            logger.info(f"Batch call succeeded on region '{location}' (attempt {attempt + 1})")
+            client = _get_client(account, location)
+            results = _call_gemini_batch(
+                client, location, frames, image_bytes_list, prompt
+            )
+            logger.info(
+                f"Batch call succeeded (account={account.name}, region='{location}', "
+                f"attempt {idx + 1}/{len(plan)})"
+            )
             return results
 
         except Exception as exc:
             rate_limited = _is_rate_limit(exc)
             logger.warning(
-                f"Batch call failed on region '{location}' "
-                f"(attempt {attempt + 1}/{MAX_RETRIES + 1}): "
+                f"Batch call failed (account={account.name}, region='{location}', "
+                f"attempt {idx + 1}/{len(plan)}): "
                 f"{'rate-limit 429' if rate_limited else type(exc).__name__}: {exc}"
             )
 
-            if attempt >= MAX_RETRIES:
-                logger.error("All retry attempts exhausted — returning empty results")
+            is_last = idx + 1 >= len(plan)
+            if is_last:
+                logger.error("All Vertex accounts/regions exhausted — returning empty results")
                 return [VisionResult(frame=f) for f in frames]
 
-            # Advance to next region on 429; stay on same region for transient errors
-            if rate_limited and region_idx < len(_REGION_CHAIN) - 1:
-                region_idx += 1
-                next_region = _REGION_CHAIN[region_idx]
-                logger.info(f"Rate-limited — falling back to region '{next_region}'")
+            if rate_limited:
+                # Fresh region/account quota — switch immediately, no sleep.
+                nxt_account, nxt_region = plan[idx + 1]
+                logger.info(
+                    f"Rate-limited — switching to account={nxt_account.name}, "
+                    f"region='{nxt_region}' (no wait)"
+                )
+                continue
 
-            delay = _backoff_delay(attempt)
-            logger.info(f"Waiting {delay:.1f}s before retry (attempt {attempt + 2})...")
-            time.sleep(delay)
-            attempt += 1
+            # Transient (non-429) error: brief backoff before the next entry, but
+            # cap total transient sleeps so a flaky endpoint can't stall the job.
+            if transient_retries < MAX_RETRIES:
+                delay = _backoff_delay(transient_retries)
+                logger.info(f"Transient error — waiting {delay:.1f}s before next region...")
+                time.sleep(delay)
+                transient_retries += 1
 
     return [VisionResult(frame=f) for f in frames]
 
@@ -435,7 +507,10 @@ def _call_gemini_batch(
         config=types.GenerateContentConfig(
             system_instruction=_BATCH_SYSTEM_PROMPT,
             temperature=0.1,
-            max_output_tokens=8192,
+            # Thinking (≤4096) and JSON output share this budget. Raised from 8192
+            # so a full-reel batch (~10 frames) has ample room and never truncates
+            # the JSON array — a truncated array silently zeroes the whole reel.
+            max_output_tokens=12288,
             thinking_config=types.ThinkingConfig(thinking_budget=4096),
             tools=[google_search_tool],
         ),

@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     # Path to a service account JSON key; leave unset to use ADC
     google_application_credentials: Optional[str] = None
 
+    # Vertex fallback account — tried only when the primary project returns 429
+    # (RESOURCE_EXHAUSTED). Lets a rate-limited Gemini call retry instantly against
+    # a second project's independent quota. Both optional; omit to disable fallback.
+    vertex_fallback_project: Optional[str] = None
+    vertex_fallback_service_account_json: Optional[str] = None  # full SA JSON string
+
     # Google Maps — Places API for place enrichment (optional but recommended)
     google_maps_api_key: Optional[str] = None
 
