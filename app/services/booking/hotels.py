@@ -350,7 +350,12 @@ async def _run_fullsearch(
         if resp.status_code != 200:
             # Non-200 from Booking's WAF — treat as a block so the proxy retry fires.
             raise ScraperBlocked(f"HTTP {resp.status_code}")
-        return resp.json()
+        j = resp.json()
+        # 200 + GraphQL errors + null data = blocked/rejected, not "no hotels".
+        # Partial errors (data present) are tolerated and parsed below.
+        if j.get("errors") and not j.get("data"):
+            raise ScraperBlocked(f"graphql errors: {[e.get('message') for e in j['errors'][:2]]}")
+        return j
 
     try:
         data = await with_proxy_fallback("booking_hotels", _do)

@@ -65,3 +65,5 @@ breaker_booking  = CircuitBreaker("Booking",    failure_threshold=2, recovery_ti
 breaker_emt      = CircuitBreaker("EaseMyTrip", failure_threshold=3, recovery_timeout=60.0)
 breaker_redbus   = CircuitBreaker("RedBus",     failure_threshold=3, recovery_timeout=60.0)
 breaker_flixbus  = CircuitBreaker("FlixBus",    failure_threshold=3, recovery_timeout=60.0)
+breaker_agoda    = CircuitBreaker("Agoda",      failure_threshold=3, recovery_timeout=60.0)
+breaker_ixigo    = CircuitBreaker("Ixigo",      failure_threshold=3, recovery_timeout=60.0)

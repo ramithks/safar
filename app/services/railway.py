@@ -17,6 +17,7 @@ import httpx
 
 from app.config import settings
 from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
+from app.services.geo import is_known_foreign
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,14 @@ async def resolve_station_async(city_name: str) -> str | None:
     key = city_name.lower().strip()
     if key in _STATION_CACHE:
         return _STATION_CACHE[key]
+
+    # ConfirmTKT is India-only. Don't resolve a station for a known-foreign city —
+    # this prevents a foreign name colliding with an Indian station code and
+    # surfacing nonsense like a "train" for an international leg.
+    if is_known_foreign(city_name):
+        _STATION_CACHE[key] = None
+        logger.info("[railway] '%s' is outside India — no train search", city_name)
+        return None
 
     async def _do(proxy):
         async with httpx.AsyncClient(timeout=8.0, proxy=proxy) as client:
@@ -336,6 +345,15 @@ class RailwayService:
         (from Gemini) to avoid the city→code lookup.
         Returns {"trains": [...], "from_code": str, "to_code": str, "resolved": bool}
         """
+        # India-only: refuse cross-border even when codes are supplied by Gemini.
+        if is_known_foreign(origin) or is_known_foreign(destination):
+            outside = origin if is_known_foreign(origin) else destination
+            return {
+                "trains": [], "from_code": None, "to_code": None,
+                "resolved": False,
+                "note": f"Trains are India-only — {outside} is outside India",
+            }
+
         fc = from_code or city_to_station_code(origin)
         tc = to_code or city_to_station_code(destination)
 

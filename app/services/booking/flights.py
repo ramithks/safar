@@ -13,7 +13,8 @@ import httpx
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
 from app.config import settings
-from app.services.scraper_proxy import with_proxy_fallback
+from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
+from app.services.geo import iata_of as geo_iata
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +43,23 @@ _IATA_CACHE: dict[str, str] = {}
 
 async def resolve_iata(city: str) -> str | None:
     """
-    Resolve city name → IATA code via EaseMyTrip autosuggest API.
-    Response City field format: "New Delhi(DEL)" — IATA extracted from parentheses.
+    Resolve city name → IATA code.
+
+    Order: in-memory cache → static geo table (instant, offline) → EaseMyTrip
+    autosuggest (long tail). The static table removes the single point of failure
+    that previously caused 'no flights' when the autosuggest call was blocked or
+    changed shape. Response City field format: "New Delhi(DEL)".
     Results cached in-memory after first call.
     """
     key = city.lower().strip()
     if key in _IATA_CACHE:
         return _IATA_CACHE[key]
+
+    static = geo_iata(city)
+    if static:
+        _IATA_CACHE[key] = static
+        logger.info("[flights] IATA '%s' → %s (static)", city, static)
+        return static
 
     async def _do(proxy):
         async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
@@ -132,7 +143,13 @@ async def search_flights(
                 timeout=20,
             )
         r.raise_for_status()
-        return r.json()
+        j = r.json()
+        # A genuine "no flights" response still carries the flightOffers key (empty
+        # list). Its absence means a WAF/error body, not real emptiness — treat as
+        # a block so the proxy retry fires and it isn't reported as "0 results".
+        if "flightOffers" not in j:
+            raise ScraperBlocked("flightOffers key missing")
+        return j
 
     try:
         offers = (await with_proxy_fallback("flights_booking", _do)).get("flightOffers") or []

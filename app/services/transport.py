@@ -18,6 +18,7 @@ from app.services.bus.redbus import search_city as redbus_search_city, search_bu
 from app.services.bus.flixbus import search_city as flixbus_search_city, search_buses as flixbus_search_buses
 from app.services.flights import FlightService
 from app.services.railway import RailwayService
+from app.services.geo import is_known_foreign, india_abroad
 from app.core.circuit_breaker import breaker_redbus, breaker_flixbus
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,10 @@ class TransportService:
         limit: int = 30,
     ) -> dict:
         """Search buses: resolves city IDs then delegates to search_buses_direct."""
+        if india_abroad(origin, destination):
+            logger.info("[buses] %r→%r | skipped — no bus between India and abroad", origin, destination)
+            return {"buses": [], "from_city_id": None, "to_city_id": None,
+                    "resolved": False, "note": "No bus service between India and abroad"}
         from_id, to_id = await asyncio.gather(
             self.resolve_bus_city_id(origin),
             self.resolve_bus_city_id(destination),
@@ -143,18 +148,33 @@ class TransportService:
         want_train  = not modes or "train" in modes or "railway" in modes
         want_flight = not modes or "flight"                 in modes
 
+        # Country gates: trains are India-only; buses don't cross India↔abroad.
+        # Skipped modes still return a result with a note so the UI can explain
+        # the absence instead of silently dropping the mode.
+        train_blocked = is_known_foreign(origin) or is_known_foreign(destination)
+        bus_blocked   = india_abroad(origin, destination)
+
         tasks = {}
+        output: dict = {}
         if want_bus:
-            tasks["buses"]   = self.search_buses(origin, destination, date, travelers)
+            if bus_blocked:
+                output["buses"] = {"buses": [], "resolved": False,
+                                   "note": "No bus service between India and abroad"}
+            else:
+                tasks["buses"] = self.search_buses(origin, destination, date, travelers)
         if want_train:
-            tasks["trains"]  = _railway.search(origin, destination, date)
+            if train_blocked:
+                outside = origin if is_known_foreign(origin) else destination
+                output["trains"] = {"trains": [], "resolved": False,
+                                    "note": f"Trains are India-only — {outside} is outside India"}
+            else:
+                tasks["trains"] = _railway.search(origin, destination, date)
         if want_flight:
             tasks["flights"] = _flights.search(origin, destination, date, adults=travelers)
 
         keys = list(tasks.keys())
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
-        output: dict = {}
         for key, result in zip(keys, results):
             if isinstance(result, Exception):
                 output[key] = {"resolved": False, "error": str(result)}

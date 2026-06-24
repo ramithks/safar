@@ -16,6 +16,7 @@ import urllib.parse
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
 from app.services.scraper_proxy import with_proxy_fallback
+from app.services.geo import is_domestic_iata
 
 logger = logging.getLogger(__name__)
 
@@ -148,9 +149,12 @@ async def search_flights(
     cabin_class: str = "economy",
     nonstop_only: bool = False,
 ) -> list[dict]:
-    """Search one-way domestic flights on EaseMyTrip."""
+    """Search one-way flights on EaseMyTrip (domestic or international)."""
     cabin_code = _CABIN_CODE.get(cabin_class.lower(), 0)
     ts = int(time.time() * 1000)
+    # Previously hardcoded True, which broke every international route. Detect from
+    # the airport codes; unknown codes default to domestic (the common case).
+    is_domestic = is_domestic_iata(from_airport, to_airport)
 
     # No TKN needed — including it causes prices to be hidden at bundle level.
     # Prices are at segment level (j[0].s[i].TF) regardless of TKN.
@@ -164,7 +168,7 @@ async def search_flights(
         "arrDT": "",
         "userid": "",
         "IsDoubelSeat": False,
-        "isDomestic": True,
+        "isDomestic": is_domestic,
         "isOneway": True,
         "airline": "undefined",
         "Cabin": cabin_code,

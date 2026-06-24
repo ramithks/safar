@@ -15,7 +15,11 @@ from app.services.easemytrip.hotels import search_hotels as emt_search_hotels
 
 logger = logging.getLogger(__name__)
 from app.services.booking.hotels import search_hotels as booking_search_hotels
-from app.core.circuit_breaker import breaker_emt, breaker_booking
+from app.services.agoda.hotels import search_hotels as agoda_search_hotels
+from app.services.ixigo.hotels import search_hotels as ixigo_search_hotels
+from app.core.circuit_breaker import (
+    breaker_emt, breaker_booking, breaker_agoda, breaker_ixigo,
+)
 
 _BUDGET_SORT_EMT = {
     "low":  "Price|ASC",
@@ -75,7 +79,7 @@ class HotelService:
         bkg_sort = _BUDGET_SORT_BOOKING.get(budget)
         per_src  = max(limit * 2, 30)
 
-        emt_r, booking_r = await asyncio.gather(
+        emt_r, booking_r, agoda_r, ixigo_r = await asyncio.gather(
             breaker_emt.call(
                 emt_search_hotels, destination, checkin, checkout,
                 rooms=rooms, adults=adults, children=children,
@@ -85,6 +89,16 @@ class HotelService:
                 booking_search_hotels, destination, checkin, checkout,
                 rooms=rooms, adults=adults, children=children,
                 sort=bkg_sort, limit=per_src, fallback=[],
+            ),
+            breaker_agoda.call(
+                agoda_search_hotels, destination, checkin, checkout,
+                rooms=rooms, adults=adults, children=children,
+                limit=per_src, fallback=[],
+            ),
+            breaker_ixigo.call(
+                ixigo_search_hotels, destination, checkin, checkout,
+                rooms=rooms, adults=adults, children=children,
+                limit=per_src, fallback=[],
             ),
             return_exceptions=True,
         )
@@ -106,8 +120,13 @@ class HotelService:
 
         emt_status     = _src_status(emt_r,    "easemytrip")
         booking_status = _src_status(booking_r, "booking")
+        agoda_status   = _src_status(agoda_r,  "agoda")
+        ixigo_status   = _src_status(ixigo_r,  "ixigo")
 
-        logger.info("[hotels] %r | EaseMyTrip: %s | Booking: %s", destination, emt_status, booking_status)
+        logger.info(
+            "[hotels] %r | EaseMyTrip: %s | Booking: %s | Agoda: %s | Ixigo: %s",
+            destination, emt_status, booking_status, agoda_status, ixigo_status,
+        )
 
         if not all_hotels:
             return {"hotels": [], "source": "none", "nights": nights}
