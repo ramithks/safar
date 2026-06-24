@@ -14,6 +14,8 @@ import uuid
 from datetime import date, datetime
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
+from app.services.scraper_proxy import with_proxy_fallback
+
 logger = logging.getLogger(__name__)
 
 _BASE = "https://hotelservice.easemytrip.com/api/HotelService/HotelListIdWiseNew"
@@ -119,11 +121,14 @@ async def search_hotels(
         "isfifty": False,
     }
 
-    try:
-        async with CurlAsyncSession(impersonate="chrome") as s:
+    async def _do(proxy):
+        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(_BASE, headers=_HEADERS, json=payload, timeout=20)
         r.raise_for_status()
-        data = r.json()
+        return r.json()
+
+    try:
+        data = await with_proxy_fallback("easemytrip", _do)
         if data.get("error"):
             logger.warning("[easemytrip] API error for %r: %s", city_name, data["error"])
             return []

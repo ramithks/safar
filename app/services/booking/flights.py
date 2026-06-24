@@ -13,6 +13,7 @@ import httpx
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
 from app.config import settings
+from app.services.scraper_proxy import with_proxy_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +50,8 @@ async def resolve_iata(city: str) -> str | None:
     if key in _IATA_CACHE:
         return _IATA_CACHE[key]
 
-    try:
-        async with CurlAsyncSession(impersonate="chrome") as s:
+    async def _do(proxy):
+        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _EMT_AUTOSUGGEST,
                 headers={
@@ -64,7 +65,11 @@ async def resolve_iata(city: str) -> str | None:
                 json={"Prefix": city},
                 timeout=8,
             )
-        items = r.json() if isinstance(r.json(), list) else []
+        return r.json()
+
+    try:
+        parsed = await with_proxy_fallback("flights_booking", _do)
+        items = parsed if isinstance(parsed, list) else []
         for item in items:
             city_field = item.get("City") or ""   # e.g. "New Delhi(DEL)"
             country    = (item.get("Country") or "").lower()
@@ -106,8 +111,8 @@ async def search_flights(
     sort: str = "CHEAPEST",
 ) -> list[dict]:
     """Search one-way flights. Returns normalized list sorted by sort param."""
-    try:
-        async with CurlAsyncSession(impersonate="chrome") as s:
+    async def _do(proxy):
+        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.get(
                 _BASE,
                 headers=_build_headers(),
@@ -127,7 +132,10 @@ async def search_flights(
                 timeout=20,
             )
         r.raise_for_status()
-        offers = r.json().get("flightOffers") or []
+        return r.json()
+
+    try:
+        offers = (await with_proxy_fallback("flights_booking", _do)).get("flightOffers") or []
         return [_normalise_offer(o, depart_date, adults) for o in offers]
     except Exception as e:
         logger.warning("[flights_booking] %s→%s on %s: %s", from_airport, to_airport, depart_date, e)

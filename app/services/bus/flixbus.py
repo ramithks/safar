@@ -12,6 +12,8 @@ import logging
 from datetime import datetime
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
+from app.services.scraper_proxy import with_proxy_fallback
+
 logger = logging.getLogger(__name__)
 
 _AUTOCOMPLETE_URL = "https://global.api.flixbus.com/search/autocomplete/cities"
@@ -45,8 +47,8 @@ async def search_city(name: str, country: str = "in") -> list[dict]:
     Resolve a city name to a FlixBus city ID.
     Returns [{id, name, lat, lon, country}]
     """
-    try:
-        async with CurlAsyncSession(impersonate="chrome") as s:
+    async def _do(proxy):
+        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.get(
                 _AUTOCOMPLETE_URL,
                 headers=_AUTOCOMPLETE_HEADERS,
@@ -63,7 +65,10 @@ async def search_city(name: str, country: str = "in") -> list[dict]:
                 timeout=20,
             )
         r.raise_for_status()
-        data = r.json()
+        return r.json()
+
+    try:
+        data = await with_proxy_fallback("flixbus", _do)
         results = data if isinstance(data, list) else (data.get("results") or [])
         return [
             {
@@ -101,8 +106,8 @@ async def search_buses(
         logger.warning("[flixbus] bad date: %s", e)
         return []
 
-    try:
-        async with CurlAsyncSession(impersonate="chrome") as s:
+    async def _do(proxy):
+        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.get(
                 _SEARCH_URL,
                 headers=_SEARCH_HEADERS,
@@ -119,10 +124,13 @@ async def search_buses(
                 timeout=20,
             )
         if r.status_code == 400:
-            # 400 = route doesn't exist on FlixBus, not an error
-            return []
+            # 400 = route doesn't exist on FlixBus, not a block — don't retry
+            return {"trips": []}
         r.raise_for_status()
-        data = r.json()
+        return r.json()
+
+    try:
+        data = await with_proxy_fallback("flixbus", _do)
         trips = data.get("trips") or []
         results = [_normalise(t) for t in trips if t.get("status") == "available"]
         if results:

@@ -26,6 +26,7 @@ import secrets
 import json as _json
 
 from app.config import settings
+from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
 
 logger = logging.getLogger(__name__)
 
@@ -184,20 +185,21 @@ async def resolve_dest_id(city_name: str) -> tuple[int | None, str, str]:
             "extensions": {},
             "query": _AUTOCOMPLETE_GQL_QUERY,
         }
-        async with CurlAsyncSession() as s:
-            r = await s.post(
-                f"{_GRAPHQL_URL}?lang=en-us",
-                headers={**_AUTOCOMPLETE_GQL_HEADERS, "x-booking-pageview-id": pageview_id},
-                json=payload,
-                impersonate="chrome",
-                timeout=10,
-            )
-        r.raise_for_status()
+        async def _do(proxy):
+            async with CurlAsyncSession(proxy=proxy) as s:
+                r = await s.post(
+                    f"{_GRAPHQL_URL}?lang=en-us",
+                    headers={**_AUTOCOMPLETE_GQL_HEADERS, "x-booking-pageview-id": pageview_id},
+                    json=payload,
+                    impersonate="chrome",
+                    timeout=10,
+                )
+            r.raise_for_status()
+            return r.json()
+
         results = (
-            (r.json().get("data") or {})
-            .get("autoCompleteSuggestions", {})
-            .get("results") or []
-        )
+            (await with_proxy_fallback("booking_hotels", _do)).get("data") or {}
+        ).get("autoCompleteSuggestions", {}).get("results") or []
         # Two passes: first prefer India, then accept any country
         for prefer_india in (True, False):
             for priority in ("CITY", "REGION", "DISTRICT"):
@@ -336,8 +338,8 @@ async def _run_fullsearch(
         "query": _GQL_QUERY,
     }
 
-    try:
-        async with CurlAsyncSession() as s:
+    async def _do(proxy):
+        async with CurlAsyncSession(proxy=proxy) as s:
             resp = await s.post(
                 gql_url,
                 headers=gql_headers,
@@ -345,12 +347,13 @@ async def _run_fullsearch(
                 impersonate="chrome",
                 timeout=25,
             )
-
         if resp.status_code != 200:
-            logger.info(f"[booking_hotels] HTTP {resp.status_code} for '{city_canonical}' (destType={dest_type})")
-            return []
+            # Non-200 from Booking's WAF — treat as a block so the proxy retry fires.
+            raise ScraperBlocked(f"HTTP {resp.status_code}")
+        return resp.json()
 
-        data = resp.json()
+    try:
+        data = await with_proxy_fallback("booking_hotels", _do)
         errors = data.get("errors") or []
         if errors:
             msgs = [e.get("message", "") for e in errors[:2]]

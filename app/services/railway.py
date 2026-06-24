@@ -16,6 +16,7 @@ from datetime import datetime
 import httpx
 
 from app.config import settings
+from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +100,8 @@ async def resolve_station_async(city_name: str) -> str | None:
     if key in _STATION_CACHE:
         return _STATION_CACHE[key]
 
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
+    async def _do(proxy):
+        async with httpx.AsyncClient(timeout=8.0, proxy=proxy) as client:
             r = await client.get(
                 f"{_BASE}/api/v2/trains/stations/auto-suggestion",
                 headers=_build_headers(),
@@ -113,15 +114,20 @@ async def resolve_station_async(city_name: str) -> str | None:
                     "language": "EN",
                 },
             )
-        if r.status_code == 200:
-            stations = (r.json().get("data") or {}).get("stationList") or []
-            code = _pick_best_station(stations, city_name)
-            _STATION_CACHE[key] = code
-            if code:
-                logger.info("[railway] autocomplete '%s' → %s", city_name, code)
-            else:
-                logger.info("[railway] autocomplete '%s' → no match (no rail connectivity)", city_name)
-            return code
+        if r.status_code != 200:
+            raise ScraperBlocked(f"HTTP {r.status_code}")
+        return r.json()
+
+    try:
+        data = await with_proxy_fallback("railway", _do)
+        stations = (data.get("data") or {}).get("stationList") or []
+        code = _pick_best_station(stations, city_name)
+        _STATION_CACHE[key] = code
+        if code:
+            logger.info("[railway] autocomplete '%s' → %s", city_name, code)
+        else:
+            logger.info("[railway] autocomplete '%s' → no match (no rail connectivity)", city_name)
+        return code
     except Exception as e:
         logger.warning("[railway] station autocomplete '%s': %s", city_name, e)
 
@@ -153,8 +159,8 @@ async def search_trains(
     except Exception:
         doj = date
 
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+    async def _do(proxy):
+        async with httpx.AsyncClient(timeout=20.0, proxy=proxy) as client:
             r = await client.get(
                 f"{_BASE}/api/v1/trains/search",
                 headers=_build_headers(),
@@ -177,7 +183,10 @@ async def search_trains(
                 },
             )
         r.raise_for_status()
-        data = r.json()
+        return r.json()
+
+    try:
+        data = await with_proxy_fallback("railway", _do)
         # New API: response is {"data": {"trainList": [...]}}
         # Old API: response is {"trainsList": [...]} or {"trains": [...]}
         trains_raw = (

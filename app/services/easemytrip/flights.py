@@ -15,6 +15,8 @@ import time
 import urllib.parse
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
+from app.services.scraper_proxy import with_proxy_fallback
+
 logger = logging.getLogger(__name__)
 
 _BASE = "https://flightservice-node.easemytrip.com/AirAvail_Lights/AirBus_New"
@@ -66,13 +68,17 @@ async def _resolve_iata_city(iata: str) -> tuple[str, str]:
     if key in _CITY_CACHE:
         return _CITY_CACHE[key]
 
-    try:
-        async with CurlAsyncSession(impersonate="chrome") as s:
+    async def _do(proxy):
+        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _AUTOSUGGEST_URL, headers=_AUTOSUGGEST_HEADERS,
                 json={"Prefix": iata}, timeout=8,
             )
-        items = r.json() if isinstance(r.json(), list) else []
+        return r.json()
+
+    try:
+        parsed = await with_proxy_fallback("emt_autosuggest", _do)
+        items = parsed if isinstance(parsed, list) else []
         for item in items:
             city_field = item.get("City", "")   # e.g. "New Delhi(DEL)"
             if f"({key})" in city_field:
@@ -180,8 +186,8 @@ async def search_flights(
         "FareTypeUI": 0,
     }
 
-    try:
-        async with CurlAsyncSession(impersonate="chrome") as s:
+    async def _do(proxy):
+        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _BASE,
                 headers=_HEADERS,
@@ -190,7 +196,10 @@ async def search_flights(
                 timeout=25,
             )
         r.raise_for_status()
-        raw = r.json()
+        return r.json()
+
+    try:
+        raw = await with_proxy_fallback("emt_flights", _do)
         listing_url = await _build_listing_url(from_airport, to_airport, depart_date, adults)
         flights = _extract_flights(raw, from_airport, to_airport, depart_date, adults, listing_url)
         if nonstop_only:
