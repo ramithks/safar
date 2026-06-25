@@ -67,3 +67,4 @@ breaker_redbus   = CircuitBreaker("RedBus",     failure_threshold=3, recovery_ti
 breaker_flixbus  = CircuitBreaker("FlixBus",    failure_threshold=3, recovery_timeout=60.0)
 breaker_agoda    = CircuitBreaker("Agoda",      failure_threshold=3, recovery_timeout=60.0)
 breaker_ixigo    = CircuitBreaker("Ixigo",      failure_threshold=3, recovery_timeout=60.0)
+breaker_gotogate = CircuitBreaker("Gotogate",   failure_threshold=3, recovery_timeout=60.0)

@@ -9,13 +9,16 @@ Booking URL format (confirmed):
     &isow=true&isdm=true&lang=en-us&IsDoubleSeat=false&CCODE=IN&curr=INR&apptype=B2C
 """
 import asyncio
+import base64
 import logging
 import re
 import time
 import urllib.parse
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.padding import PKCS7
 
-from app.services.scraper_proxy import with_proxy_fallback
+from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
 from app.services.geo import is_domestic_iata
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,67 @@ _HEADERS = {
 _CABIN_CODE = {
     "economy": 0, "business": 1, "first": 2, "premium_economy": 3,
 }
+
+# ── Search token (TKN) handshake ─────────────────────────────────────────────
+# As of 2026-06 the AirBus_New search rejects requests without a valid TKN
+# ("TOKEN NOT VALID"). The EMT SPA mints one via a two-step call to its etoken
+# service, then passes it as payload.TKN. Reproduced from the flight-search
+# Angular bundle (chunk 732):
+#   1. POST etoken/UMS  (header ATK, body "{}")        → {ITK, b}  (both opaque)
+#   2. POST etoken/PSP  (header autk=enc("EMT|<static>|<b>|<ITK>"),
+#                        body {UserName:"EMT", ITK:enc(ITK), IP:enc(b)}) → {STK}
+# enc = AES-128-CBC(key=iv=encKeySrchV1), PKCS7, base64. STK is the TKN.
+_UMS_URL    = "https://gi.easemytrip.com/etm/api/etoken/UMS"
+_PSP_URL    = "https://gi.easemytrip.com/etm/api/etoken/PSP"
+_ENC_KEY    = b"hylW@zmEQdG@4Idr"   # encKeySrchV1 (key == iv)
+_ATK        = "c0ruxuOD/XqyNXB3kRAqvRUliyqhyFOOUwgDTCP1tLx09TRNEbblvRQLgfPz2ivf"
+_PSP_STATIC = "EMTWvggk6zYLVynBA56C3aNn4HLREMHV9bEP9Q"
+_TOKEN_TTL  = 300.0   # seconds; refreshed lazily on expiry or rejection
+
+# (token, fetched_at) — shared process-wide so the handshake runs ~once per TTL.
+_token_cache: tuple[str, float] | None = None
+
+
+def _enc_fsearch(value: str) -> str:
+    """EMT EncryptionFSearch: AES-128-CBC with key==iv==encKeySrchV1, base64."""
+    padder = PKCS7(128).padder()
+    data = padder.update(value.encode()) + padder.finalize()
+    enc = Cipher(algorithms.AES(_ENC_KEY), modes.CBC(_ENC_KEY)).encryptor()
+    return base64.b64encode(enc.update(data) + enc.finalize()).decode()
+
+
+def _invalidate_token() -> None:
+    global _token_cache
+    _token_cache = None
+
+
+async def _get_search_token(session: CurlAsyncSession) -> str | None:
+    """Return a valid search TKN, minting (and caching) one if needed."""
+    global _token_cache
+    if _token_cache and (time.monotonic() - _token_cache[1]) < _TOKEN_TTL:
+        return _token_cache[0]
+
+    r1 = await session.post(
+        _UMS_URL, headers={"Content-Type": "application/json", "ATK": _ATK},
+        data="{}", timeout=12,
+    )
+    j1 = r1.json()
+    itk, ip = j1.get("ITK"), j1.get("b")
+    if not itk or not ip:
+        raise ScraperBlocked(f"UMS no ITK/b: {str(j1)[:80]}")
+
+    autk = _enc_fsearch(f"EMT|{_PSP_STATIC}|{ip}|{itk}")
+    r2 = await session.post(
+        _PSP_URL, headers={"Content-Type": "application/json", "autk": autk},
+        json={"UserName": "EMT", "ITK": _enc_fsearch(itk), "IP": _enc_fsearch(ip)},
+        timeout=12,
+    )
+    stk = (r2.json() or {}).get("STK")
+    if not stk:
+        raise ScraperBlocked(f"PSP no STK: {str(r2.text)[:80]}")
+
+    _token_cache = (stk, time.monotonic())
+    return stk
 
 _AUTOSUGGEST_URL = "https://www.easemytrip.com/api/Flight/GetAutoSuggestNew"
 _AUTOSUGGEST_HEADERS = {
@@ -156,8 +220,8 @@ async def search_flights(
     # the airport codes; unknown codes default to domestic (the common case).
     is_domestic = is_domestic_iata(from_airport, to_airport)
 
-    # No TKN needed — including it causes prices to be hidden at bundle level.
-    # Prices are at segment level (j[0].s[i].TF) regardless of TKN.
+    # TKN is required (see _get_search_token); filled in per-attempt inside _do
+    # so a stale/rejected token can be re-minted on the proxy retry.
     payload = {
         "org": from_airport.upper(),
         "dept": to_airport.upper(),
@@ -187,11 +251,13 @@ async def search_flights(
         "IpAddress": "",
         "LoginKey": "",
         "UUID": "",
+        "TKN": "",
         "FareTypeUI": 0,
     }
 
     async def _do(proxy):
         async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+            payload["TKN"] = await _get_search_token(s)
             r = await s.post(
                 _BASE,
                 headers=_HEADERS,
@@ -200,7 +266,14 @@ async def search_flights(
                 timeout=25,
             )
         r.raise_for_status()
-        return r.json()
+        j = r.json()
+        # A valid search returns a JSON object. A bare string ("TOKEN NOT VALID",
+        # block bodies) means the token was rejected — drop it so the proxy retry
+        # re-mints a fresh one, and surface as a block rather than "0 results".
+        if isinstance(j, str):
+            _invalidate_token()
+            raise ScraperBlocked(f"AirBus_New string response: {j[:60]}")
+        return j
 
     try:
         raw = await with_proxy_fallback("emt_flights", _do)

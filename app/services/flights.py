@@ -1,7 +1,7 @@
 """
 Flight aggregator service.
 
-Sources (parallel): Booking.com + EaseMyTrip
+Sources (parallel): Booking.com + EaseMyTrip + Gotogate
 Merges results, deduplicates by flight_number+departure_time, sorts by price.
 
 Usage:
@@ -18,7 +18,8 @@ from app.services.booking.flights import (
     city_to_iata,
 )
 from app.services.easemytrip.flights import search_flights as emt_search_flights
-from app.core.circuit_breaker import breaker_booking, breaker_emt
+from app.services.gotogate.flights import search_flights as gotogate_search_flights
+from app.core.circuit_breaker import breaker_booking, breaker_emt, breaker_gotogate
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ class FlightService:
             }
 
         try:
-            booking_r, emt_r = await asyncio.wait_for(
+            booking_r, emt_r, gotogate_r = await asyncio.wait_for(
                 asyncio.gather(
                     breaker_booking.call(
                         booking_search_flights, from_iata, to_iata, date,
@@ -76,27 +77,37 @@ class FlightService:
                         nonstop_only=nonstop_only,
                         fallback=[],
                     ),
+                    breaker_gotogate.call(
+                        gotogate_search_flights, from_iata, to_iata, date,
+                        adults=adults, cabin_class=cabin_class,
+                        nonstop_only=nonstop_only,
+                        fallback=[],
+                    ),
                     return_exceptions=True,
                 ),
                 timeout=30.0,
             )
         except asyncio.TimeoutError:
             logger.warning("[flights] search timeout for %s→%s on %s", from_iata, to_iata, date)
-            booking_r, emt_r = [], []
+            booking_r, emt_r, gotogate_r = [], [], []
 
         def _src_status(result) -> tuple[list, str]:
             if isinstance(result, Exception):
                 return [], f"✗ {str(result)[:120]}"
             return (result, f"✓ {len(result)}") if result else ([], "✗ 0 results")
 
-        booking_flights, booking_status = _src_status(booking_r)
-        emt_flights,     emt_status     = _src_status(emt_r)
+        booking_flights,  booking_status  = _src_status(booking_r)
+        emt_flights,      emt_status      = _src_status(emt_r)
+        gotogate_flights, gotogate_status = _src_status(gotogate_r)
 
-        logger.info("[flights] %s→%s (%s) | Booking:%s EMT:%s", from_iata, to_iata, date, booking_status, emt_status)
+        logger.info(
+            "[flights] %s→%s (%s) | Booking:%s EMT:%s Gotogate:%s",
+            from_iata, to_iata, date, booking_status, emt_status, gotogate_status,
+        )
 
         seen: set[str] = set()
         merged: list[dict] = []
-        for flight in booking_flights + emt_flights:
+        for flight in booking_flights + emt_flights + gotogate_flights:
             key = flight.get("flight_number", "") + str(flight.get("departure_time", ""))
             if key and key in seen:
                 continue

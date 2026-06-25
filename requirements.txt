@@ -40,6 +40,9 @@ httpx==0.28.1
 # Browser-impersonation client (used for Expedia — bypasses Akamai bot detection)
 curl-cffi>=0.7.0
 
+# AES-CBC for the EaseMyTrip search-token handshake (also a PyJWT[crypto] dep)
+cryptography>=44.0.0
+
 # Logging
 structlog==24.4.0
 
