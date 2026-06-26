@@ -11,6 +11,7 @@ everything. Direct-first keeps proxy bandwidth near zero until the datacenter IP
 is actually blocked.
 """
 import logging
+import time
 from typing import Awaitable, Callable, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -44,11 +45,48 @@ async def with_proxy_fallback(
     on a condition that warrants a proxy retry. If no proxy is configured the
     direct error propagates unchanged (callers handle it as before).
     """
+    # Lazy import keeps this module importable without the metrics registry and
+    # avoids an import cycle (metrics.classify_exception imports ScraperBlocked).
+    from app.core.metrics import METRICS, classify_exception, OUTCOME_SUCCESS
+
     proxy = get_proxy_url()
+    started = time.monotonic()
     try:
-        return await do_request(None)
-    except Exception as exc:
+        result = await do_request(None)
+    except Exception as direct_exc:
+        # Record the failed direct attempt, then decide whether to retry.
+        METRICS.record_request(
+            label,
+            latency_ms=(time.monotonic() - started) * 1000,
+            outcome=classify_exception(direct_exc),
+            proxy_used=False,
+        )
         if not proxy:
             raise
-        logger.info("[%s] direct request failed (%s) — retrying via proxy", label, exc)
-        return await do_request(proxy)
+        logger.info("[%s] direct request failed (%s) — retrying via proxy", label, direct_exc)
+        retry_started = time.monotonic()
+        try:
+            result = await do_request(proxy)
+        except Exception as proxy_exc:
+            METRICS.record_request(
+                label,
+                latency_ms=(time.monotonic() - retry_started) * 1000,
+                outcome=classify_exception(proxy_exc),
+                proxy_used=True,
+            )
+            raise
+        METRICS.record_request(
+            label,
+            latency_ms=(time.monotonic() - retry_started) * 1000,
+            outcome=OUTCOME_SUCCESS,
+            proxy_used=True,
+        )
+        return result
+
+    METRICS.record_request(
+        label,
+        latency_ms=(time.monotonic() - started) * 1000,
+        outcome=OUTCOME_SUCCESS,
+        proxy_used=False,
+    )
+    return result

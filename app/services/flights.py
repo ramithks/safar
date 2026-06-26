@@ -20,6 +20,8 @@ from app.services.booking.flights import (
 from app.services.easemytrip.flights import search_flights as emt_search_flights
 from app.services.gotogate.flights import search_flights as gotogate_search_flights
 from app.core.circuit_breaker import breaker_booking, breaker_emt, breaker_gotogate
+from app.core.metrics import METRICS
+from app.services.scoring import score_flights
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +50,19 @@ def sort_flights(flights: list[dict], sort: str) -> list[dict]:
     if sort == "FASTEST":
         return sorted(flights, key=lambda f: (f.get("duration_min") or 9999))
     if sort == "BEST":
-        def _score(f: dict) -> float:
+        # Prefer the weighted composite (rank_score, set by score_flights) when it
+        # has been attached — a real multi-factor blend of price, duration, stops,
+        # provider, and departure time. Fall back to the legacy price/time blend
+        # for any flight that wasn't scored, sinking it below scored flights.
+        def _best_key(f: dict) -> tuple[int, float]:
+            rs = f.get("rank_score")
+            if rs is not None:
+                return (0, -rs)  # scored first, higher rank_score first
             price = f.get("price_total") or 99999
             dur   = f.get("duration_min") or 999
             stops = (f.get("stops") or 0) * 60
-            return price * 0.6 + (dur + stops) * 0.4
-        return sorted(flights, key=_score)
+            return (1, price * 0.6 + (dur + stops) * 0.4)
+        return sorted(flights, key=_best_key)
     # default: CHEAPEST
     return sorted(flights, key=lambda f: (f.get("price_total") is None, f.get("price_total") or 99999))
 
@@ -136,23 +145,37 @@ class FlightService:
         emt_flights,      emt_status      = _src_status(emt_r)
         gotogate_flights, gotogate_status = _src_status(gotogate_r)
 
+        # Per-provider result counts for this search (observability).
+        for prov, flights_list in (
+            ("booking", booking_flights), ("easemytrip", emt_flights), ("gotogate", gotogate_flights),
+        ):
+            METRICS.record_search(prov, raw_count=len(flights_list), deduped_count=len(flights_list))
+
         logger.info(
             "[flights] %s→%s (%s) | Booking:%s EMT:%s Gotogate:%s",
             from_iata, to_iata, date, booking_status, emt_status, gotogate_status,
         )
 
+        all_raw = booking_flights + emt_flights + gotogate_flights
         seen: set[str] = set()
         merged: list[dict] = []
-        for flight in booking_flights + emt_flights + gotogate_flights:
+        for flight in all_raw:
             key = flight.get("flight_number", "") + str(flight.get("departure_time", ""))
             if key and key in seen:
                 continue
             seen.add(key)
             merged.append(flight)
 
+        # Cross-source duplicate ratio for this search (observability).
+        METRICS.record_search("flights_merge", raw_count=len(all_raw), deduped_count=len(merged))
+
         if nonstop_only:
             merged = [f for f in merged if (f.get("stops") or 0) == 0]
 
+        # Weighted ranking: attach quality_score + rank_score (price+duration+stops
+        # +provider+departure). BEST sort consumes rank_score; CHEAPEST/FASTEST stay
+        # pure single-axis so an explicit user sort is honoured exactly.
+        merged = score_flights(merged)
         # Final merge-wide rerank by the requested sort (matches what we asked each
         # provider for upstream). sort_flights sinks unpriced flights to the bottom.
         merged = sort_flights(merged, eff_sort)

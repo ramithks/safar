@@ -20,6 +20,8 @@ from app.services.ixigo.hotels import search_hotels as ixigo_search_hotels
 from app.core.circuit_breaker import (
     breaker_emt, breaker_booking, breaker_agoda, breaker_ixigo,
 )
+from app.core.metrics import METRICS
+from app.services.scoring import score_hotels
 from app.services.hotels_filters import (
     budget_to_hotel_sort, derive_travel_type, preferred_types,
     filter_and_rank_by_persona,
@@ -113,8 +115,11 @@ class HotelService:
             if isinstance(result, Exception):
                 return f"✗ error"
             if not result:
+                METRICS.record_search(name, raw_count=0, deduped_count=0)
                 return "✗ 0"
             raw = len(result)
+            # Per-provider contribution to this search (drives avg_result_count).
+            METRICS.record_search(name, raw_count=raw, deduped_count=raw)
             budget_filtered = _filter_by_budget(result, budget, currency_code)
             all_hotels.extend(budget_filtered)
             sources.append(name)
@@ -139,12 +144,20 @@ class HotelService:
                     "travel_type": persona, "property_types": ptypes,
                     "destination": dest.display_name, "dest_class": dest.dest_class}
 
+        total_raw = len(all_hotels)
         deduped = _deduplicate_by_name(all_hotels)
+        # Cross-source duplicate ratio for this search (observability).
+        METRICS.record_search("hotels_merge", raw_count=total_raw, deduped_count=len(deduped))
         # Context-aware distance filter (widens automatically if too few survive).
         nearby = _filter_by_distance_adaptive(deduped, base_km)
+        # Weighted ranking: attach quality_score + rank_score and order by the
+        # composite (price+rating+reviews+distance+provider+images+amenities+
+        # freshness) — replaces the old richness-only ordering.
+        scored = score_hotels(nearby)
         # Soft persona filter: keep the persona's preferred property types (never
-        # empties), preferred types ranked first.
-        persona_filtered = filter_and_rank_by_persona(nearby, persona, budget)
+        # empties); a STABLE sort by persona tier preserves rank_score order within
+        # each tier, so preferred types lead and the best-scored lead within them.
+        persona_filtered = filter_and_rank_by_persona(scored, persona, budget)
         hotels_with_map = [_add_map_url(h) for h in persona_filtered]
         return {
             "hotels": hotels_with_map,

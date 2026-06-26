@@ -19,6 +19,7 @@ from app.services.vertex import vertex_generate, extract_json
 from app.services.transport import TransportService
 from app.services.hotels import HotelService
 from app.services.flights import FlightService, budget_to_sort, sort_flights
+from app.services.journey_reasoning import build_journey_reasoning
 from app.services.railway import RailwayService, city_to_station_code, resolve_station_async
 
 from .models import PlanJourneyRequest
@@ -795,7 +796,19 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
     }
 
     # ── Build fastest/cheapest/balanced journey options ───────────────────────
-    route_plan["journey_options"] = _build_journey_options(route_plan, body.travelers)
+    journey_options = _build_journey_options(route_plan, body.travelers)
+    route_plan["journey_options"] = journey_options
+
+    # ── Reason over the options: trade-off narrative (Score → Reason → Recommend)
+    reasoning = build_journey_reasoning(
+        journey_options,
+        symbol=symbol,
+        hotel_per_night=live_costs.get("hotel_per_night"),
+    )
+    if reasoning:
+        route_plan["journey_reasoning"] = reasoning
+        # Surface the headline + insights on the recommendations block too.
+        route_plan["recommendations"]["reasoning"] = reasoning
 
     # ── Bundle a complete door-to-door all-train journey (if feasible) ────────
     train_journey = _build_train_journey_bundle(legs, body.travelers)
@@ -925,6 +938,8 @@ def _option_block(c: dict, tag: str, label: str) -> dict:
         "duration_display": _fmt_duration(c["duration_min"]),
         "operator": c["operator"],
         "booking_url": c.get("booking_url"),
+        "departure_time": c.get("departure_time"),
+        "arrival_time": c.get("arrival_time"),
         "from_iata": c.get("from_iata"),
         "to_iata": c.get("to_iata"),
         "from_code": c.get("from_code"),
@@ -965,6 +980,8 @@ def _build_journey_options(journey_result: dict, travelers: int) -> dict:
             "operator": f.get("airline") or "Flight",
             "description": f"{f.get('airline', 'Flight')} {f.get('flight_number', '')}".strip(),
             "booking_url": f.get("booking_url"),
+            "departure_time": f.get("departure_time"),
+            "arrival_time": f.get("arrival_time"),
         })
 
     if train_items:
@@ -977,6 +994,8 @@ def _build_journey_options(journey_result: dict, travelers: int) -> dict:
             "operator": t.get("train_name") or "Train",
             "description": f"{t.get('train_name', 'Train')} ({t.get('train_number', '')})".strip(" ()"),
             "booking_url": None,
+            "departure_time": t.get("departure_time"),
+            "arrival_time": t.get("arrival_time"),
         })
 
     if bus_items:
@@ -989,6 +1008,8 @@ def _build_journey_options(journey_result: dict, travelers: int) -> dict:
             "operator": b.get("operator") or "Bus",
             "description": f"{b.get('operator', 'Bus')} — {b.get('bus_type', '')}".strip(" —"),
             "booking_url": b.get("booking_url"),
+            "departure_time": b.get("departure"),
+            "arrival_time": b.get("arrival"),
         })
 
     if not candidates:
@@ -1042,6 +1063,8 @@ def _build_journey_options(journey_result: dict, travelers: int) -> dict:
                         f"{b.get('airline', '')} {b.get('flight_number', '')}".strip()
                     ),
                     "booking_url": b.get("booking_url"),
+                    "departure_time": b.get("departure") if sole_mode == "bus" else b.get("departure_time"),
+                    "arrival_time": b.get("arrival") if sole_mode == "bus" else b.get("arrival_time"),
                 }
 
             return {
