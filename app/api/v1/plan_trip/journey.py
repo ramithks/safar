@@ -18,7 +18,7 @@ from app.db.client import get_db
 from app.services.vertex import vertex_generate, extract_json
 from app.services.transport import TransportService
 from app.services.hotels import HotelService
-from app.services.flights import FlightService
+from app.services.flights import FlightService, budget_to_sort, sort_flights
 from app.services.railway import RailwayService, city_to_station_code, resolve_station_async
 
 from .models import PlanJourneyRequest
@@ -458,9 +458,11 @@ def _pick_recommended_hotel(hotels: list[dict], budget: str) -> dict | None:
 
 
 def _pick_recommended_flight(flights: list[dict], budget: str) -> dict | None:
+    """Top flight under the budget tier's sort (low=cheapest, mid=best, high=fastest)."""
     if not flights:
         return None
-    pick = dict(min(flights, key=lambda f: f.get("price_total") or 999_999))
+    ranked = sort_flights(flights, budget_to_sort(budget) or "CHEAPEST")
+    pick = dict(ranked[0])
     pick["is_recommended"] = True
     return pick
 
@@ -621,6 +623,7 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
                     _flights.search, origin_s, dest_s, departure_date,
                     adults=body.travelers,
                     from_iata=from_iata, to_iata=to_iata,
+                    sort=budget_to_sort(safe_budget),   # budget → upstream provider sort
                     fallback={"flights": [], "resolved": False},
                 ))
             else:
@@ -717,7 +720,9 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
                         b["is_recommended"] = True
 
         elif mode_type == "flight":
-            flights = result.get("flights") or []
+            # Order the list by the budget tier's sort so it matches the recommendation.
+            flights = sort_flights(result.get("flights") or [], budget_to_sort(safe_budget) or "CHEAPEST")
+            result["flights"] = flights
             rec = _pick_recommended_flight(flights, safe_budget)
             if rec and not _rec_flight:
                 _rec_flight = rec

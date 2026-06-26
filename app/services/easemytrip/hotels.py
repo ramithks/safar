@@ -50,6 +50,25 @@ _JWT_TOKEN = (
     ".BcyiSrb_Q4J4wvNUCdKDP4NZofUxL3dH6947Y-CobvEf"
 )
 
+# Native sort codes — canonical sort key → EaseMyTrip `sorttype` ("Field|DIR").
+_SORTS = {
+    "price_asc":   "Price|ASC",
+    "price_desc":  "Price|DESC",
+    "recommended": "Popular|DESC",
+    "rating":      "Rating|DESC",
+}
+# Native property-type filter — canonical type → EMT `selectedProp` value
+# (matches the `catgry` field in responses; verified live: Hostel/Hotel/Resort
+# Property/Homestay/Apartment all filter correctly).
+_PROP_FILTER = {
+    "hostel":    "Hostel",
+    "hotel":     "Hotel",
+    "resort":    "Resort Property",
+    "homestay":  "Homestay",
+    "apartment": "Apartment",
+}
+
+
 def _build_search_key(city_name: str, checkin: str, checkout: str, rooms: int, adults: int, children: int) -> str:
     city_upper = city_name.upper().replace(" ", ",").replace(",,", ",")
     return f"15~INR~{city_upper}~{checkin}~{checkout}~{rooms}~{adults}_{children}~~~EASEMYTRIP~NA~NA~NA~IN"
@@ -68,17 +87,26 @@ async def search_hotels(
     adults: int = 2,
     children: int = 0,
     page: int = 1,
-    limit: int = 10,
-    sort: str = "Popular|DESC",
+    limit: int = 40,
+    sort: str | None = "recommended",
+    property_types: list[str] | None = None,
 ) -> list[dict]:
     """
     Search hotels on EaseMyTrip for a given city and date range.
+    `sort` is a canonical key (price_asc|price_desc|recommended|rating); a native
+    "Field|DIR" string is also accepted as-is. `property_types` is a list of
+    canonical types — mapped to EMT's `selectedProp` to restrict the result set.
     Returns a normalized list of hotel options.
     """
     city_lower = city_name.lower().strip()
     search_key = _build_search_key(city_lower, checkin, checkout, rooms, adults, children)
     cid = _build_cid(city_name)
     traceid = datetime.now().strftime("%Y%d%m%H%M%S")
+
+    sorttype = _SORTS.get(sort) or (sort if (sort and "|" in sort) else "Popular|DESC")
+    selected_prop = [
+        _PROP_FILTER[t] for t in (property_types or []) if t in _PROP_FILTER
+    ]
 
     payload = {
         "PageNo": page,
@@ -93,7 +121,7 @@ async def search_hotels(
         "CityName": city_lower,
         "EMTCommonID": "",
         "NoOfRooms": rooms,
-        "sorttype": sort,
+        "sorttype": sorttype,
         "auth": _AUTH,
         "minPrice": 1,
         "maxPrice": 10_000_000,
@@ -111,7 +139,7 @@ async def search_hotels(
         "selectchain": [],
         "selectedAreas": [],
         "selectedAmen": [],
-        "selectedProp": [],
+        "selectedProp": selected_prop,
         "selectedTARating": [],
         "selectedRating": [],
         "wlcode": "",
@@ -144,6 +172,8 @@ def _normalise_hotel(h: dict, checkin: str, checkout: str) -> dict:
     except Exception:
         nights = 1
 
+    from app.services.hotels_filters import classify_property_type
+
     images = h.get("imgarry") or []
     if h.get("imgU"):
         images = [h["imgU"]] + [img for img in images if img != h["imgU"]]
@@ -151,10 +181,12 @@ def _normalise_hotel(h: dict, checkin: str, checkout: str) -> dict:
     amenities_raw = h.get("amen") or []
     amenities = [a.strip() for a in amenities_raw if a and a.strip()]
 
+    category = h.get("catgry")
     return {
         "hotel_id": h.get("hid"),
         "name": h.get("nm"),
-        "category": h.get("catgry"),       # "Hotel" | "Resort Property" | "Homestay"
+        "category": category,              # "Hotel" | "Resort Property" | "Homestay"
+        "property_type": classify_property_type({"category": category, "name": h.get("nm")}),
         "star_rating": _safe_float(h.get("rat")),
         "ta_rating": _safe_float(h.get("tr")),
         "address": h.get("adrs"),

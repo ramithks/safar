@@ -28,6 +28,36 @@ async def _noop(value):
     return value
 
 
+# ── Sorting (shared by /search/flights and the /plan journey) ────────────────
+# Budget tier → sort intent. The single source of truth so the standalone search
+# endpoint and the trip planner order flights identically.
+_BUDGET_SORT = {"low": "CHEAPEST", "mid": "BEST", "high": "FASTEST"}
+
+
+def budget_to_sort(budget: str | None) -> str | None:
+    """Map a budget tier (low|mid|high) → sort key, or None if not a known tier."""
+    return _BUDGET_SORT.get((budget or "").lower())
+
+
+def sort_flights(flights: list[dict], sort: str) -> list[dict]:
+    """
+    Order flights by sort intent. CHEAPEST/FASTEST sort on a single field; BEST
+    blends price and time (price dominates by design — kept behaviour-preserving).
+    Unpriced flights always sink to the bottom.
+    """
+    if sort == "FASTEST":
+        return sorted(flights, key=lambda f: (f.get("duration_min") or 9999))
+    if sort == "BEST":
+        def _score(f: dict) -> float:
+            price = f.get("price_total") or 99999
+            dur   = f.get("duration_min") or 999
+            stops = (f.get("stops") or 0) * 60
+            return price * 0.6 + (dur + stops) * 0.4
+        return sorted(flights, key=_score)
+    # default: CHEAPEST
+    return sorted(flights, key=lambda f: (f.get("price_total") is None, f.get("price_total") or 99999))
+
+
 class FlightService:
     """Unified flight search: Booking.com + EaseMyTrip (parallel, deduplicated, price-sorted)."""
 
@@ -63,12 +93,18 @@ class FlightService:
                 "to_iata": to_iata, "resolved": False,
             }
 
+        # Push the requested sort UPSTREAM so each provider returns a slice that
+        # already favours it — sorting after a biased page can't recover the
+        # candidates a provider never returned. Booking + Gotogate sort natively;
+        # EMT has no upstream sort but returns near-full inventory, so reranking it
+        # locally is safe. A final merge-wide rerank by `sort` happens below.
+        eff_sort = (sort or "CHEAPEST").upper()
         try:
             booking_r, emt_r, gotogate_r = await asyncio.wait_for(
                 asyncio.gather(
                     breaker_booking.call(
                         booking_search_flights, from_iata, to_iata, date,
-                        adults=adults, cabin_class=cabin_class, sort=sort,
+                        adults=adults, cabin_class=cabin_class, sort=eff_sort,
                         fallback=[],
                     ),
                     breaker_emt.call(
@@ -80,7 +116,7 @@ class FlightService:
                     breaker_gotogate.call(
                         gotogate_search_flights, from_iata, to_iata, date,
                         adults=adults, cabin_class=cabin_class,
-                        nonstop_only=nonstop_only,
+                        nonstop_only=nonstop_only, sort=eff_sort,
                         fallback=[],
                     ),
                     return_exceptions=True,
@@ -117,8 +153,9 @@ class FlightService:
         if nonstop_only:
             merged = [f for f in merged if (f.get("stops") or 0) == 0]
 
-        # Priced flights first, then unpriced (EMT schedule-only)
-        merged.sort(key=lambda f: (f.get("price_total") is None, f.get("price_total") or 999_999))
+        # Final merge-wide rerank by the requested sort (matches what we asked each
+        # provider for upstream). sort_flights sinks unpriced flights to the bottom.
+        merged = sort_flights(merged, eff_sort)
 
         return {
             "flights": merged,

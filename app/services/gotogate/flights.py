@@ -43,6 +43,15 @@ _CABIN = {
     "first": "FIRST",
 }
 
+# Native server-side sort — canonical sort → Gotogate sortTypeCode (verified live
+# via availableSortTypes). Driving sort upstream decides which flights land in the
+# returned slice, so a later local rerank can't miss them.
+_SORT_CODES = {
+    "CHEAPEST": "CHEAP_TRIP",
+    "FASTEST":  "SHORT_TRIP",
+    "BEST":     "RECOMMENDATION",
+}
+
 _SEARCH_LOCATIONS_QUERY = (
     "query searchLocations($searchTerm: String) {\n"
     "  searchLocations(searchTerm: $searchTerm) {\n"
@@ -165,8 +174,13 @@ async def search_flights(
     cabin_class: str = "ECONOMY",
     child_ages: list[int] | None = None,
     nonstop_only: bool = False,
+    sort: str | None = None,
 ) -> list[dict]:
-    """Search one-way flights on Gotogate. Returns a normalized, price-sorted list."""
+    """
+    Search one-way flights on Gotogate. `sort` is a canonical flight sort
+    (CHEAPEST|FASTEST|BEST); it is pushed to the server via `sortTypeCode` so the
+    returned slice already favours the requested ranking.
+    """
     cabin = _CABIN.get(cabin_class.lower(), "ECONOMY")
     variables = {
         "adults": adults,
@@ -183,6 +197,9 @@ async def search_flights(
     }
     if nonstop_only:
         variables["direct"] = True
+    sort_code = _SORT_CODES.get((sort or "").upper())
+    if sort_code:
+        variables["sortTypeCode"] = sort_code
 
     async def _do(proxy):
         async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
@@ -208,7 +225,10 @@ async def search_flights(
         flights = [f for f in flights if f]
         if nonstop_only:
             flights = [f for f in flights if (f.get("stops") or 0) == 0]
-        flights.sort(key=lambda f: (f.get("price_total") is None, f.get("price_total") or 999_999))
+        # Keep the server order for FASTEST/BEST (it already ranked the slice);
+        # only price-sort for the cheapest case (and as the default).
+        if (sort or "CHEAPEST").upper() == "CHEAPEST":
+            flights.sort(key=lambda f: (f.get("price_total") is None, f.get("price_total") or 999_999))
         return flights
     except Exception as e:
         logger.warning("[gotogate] %s→%s on %s: %s", from_airport, to_airport, depart_date, e)

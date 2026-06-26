@@ -41,6 +41,18 @@ _GRAPHQL_URL  = "https://www.booking.com/dml/graphql"
 _SEARCH_PAGE  = "https://www.booking.com/searchresults.html"
 _PHOTO_BASE   = "https://cf.bstatic.com"
 
+# Native sort codes — canonical sort key → Booking `selectedSorter` (verified live).
+# Property-type filtering is NOT done natively (Booking's GraphQL `filters` input
+# rejects ht_id codes); the shared classifier tags property_type instead, and the
+# aggregator's persona filter ranks/keeps the right types.
+_SORTS = {
+    "price_asc":   "price",
+    "price_desc":  "price_from_high_to_low",
+    "recommended": "popularity",
+    "rating":      "bayesian_review_score",
+    "class":       "class",
+}
+
 _COMMON_HEADERS = {
     "accept": "*/*",
     "accept-language": "en-US,en;q=0.9",
@@ -386,17 +398,23 @@ async def search_hotels(
     adults: int = 2,
     children: int = 0,
     sort: str | None = None,
-    limit: int = 10,
+    limit: int = 40,
     offset: int = 0,
+    property_types: list[str] | None = None,   # accepted for API uniformity; classifier-only
 ) -> list[dict]:
     """
     Search hotels on Booking.com. Returns a normalized list.
+    `sort` is a canonical key (price_asc|price_desc|recommended|rating|class); a
+    native Booking sorter string is accepted as-is. `property_types` is accepted
+    for signature parity but enforced via the shared classifier, not natively.
     Tries CITY destType first; retries as REGION then DISTRICT when results are empty.
     Requires curl_cffi (bypasses AWS WAF with Chrome impersonation).
     """
     if not _CURL_AVAILABLE:
         logger.warning("[booking_hotels] curl_cffi not installed — pip install curl-cffi")
         return []
+
+    sort = _SORTS.get(sort, sort)   # canonical → native; pass through unknown/native
 
     dest_id, city_canonical, dest_type = await resolve_dest_id(city_name)
     if dest_id is None:
@@ -455,6 +473,7 @@ async def search_hotels(
 
 
 def _normalise(r: dict, checkin: str, checkout: str, nights: int) -> dict:
+    from app.services.hotels_filters import classify_property_type
     basic = r.get("basicPropertyData") or {}
     loc   = basic.get("location") or {}
     reviews = basic.get("reviewScore") or {}
@@ -530,6 +549,7 @@ def _normalise(r: dict, checkin: str, checkout: str, nights: int) -> dict:
         "photos": photos,
         "booking_url": booking_url,
         "is_sold_out": sold_out,
+        "property_type": classify_property_type({"name": name}),
         "source": "booking",
     }
 

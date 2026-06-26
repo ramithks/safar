@@ -29,6 +29,17 @@ _BASE = "https://www.agoda.com/graphql/search"
 _SUGGEST = "https://www.agoda.com/api/cronos/search/GetUnifiedSuggestResult/3/15/1/0/en-in/"
 _SITE = "https://www.agoda.com"
 _CID = "1844104"
+
+# Native sort codes — canonical sort key → Agoda (sortField, sortOrder).
+# Verified valid sortFields: Price, Ranking, StarRating (others 400).
+_SORTS = {
+    "price_asc":   ("Price", "Asc"),
+    "price_desc":  ("Price", "Desc"),
+    "recommended": ("Ranking", "Desc"),
+    "rating":      ("StarRating", "Desc"),
+}
+# Persona → Agoda travellerType string.
+_TRAVELLER = {"solo": "Solo", "couple": "Couple", "friends": "Group", "family": "Family"}
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
@@ -217,7 +228,9 @@ def _iso_z(d: str) -> str:
 
 
 def _build_variables(city_id: int, checkin: str, checkout: str, los: int,
-                     rooms: int, adults: int, children: int, page_size: int) -> dict:
+                     rooms: int, adults: int, children: int, page_size: int,
+                     sort: str | None = None, traveller_type: str = "Couple") -> dict:
+    sort_field, sort_order = _SORTS.get(sort, ("Ranking", "Desc"))
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     user_id = str(uuid.uuid4())
     search_id = str(uuid.uuid4())
@@ -239,8 +252,8 @@ def _build_variables(city_id: int, checkin: str, checkout: str, los: int,
                     "childAges": [],
                     "isUserLoggedIn": False,
                     "currency": "INR",
-                    "travellerType": "Couple",
-                    "sorting": {"sortField": "Ranking", "sortOrder": "Desc", "sortParams": None},
+                    "travellerType": traveller_type,
+                    "sorting": {"sortField": sort_field, "sortOrder": sort_order, "sortParams": None},
                     "requiredBasis": "PRPN",
                     "requiredPrice": "Exclusive",
                     "synchronous": False,
@@ -338,9 +351,17 @@ async def search_hotels(
     rooms: int = 1,
     adults: int = 2,
     children: int = 0,
-    limit: int = 10,
+    limit: int = 40,
+    sort: str | None = None,
+    property_types: list[str] | None = None,   # accepted for API uniformity; classifier-only
+    travel_type: str = "couple",
 ) -> list[dict]:
-    """Search hotels on Agoda for a city + date range. Returns a normalized list."""
+    """
+    Search hotels on Agoda for a city + date range. `sort` is a canonical key
+    (price_asc|price_desc|recommended|rating). `travel_type` sets Agoda's
+    travellerType. Property type is enforced via the shared classifier. Returns
+    a normalized list.
+    """
     city_id = await resolve_city_id(city_name)
     if city_id is None:
         return []
@@ -350,9 +371,11 @@ async def search_hotels(
     except Exception:
         los = 1
 
+    traveller = _TRAVELLER.get((travel_type or "couple").lower(), "Couple")
     payload = {
         "query": _QUERY,
-        "variables": _build_variables(city_id, checkin, checkout, los, rooms, adults, children, max(limit, 20)),
+        "variables": _build_variables(city_id, checkin, checkout, los, rooms, adults, children,
+                                      max(limit, 20), sort=sort, traveller_type=traveller),
     }
 
     async def _do(proxy):
@@ -378,6 +401,7 @@ async def search_hotels(
 
 
 def _normalise(p: dict, checkin: str, checkout: str, nights: int) -> dict:
+    from app.services.hotels_filters import classify_property_type
     content = p.get("content") or {}
     info = content.get("informationSummary") or {}
     addr = info.get("address") or {}
@@ -432,6 +456,7 @@ def _normalise(p: dict, checkin: str, checkout: str, nights: int) -> dict:
         "nights": nights,
         "photos": photos,
         "booking_url": booking_url,
+        "property_type": classify_property_type({"name": info.get("displayName")}),
         "source": "agoda",
     }
 

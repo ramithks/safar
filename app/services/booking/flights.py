@@ -14,7 +14,7 @@ from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
 from app.config import settings
 from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
-from app.services.geo import iata_of as geo_iata
+from app.services.geo import iata_of as geo_iata, country_of, country_of_iata
 
 logger = logging.getLogger(__name__)
 
@@ -41,15 +41,31 @@ def _build_headers() -> dict:
 _IATA_CACHE: dict[str, str] = {}
 
 
+def _country_matches(city: str, code: str) -> bool:
+    """
+    True unless the candidate airport is in a *different* known country than the
+    city. Rejects cross-country garbage (e.g. 'Kasol' → KUL/Kuala Lumpur) while
+    giving the benefit of the doubt when either side's country is unknown.
+    """
+    expected = country_of(city)
+    if not expected:
+        return True                      # no expectation → accept
+    actual = country_of_iata(code)
+    if actual is None:
+        return True                      # unknown airport country → accept
+    return actual == expected
+
+
 async def resolve_iata(city: str) -> str | None:
     """
-    Resolve city name → IATA code.
+    Resolve city name → IATA code (the single shared flight-location resolver).
 
-    Order: in-memory cache → static geo table (instant, offline) → EaseMyTrip
-    autosuggest (long tail). The static table removes the single point of failure
-    that previously caused 'no flights' when the autosuggest call was blocked or
-    changed shape. Response City field format: "New Delhi(DEL)".
-    Results cached in-memory after first call.
+    Order: in-memory cache → static geo table (instant, offline, incl. nearest
+    airport for airport-less towns) → EaseMyTrip autosuggest → Gotogate
+    searchLocations. Every live candidate is country-validated against the city's
+    known country so a confident wrong-country match can never win. The static
+    table removes the single point of failure that once caused 'no flights'.
+    Results (including misses) cached in-memory.
     """
     key = city.lower().strip()
     if key in _IATA_CACHE:
@@ -61,6 +77,7 @@ async def resolve_iata(city: str) -> str | None:
         logger.info("[flights] IATA '%s' → %s (static)", city, static)
         return static
 
+    # ── Fallback source 1: EaseMyTrip autosuggest (validated) ────────────────
     async def _do(proxy):
         async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
@@ -81,28 +98,35 @@ async def resolve_iata(city: str) -> str | None:
     try:
         parsed = await with_proxy_fallback("flights_booking", _do)
         items = parsed if isinstance(parsed, list) else []
-        for item in items:
-            city_field = item.get("City") or ""   # e.g. "New Delhi(DEL)"
-            country    = (item.get("Country") or "").lower()
-            m = _re.search(r'\(([A-Z]{3})\)', city_field)
-            if m:
+        # Prefer Indian airports, then any — but only when the country is consistent.
+        for india_only in (True, False):
+            for item in items:
+                city_field = item.get("City") or ""   # e.g. "New Delhi(DEL)"
+                country    = (item.get("Country") or "").lower()
+                if india_only and country not in ("india", "in"):
+                    continue
+                m = _re.search(r'\(([A-Z]{3})\)', city_field)
+                if not m:
+                    continue
                 code = m.group(1)
-                # Prefer Indian airports; fall back to any
-                if country in ("india", "in"):
-                    _IATA_CACHE[key] = code
-                    logger.info("[flights] IATA '%s' → %s", city, code)
-                    return code
-        # Second pass: accept any country
-        for item in items:
-            city_field = item.get("City") or ""
-            m = _re.search(r'\(([A-Z]{3})\)', city_field)
-            if m:
-                code = m.group(1)
+                if not _country_matches(city, code):
+                    continue
                 _IATA_CACHE[key] = code
-                logger.info("[flights] IATA '%s' → %s", city, code)
+                logger.info("[flights] IATA '%s' → %s (emt)", city, code)
                 return code
     except Exception as e:
         logger.warning("[flights] IATA autocomplete '%s': %s", city, e)
+
+    # ── Fallback source 2: Gotogate searchLocations (validated) ──────────────
+    try:
+        from app.services.gotogate.flights import resolve_iata as gotogate_resolve
+        code = await gotogate_resolve(city)
+        if code and _country_matches(city, code):
+            _IATA_CACHE[key] = code
+            logger.info("[flights] IATA '%s' → %s (gotogate)", city, code)
+            return code
+    except Exception as e:
+        logger.warning("[flights] gotogate IATA fallback '%s': %s", city, e)
 
     _IATA_CACHE[key] = None
     return None

@@ -20,22 +20,15 @@ from app.services.ixigo.hotels import search_hotels as ixigo_search_hotels
 from app.core.circuit_breaker import (
     breaker_emt, breaker_booking, breaker_agoda, breaker_ixigo,
 )
+from app.services.hotels_filters import (
+    budget_to_hotel_sort, derive_travel_type, preferred_types,
+    filter_and_rank_by_persona,
+)
+from app.services.hotels_destination import normalize_destination, distance_km_for
 
-_BUDGET_SORT_EMT = {
-    "low":  "Price|ASC",
-    "mid":  "Popular|DESC",
-    "high": "Rating|DESC",
-}
-_BUDGET_SORT_BOOKING = {
-    "low":  "price",
-    "mid":  None,
-    "high": "class",
-}
-_BUDGET_QUERY = {
-    "low":  "budget affordable hotels homestay",
-    "mid":  "mid-range 3-star hotels",
-    "high": "luxury 5-star hotels resort",
-}
+# Fixed per-source fetch size. No user-facing limit — each API still needs a page
+# size (Booking self-caps at 25); the merged list is returned in full.
+_PER_SOURCE = 40
 
 # Per-night price thresholds for soft budget filtering, by currency
 _BUDGET_PRICE_RANGE: dict[str, dict[str, tuple[int, int]]] = {
@@ -65,8 +58,9 @@ class HotelService:
         adults: int = 2,
         children: int = 0,
         budget: str = "mid",
-        limit: int = 10,
-        max_distance_km: float = 20.0,
+        travel_type: str | None = None,
+        sort: str | None = None,
+        max_distance_km: float | None = None,
         currency_code: str = "inr",
     ) -> dict:
         from datetime import datetime
@@ -75,30 +69,37 @@ class HotelService:
         except Exception:
             nights = 1
 
-        emt_sort = _BUDGET_SORT_EMT.get(budget, "Popular|DESC")
-        bkg_sort = _BUDGET_SORT_BOOKING.get(budget)
-        per_src  = max(limit * 2, 30)
+        # Canonical destination: one query string for every source (EMT has no
+        # autocomplete) + a class that adapts the distance radius.
+        dest  = normalize_destination(destination)
+        city  = dest.query
+
+        # Persona + budget drive property type; budget drives sort (budget wins).
+        persona      = derive_travel_type(adults, travel_type)
+        ptypes       = preferred_types(persona, budget)
+        canonical_sort = budget_to_hotel_sort(budget) or sort or "recommended"
 
         emt_r, booking_r, agoda_r, ixigo_r = await asyncio.gather(
             breaker_emt.call(
-                emt_search_hotels, destination, checkin, checkout,
+                emt_search_hotels, city, checkin, checkout,
                 rooms=rooms, adults=adults, children=children,
-                limit=per_src, sort=emt_sort, fallback=[],
+                limit=_PER_SOURCE, sort=canonical_sort, property_types=ptypes, fallback=[],
             ),
             breaker_booking.call(
-                booking_search_hotels, destination, checkin, checkout,
+                booking_search_hotels, city, checkin, checkout,
                 rooms=rooms, adults=adults, children=children,
-                sort=bkg_sort, limit=per_src, fallback=[],
+                sort=canonical_sort, limit=_PER_SOURCE, property_types=ptypes, fallback=[],
             ),
             breaker_agoda.call(
-                agoda_search_hotels, destination, checkin, checkout,
+                agoda_search_hotels, city, checkin, checkout,
                 rooms=rooms, adults=adults, children=children,
-                limit=per_src, fallback=[],
+                limit=_PER_SOURCE, sort=canonical_sort, property_types=ptypes,
+                travel_type=persona, fallback=[],
             ),
             breaker_ixigo.call(
-                ixigo_search_hotels, destination, checkin, checkout,
+                ixigo_search_hotels, city, checkin, checkout,
                 rooms=rooms, adults=adults, children=children,
-                limit=per_src, fallback=[],
+                limit=_PER_SOURCE, sort=canonical_sort, property_types=ptypes, fallback=[],
             ),
             return_exceptions=True,
         )
@@ -107,36 +108,52 @@ class HotelService:
         sources: list[str] = []
 
         def _src_status(result, name: str) -> str:
+            # Budget filter per source; distance filtering happens once after merge
+            # so its radius can adapt and widen on sparse results.
             if isinstance(result, Exception):
                 return f"✗ error"
             if not result:
                 return "✗ 0"
             raw = len(result)
             budget_filtered = _filter_by_budget(result, budget, currency_code)
-            nearby = _filter_by_distance(budget_filtered, max_distance_km)
-            all_hotels.extend(nearby)
+            all_hotels.extend(budget_filtered)
             sources.append(name)
-            return f"✓ {len(nearby)}/{raw}"
+            return f"✓ {len(budget_filtered)}/{raw}"
 
         emt_status     = _src_status(emt_r,    "easemytrip")
         booking_status = _src_status(booking_r, "booking")
         agoda_status   = _src_status(agoda_r,  "agoda")
         ixigo_status   = _src_status(ixigo_r,  "ixigo")
 
+        # Adaptive distance radius by destination class (override wins if passed).
+        base_km = max_distance_km if max_distance_km is not None else distance_km_for(dest.dest_class)
+
         logger.info(
-            "[hotels] %r | EaseMyTrip: %s | Booking: %s | Agoda: %s | Ixigo: %s",
-            destination, emt_status, booking_status, agoda_status, ixigo_status,
+            "[hotels] %r→%r [%s, %.0fkm] | EaseMyTrip: %s | Booking: %s | Agoda: %s | Ixigo: %s",
+            destination, city, dest.dest_class, base_km,
+            emt_status, booking_status, agoda_status, ixigo_status,
         )
 
         if not all_hotels:
-            return {"hotels": [], "source": "none", "nights": nights}
+            return {"hotels": [], "source": "none", "nights": nights,
+                    "travel_type": persona, "property_types": ptypes,
+                    "destination": dest.display_name, "dest_class": dest.dest_class}
 
         deduped = _deduplicate_by_name(all_hotels)
-        hotels_with_map = [_add_map_url(h) for h in deduped]
+        # Context-aware distance filter (widens automatically if too few survive).
+        nearby = _filter_by_distance_adaptive(deduped, base_km)
+        # Soft persona filter: keep the persona's preferred property types (never
+        # empties), preferred types ranked first.
+        persona_filtered = filter_and_rank_by_persona(nearby, persona, budget)
+        hotels_with_map = [_add_map_url(h) for h in persona_filtered]
         return {
             "hotels": hotels_with_map,
             "source": "+".join(sources),
             "nights": nights,
+            "travel_type": persona,
+            "property_types": ptypes,
+            "destination": dest.display_name,
+            "dest_class": dest.dest_class,
         }
 
 
@@ -149,6 +166,20 @@ def _add_map_url(hotel: dict) -> dict:
         f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(query)}"
     )
     return hotel
+
+
+def _filter_by_distance_adaptive(hotels: list[dict], base_km: float,
+                                 min_results: int = 6) -> list[dict]:
+    """
+    Distance filter with automatic widening: try the class base radius, then 2x,
+    then 3x; if even that is too sparse, keep everything. Prevents a tight radius
+    (e.g. a hill town) from emptying the list while still favouring nearby hotels.
+    """
+    for mult in (1.0, 2.0, 3.0):
+        kept = _filter_by_distance(hotels, base_km * mult)
+        if len(kept) >= min_results:
+            return kept
+    return hotels
 
 
 def _filter_by_distance(hotels: list[dict], max_km: float) -> list[dict]:

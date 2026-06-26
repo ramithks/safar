@@ -12,8 +12,9 @@ import asyncio
 from fastapi import APIRouter, Depends
 
 from app.deps.auth import require_user
-from app.services.flights import FlightService
+from app.services.flights import FlightService, budget_to_sort, sort_flights
 from app.services.hotels import HotelService
+from app.services.hotels_filters import budget_to_hotel_sort
 from app.services.transport import TransportService
 
 from .models import (
@@ -32,20 +33,8 @@ _transport = TransportService()
 
 
 # ── Sort helpers ──────────────────────────────────────────────────────────────
-
-def _sort_flights(flights: list[dict], sort: str) -> list[dict]:
-    if sort == "FASTEST":
-        return sorted(flights, key=lambda f: (f.get("duration_min") or 9999))
-    if sort == "BEST":
-        def _score(f: dict) -> float:
-            price = f.get("price_total") or 99999
-            dur   = f.get("duration_min") or 999
-            stops = (f.get("stops") or 0) * 60
-            return price * 0.6 + (dur + stops) * 0.4
-        return sorted(flights, key=_score)
-    # default: CHEAPEST
-    return sorted(flights, key=lambda f: (f.get("price_total") is None, f.get("price_total") or 99999))
-
+# Flight sorting lives in app.services.flights (sort_flights / budget_to_sort) so
+# the standalone search and the trip planner stay in lock-step.
 
 def _sort_hotels(hotels: list[dict], sort: str) -> list[dict]:
     if sort == "price_asc":
@@ -93,21 +82,22 @@ def _tag_recommended(items: list[dict]) -> list[dict]:
 @router.post("/flights")
 async def search_flights(body: FlightSearchRequest, _user=Depends(require_user)):
     """
-    Search one-way flights. Results from Booking.com + EaseMyTrip (parallel, deduplicated).
-    sort: CHEAPEST | FASTEST | BEST
-    Returns all merged results; first item flagged is_recommended=true.
+    Search one-way flights. Results from Booking.com + EaseMyTrip + Gotogate (parallel, deduplicated).
+    sort: CHEAPEST | FASTEST | BEST. If `budget` (low|mid|high) is set it dictates
+    the sort and overrides `sort`. Returns all merged results; first flagged is_recommended.
     """
+    # Budget always wins: a budget tier dictates sort, overriding any explicit sort.
+    effective_sort = budget_to_sort(body.budget) or body.sort
     result = await _flights.search(
         origin=body.origin,
         destination=body.destination,
         date=body.date,
         adults=body.adults,
         cabin_class=body.cabin_class,
-        sort="CHEAPEST",  # always fetch cheapest; client-sort handles UI ordering
-        limit=body.limit,
+        sort=effective_sort,   # pushed upstream to each provider, then reranked
         nonstop_only=body.nonstop_only,
     )
-    flights = _tag_recommended(_sort_flights(result.get("flights") or [], body.sort))
+    flights = _tag_recommended(sort_flights(result.get("flights") or [], effective_sort))
     cheapest = min(
         (f.get("price_total") for f in flights if f.get("price_total")),
         default=None,
@@ -129,7 +119,7 @@ async def search_flights(body: FlightSearchRequest, _user=Depends(require_user))
         "recommended": recommended,
         "cheapest_price": cheapest,
         "total": len(flights),
-        "sort_applied": body.sort,
+        "sort_applied": effective_sort,
     }
 
 
@@ -148,9 +138,11 @@ async def search_hotels(body: HotelSearchRequest, _user=Depends(require_user)):
         adults=body.adults,
         children=body.children,
         budget=body.budget,
-        limit=body.limit,
+        travel_type=body.travel_type,
     )
-    hotels = _tag_recommended(_sort_hotels(result.get("hotels") or [], body.sort))
+    # Budget always wins: a budget tier dictates sort, overriding any explicit sort.
+    effective_sort = budget_to_hotel_sort(body.budget) or body.sort
+    hotels = _tag_recommended(_sort_hotels(result.get("hotels") or [], effective_sort))
     cheapest = min(
         (
             h.get("price_per_night") or h.get("estimated_price_per_night")
@@ -162,6 +154,7 @@ async def search_hotels(body: HotelSearchRequest, _user=Depends(require_user)):
     top = hotels[0] if hotels else None
     recommended = {
         "name": top.get("name"),
+        "property_type": top.get("property_type"),
         "price_per_night": top.get("price_per_night") or top.get("estimated_price_per_night"),
         "review_score": top.get("review_score") or top.get("star_rating") or top.get("google_rating"),
         "review_label": top.get("review_label"),
@@ -176,7 +169,7 @@ async def search_hotels(body: HotelSearchRequest, _user=Depends(require_user)):
         "recommended": recommended,
         "cheapest_price_per_night": cheapest,
         "total": len(hotels),
-        "sort_applied": body.sort,
+        "sort_applied": effective_sort,
     }
 
 
@@ -285,7 +278,6 @@ async def search_all(body: AllSearchRequest, _user=Depends(require_user)):
                 checkout=body.checkout,
                 rooms=body.rooms,
                 adults=body.travelers,
-                limit=10,
             ),
             return_exceptions=True,
         )

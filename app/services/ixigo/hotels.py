@@ -21,11 +21,18 @@ from datetime import datetime
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
 from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
+from app.services.hotels_filters import classify_property_type
 
 logger = logging.getLogger(__name__)
 
 _BASE = "https://www.ixigo.com/accommodation-search/api/v3/accommodations/search"
 _AUTOCOMPLETE = "https://www.ixigo.com/hotels-autocompleter/api/v2/results"
+
+# Native sort codes — canonical sort key → Ixigo `sortCriteria`. Only price (SC_P)
+# is verified; other canonical keys fall back to it (the endpoint applies the
+# final ordering anyway), so we never send an unverified code.
+_SORTS = {"price_asc": "SC_P"}
+_DEFAULT_SORT = "SC_P"
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
@@ -167,13 +174,20 @@ async def search_hotels(
     children: int = 0,
     child_ages: list[int] | None = None,
     page: int = 1,
-    limit: int = 10,
-    sort: str = "SC_P",   # SC_P = price (from the verified curl)
+    limit: int = 40,
+    sort: str | None = None,   # canonical key; only price_asc maps natively (SC_P)
+    property_types: list[str] | None = None,   # accepted for API uniformity; classifier-only
 ) -> list[dict]:
-    """Search hotels on Ixigo for a city + date range. Returns a normalized list."""
+    """
+    Search hotels on Ixigo for a city + date range. `sort` is a canonical key
+    (only price_asc maps natively → SC_P; others fall back). Property type is
+    enforced via the shared classifier. Returns a normalized list.
+    """
     loc = await resolve_location(city_name)
     if not loc:
         return []
+
+    sort_code = _SORTS.get(sort, _DEFAULT_SORT)
 
     payload = {
         "roomCount": rooms,
@@ -195,7 +209,7 @@ async def search_hotels(
         "subsource": "Autocomplete",
         "cityId": loc.get("cityId", loc["locationId"]),
         "filterCriteria": [],
-        "sortCriteria": sort,
+        "sortCriteria": sort_code,
         "pageNumber": page,
         "pageSize": limit,
         "isNearByHotelsEnabled": False,
@@ -317,6 +331,7 @@ def _normalise(h: dict, checkin: str, checkout: str) -> dict:
         "amenities": amenities,
         "couple_friendly": bool(h.get("coupleFriendly")),
         "photos": photos,
+        "property_type": classify_property_type({"name": h.get("name")}),
         "booking_url": None,   # set by caller via _booking_url
         "source": "ixigo",
     }
