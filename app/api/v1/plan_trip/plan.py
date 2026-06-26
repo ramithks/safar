@@ -120,6 +120,12 @@ def _shape_journey(j: dict, include_hotels: bool = False) -> dict:
         },
     }
 
+    # Trade-off narrative (Score→Reason→Recommend) — surface it on the block so it
+    # reaches the /plan response, not just the raw journey result.
+    reasoning = j.get("journey_reasoning")
+    if reasoning:
+        block["reasoning"] = reasoning
+
     if trains_block:
         block["trains"] = trains_block
 

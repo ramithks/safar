@@ -15,6 +15,7 @@ per-search session id and a fresh UUID is accepted on the result page request.
 Fails closed everywhere: an unresolved city, a block, or an unexpected response
 shape returns [] so the aggregator simply falls back to its other sources.
 """
+import asyncio
 import logging
 import re
 import uuid
@@ -219,7 +220,9 @@ async def search_flights(
         return j
 
     try:
-        data = await with_proxy_fallback("gotogate", _do)
+        # Cap the retry loop at 25s (< FlightService's 30s merge budget) so this
+        # provider's proxy retries can never time out the shared gather.
+        data = await asyncio.wait_for(with_proxy_fallback("gotogate", _do), timeout=25.0)
         trips = ((data.get("data") or {}).get("search") or {}).get("flights") or []
         flights = [_normalise(t, from_airport, to_airport, adults) for t in trips]
         flights = [f for f in flights if f]

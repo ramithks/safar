@@ -7,6 +7,7 @@ IATA resolution: EaseMyTrip autosuggest API.
   Response City field format: "New Delhi(DEL)" → extract 3-letter code.
 No hardcoded values — cache populated on first lookup.
 """
+import asyncio
 import logging
 import re as _re
 import httpx
@@ -147,6 +148,8 @@ async def search_flights(
 ) -> list[dict]:
     """Search one-way flights. Returns normalized list sorted by sort param."""
     async def _do(proxy):
+        # Tighter per-request timeout (12s) so several fresh-IP proxy retries fit
+        # inside this scraper's own budget instead of hanging on one slow attempt.
         async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.get(
                 _BASE,
@@ -164,7 +167,7 @@ async def search_flights(
                     "aid": settings.booking_affiliate_id,
                     "enableVI": "1",
                 },
-                timeout=20,
+                timeout=12,
             )
         r.raise_for_status()
         j = r.json()
@@ -176,7 +179,14 @@ async def search_flights(
         return j
 
     try:
-        offers = (await with_proxy_fallback("flights_booking", _do)).get("flightOffers") or []
+        # 4 fresh-IP attempts for the brittle WAF, but cap the whole retry loop at
+        # 25s (< the 30s FlightService merge budget) so Booking's retries can never
+        # time out the shared gather and zero EMT/Gotogate too.
+        raw = await asyncio.wait_for(
+            with_proxy_fallback("flights_booking", _do, proxy_attempts=4),
+            timeout=25.0,
+        )
+        offers = raw.get("flightOffers") or []
         return [_normalise_offer(o, depart_date, adults) for o in offers]
     except Exception as e:
         logger.warning("[flights_booking] %s→%s on %s: %s", from_airport, to_airport, depart_date, e)

@@ -276,7 +276,9 @@ async def search_flights(
         return j
 
     try:
-        raw = await with_proxy_fallback("emt_flights", _do)
+        # Cap the retry loop at 25s (< FlightService's 30s merge budget) so this
+        # provider's proxy retries can never time out the shared gather.
+        raw = await asyncio.wait_for(with_proxy_fallback("emt_flights", _do), timeout=25.0)
         listing_url = await _build_listing_url(from_airport, to_airport, depart_date, adults)
         flights = _extract_flights(raw, from_airport, to_airport, depart_date, adults, listing_url)
         if nonstop_only:

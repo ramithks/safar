@@ -210,7 +210,7 @@ async def resolve_dest_id(city_name: str) -> tuple[int | None, str, str]:
             return r.json()
 
         results = (
-            (await with_proxy_fallback("booking_hotels", _do)).get("data") or {}
+            (await with_proxy_fallback("booking_hotels", _do, proxy_attempts=4)).get("data") or {}
         ).get("autoCompleteSuggestions", {}).get("results") or []
         # Two passes: first prefer India, then accept any country
         for prefer_india in (True, False):
@@ -370,7 +370,9 @@ async def _run_fullsearch(
         return j
 
     try:
-        data = await with_proxy_fallback("booking_hotels", _do)
+        # Booking's WAF is the brittlest of our sources — give it extra fresh-IP
+        # proxy attempts so a transient block doesn't cost the whole search.
+        data = await with_proxy_fallback("booking_hotels", _do, proxy_attempts=4)
         errors = data.get("errors") or []
         if errors:
             msgs = [e.get("message", "") for e in errors[:2]]

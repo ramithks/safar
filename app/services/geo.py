@@ -19,6 +19,7 @@ country codes are ISO-3166 alpha-2; "IN" = India.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Optional
 
 # ─── Normalisation ───────────────────────────────────────────────────────────
@@ -85,15 +86,65 @@ _ALIASES = {
     "st petersburg": "saint petersburg",
     "cologne": "koln",
     "sao paulo city": "sao paulo",
+    # region / landmark phrasings → nearest covered gateway city
+    "hoi an": "da nang",
+    "cabo san lucas": "los cabos",
+    "amalfi": "naples",
+    "amalfi coast": "naples",
+    "positano": "naples",
+    "tuscany": "florence",
+    "lake como": "milan",
+    "costa del sol": "malaga",
+    "french riviera": "nice",
+    "bavaria": "munich",
+    "scottish highlands": "edinburgh",
+    "swiss alps": "zurich",
+    "phuket island": "phuket",
+    "angkor wat": "siem reap",
+    "halong bay": "hanoi",
+    "great barrier reef": "cairns",
+    "niagara falls": "toronto",
+    "grand canyon": "phoenix",
 }
 
 
 def normalize(city: str) -> str:
-    """Lowercase, strip punctuation, collapse whitespace, resolve aliases."""
+    """
+    Lowercase, fold accents (Zürich→zurich, Malé→male), strip punctuation,
+    collapse whitespace, resolve aliases. Accent folding matters: without it the
+    punctuation strip deletes the bare accented letter (ü→'') giving 'zrich'.
+    """
     s = (city or "").lower().strip()
+    # NFKD splits 'ü' → 'u' + combining diaeresis; drop the combining marks.
+    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
     s = re.sub(r"[^a-z0-9\s]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return _ALIASES.get(s, s)
+
+
+def _match_key(city: str) -> str:
+    """
+    Resolve messy city strings to a known table key. Gemini (and OTA autocompletes)
+    emit names like "Delhi Airport", "Tokyo Narita", "Dubai International Airport",
+    "New Delhi" — none of which are bare keys. We try the full normalised string,
+    then every contiguous word-span (longest first), accepting only spans that are
+    real table keys. This strips airport/terminal/qualifier noise generically
+    without a hand-maintained stopword list, and never invents a city: "tokyo
+    narita"→"tokyo", "delhi airport"→"delhi", "new delhi"→"delhi", "los angeles
+    intl airport"→"los angeles". Unknown strings pass through unchanged.
+    """
+    s = normalize(city)
+    if s in _INDIA or s in _FOREIGN:
+        return s
+    toks = s.split()
+    n = len(toks)
+    if n > 1:
+        for length in range(n, 0, -1):          # longest span wins
+            for start in range(n - length + 1):
+                span = _ALIASES.get(" ".join(toks[start:start + length]), " ".join(toks[start:start + length]))
+                if span in _INDIA or span in _FOREIGN:
+                    return span
+    return s
 
 
 # ─── Reference data ──────────────────────────────────────────────────────────
@@ -154,6 +205,39 @@ _INDIA: dict[str, Optional[str]] = {
     "rameshwaram": "IXM", "yercaud": "SXV", "chikmagalur": "HBX",
     "sakleshpur": "IXE", "dwarka": "JGA", "somnath": "DIU", "gir": "DIU",
     "havelock": "IXZ", "neil island": "IXZ",
+    # ── more commercial airports (own IATA) ──
+    "hindon": "HDO", "ludhiana": "LUH", "jalandhar": "AIP", "bathinda": "BUP",
+    "pathankot": "IXP", "hisar": "HSS", "shivamogga": "RQY", "shimoga": "RQY",
+    "jalgaon": "JLG", "nanded": "NDC", "gondia": "GDB", "akola": "AKD",
+    "porbandar": "PBD", "bhavnagar": "BHU", "kandla": "IXY", "keshod": "IXK",
+    "kalaburagi": "GBI", "gulbarga": "GBI", "ballari": "VDY", "bellary": "VDY",
+    "jeypore": "PYB", "rourkela": "RRK", "cooch behar": "COH", "lilabari": "IXI",
+    "north lakhimpur": "IXI", "rupsi": "RUP", "tezu": "TEI", "rewa": "REW",
+    "bilaspur": "PAB", "nellore": "TIR", "puttaparthi": "PUT",
+    # ── more tourist towns → nearest serviceable airport ──
+    "kovalam": "TRV", "kumarakom": "COK", "thekkady": "COK", "vagamon": "COK",
+    "bekal": "CNN", "kasaragod": "CNN", "thrissur": "COK", "kollam": "TRV",
+    "murudeshwar": "IXE", "udupi": "IXE", "karwar": "IXE", "dandeli": "HBX",
+    "jog falls": "HBX", "badami": "HBX", "bijapur": "GBI", "vijayapura": "GBI",
+    "belur": "HBX", "halebidu": "HBX", "nandi hills": "BLR", "chikballapur": "BLR",
+    "coonoor": "CJB", "valparai": "CJB", "masinagudi": "CJB", "yelagiri": "SXV",
+    "thanjavur": "TRZ", "kumbakonam": "TRZ", "velankanni": "TRZ", "chidambaram": "PNY",
+    "kanchipuram": "MAA", "vellore": "MAA", "hogenakkal": "SXV", "araku": "VTZ",
+    "araku valley": "VTZ", "lambasingi": "VTZ", "srikalahasti": "TIR",
+    "horsley hills": "TIR", "gandikota": "CDP", "srisailam": "HYD", "warangal": "HYD",
+    "ajanta": "IXU", "ellora": "IXU", "lonar": "IXU", "bhandardara": "ISK",
+    "alibaug": "BOM", "kashid": "BOM", "tarkarli": "RTC", "ganpatipule": "KLH",
+    "daman": "STV", "kumbhalgarh": "UDR", "ranakpur": "UDR", "nathdwara": "UDR",
+    "mandawa": "JAI", "shekhawati": "JAI", "alwar": "JAI", "neemrana": "JAI",
+    "barmer": "JSA", "osian": "JDH", "khimsar": "JDH", "junagadh": "RAJ",
+    "palitana": "BHU", "statue of unity": "BDQ", "kevadia": "BDQ", "modhera": "AMD",
+    "patan": "AMD", "dholavira": "BHJ", "champaner": "BDQ", "pavagadh": "BDQ",
+    "orchha": "GWL", "chitrakoot": "REW", "panna": "HJR", "pachmarhi": "BHO",
+    "kanha": "JLR", "bandhavgarh": "JLR", "pench": "NAG", "tadoba": "NAG",
+    "anandpur sahib": "IXC", "spiti valley": "KUU", "kaza": "KUU", "kalpa": "KUU",
+    "narkanda": "SLV", "barot": "DHM", "morni": "IXC", "pinjore": "IXC",
+    "joshimath": "DED", "munsiyari": "PGH", "pithoragarh": "PGH",
+    "valley of flowers": "DED", "hemkund sahib": "DED", "champawat": "PGH",
 }
 
 # Foreign cities — major world cities + routes Indians book. Country code + primary IATA.
@@ -236,6 +320,107 @@ _FOREIGN: dict[str, tuple[str, Optional[str]]] = {
     "perth": ("AU", "PER"), "adelaide": ("AU", "ADL"), "gold coast": ("AU", "OOL"),
     "auckland": ("NZ", "AKL"), "christchurch": ("NZ", "CHC"), "queenstown": ("NZ", "ZQN"),
     "wellington": ("NZ", "WLG"), "nadi": ("FJ", "NAN"),
+    "papeete": ("PF", "PPT"), "tahiti": ("PF", "PPT"), "bora bora": ("PF", "BOB"),
+    "french polynesia": ("PF", "PPT"),
+    # ── Micro-states & enclaves → nearest serviceable gateway (no own airport) ──
+    "liechtenstein": ("LI", "ZRH"), "vaduz": ("LI", "ZRH"),
+    "monaco": ("MC", "NCE"), "monte carlo": ("MC", "NCE"),
+    "andorra": ("AD", "BCN"), "andorra la vella": ("AD", "BCN"),
+    "vatican city": ("VA", "FCO"), "vatican": ("VA", "FCO"),
+    "san marino": ("SM", "RMI"),
+    "luxembourg": ("LU", "LUX"), "luxembourg city": ("LU", "LUX"),
+    "malta": ("MT", "MLA"),  # "valletta" already mapped in the Europe block
+    # ── Remote islands / arctic / landmark gateways ──
+    "iceland": ("IS", "KEF"), "keflavik": ("IS", "KEF"),
+    "greenland": ("GL", "GOH"), "nuuk": ("GL", "GOH"), "kangerlussuaq": ("GL", "SFJ"),
+    "faroe islands": ("FO", "FAE"), "torshavn": ("FO", "FAE"), "vagar": ("FO", "FAE"),
+    "svalbard": ("NO", "LYR"), "longyearbyen": ("NO", "LYR"),
+    "easter island": ("CL", "IPC"), "hanga roa": ("CL", "IPC"), "mataveri": ("CL", "IPC"),
+    "serengeti": ("TZ", "JRO"), "arusha": ("TZ", "JRO"), "kilimanjaro": ("TZ", "JRO"),
+    "yellowstone": ("US", "BZN"), "bozeman": ("US", "BZN"),
+    "jackson hole": ("US", "JAC"), "jackson": ("US", "JAC"),
+    # ── Countries sometimes passed as the destination itself ──
+    "ireland": ("IE", "DUB"), "scotland": ("GB", "EDI"),
+    # ── Europe (secondary cities + holiday gateways) ──
+    "valencia": ("ES", "VLC"), "seville": ("ES", "SVQ"), "bilbao": ("ES", "BIO"),
+    "palma": ("ES", "PMI"), "mallorca": ("ES", "PMI"), "ibiza": ("ES", "IBZ"),
+    "alicante": ("ES", "ALC"), "granada": ("ES", "GRX"), "santiago de compostela": ("ES", "SCQ"),
+    "faro": ("PT", "FAO"), "madeira": ("PT", "FNC"), "funchal": ("PT", "FNC"), "azores": ("PT", "PDL"),
+    "turin": ("IT", "TRN"), "pisa": ("IT", "PSA"), "catania": ("IT", "CTA"), "palermo": ("IT", "PMO"),
+    "bari": ("IT", "BRI"), "cagliari": ("IT", "CAG"), "verona": ("IT", "VRN"), "genoa": ("IT", "GOA"),
+    "basel": ("CH", "BSL"), "salzburg": ("AT", "SZG"), "innsbruck": ("AT", "INN"), "graz": ("AT", "GRZ"),
+    "nuremberg": ("DE", "NUE"), "hannover": ("DE", "HAJ"), "leipzig": ("DE", "LEJ"), "dresden": ("DE", "DRS"),
+    "bremen": ("DE", "BRE"), "rotterdam": ("NL", "RTM"), "eindhoven": ("NL", "EIN"),
+    "gothenburg": ("SE", "GOT"), "malmo": ("SE", "MMX"), "bergen": ("NO", "BGO"), "stavanger": ("NO", "SVG"),
+    "trondheim": ("NO", "TRD"), "tromso": ("NO", "TOS"), "aarhus": ("DK", "AAR"), "billund": ("DK", "BLL"),
+    "gdansk": ("PL", "GDN"), "wroclaw": ("PL", "WRO"), "poznan": ("PL", "POZ"), "katowice": ("PL", "KTW"),
+    "bratislava": ("SK", "BTS"), "cluj": ("RO", "CLJ"), "timisoara": ("RO", "TSR"),
+    "varna": ("BG", "VAR"), "burgas": ("BG", "BOJ"), "thessaloniki": ("GR", "SKG"), "heraklion": ("GR", "HER"),
+    "crete": ("GR", "HER"), "rhodes": ("GR", "RHO"), "corfu": ("GR", "CFU"), "mykonos": ("GR", "JMK"),
+    "kos": ("GR", "KGS"), "split": ("HR", "SPU"), "dubrovnik": ("HR", "DBV"), "zadar": ("HR", "ZAD"),
+    "sarajevo": ("BA", "SJJ"), "skopje": ("MK", "SKP"), "tirana": ("AL", "TIA"), "podgorica": ("ME", "TGD"),
+    "kotor": ("ME", "TIV"), "tivat": ("ME", "TIV"), "chisinau": ("MD", "KIV"), "lviv": ("UA", "LWO"),
+    "batumi": ("GE", "BUS"), "kutaisi": ("GE", "KUT"),
+    # ── Turkey & Middle East (more) ──
+    "ankara": ("TR", "ESB"), "izmir": ("TR", "ADB"), "bodrum": ("TR", "BJV"), "dalaman": ("TR", "DLM"),
+    "cappadocia": ("TR", "NAV"), "nevsehir": ("TR", "NAV"), "kayseri": ("TR", "ASR"), "trabzon": ("TR", "TZX"),
+    "aqaba": ("JO", "AQJ"), "shiraz": ("IR", "SYZ"), "isfahan": ("IR", "IFN"), "mashhad": ("IR", "MHD"),
+    "medina": ("SA", "MED"), "najaf": ("IQ", "NJF"), "erbil": ("IQ", "EBL"), "baghdad": ("IQ", "BGW"),
+    "sharm el sheikh": ("EG", "SSH"), "hurghada": ("EG", "HRG"), "luxor": ("EG", "LXR"), "aswan": ("EG", "ASW"),
+    # ── Asia (more) ──
+    "chiang rai": ("TH", "CEI"), "hat yai": ("TH", "HDY"), "surat thani": ("TH", "URT"),
+    "luang prabang": ("LA", "LPQ"), "mandalay": ("MM", "MDL"), "kuching": ("MY", "KCH"),
+    "kota kinabalu": ("MY", "BKI"), "johor bahru": ("MY", "JHB"), "ipoh": ("MY", "IPH"),
+    "bandung": ("ID", "BDO"), "yogyakarta": ("ID", "YIA"), "lombok": ("ID", "LOP"), "medan": ("ID", "KNO"),
+    "makassar": ("ID", "UPG"), "davao": ("PH", "DVO"), "puerto princesa": ("PH", "PPS"),
+    "boracay": ("PH", "MPH"), "caticlan": ("PH", "MPH"), "kalibo": ("PH", "KLO"),
+    "da lat": ("VN", "DLI"), "nha trang": ("VN", "CXR"), "phu quoc": ("VN", "PQC"), "hue": ("VN", "HUI"),
+    "haiphong": ("VN", "HPH"),
+    # ── East Asia (more) ──
+    "naha": ("JP", "OKA"), "okinawa": ("JP", "OKA"), "hiroshima": ("JP", "HIJ"), "sendai": ("JP", "SDJ"),
+    "kagoshima": ("JP", "KOJ"), "kobe": ("JP", "UKB"), "jeju": ("KR", "CJU"), "daegu": ("KR", "TAE"),
+    "xian": ("CN", "XIY"), "hangzhou": ("CN", "HGH"), "nanjing": ("CN", "NKG"), "qingdao": ("CN", "TAO"),
+    "kunming": ("CN", "KMG"), "xiamen": ("CN", "XMN"), "wuhan": ("CN", "WUH"), "sanya": ("CN", "SYX"),
+    "guilin": ("CN", "KWL"), "chongqing": ("CN", "CKG"), "harbin": ("CN", "HRB"), "dalian": ("CN", "DLC"),
+    "kaohsiung": ("TW", "KHH"),
+    # ── Oceania (more) ──
+    "cairns": ("AU", "CNS"), "darwin": ("AU", "DRW"), "hobart": ("AU", "HBA"), "canberra": ("AU", "CBR"),
+    "sunshine coast": ("AU", "MCY"), "alice springs": ("AU", "ASP"), "townsville": ("AU", "TSV"),
+    "dunedin": ("NZ", "DUD"), "rotorua": ("NZ", "ROT"), "noumea": ("NC", "NOU"), "port vila": ("VU", "VLI"),
+    "apia": ("WS", "APW"), "nukualofa": ("TO", "TBU"), "rarotonga": ("CK", "RAR"), "guam": ("GU", "GUM"),
+    # ── North America (more) ──
+    "nashville": ("US", "BNA"), "new orleans": ("US", "MSY"), "salt lake city": ("US", "SLC"),
+    "kansas city": ("US", "MCI"), "st louis": ("US", "STL"), "raleigh": ("US", "RDU"), "charlotte": ("US", "CLT"),
+    "pittsburgh": ("US", "PIT"), "cleveland": ("US", "CLE"), "cincinnati": ("US", "CVG"),
+    "columbus": ("US", "CMH"), "indianapolis": ("US", "IND"), "milwaukee": ("US", "MKE"),
+    "sacramento": ("US", "SMF"), "san jose california": ("US", "SJC"), "oakland": ("US", "OAK"),
+    "tampa": ("US", "TPA"), "fort lauderdale": ("US", "FLL"), "anchorage": ("US", "ANC"),
+    "albuquerque": ("US", "ABQ"), "tucson": ("US", "TUS"), "memphis": ("US", "MEM"),
+    "jacksonville": ("US", "JAX"), "palm springs": ("US", "PSP"), "savannah": ("US", "SAV"),
+    "charleston": ("US", "CHS"), "asheville": ("US", "AVL"),
+    "ottawa": ("CA", "YOW"), "edmonton": ("CA", "YEG"), "winnipeg": ("CA", "YWG"), "halifax": ("CA", "YHZ"),
+    "quebec city": ("CA", "YQB"), "victoria": ("CA", "YYJ"), "kelowna": ("CA", "YLW"),
+    "guadalajara": ("MX", "GDL"), "monterrey": ("MX", "MTY"), "tijuana": ("MX", "TIJ"),
+    "los cabos": ("MX", "SJD"), "cabo": ("MX", "SJD"), "puerto vallarta": ("MX", "PVR"), "merida": ("MX", "MID"),
+    "tulum": ("MX", "CUN"), "nassau": ("BS", "NAS"), "montego bay": ("JM", "MBJ"), "kingston": ("JM", "KIN"),
+    "punta cana": ("DO", "PUJ"), "santo domingo": ("DO", "SDQ"), "san juan": ("PR", "SJU"),
+    "aruba": ("AW", "AUA"), "barbados": ("BB", "BGI"), "st lucia": ("LC", "UVF"), "grand cayman": ("KY", "GCM"),
+    "belize city": ("BZ", "BZE"), "guatemala city": ("GT", "GUA"), "san salvador": ("SV", "SAL"),
+    # ── South America (more) ──
+    "medellin": ("CO", "MDE"), "cartagena": ("CO", "CTG"), "cusco": ("PE", "CUZ"), "arequipa": ("PE", "AQP"),
+    "la paz": ("BO", "LPB"), "santa cruz": ("BO", "VVI"), "montevideo": ("UY", "MVD"), "asuncion": ("PY", "ASU"),
+    "guayaquil": ("EC", "GYE"), "galapagos": ("EC", "GPS"), "manaus": ("BR", "MAO"), "brasilia": ("BR", "BSB"),
+    "salvador": ("BR", "SSA"), "recife": ("BR", "REC"), "fortaleza": ("BR", "FOR"), "florianopolis": ("BR", "FLN"),
+    "porto alegre": ("BR", "POA"), "mendoza": ("AR", "MDZ"), "bariloche": ("AR", "BRC"), "ushuaia": ("AR", "USH"),
+    "iguazu falls": ("AR", "IGR"), "foz do iguacu": ("BR", "IGU"),
+    # ── Africa (more) ──
+    "abuja": ("NG", "ABV"), "mombasa": ("KE", "MBA"), "kigali": ("RW", "KGL"), "entebbe": ("UG", "EBB"),
+    "kampala": ("UG", "EBB"), "victoria falls": ("ZW", "VFA"), "windhoek": ("NA", "WDH"),
+    "gaborone": ("BW", "GBE"), "maputo": ("MZ", "MPM"), "antananarivo": ("MG", "TNR"),
+    "durban": ("ZA", "DUR"), "lusaka": ("ZM", "LUN"), "harare": ("ZW", "HRE"), "dakar": ("SN", "DSS"),
+    "abidjan": ("CI", "ABJ"), "tunis": ("TN", "TUN"), "algiers": ("DZ", "ALG"), "agadir": ("MA", "AGA"),
+    "fes": ("MA", "FEZ"), "tangier": ("MA", "TNG"), "khartoum": ("SD", "KRT"), "djibouti": ("DJ", "JIB"),
+    "reunion": ("RE", "RUN"),
 }
 
 
@@ -269,7 +454,7 @@ def is_domestic_iata(from_iata: str, to_iata: str) -> bool:
 
 def country_of(city: str) -> Optional[str]:
     """ISO country code for a city, or None if unknown. Indian cities → 'IN'."""
-    key = normalize(city)
+    key = _match_key(city)
     if key in _INDIA:
         return "IN"
     f = _FOREIGN.get(key)
@@ -278,7 +463,7 @@ def country_of(city: str) -> Optional[str]:
 
 def iata_of(city: str) -> Optional[str]:
     """Primary IATA airport code for a city, or None if unknown / no airport."""
-    key = normalize(city)
+    key = _match_key(city)
     if key in _INDIA:
         return _INDIA[key]
     f = _FOREIGN.get(key)
