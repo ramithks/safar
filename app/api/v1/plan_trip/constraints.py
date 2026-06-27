@@ -129,7 +129,13 @@ def validate_trip(
     total_ceiling = ceiling_pp * travelers
 
     # ── 1. Budget ─────────────────────────────────────────────────────────────
-    total = (merged.get("budget_breakdown") or {}).get("total") or 0
+    # Read the canonical `costs` block (assembled by the supervisor); fall back to
+    # the legacy budget_breakdown for the non-supervisor run_plan path.
+    total = (
+        (merged.get("costs") or {}).get("total")
+        or (merged.get("budget_breakdown") or {}).get("total")
+        or 0
+    )
     if total > total_ceiling * 1.5:
         issues.append(
             f"Trip cost {symbol}{total:,} is {int((total/total_ceiling-1)*100)}% over "
@@ -140,7 +146,7 @@ def validate_trip(
     elif total > total_ceiling:
         warnings.append(
             f"Trip cost {symbol}{total:,} slightly exceeds {safe_budget} budget ceiling "
-            f"({symbol}{total_ceiling:,}). Budget status block has suggestions."
+            f"({symbol}{total_ceiling:,}). See costs.suggestions for cheaper options."
         )
 
     # ── 2. Arrival timing vs Day 1 itinerary ─────────────────────────────────

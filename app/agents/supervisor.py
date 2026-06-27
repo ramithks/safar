@@ -111,6 +111,11 @@ def _apply_intervention(merged: dict, intervention: dict, currency_code: str) ->
         flights_block["recommended"] = option
         going["flights"] = flights_block
 
+    elif to_mode == "train_journey":
+        # Complete all-train door-to-door route replaces the planned transport.
+        option["is_recommended"] = True
+        going["train_journey"] = option
+
     merged["going"] = going
 
     # Update budget_breakdown transport cost to reflect the new mode
@@ -127,16 +132,55 @@ def _apply_intervention(merged: dict, intervention: dict, currency_code: str) ->
         new_pp = option.get("fare_discounted") or option.get("fare_original") or 0
     elif to_mode == "flight":
         new_pp = option.get("price_total") or 0
+    elif to_mode == "train_journey":
+        # Bundle fare already sums every intercity segment by train.
+        new_pp = option.get("total_fare_per_person") or 0
     else:
         new_pp = 0
 
     new_transport_total = new_pp * travelers
     if new_transport_total > 0:
-        breakdown["transport"]   = new_transport_total
-        breakdown["total"]       = breakdown.get("total", 0) - old_transport + new_transport_total
-        breakdown["per_person"]  = breakdown["total"] // max(travelers, 1)
+        # Recompute the whole breakdown from the new transport so every bucket
+        # stays consistent — misc is a 10% buffer on transport+stay, so it must
+        # be recomputed too (not left at the old, higher flight-based value).
+        stay = breakdown.get("stay") or 0
+        food = breakdown.get("food") or 0
+        acts = breakdown.get("activities") or 0
+        breakdown["transport"]  = new_transport_total
+        breakdown["misc"]       = round((new_transport_total + stay) * 0.10)
+        breakdown["total"]      = new_transport_total + stay + food + acts + breakdown["misc"]
+        breakdown["per_person"] = breakdown["total"] // max(travelers, 1)
         merged["budget_breakdown"] = breakdown
 
+        # Refresh budget_status so total_generated / fits_budget / overspend
+        # reflect the post-intervention total instead of the stale pre-switch one.
+        bs = merged.get("budget_status") or {}
+        if bs:
+            total_ceiling = bs.get("total_ceiling") or 0
+            new_total = breakdown["total"]
+            bs["total_generated"] = new_total
+            bs["fits_budget"]     = new_total <= total_ceiling
+            bs["overspend"]       = max(0, new_total - total_ceiling)
+            # The pre-switch suggestions referenced the old (higher) total — keep
+            # only the applied switch and regenerate reduce_scope against the new
+            # total so no suggestion contradicts the headline figure.
+            kept = [
+                s for s in (bs.get("suggestions") or [])
+                if s.get("type") in ("switch_transport", "switch_to_train_journey")
+            ]
+            if total_ceiling and new_total > total_ceiling * 1.5:
+                pct = int((new_total / total_ceiling - 1) * 100)
+                kept.append({
+                    "type": "reduce_scope",
+                    "message": (
+                        f"Trip at {symbol}{new_total:,} is {pct}% over budget. "
+                        f"Consider fewer days or reducing party size."
+                    ),
+                })
+            bs["suggestions"] = kept
+            merged["budget_status"] = bs
+
+    _label = "an all-train route" if to_mode == "train_journey" else to_mode
     merged["supervisor_action"] = {
         "type": "budget_intervention",
         "applied": True,
@@ -144,8 +188,8 @@ def _apply_intervention(merged: dict, intervention: dict, currency_code: str) ->
         "saving_total": saving,
         "message": msg,
         "note": (
-            f"Trip was over budget. Supervisor switched recommended transport to "
-            f"{to_mode} to save {symbol}{saving:,}."
+            f"Trip was over budget. Supervisor switched the recommended transport to "
+            f"{_label} to save {symbol}{saving:,}."
         ),
     }
 
@@ -153,6 +197,50 @@ def _apply_intervention(merged: dict, intervention: dict, currency_code: str) ->
         "[supervisor] Intervention applied: switched to %s, saves %s%s",
         to_mode, symbol, f"{saving:,}",
     )
+    return merged
+
+
+def _assemble_costs(merged: dict) -> dict:
+    """
+    Collapse the four overlapping cost blocks (cost_breakdown, budget_breakdown,
+    budget_status, supervisor_action) into a single canonical `costs` block, then
+    drop the originals. One place for every cost number — and they all agree
+    because they're derived from the same reconciled budget_breakdown.
+    """
+    bb = merged.pop("budget_breakdown", {}) or {}
+    bs = merged.pop("budget_status", {}) or {}
+    sa = merged.pop("supervisor_action", None)
+    cb = merged.pop("cost_breakdown", {}) or {}
+
+    costs = {
+        "currency": bb.get("currency") or bs.get("currency"),
+        "currency_code": bb.get("currency_code"),
+        "total": bb.get("total", 0),
+        "per_person": bb.get("per_person", 0),
+        "travelers": bb.get("travelers"),
+        "nights": bb.get("nights"),
+        "hotel_per_night": bb.get("hotel_per_night"),
+        "breakdown": {
+            "transport":  bb.get("transport", 0),
+            "stay":       bb.get("stay", 0),
+            "food":       bb.get("food", 0),
+            "activities": bb.get("activities", 0),
+            "misc":       bb.get("misc", 0),
+        },
+        "budget": {
+            "tier":               merged.get("budget"),
+            "ceiling_per_person": bs.get("ceiling_per_person"),
+            "ceiling_total":      bs.get("total_ceiling"),
+            "fits":               bs.get("fits_budget", True),
+            "overspend":          bs.get("overspend", 0),
+        },
+        "suggestions": bs.get("suggestions") or [],
+        "intervention": sa,
+        # Per-leg live fare detail (e.g. leg4_flight, hotel_total) — kept for drill-down.
+        "route_breakdown": cb.get("breakdown") or {},
+        "source": bb.get("source", "live+estimated"),
+    }
+    merged["costs"] = costs
     return merged
 
 
@@ -316,6 +404,9 @@ async def supervisor_run(body: PlanRequest, user_id: str) -> dict:
             budget_status.get("overspend", 0),
         )
 
+    # ── Phase 3.5: Collapse all cost blocks into one canonical `costs` ────────
+    merged = _assemble_costs(merged)
+
     # ── Phase 4: Constraint Solver ────────────────────────────────────────────
     merged = validate_trip(merged, body.budget, currency_code, body.travelers)
 
@@ -380,6 +471,22 @@ async def _save_trip_journey(user_id: str, body: PlanRequest, merged: dict, end_
             except (TypeError, ValueError):
                 return None
 
+        # The response now carries a single `costs` block. Decompose it back into
+        # the existing trip_journey columns so no DB migration is required.
+        costs = merged.get("costs") or {}
+        costs_budget = costs.get("budget") or {}
+        budget_breakdown = {
+            **(costs.get("breakdown") or {}),
+            "total": costs.get("total"),
+            "per_person": costs.get("per_person"),
+            "currency": costs.get("currency"),
+        }
+        budget_status = {
+            **costs_budget,
+            "suggestions": costs.get("suggestions") or [],
+            "intervention": costs.get("intervention"),
+        }
+
         await loop.run_in_executor(None, lambda: (
             db.table("trip_journey").insert({
                 "trip_id": trip_id,
@@ -397,11 +504,11 @@ async def _save_trip_journey(user_id: str, body: PlanRequest, merged: dict, end_
                 "journey_summary": merged.get("journey_summary"),
                 "total_distance_km": _to_numeric(merged.get("total_distance_km")),
                 "total_duration_approx": merged.get("total_duration_approx"),
-                "total_estimated_cost": _to_numeric(merged.get("total_estimated_cost")),
-                "cost_per_person": _to_numeric(merged.get("cost_per_person")),
-                "cost_for_all_travelers": _to_numeric(merged.get("cost_for_all_travelers")),
-                "cost_breakdown": merged.get("cost_breakdown") or {},
-                "budget_breakdown": merged.get("budget_breakdown") or {},
+                "total_estimated_cost": _to_numeric(costs.get("total")),
+                "cost_per_person": _to_numeric(costs.get("per_person")),
+                "cost_for_all_travelers": _to_numeric(costs.get("total")),
+                "cost_breakdown": costs,
+                "budget_breakdown": budget_breakdown,
                 "best_time_to_depart": merged.get("best_time_to_depart"),
                 "packing_tips": merged.get("packing_tips") or [],
                 "is_international": bool(merged.get("is_international", False)),
@@ -410,8 +517,8 @@ async def _save_trip_journey(user_id: str, body: PlanRequest, merged: dict, end_
                 "documents_needed": merged.get("documents_needed") or [],
                 "health_requirements": merged.get("health_requirements") or [],
                 "currency_info": merged.get("currency_info") or {},
-                "supervisor_action": merged.get("supervisor_action"),
-                "budget_status": merged.get("budget_status"),
+                "supervisor_action": costs.get("intervention"),
+                "budget_status": budget_status,
                 "trip_validation": merged.get("trip_validation"),
             }).execute()
         ))

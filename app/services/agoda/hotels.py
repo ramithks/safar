@@ -61,6 +61,7 @@ _QUERY = """query citySearch($CitySearchRequest: CitySearchRequest!, $ContentSum
         }
         reviews { cumulative { reviewCount score } }
         images { hotelImages { urls { value } } }
+        facilities { name }
       }
       pricing {
         isAvailable
@@ -437,6 +438,12 @@ def _normalise(p: dict, checkin: str, checkout: str, nights: int) -> dict:
                 photos.append("https:" + val if val.startswith("//") else val)
     photos = photos[:6]
 
+    # Amenities from facilities list
+    amenities = [
+        f.get("name") for f in (content.get("facilities") or [])
+        if isinstance(f, dict) and f.get("name")
+    ][:12]
+
     page = (info.get("propertyLinks") or {}).get("propertyPage") or ""
     booking_url = page if page.startswith("http") else (f"{_SITE}{page}" if page else None)
 
@@ -454,6 +461,7 @@ def _normalise(p: dict, checkin: str, checkout: str, nights: int) -> dict:
         "total_price": int(min(per_book)) if per_book else None,
         "currency": currency,
         "nights": nights,
+        "amenities": amenities,
         "photos": photos,
         "booking_url": booking_url,
         "property_type": classify_property_type({"name": info.get("displayName")}),

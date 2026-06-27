@@ -231,6 +231,8 @@ def _deduplicate_by_name(hotels: list[dict]) -> list[dict]:
     Remove near-duplicate entries (same hotel listed by multiple sources).
     When duplicates exist, keep the entry with the most data:
     booking_url + price_per_night + photos score highest.
+    Enrichment fields (amenities, review_label, free_cancellation, etc.) are
+    merged from the loser into the winner so no data is discarded.
     """
     def _richness(h: dict) -> int:
         return (
@@ -245,13 +247,52 @@ def _deduplicate_by_name(hotels: list[dict]) -> list[dict]:
         """Normalize hotel name for dedup — strip spaces/punctuation, first 24 chars."""
         return "".join(c for c in (name or "").lower() if c.isalnum())[:24]
 
+    # Fields to carry over from the loser if the winner is missing them
+    _MERGE_FIELDS = (
+        "amenities", "review_label", "free_cancellation", "free_cancellation_until",
+        "meal_plan", "highlights", "couple_friendly", "distance_km",
+        "no_prepayment", "is_breakfast_included", "checkin_time", "checkout_time",
+    )
+
     seen: dict[str, dict] = {}
     for h in hotels:
         key = _norm(h.get("name", ""))
         if not key:
             continue
         if key not in seen or _richness(h) > _richness(seen[key]):
+            if key in seen:
+                # Merge enrichment fields from the old winner into the new winner
+                old = seen[key]
+                for field in _MERGE_FIELDS:
+                    if not h.get(field) and old.get(field):
+                        h[field] = old[field]
+                # Merge photos if the new winner has fewer than 6 photos
+                h_photos = h.get("photos") or []
+                old_photos = old.get("photos") or []
+                if len(h_photos) < 6 and old_photos:
+                    for p in old_photos:
+                        if p not in h_photos:
+                            h_photos.append(p)
+                        if len(h_photos) >= 6:
+                            break
+                    h["photos"] = h_photos
             seen[key] = h
+        else:
+            # Current entry lost — merge its enrichment into the existing winner
+            winner = seen[key]
+            for field in _MERGE_FIELDS:
+                if not winner.get(field) and h.get(field):
+                    winner[field] = h[field]
+            # Merge photos if the winner has fewer than 6 photos
+            winner_photos = winner.get("photos") or []
+            h_photos = h.get("photos") or []
+            if len(winner_photos) < 6 and h_photos:
+                for p in h_photos:
+                    if p not in winner_photos:
+                        winner_photos.append(p)
+                    if len(winner_photos) >= 6:
+                        break
+                winner["photos"] = winner_photos
 
     # Sort: richest entries first (booking_url > price > photos)
     result = list(seen.values())

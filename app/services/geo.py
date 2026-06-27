@@ -498,3 +498,112 @@ def india_abroad(a: str, b: str) -> bool:
     foreign_a = ca is not None and ca != "IN"
     foreign_b = cb is not None and cb != "IN"
     return (in_a and foreign_b) or (in_b and foreign_a)
+
+
+# ─── Autocomplete (offline location search) ──────────────────────────────────
+# Powers /autocomplete/airports + /autocomplete/destinations. Pure in-memory
+# substring search over the same tables the search pipeline already trusts —
+# zero network, zero anti-bot risk, instant. The live OTA autosuggests stay the
+# long-tail fallback (see app.services.autocomplete).
+
+# Minimal ISO-3166 alpha-2 → display name, only for the countries our tables
+# actually contain. Unknown codes fall back to the bare code in the label.
+_COUNTRY_NAME: dict[str, str] = {
+    "IN": "India", "AE": "UAE", "QA": "Qatar", "OM": "Oman", "SA": "Saudi Arabia",
+    "KW": "Kuwait", "BH": "Bahrain", "JO": "Jordan", "LB": "Lebanon", "IL": "Israel",
+    "IR": "Iran", "NP": "Nepal", "LK": "Sri Lanka", "MV": "Maldives", "BD": "Bangladesh",
+    "BT": "Bhutan", "AZ": "Azerbaijan", "UZ": "Uzbekistan", "KZ": "Kazakhstan",
+    "KG": "Kyrgyzstan", "AM": "Armenia", "GE": "Georgia", "SG": "Singapore",
+    "TH": "Thailand", "MY": "Malaysia", "ID": "Indonesia", "VN": "Vietnam",
+    "PH": "Philippines", "KH": "Cambodia", "LA": "Laos", "MM": "Myanmar",
+    "JP": "Japan", "KR": "South Korea", "CN": "China", "HK": "Hong Kong",
+    "TW": "Taiwan", "MO": "Macau", "MN": "Mongolia", "AU": "Australia",
+    "NZ": "New Zealand", "FJ": "Fiji", "PF": "French Polynesia", "GB": "United Kingdom",
+    "FR": "France", "DE": "Germany", "IT": "Italy", "ES": "Spain", "PT": "Portugal",
+    "NL": "Netherlands", "BE": "Belgium", "CH": "Switzerland", "AT": "Austria",
+    "GR": "Greece", "TR": "Turkey", "RU": "Russia", "IE": "Ireland", "IS": "Iceland",
+    "NO": "Norway", "SE": "Sweden", "DK": "Denmark", "FI": "Finland", "PL": "Poland",
+    "CZ": "Czechia", "HU": "Hungary", "HR": "Croatia", "RO": "Romania", "US": "USA",
+    "CA": "Canada", "MX": "Mexico", "BR": "Brazil", "AR": "Argentina", "PE": "Peru",
+    "CL": "Chile", "CO": "Colombia", "ZA": "South Africa", "EG": "Egypt",
+    "KE": "Kenya", "TZ": "Tanzania", "MA": "Morocco", "MU": "Mauritius",
+    "SC": "Seychelles", "ET": "Ethiopia", "LI": "Liechtenstein", "MC": "Monaco",
+    "AD": "Andorra", "VA": "Vatican", "LU": "Luxembourg", "GL": "Greenland",
+    "FO": "Faroe Islands",
+}
+
+# canonical key → its aliases, so typing "bombay"/"bom" surfaces Mumbai even
+# though normalize() only rewrites a full-string alias.
+_ALIAS_BY_CANON: dict[str, list[str]] = {}
+for _alias, _canon in _ALIASES.items():
+    _ALIAS_BY_CANON.setdefault(_canon, []).append(_alias)
+
+
+def country_name(code: Optional[str]) -> Optional[str]:
+    """Display country name for an ISO alpha-2 code, falling back to the code."""
+    if not code:
+        return None
+    return _COUNTRY_NAME.get(code.upper(), code.upper())
+
+
+def _iter_locations():
+    """Yield (key, country_code, iata) for every city in both tables."""
+    for key, code in _INDIA.items():
+        yield key, "IN", code
+    for key, (cc, code) in _FOREIGN.items():
+        yield key, cc, code
+
+
+def _match_score(nq: str, names: list[str]) -> float:
+    """
+    Rank a query against a city's names (canonical + aliases). Exact > prefix >
+    word-boundary > substring. 0 means no match. Shorter, closer names win ties.
+    """
+    best = 0.0
+    for name in names:
+        if not name:
+            continue
+        if name == nq:
+            best = max(best, 100.0)
+        elif name.startswith(nq):
+            # Closer-length prefixes rank higher (e.g. "goa" beats "goalpara").
+            best = max(best, 70.0 - min(len(name) - len(nq), 20))
+        elif f" {nq}" in f" {name}":          # matches start of any word
+            best = max(best, 45.0)
+        elif nq in name:
+            best = max(best, 25.0)
+    return best
+
+
+def search_locations(q: str, limit: int = 8, require_iata: bool = False) -> list[dict]:
+    """
+    Offline autocomplete over the geo tables. Returns ranked
+    ``[{city, country_code, country, iata}]``. When ``require_iata`` is set
+    (flight origins/destinations) cities without a servicing airport are skipped.
+    """
+    nq = normalize(q)
+    if not nq:
+        return []
+
+    scored: list[tuple[float, str, str, Optional[str]]] = []
+    for key, cc, code in _iter_locations():
+        if require_iata and not code:
+            continue
+        names = [key] + _ALIAS_BY_CANON.get(key, [])
+        score = _match_score(nq, names)
+        if score <= 0:
+            continue
+        scored.append((score, key, cc, code))
+
+    # Highest score first; tie-break by shorter (more canonical) name, then alpha.
+    scored.sort(key=lambda r: (-r[0], len(r[1]), r[1]))
+
+    out: list[dict] = []
+    for _score, key, cc, code in scored[:limit]:
+        out.append({
+            "city": key.title(),
+            "country_code": cc,
+            "country": country_name(cc),
+            "iata": code,
+        })
+    return out

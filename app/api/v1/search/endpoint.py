@@ -12,6 +12,7 @@ import asyncio
 from fastapi import APIRouter, Depends
 
 from app.deps.auth import require_user
+from app.agents.recommendation_agent import recommend_flights, recommend_hotels
 from app.services.flights import FlightService, budget_to_sort, sort_flights
 from app.services.hotels import HotelService
 from app.services.hotels_filters import budget_to_hotel_sort
@@ -85,6 +86,7 @@ async def search_flights(body: FlightSearchRequest, _user=Depends(require_user))
     Search one-way flights. Results from Booking.com + EaseMyTrip + Gotogate (parallel, deduplicated).
     sort: CHEAPEST | FASTEST | BEST. If `budget` (low|mid|high) is set it dictates
     the sort and overrides `sort`. Returns all merged results; first flagged is_recommended.
+    Pass `from_iata`/`to_iata` (from /autocomplete/airports) to skip city→IATA resolution.
     """
     # Budget always wins: a budget tier dictates sort, overriding any explicit sort.
     effective_sort = budget_to_sort(body.budget) or body.sort
@@ -95,6 +97,9 @@ async def search_flights(body: FlightSearchRequest, _user=Depends(require_user))
         adults=body.adults,
         cabin_class=body.cabin_class,
         sort=effective_sort,   # pushed upstream to each provider, then reranked
+        # IATA pre-resolved by /autocomplete/airports → skip the resolver round-trip.
+        from_iata=(body.from_iata or "").strip().upper() or None,
+        to_iata=(body.to_iata or "").strip().upper() or None,
         nonstop_only=body.nonstop_only,
     )
     flights = _tag_recommended(sort_flights(result.get("flights") or [], effective_sort))
@@ -171,6 +176,88 @@ async def search_hotels(body: HotelSearchRequest, _user=Depends(require_user)):
         "total": len(hotels),
         "sort_applied": effective_sort,
     }
+
+
+def _attach_recommendation(items: list[dict], ai: dict | None) -> dict | None:
+    """
+    Map an agent recommendation back onto the real result list: stamp the chosen
+    item (and runner-up) with the reason/pros, re-flag is_recommended on the pick,
+    and return the top-level ai_recommendation block. Returns None when there's no
+    usable recommendation (caller keeps the deterministic recommended item).
+    """
+    if not ai or not items:
+        return None
+    idx = ai["recommended_index"]
+    # Re-point is_recommended at the agent's pick (search already flagged items[0]).
+    for it in items:
+        it["is_recommended"] = False
+    items[idx]["is_recommended"] = True
+    items[idx]["ai_reason"] = ai.get("reason")
+    items[idx]["ai_pros"] = ai.get("pros")
+    items[idx]["ai_best_for"] = ai.get("best_for")
+    ru = ai.get("runner_up_index")
+    if isinstance(ru, int) and 0 <= ru < len(items):
+        items[ru]["ai_reason"] = ai.get("runner_up_reason")
+    return {
+        "recommended_index": idx,
+        "reason": ai.get("reason"),
+        "pros": ai.get("pros"),
+        "best_for": ai.get("best_for"),
+        "runner_up_index": ru,
+        "runner_up_reason": ai.get("runner_up_reason"),
+    }
+
+
+@router.post("/flights/smart")
+async def search_flights_smart(body: FlightSearchRequest, _user=Depends(require_user)):
+    """
+    Agent-assisted flight search. Runs the normal /flights search, then asks the
+    recommendation agent which option to book and *why*. Adds an `ai_recommendation`
+    block (reason, pros, best_for, runner-up) and stamps the chosen flight with
+    `ai_reason`/`ai_pros` + is_recommended. Falls back to the deterministic
+    recommendation if the agent is unavailable.
+    """
+    base = await search_flights(body, _user)
+    flights = base.get("flights") or []
+    ai = await recommend_flights(flights, context={
+        "route": f"{base.get('from_iata') or body.origin} → {base.get('to_iata') or body.destination}",
+        "date": body.date,
+        "passengers": body.adults,
+        "cabin_class": body.cabin_class,
+        "nonstop_only": body.nonstop_only,
+        "sort": base.get("sort_applied"),
+    })
+    rec = _attach_recommendation(flights, ai)
+    if rec:
+        base["ai_recommendation"] = rec
+    return base
+
+
+@router.post("/hotels/smart")
+async def search_hotels_smart(body: HotelSearchRequest, _user=Depends(require_user)):
+    """
+    Agent-assisted hotel search. Runs the normal /hotels search, then asks the
+    recommendation agent which stay to book and *why*. Adds an `ai_recommendation`
+    block (reason, pros, best_for, runner-up) and stamps the chosen hotel with
+    `ai_reason`/`ai_pros` + is_recommended. Falls back to the deterministic
+    recommendation if the agent is unavailable.
+    """
+    base = await search_hotels(body, _user)
+    hotels = base.get("hotels") or []
+    ai = await recommend_hotels(hotels, context={
+        "destination": body.destination,
+        "checkin": body.checkin,
+        "checkout": body.checkout,
+        "rooms": body.rooms,
+        "adults": body.adults,
+        "children": body.children,
+        "budget": body.budget,
+        "sort": base.get("sort_applied"),
+    })
+    rec = _attach_recommendation(hotels, ai)
+    if rec:
+        base["ai_recommendation"] = rec
+    return base
 
 
 @router.post("/buses")

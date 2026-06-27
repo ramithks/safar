@@ -14,6 +14,16 @@ class FlightSearchRequest(BaseModel):
         None,
         description="low | mid | high — when set, dictates sort (low→cheapest, mid→best, high→fastest) and overrides `sort`.",
     )
+    from_iata: Optional[str] = Field(
+        None,
+        description="Pre-resolved origin IATA from /autocomplete/airports — skips re-resolution.",
+        examples=["DEL"],
+    )
+    to_iata: Optional[str] = Field(
+        None,
+        description="Pre-resolved destination IATA from /autocomplete/airports — skips re-resolution.",
+        examples=["GOI"],
+    )
     nonstop_only: bool = False
 
 

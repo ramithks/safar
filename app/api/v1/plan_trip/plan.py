@@ -111,8 +111,6 @@ def _shape_journey(j: dict, include_hotels: bool = False) -> dict:
     flights_block = _collect_flight_items(legs, recs.get("flight"))
 
     block: dict = {
-        "buses": bus_block,
-        "journey_options": j.get("journey_options") or {},
         "legs": legs,
         "summary": {
             "duration": j.get("total_duration_approx"),
@@ -120,33 +118,43 @@ def _shape_journey(j: dict, include_hotels: bool = False) -> dict:
         },
     }
 
+    # Only include transport blocks that actually carry data — an empty
+    # buses/trains/flights block is noise the frontend has to skip past.
+    if bus_block.get("items") or bus_block.get("recommended"):
+        block["buses"] = bus_block
+    if trains_block:
+        block["trains"] = trains_block
+    if flights_block:
+        block["flights"] = flights_block
+
+    journey_options = j.get("journey_options") or {}
+    if journey_options:
+        block["journey_options"] = journey_options
+
     # Trade-off narrative (Score→Reason→Recommend) — surface it on the block so it
     # reaches the /plan response, not just the raw journey result.
     reasoning = j.get("journey_reasoning")
     if reasoning:
         block["reasoning"] = reasoning
 
-    if trains_block:
-        block["trains"] = trains_block
-
+    # Fold the all-train bundle in only when it's a feasible end-to-end option.
     train_journey = j.get("train_journey")
-    if train_journey:
+    if train_journey and train_journey.get("feasible"):
         block["train_journey"] = train_journey
-
-    if flights_block:
-        block["flights"] = flights_block
 
     if include_hotels:
         dh = j.get("destination_hotels") or {}
-        block["hotels"] = {
-            "destination": dh.get("destination"),
-            "checkin": dh.get("checkin"),
-            "checkout": dh.get("checkout"),
-            "nights": dh.get("nights"),
-            "source": dh.get("source"),
-            "items": dh.get("hotels") or [],
-            "recommended": dh.get("top_pick") or recs.get("hotel"),
-        }
+        hotel_items = dh.get("hotels") or []
+        if hotel_items or dh.get("top_pick") or recs.get("hotel"):
+            block["hotels"] = {
+                "destination": dh.get("destination"),
+                "checkin": dh.get("checkin"),
+                "checkout": dh.get("checkout"),
+                "nights": dh.get("nights"),
+                "source": dh.get("source"),
+                "items": hotel_items,
+                "recommended": dh.get("top_pick") or recs.get("hotel"),
+            }
 
     return block
 

@@ -122,7 +122,11 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
                 asyncio.get_event_loop().run_in_executor(None, fetch_memory_context, db, user_id, body.destination),
             )
 
-    currency_code = (profile.get("currency") or "usd").lower()
+    # Default to INR (not USD) so the itinerary's currency matches the journey
+    # planner and the live scraper prices (EaseMyTrip/Booking/ConfirmTKT all
+    # return INR). A mismatched default makes the budget engine sum INR transport
+    # with USD food and compare against a USD ceiling — producing nonsense totals.
+    currency_code = (profile.get("currency") or "inr").lower()
     ci = CURRENCY_CONFIG.get(currency_code) or CURRENCY_CONFIG["usd"]
     symbol = ci["symbol"]
     brange = ci["range"][safe_budget]

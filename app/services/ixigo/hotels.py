@@ -313,6 +313,31 @@ def _normalise(h: dict, checkin: str, checkout: str) -> dict:
     amenities = [a.get("name") for a in (h.get("amenities") or [])
                  if isinstance(a, dict) and a.get("name")][:10]
 
+    # Free cancellation check from topOfferings
+    top_offerings = h.get("topOfferings") or []
+    free_cancel = any("free cancellation" in str(opt).lower() for opt in top_offerings)
+
+    # Parse distance_km from distanceFromSearchedEntity (e.g. "2.5 km from Mall Road Market Manali")
+    dist_km = None
+    dist_str = h.get("distanceFromSearchedEntity")
+    if dist_str:
+        import re
+        match = re.search(r"([\d\.]+)\s*km", dist_str, re.IGNORECASE)
+        if match:
+            try:
+                dist_km = float(match.group(1))
+            except Exception:
+                pass
+
+    # Extract breakfast/meal info
+    is_breakfast = any("breakfast" in str(opt).lower() for opt in top_offerings) or \
+                   any("breakfast" in str(amen).lower() for amen in amenities)
+    meal_plan = "Breakfast included" if is_breakfast else None
+
+    # Urgency / FOMO tags
+    fomo_tags = [f.get("data") for f in (h.get("fomoTags") or []) if isinstance(f, dict) and f.get("data")]
+    highlights_str = "|".join(top_offerings) if top_offerings else None
+
     return {
         "hotel_id": str(h.get("hotelId")) if h.get("hotelId") is not None else None,
         "name": h.get("name"),
@@ -331,6 +356,13 @@ def _normalise(h: dict, checkin: str, checkout: str) -> dict:
         "amenities": amenities,
         "couple_friendly": bool(h.get("coupleFriendly")),
         "photos": photos,
+        "free_cancellation": free_cancel,
+        "distance_km": dist_km,
+        "is_breakfast_included": is_breakfast,
+        "meal_plan": meal_plan,
+        "highlights": highlights_str,
+        "description": h.get("summary"),
+        "tags": fomo_tags[0] if fomo_tags else None,
         "property_type": classify_property_type({"name": h.get("name")}),
         "booking_url": None,   # set by caller via _booking_url
         "source": "ixigo",

@@ -60,7 +60,11 @@ _PSP_URL    = "https://gi.easemytrip.com/etm/api/etoken/PSP"
 _ENC_KEY    = b"hylW@zmEQdG@4Idr"   # encKeySrchV1 (key == iv)
 _ATK        = "c0ruxuOD/XqyNXB3kRAqvRUliyqhyFOOUwgDTCP1tLx09TRNEbblvRQLgfPz2ivf"
 _PSP_STATIC = "EMTWvggk6zYLVynBA56C3aNn4HLREMHV9bEP9Q"
-_TOKEN_TTL  = 300.0   # seconds; refreshed lazily on expiry or rejection
+_TOKEN_TTL  = 120.0   # seconds; EMT rejects tokens well before 300s (a 176s-old
+                      # token returned "TOKEN NOT VALID" in prod), so keep our
+                      # cache window comfortably under that. A stale token is also
+                      # re-minted in-flight (see _do), so this is just to avoid a
+                      # predictable first-call rejection.
 
 # (token, fetched_at) — shared process-wide so the handshake runs ~once per TTL.
 _token_cache: tuple[str, float] | None = None
@@ -256,24 +260,33 @@ async def search_flights(
     }
 
     async def _do(proxy):
+        # "TOKEN NOT VALID" is a stale/expired token, NOT an IP block — re-mint
+        # and retry once on the *same* connection (near-instant on the direct
+        # path) before with_proxy_fallback escalates to the slow proxy retries.
+        # Jumping straight to proxy would re-run the UMS+PSP handshake over the
+        # proxy and burn the whole 25s budget before the fresh-token search lands.
         async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
-            payload["TKN"] = await _get_search_token(s)
-            r = await s.post(
-                _BASE,
-                headers=_HEADERS,
-                params={"_": ts, "ngsw-bypass": "true"},
-                json=payload,
-                timeout=25,
-            )
-        r.raise_for_status()
-        j = r.json()
-        # A valid search returns a JSON object. A bare string ("TOKEN NOT VALID",
-        # block bodies) means the token was rejected — drop it so the proxy retry
-        # re-mints a fresh one, and surface as a block rather than "0 results".
-        if isinstance(j, str):
-            _invalidate_token()
-            raise ScraperBlocked(f"AirBus_New string response: {j[:60]}")
-        return j
+            for token_attempt in range(2):
+                payload["TKN"] = await _get_search_token(s)
+                r = await s.post(
+                    _BASE,
+                    headers=_HEADERS,
+                    params={"_": ts, "ngsw-bypass": "true"},
+                    json=payload,
+                    timeout=25,
+                )
+                r.raise_for_status()
+                j = r.json()
+                # A valid search returns a JSON object. A bare string
+                # ("TOKEN NOT VALID", block bodies) means the token was rejected.
+                if isinstance(j, str):
+                    _invalidate_token()         # force a fresh mint next call
+                    if token_attempt == 0:
+                        continue                # retry once on this connection
+                    # A freshly minted token was also rejected → treat as a real
+                    # block so with_proxy_fallback rotates to a proxy exit IP.
+                    raise ScraperBlocked(f"AirBus_New string response: {j[:60]}")
+                return j
 
     try:
         # Cap the retry loop at 25s (< FlightService's 30s merge budget) so this

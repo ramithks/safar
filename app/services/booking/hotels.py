@@ -24,6 +24,7 @@ import time
 import base64
 import secrets
 import json as _json
+from urllib.parse import quote, quote_plus
 
 from app.config import settings
 from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
@@ -130,6 +131,10 @@ _GQL_QUERY = """query FullSearch($input: SearchQueryInput!) {
                 highResUrl { relativeUrl }
                 highResJpegUrl { relativeUrl }
               }
+              all {
+                highResUrl { relativeUrl }
+                highResJpegUrl { relativeUrl }
+              }
             }
             reviewScore: reviews {
               score: totalScore
@@ -137,6 +142,7 @@ _GQL_QUERY = """query FullSearch($input: SearchQueryInput!) {
               totalScoreTextTag { translation }
             }
             starRating { value }
+            hotelFacilities { id name }
           }
           displayName { text }
           location { mainDistance geoDistanceMeters }
@@ -264,22 +270,28 @@ async def _run_fullsearch(
     # Booking.com caps meaningful results around 25 per page; sending more causes empty responses.
     rows = min(limit, 25)
 
+    # City names resolved from autocomplete can carry non-ASCII characters (e.g.
+    # "Manālī" with ā = U+0101). They flow into the request URL and the `referer`
+    # header, and curl_cffi encodes headers as latin-1 — anything above U+00FF
+    # raises UnicodeEncodeError. Percent-encode the value so it's ASCII-safe.
+    ss = quote_plus(city_canonical)
+
     gql_url = (
         f"{_GRAPHQL_URL}"
-        f"?ss={city_canonical.replace(' ', '+')}"
+        f"?ss={ss}"
         f"&dest_id={dest_id}&dest_type={dest_type_lower}"
         f"&checkin={checkin}&checkout={checkout}"
         f"&group_adults={adults}&no_rooms={rooms}&group_children={children}"
     )
     referer = (
         f"{_SEARCH_PAGE}"
-        f"?ss={city_canonical.replace(' ', '+')}"
+        f"?ss={ss}"
         f"&dest_id={dest_id}&dest_type={dest_type_lower}"
         f"&checkin={checkin}&checkout={checkout}"
         f"&group_adults={adults}&no_rooms={rooms}&group_children={children}"
     )
     raw_query = (
-        f"/searchresults.html?ss={city_canonical}&dest_id={dest_id}&dest_type={dest_type_lower}"
+        f"/searchresults.html?ss={quote(city_canonical)}&dest_id={dest_id}&dest_type={dest_type_lower}"
         f"&checkin={checkin}&checkout={checkout}"
         f"&group_adults={adults}&no_rooms={rooms}&group_children={children}"
         f"&lang=en-us&aid=304142"
@@ -486,13 +498,33 @@ def _normalise(r: dict, checkin: str, checkout: str, nights: int) -> dict:
     page_name = basic.get("pageName") or ""
     booking_url = f"https://www.booking.com/hotel/in/{page_name}.html" if page_name else None
 
-    # Photos: highResUrl (webp, includes ?k= hash) > highResJpegUrl fallback
-    main_photo = basic.get("photos", {}).get("main") or {}
-    photo_rel = (
-        (main_photo.get("highResUrl") or main_photo.get("highResJpegUrl") or {})
-        .get("relativeUrl", "")
-    )
-    photos = [_PHOTO_BASE + photo_rel] if photo_rel else []
+    # Photos: main + up to 5 otherPhotos (webp highResUrl preferred, jpeg fallback)
+    photos_data = basic.get("photos") or {}
+    main_photo = photos_data.get("main") or {}
+
+    def _rel_url(photo_obj: dict) -> str | None:
+        rel = (
+            (photo_obj.get("highResUrl") or photo_obj.get("highResJpegUrl") or {})
+            .get("relativeUrl", "")
+        )
+        return (_PHOTO_BASE + rel) if rel else None
+
+    photos: list[str] = []
+    main_url = _rel_url(main_photo)
+    if main_url:
+        photos.append(main_url)
+    for other in (photos_data.get("all") or []):
+        u = _rel_url(other)
+        if u and u not in photos:
+            photos.append(u)
+        if len(photos) >= 6:
+            break
+
+    # Amenities from hotelFacilities
+    amenities = [
+        f.get("name") for f in (basic.get("hotelFacilities") or [])
+        if isinstance(f, dict) and f.get("name")
+    ][:12]
 
     # Price: displayPrice.amountPerStay is the total for the stay
     price_info  = r.get("priceDisplayInfoIrene") or {}
@@ -548,6 +580,7 @@ def _normalise(r: dict, checkin: str, checkout: str, nights: int) -> dict:
         "free_cancellation_until": free_cancel_until,
         "no_prepayment": policies.get("showNoPrepayment", False),
         "meal_plan": meal,
+        "amenities": amenities,
         "photos": photos,
         "booking_url": booking_url,
         "is_sold_out": sold_out,

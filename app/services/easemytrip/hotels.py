@@ -181,6 +181,29 @@ def _normalise_hotel(h: dict, checkin: str, checkout: str) -> dict:
     amenities_raw = h.get("amen") or []
     amenities = [a.strip() for a in amenities_raw if a and a.strip()]
 
+    # Cancellation policy: htlPlcy has human-readable text (e.g. "NonRefundable Booking")
+    # plcy is the raw policy blob; prefer htlPlcy when it has content
+    cancellation_policy = h.get("htlPlcy") or h.get("plcy") or None
+
+    # Meal plan: EMT has both a `meal` text field and `isBreakFast` flag
+    meal_text = h.get("meal")
+    is_breakfast = h.get("isBreakFast", False)
+    meal_plan = meal_text or ("Breakfast included" if is_breakfast else None)
+
+    # Review count from TripAdvisor count
+    try:
+        review_count = int(h.get("tCount") or 0) or None
+    except Exception:
+        review_count = None
+
+    # Distance: distKM=0 means no distance data (hotel is at the destination)
+    dist_km = h.get("distKM")
+    if dist_km is not None:
+        try:
+            dist_km = float(dist_km) or None   # treat 0.0 as None (unknown)
+        except Exception:
+            dist_km = None
+
     category = h.get("catgry")
     return {
         "hotel_id": h.get("hid"),
@@ -189,9 +212,10 @@ def _normalise_hotel(h: dict, checkin: str, checkout: str) -> dict:
         "property_type": classify_property_type({"category": category, "name": h.get("nm")}),
         "star_rating": _safe_float(h.get("rat")),
         "ta_rating": _safe_float(h.get("tr")),
+        "review_count": review_count,
         "address": h.get("adrs"),
         "distance_from_dest": h.get("dist"),
-        "distance_km": h.get("distKM"),
+        "distance_km": dist_km,
         "lat": _safe_float(h.get("lat")),
         "lon": _safe_float(h.get("lon")),
         "price_per_night": h.get("prc"),
@@ -202,9 +226,12 @@ def _normalise_hotel(h: dict, checkin: str, checkout: str) -> dict:
         "nights": nights,
         "checkin_time": h.get("cinTime"),
         "checkout_time": h.get("coutTime"),
-        "is_breakfast_included": h.get("isBreakFast", False),
-        "cancellation_policy": h.get("plcy"),
-        "highlights": h.get("highlt"),     # e.g. "Couple Friendly"
+        "is_breakfast_included": is_breakfast,
+        "meal_plan": meal_plan,
+        "cancellation_policy": cancellation_policy,
+        "couple_friendly": bool(h.get("isCF", False)),
+        "highlights": h.get("highlt"),     # e.g. "Couple Friendly|Solo Traveller Friendly"
+        "tags": h.get("tags"),              # e.g. "New on EMT"
         "amenities": amenities,
         "photos": images[:6],
         "booking_url": h.get("durl"),
