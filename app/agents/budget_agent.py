@@ -22,46 +22,49 @@ from app.api.v1.plan_trip.helpers import CURRENCY_CONFIG
 logger = logging.getLogger(__name__)
 
 
-def _cheapest_from_going(going: dict) -> tuple[str | None, int, dict | None]:
+def _planned_transport_pp(merged: dict) -> int:
     """
-    Scan all transport blocks in the going journey and return
-    (mode, cheapest_price_per_person, item) across flights/trains/buses.
+    Per-person transport cost of the *complete* planned journey — the sum of the
+    cheapest fare on every intercity leg (cost_breakdown.transport_per_person).
+
+    This is the only honest "current transport" figure for a multi-leg journey:
+    e.g. Bhiwani→Delhi train (₹150) + Delhi→Goa flight (₹26,532) = ₹26,682. The
+    old code returned a single leg's fare, which let the budget agent compare a
+    cheap feeder against the whole journey.
     """
-    best_price = 999_999
-    best_mode: str | None = None
-    best_item: dict | None = None
+    cb = merged.get("cost_breakdown") or {}
+    tp = cb.get("transport_per_person")
+    if tp:
+        return tp
 
-    for f in (going.get("flights") or {}).get("items") or []:
-        p = f.get("price_total") or 0
-        if 0 < p < best_price:
-            best_price, best_mode, best_item = p, "flight", f
-
-    for t in (going.get("trains") or {}).get("items") or []:
-        p = t.get("cheapest_fare") or 0
-        if 0 < p < best_price:
-            best_price, best_mode, best_item = p, "train", t
-
-    for b in (going.get("buses") or {}).get("items") or []:
-        p = b.get("fare_discounted") or b.get("fare_original") or 0
-        if 0 < p < best_price:
-            best_price, best_mode, best_item = p, "bus", b
-
-    return best_mode, (best_price if best_mode else 0), best_item
-
-
-def _current_transport_cost_pp(going: dict) -> int:
-    """Extract per-person cost of the currently recommended transport."""
+    # Fallback for legacy single-leg journeys with no cost_breakdown.
+    going = merged.get("going") or {}
     rec_flight = (going.get("flights") or {}).get("recommended") or {}
     if rec_flight.get("price_total"):
         return rec_flight["price_total"]
-
     rec_train = (going.get("trains") or {}).get("recommended") or {}
     if rec_train.get("cheapest_fare"):
         return rec_train["cheapest_fare"]
-
     rec_bus = (going.get("buses") or {}).get("recommended") or {}
-    fare = rec_bus.get("fare_discounted") or rec_bus.get("fare_original") or 0
-    return fare
+    return rec_bus.get("fare_discounted") or rec_bus.get("fare_original") or 0
+
+
+def _train_journey_alternative(going: dict, current_pp: int) -> tuple[int, dict] | None:
+    """
+    The only valid cheaper alternative is a *complete* door-to-door journey, not a
+    single leg. We use the all-train bundle (every intercity segment by train),
+    which is already stitched and feasibility-checked upstream.
+
+    Returns (per_person_fare, bundle) when the bundle is feasible and genuinely
+    cheaper than the planned journey; otherwise None (so no fake swap is offered).
+    """
+    bundle = going.get("train_journey") or {}
+    if not bundle.get("feasible"):
+        return None
+    pp = bundle.get("total_fare_per_person") or 0
+    if pp <= 0 or pp >= current_pp:
+        return None
+    return pp, bundle
 
 
 def budget_agent_check(
@@ -97,23 +100,24 @@ def budget_agent_check(
     if total > total_ceiling:
         overspend = total - total_ceiling
         going = merged.get("going") or {}
-        current_pp = _current_transport_cost_pp(going)
-        alt_mode, alt_price_pp, alt_item = _cheapest_from_going(going)
+        current_pp = _planned_transport_pp(merged)
+        alt = _train_journey_alternative(going, current_pp)
 
-        # Only suggest a switch when the alternative is cheaper than current
-        if alt_item and alt_mode and alt_price_pp < current_pp:
-            saving_pp = current_pp - alt_price_pp
+        # Only suggest a switch to a complete cheaper journey (all-train bundle),
+        # never a single feeder leg. saving = full planned transport − all-train.
+        if alt:
+            alt_pp, bundle = alt
+            saving_pp = current_pp - alt_pp
             saving_total = saving_pp * travelers
             suggestion = {
-                "type": "switch_transport",
-                "to_mode": alt_mode,
-                "option": alt_item,
+                "type": "switch_to_train_journey",
+                "to_mode": "train_journey",
+                "option": bundle,
                 "saving_per_person": saving_pp,
                 "saving_total": saving_total,
                 "message": (
-                    f"Switch to {alt_mode} ({symbol}{alt_price_pp:,}/person) "
-                    f"instead of current transport ({symbol}{current_pp:,}/person). "
-                    f"Saves {symbol}{saving_total:,} total."
+                    f"Take the all-train route ({symbol}{alt_pp:,}/person) instead of the "
+                    f"current {symbol}{current_pp:,}/person journey — saves {symbol}{saving_total:,} total."
                 ),
             }
             status["suggestions"].append(suggestion)
@@ -122,10 +126,9 @@ def budget_agent_check(
             if saving_total >= overspend * 0.60:
                 status["intervention"] = suggestion
                 logger.info(
-                    "[budget_agent] %s→ Over budget by %s%s — recommending %s, saves %s%s",
+                    "[budget_agent] %s→ Over budget by %s%s — recommending all-train route, saves %s%s",
                     merged.get("destination", "?"),
                     symbol, f"{overspend:,}",
-                    alt_mode,
                     symbol, f"{saving_total:,}",
                 )
 

@@ -24,8 +24,10 @@ import time
 import base64
 import secrets
 import json as _json
+from urllib.parse import quote, quote_plus
 
 from app.config import settings
+from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,18 @@ except ImportError:
 _GRAPHQL_URL  = "https://www.booking.com/dml/graphql"
 _SEARCH_PAGE  = "https://www.booking.com/searchresults.html"
 _PHOTO_BASE   = "https://cf.bstatic.com"
+
+# Native sort codes — canonical sort key → Booking `selectedSorter` (verified live).
+# Property-type filtering is NOT done natively (Booking's GraphQL `filters` input
+# rejects ht_id codes); the shared classifier tags property_type instead, and the
+# aggregator's persona filter ranks/keeps the right types.
+_SORTS = {
+    "price_asc":   "price",
+    "price_desc":  "price_from_high_to_low",
+    "recommended": "popularity",
+    "rating":      "bayesian_review_score",
+    "class":       "class",
+}
 
 _COMMON_HEADERS = {
     "accept": "*/*",
@@ -117,6 +131,10 @@ _GQL_QUERY = """query FullSearch($input: SearchQueryInput!) {
                 highResUrl { relativeUrl }
                 highResJpegUrl { relativeUrl }
               }
+              all {
+                highResUrl { relativeUrl }
+                highResJpegUrl { relativeUrl }
+              }
             }
             reviewScore: reviews {
               score: totalScore
@@ -124,6 +142,7 @@ _GQL_QUERY = """query FullSearch($input: SearchQueryInput!) {
               totalScoreTextTag { translation }
             }
             starRating { value }
+            hotelFacilities { id name }
           }
           displayName { text }
           location { mainDistance geoDistanceMeters }
@@ -184,20 +203,21 @@ async def resolve_dest_id(city_name: str) -> tuple[int | None, str, str]:
             "extensions": {},
             "query": _AUTOCOMPLETE_GQL_QUERY,
         }
-        async with CurlAsyncSession() as s:
-            r = await s.post(
-                f"{_GRAPHQL_URL}?lang=en-us",
-                headers={**_AUTOCOMPLETE_GQL_HEADERS, "x-booking-pageview-id": pageview_id},
-                json=payload,
-                impersonate="chrome",
-                timeout=10,
-            )
-        r.raise_for_status()
+        async def _do(proxy):
+            async with CurlAsyncSession(proxy=proxy) as s:
+                r = await s.post(
+                    f"{_GRAPHQL_URL}?lang=en-us",
+                    headers={**_AUTOCOMPLETE_GQL_HEADERS, "x-booking-pageview-id": pageview_id},
+                    json=payload,
+                    impersonate="chrome",
+                    timeout=10,
+                )
+            r.raise_for_status()
+            return r.json()
+
         results = (
-            (r.json().get("data") or {})
-            .get("autoCompleteSuggestions", {})
-            .get("results") or []
-        )
+            (await with_proxy_fallback("booking_hotels", _do, proxy_attempts=4)).get("data") or {}
+        ).get("autoCompleteSuggestions", {}).get("results") or []
         # Two passes: first prefer India, then accept any country
         for prefer_india in (True, False):
             for priority in ("CITY", "REGION", "DISTRICT"):
@@ -250,22 +270,28 @@ async def _run_fullsearch(
     # Booking.com caps meaningful results around 25 per page; sending more causes empty responses.
     rows = min(limit, 25)
 
+    # City names resolved from autocomplete can carry non-ASCII characters (e.g.
+    # "Manālī" with ā = U+0101). They flow into the request URL and the `referer`
+    # header, and curl_cffi encodes headers as latin-1 — anything above U+00FF
+    # raises UnicodeEncodeError. Percent-encode the value so it's ASCII-safe.
+    ss = quote_plus(city_canonical)
+
     gql_url = (
         f"{_GRAPHQL_URL}"
-        f"?ss={city_canonical.replace(' ', '+')}"
+        f"?ss={ss}"
         f"&dest_id={dest_id}&dest_type={dest_type_lower}"
         f"&checkin={checkin}&checkout={checkout}"
         f"&group_adults={adults}&no_rooms={rooms}&group_children={children}"
     )
     referer = (
         f"{_SEARCH_PAGE}"
-        f"?ss={city_canonical.replace(' ', '+')}"
+        f"?ss={ss}"
         f"&dest_id={dest_id}&dest_type={dest_type_lower}"
         f"&checkin={checkin}&checkout={checkout}"
         f"&group_adults={adults}&no_rooms={rooms}&group_children={children}"
     )
     raw_query = (
-        f"/searchresults.html?ss={city_canonical}&dest_id={dest_id}&dest_type={dest_type_lower}"
+        f"/searchresults.html?ss={quote(city_canonical)}&dest_id={dest_id}&dest_type={dest_type_lower}"
         f"&checkin={checkin}&checkout={checkout}"
         f"&group_adults={adults}&no_rooms={rooms}&group_children={children}"
         f"&lang=en-us&aid=304142"
@@ -336,8 +362,8 @@ async def _run_fullsearch(
         "query": _GQL_QUERY,
     }
 
-    try:
-        async with CurlAsyncSession() as s:
+    async def _do(proxy):
+        async with CurlAsyncSession(proxy=proxy) as s:
             resp = await s.post(
                 gql_url,
                 headers=gql_headers,
@@ -345,12 +371,20 @@ async def _run_fullsearch(
                 impersonate="chrome",
                 timeout=25,
             )
-
         if resp.status_code != 200:
-            logger.info(f"[booking_hotels] HTTP {resp.status_code} for '{city_canonical}' (destType={dest_type})")
-            return []
+            # Non-200 from Booking's WAF — treat as a block so the proxy retry fires.
+            raise ScraperBlocked(f"HTTP {resp.status_code}")
+        j = resp.json()
+        # 200 + GraphQL errors + null data = blocked/rejected, not "no hotels".
+        # Partial errors (data present) are tolerated and parsed below.
+        if j.get("errors") and not j.get("data"):
+            raise ScraperBlocked(f"graphql errors: {[e.get('message') for e in j['errors'][:2]]}")
+        return j
 
-        data = resp.json()
+    try:
+        # Booking's WAF is the brittlest of our sources — give it extra fresh-IP
+        # proxy attempts so a transient block doesn't cost the whole search.
+        data = await with_proxy_fallback("booking_hotels", _do, proxy_attempts=4)
         errors = data.get("errors") or []
         if errors:
             msgs = [e.get("message", "") for e in errors[:2]]
@@ -378,17 +412,23 @@ async def search_hotels(
     adults: int = 2,
     children: int = 0,
     sort: str | None = None,
-    limit: int = 10,
+    limit: int = 40,
     offset: int = 0,
+    property_types: list[str] | None = None,   # accepted for API uniformity; classifier-only
 ) -> list[dict]:
     """
     Search hotels on Booking.com. Returns a normalized list.
+    `sort` is a canonical key (price_asc|price_desc|recommended|rating|class); a
+    native Booking sorter string is accepted as-is. `property_types` is accepted
+    for signature parity but enforced via the shared classifier, not natively.
     Tries CITY destType first; retries as REGION then DISTRICT when results are empty.
     Requires curl_cffi (bypasses AWS WAF with Chrome impersonation).
     """
     if not _CURL_AVAILABLE:
         logger.warning("[booking_hotels] curl_cffi not installed — pip install curl-cffi")
         return []
+
+    sort = _SORTS.get(sort, sort)   # canonical → native; pass through unknown/native
 
     dest_id, city_canonical, dest_type = await resolve_dest_id(city_name)
     if dest_id is None:
@@ -447,6 +487,7 @@ async def search_hotels(
 
 
 def _normalise(r: dict, checkin: str, checkout: str, nights: int) -> dict:
+    from app.services.hotels_filters import classify_property_type
     basic = r.get("basicPropertyData") or {}
     loc   = basic.get("location") or {}
     reviews = basic.get("reviewScore") or {}
@@ -457,13 +498,33 @@ def _normalise(r: dict, checkin: str, checkout: str, nights: int) -> dict:
     page_name = basic.get("pageName") or ""
     booking_url = f"https://www.booking.com/hotel/in/{page_name}.html" if page_name else None
 
-    # Photos: highResUrl (webp, includes ?k= hash) > highResJpegUrl fallback
-    main_photo = basic.get("photos", {}).get("main") or {}
-    photo_rel = (
-        (main_photo.get("highResUrl") or main_photo.get("highResJpegUrl") or {})
-        .get("relativeUrl", "")
-    )
-    photos = [_PHOTO_BASE + photo_rel] if photo_rel else []
+    # Photos: main + up to 5 otherPhotos (webp highResUrl preferred, jpeg fallback)
+    photos_data = basic.get("photos") or {}
+    main_photo = photos_data.get("main") or {}
+
+    def _rel_url(photo_obj: dict) -> str | None:
+        rel = (
+            (photo_obj.get("highResUrl") or photo_obj.get("highResJpegUrl") or {})
+            .get("relativeUrl", "")
+        )
+        return (_PHOTO_BASE + rel) if rel else None
+
+    photos: list[str] = []
+    main_url = _rel_url(main_photo)
+    if main_url:
+        photos.append(main_url)
+    for other in (photos_data.get("all") or []):
+        u = _rel_url(other)
+        if u and u not in photos:
+            photos.append(u)
+        if len(photos) >= 6:
+            break
+
+    # Amenities from hotelFacilities
+    amenities = [
+        f.get("name") for f in (basic.get("hotelFacilities") or [])
+        if isinstance(f, dict) and f.get("name")
+    ][:12]
 
     # Price: displayPrice.amountPerStay is the total for the stay
     price_info  = r.get("priceDisplayInfoIrene") or {}
@@ -519,9 +580,11 @@ def _normalise(r: dict, checkin: str, checkout: str, nights: int) -> dict:
         "free_cancellation_until": free_cancel_until,
         "no_prepayment": policies.get("showNoPrepayment", False),
         "meal_plan": meal,
+        "amenities": amenities,
         "photos": photos,
         "booking_url": booking_url,
         "is_sold_out": sold_out,
+        "property_type": classify_property_type({"name": name}),
         "source": "booking",
     }
 

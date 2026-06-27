@@ -18,8 +18,10 @@ from app.db.client import get_db
 from app.services.vertex import vertex_generate, extract_json
 from app.services.transport import TransportService
 from app.services.hotels import HotelService
-from app.services.flights import FlightService
+from app.services.flights import FlightService, budget_to_sort, sort_flights
+from app.services.journey_reasoning import build_journey_reasoning
 from app.services.railway import RailwayService, city_to_station_code, resolve_station_async
+from app.agents.recommendation_agent import recommend_flights, recommend_hotels
 
 from .models import PlanJourneyRequest
 from .helpers import (
@@ -458,11 +460,64 @@ def _pick_recommended_hotel(hotels: list[dict], budget: str) -> dict | None:
 
 
 def _pick_recommended_flight(flights: list[dict], budget: str) -> dict | None:
+    """Top flight under the budget tier's sort (low=cheapest, mid=best, high=fastest)."""
     if not flights:
         return None
-    pick = dict(min(flights, key=lambda f: f.get("price_total") or 999_999))
+    ranked = sort_flights(flights, budget_to_sort(budget) or "CHEAPEST")
+    pick = dict(ranked[0])
     pick["is_recommended"] = True
     return pick
+
+
+async def _explain_picks(
+    rec_flight: dict | None, flight_pool: list[dict], flight_ctx: dict,
+    rec_hotel: dict | None,  hotel_pool: list[dict],  hotel_ctx: dict,
+) -> tuple[dict | None, dict | None]:
+    """
+    Ask the recommendation agent *which* flight/hotel to book and *why*, then
+    re-point each pick to the agent's choice and stamp it with the reasoning
+    (ai_reason / ai_pros / ai_best_for). Both calls run concurrently.
+
+    Advisory only — on any miss (no agent, bad index, empty pool) the original
+    deterministic pick is returned untouched, so the journey always has a pick.
+    """
+    keys: list[str] = []
+    coros: list = []
+    if rec_flight and flight_pool:
+        keys.append("flight")
+        coros.append(recommend_flights(flight_pool, flight_ctx))
+    if rec_hotel and hotel_pool:
+        keys.append("hotel")
+        coros.append(recommend_hotels(hotel_pool, hotel_ctx))
+    if not coros:
+        return rec_flight, rec_hotel
+
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    picks = {"flight": rec_flight, "hotel": rec_hotel}
+    pools = {"flight": flight_pool, "hotel": hotel_pool}
+
+    for key, res in zip(keys, results):
+        if isinstance(res, Exception) or not res:
+            continue
+        pool = pools[key]
+        idx = res.get("recommended_index")
+        if not isinstance(idx, int) or not (0 <= idx < len(pool)):
+            continue
+        # Re-point is_recommended at the agent's pick across the whole pool.
+        for it in pool:
+            it["is_recommended"] = False
+        chosen = pool[idx]
+        chosen["is_recommended"] = True
+        chosen["ai_reason"]   = res.get("reason")
+        chosen["ai_pros"]     = res.get("pros")
+        chosen["ai_best_for"] = res.get("best_for")
+        # Tag the runner-up too, if the agent named one.
+        ru = res.get("runner_up_index")
+        if isinstance(ru, int) and 0 <= ru < len(pool) and ru != idx:
+            pool[ru]["ai_reason"] = res.get("runner_up_reason")
+        picks[key] = dict(chosen)
+
+    return picks["flight"], picks["hotel"]
 
 
 # ── Main handler ──────────────────────────────────────────────────────────────
@@ -621,6 +676,7 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
                     _flights.search, origin_s, dest_s, departure_date,
                     adults=body.travelers,
                     from_iata=from_iata, to_iata=to_iata,
+                    sort=budget_to_sort(safe_budget),   # budget → upstream provider sort
                     fallback={"flights": [], "resolved": False},
                 ))
             else:
@@ -696,6 +752,7 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
     _rec_bus:    dict | None = None
     _rec_train:  dict | None = None
     _rec_flight: dict | None = None
+    _rec_flight_pool: list[dict] = []   # the flight list the pick came from (for AI reasoning)
 
     for task_idx, (leg_idx, mode_type) in enumerate(live_meta):
         if task_idx >= len(transport_results):
@@ -717,10 +774,13 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
                         b["is_recommended"] = True
 
         elif mode_type == "flight":
-            flights = result.get("flights") or []
+            # Order the list by the budget tier's sort so it matches the recommendation.
+            flights = sort_flights(result.get("flights") or [], budget_to_sort(safe_budget) or "CHEAPEST")
+            result["flights"] = flights
             rec = _pick_recommended_flight(flights, safe_budget)
             if rec and not _rec_flight:
                 _rec_flight = rec
+                _rec_flight_pool = flights
                 for f in flights:
                     if f.get("flight_number") == rec.get("flight_number") and f.get("departure_time") == rec.get("departure_time"):
                         f["is_recommended"] = True
@@ -759,20 +819,44 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
     route_plan["has_real_data"] = any(leg.get("has_live_data") for leg in legs)
 
     _rec_hotel: dict | None = None
+    _hotel_pool: list[dict] = []
     if hotel_result and not isinstance(hotel_result, Exception):
-        ranked = rank_hotels(hotel_result.get("hotels") or [])
-        _rec_hotel = _pick_recommended_hotel(ranked, safe_budget)
+        _hotel_pool = rank_hotels(hotel_result.get("hotels") or [])
+        _rec_hotel = _pick_recommended_hotel(_hotel_pool, safe_budget)
         if _rec_hotel:
-            for h in ranked:
-                if h.get("name") == _rec_hotel.get("name"):
-                    h["is_recommended"] = True
+            for h in _hotel_pool:
+                h["is_recommended"] = (h.get("name") == _rec_hotel.get("name"))
+
+    # ── AI reasoning: pick the best flight + hotel and explain *why* ──────────
+    # Concurrent, advisory layer over the deterministic picks. Re-points each
+    # recommendation to the agent's choice and stamps ai_reason/ai_pros/ai_best_for.
+    _rec_flight, _rec_hotel = await _explain_picks(
+        _rec_flight, _rec_flight_pool,
+        {
+            "route": f"{body.origin} → {body.destination}",
+            "date": departure_date,
+            "passengers": body.travelers,
+            "budget": safe_budget,
+        },
+        _rec_hotel, _hotel_pool,
+        {
+            "destination": body.destination,
+            "checkin": checkin,
+            "checkout": checkout,
+            "adults": body.travelers,
+            "nights": body.stay_nights,
+            "budget": safe_budget,
+        },
+    )
+
+    if hotel_result and not isinstance(hotel_result, Exception):
         route_plan["destination_hotels"] = {
             "destination": body.destination,
             "source": hotel_result.get("source"),
             "checkin": checkin,
             "checkout": checkout,
             "nights": body.stay_nights,
-            "hotels": ranked[:20],
+            "hotels": _hotel_pool,   # full ranked list — no cap
             "top_pick": _rec_hotel,
         }
 
@@ -790,7 +874,19 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
     }
 
     # ── Build fastest/cheapest/balanced journey options ───────────────────────
-    route_plan["journey_options"] = _build_journey_options(route_plan, body.travelers)
+    journey_options = _build_journey_options(route_plan, body.travelers)
+    route_plan["journey_options"] = journey_options
+
+    # ── Reason over the options: trade-off narrative (Score → Reason → Recommend)
+    reasoning = build_journey_reasoning(
+        journey_options,
+        symbol=symbol,
+        hotel_per_night=live_costs.get("hotel_per_night"),
+    )
+    if reasoning:
+        route_plan["journey_reasoning"] = reasoning
+        # Surface the headline + insights on the recommendations block too.
+        route_plan["recommendations"]["reasoning"] = reasoning
 
     # ── Bundle a complete door-to-door all-train journey (if feasible) ────────
     train_journey = _build_train_journey_bundle(legs, body.travelers)
@@ -920,6 +1016,8 @@ def _option_block(c: dict, tag: str, label: str) -> dict:
         "duration_display": _fmt_duration(c["duration_min"]),
         "operator": c["operator"],
         "booking_url": c.get("booking_url"),
+        "departure_time": c.get("departure_time"),
+        "arrival_time": c.get("arrival_time"),
         "from_iata": c.get("from_iata"),
         "to_iata": c.get("to_iata"),
         "from_code": c.get("from_code"),
@@ -948,6 +1046,33 @@ def _build_journey_options(journey_result: dict, travelers: int) -> dict:
         elif mode == "flight":
             flight_items.extend(ld.get("flights") or [])
 
+    # ── Drop feeder / last-mile legs from the cross-mode comparison ───────────
+    # In a multi-hop journey (e.g. Paris→Delhi by flight + Delhi→Bhiwani by
+    # train) the cheap domestic feeder is NOT an alternative to the international
+    # main hop — pooling them would wrongly surface a ₹150 train as the cheapest
+    # *and* fastest whole journey. Any mode whose cheapest fare is a small
+    # fraction of the priciest mode's is a feeder, so exclude it.
+    _FEEDER_RATIO = 0.2
+
+    def _cheapest(pool: list[dict], fare_fn) -> int | None:
+        fares = [fare_fn(x) for x in pool]
+        fares = [f for f in fares if f and f > 0]
+        return min(fares) if fares else None
+
+    _mode_min = {
+        "flight": _cheapest(flight_items, lambda x: x.get("price_total")),
+        "train":  _cheapest(train_items,  lambda x: x.get("cheapest_fare")),
+        "bus":    _cheapest(bus_items,    lambda x: x.get("fare_discounted") or x.get("fare_original")),
+    }
+    _present = {m: v for m, v in _mode_min.items() if v}
+    if len(_present) > 1:
+        _top = max(_present.values())
+        for _m, _v in _present.items():
+            if _v < _top * _FEEDER_RATIO:
+                if   _m == "flight": flight_items = []
+                elif _m == "train":  train_items = []
+                elif _m == "bus":    bus_items = []
+
     candidates: list[dict] = []
 
     if flight_items:
@@ -960,6 +1085,8 @@ def _build_journey_options(journey_result: dict, travelers: int) -> dict:
             "operator": f.get("airline") or "Flight",
             "description": f"{f.get('airline', 'Flight')} {f.get('flight_number', '')}".strip(),
             "booking_url": f.get("booking_url"),
+            "departure_time": f.get("departure_time"),
+            "arrival_time": f.get("arrival_time"),
         })
 
     if train_items:
@@ -972,6 +1099,8 @@ def _build_journey_options(journey_result: dict, travelers: int) -> dict:
             "operator": t.get("train_name") or "Train",
             "description": f"{t.get('train_name', 'Train')} ({t.get('train_number', '')})".strip(" ()"),
             "booking_url": None,
+            "departure_time": t.get("departure_time"),
+            "arrival_time": t.get("arrival_time"),
         })
 
     if bus_items:
@@ -984,6 +1113,8 @@ def _build_journey_options(journey_result: dict, travelers: int) -> dict:
             "operator": b.get("operator") or "Bus",
             "description": f"{b.get('operator', 'Bus')} — {b.get('bus_type', '')}".strip(" —"),
             "booking_url": b.get("booking_url"),
+            "departure_time": b.get("departure"),
+            "arrival_time": b.get("arrival"),
         })
 
     if not candidates:
@@ -1037,6 +1168,8 @@ def _build_journey_options(journey_result: dict, travelers: int) -> dict:
                         f"{b.get('airline', '')} {b.get('flight_number', '')}".strip()
                     ),
                     "booking_url": b.get("booking_url"),
+                    "departure_time": b.get("departure") if sole_mode == "bus" else b.get("departure_time"),
+                    "arrival_time": b.get("arrival") if sole_mode == "bus" else b.get("arrival_time"),
                 }
 
             return {

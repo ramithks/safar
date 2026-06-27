@@ -9,11 +9,17 @@ Booking URL format (confirmed):
     &isow=true&isdm=true&lang=en-us&IsDoubleSeat=false&CCODE=IN&curr=INR&apptype=B2C
 """
 import asyncio
+import base64
 import logging
 import re
 import time
 import urllib.parse
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.padding import PKCS7
+
+from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
+from app.services.geo import is_domestic_iata
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,71 @@ _HEADERS = {
 _CABIN_CODE = {
     "economy": 0, "business": 1, "first": 2, "premium_economy": 3,
 }
+
+# ── Search token (TKN) handshake ─────────────────────────────────────────────
+# As of 2026-06 the AirBus_New search rejects requests without a valid TKN
+# ("TOKEN NOT VALID"). The EMT SPA mints one via a two-step call to its etoken
+# service, then passes it as payload.TKN. Reproduced from the flight-search
+# Angular bundle (chunk 732):
+#   1. POST etoken/UMS  (header ATK, body "{}")        → {ITK, b}  (both opaque)
+#   2. POST etoken/PSP  (header autk=enc("EMT|<static>|<b>|<ITK>"),
+#                        body {UserName:"EMT", ITK:enc(ITK), IP:enc(b)}) → {STK}
+# enc = AES-128-CBC(key=iv=encKeySrchV1), PKCS7, base64. STK is the TKN.
+_UMS_URL    = "https://gi.easemytrip.com/etm/api/etoken/UMS"
+_PSP_URL    = "https://gi.easemytrip.com/etm/api/etoken/PSP"
+_ENC_KEY    = b"hylW@zmEQdG@4Idr"   # encKeySrchV1 (key == iv)
+_ATK        = "c0ruxuOD/XqyNXB3kRAqvRUliyqhyFOOUwgDTCP1tLx09TRNEbblvRQLgfPz2ivf"
+_PSP_STATIC = "EMTWvggk6zYLVynBA56C3aNn4HLREMHV9bEP9Q"
+_TOKEN_TTL  = 120.0   # seconds; EMT rejects tokens well before 300s (a 176s-old
+                      # token returned "TOKEN NOT VALID" in prod), so keep our
+                      # cache window comfortably under that. A stale token is also
+                      # re-minted in-flight (see _do), so this is just to avoid a
+                      # predictable first-call rejection.
+
+# (token, fetched_at) — shared process-wide so the handshake runs ~once per TTL.
+_token_cache: tuple[str, float] | None = None
+
+
+def _enc_fsearch(value: str) -> str:
+    """EMT EncryptionFSearch: AES-128-CBC with key==iv==encKeySrchV1, base64."""
+    padder = PKCS7(128).padder()
+    data = padder.update(value.encode()) + padder.finalize()
+    enc = Cipher(algorithms.AES(_ENC_KEY), modes.CBC(_ENC_KEY)).encryptor()
+    return base64.b64encode(enc.update(data) + enc.finalize()).decode()
+
+
+def _invalidate_token() -> None:
+    global _token_cache
+    _token_cache = None
+
+
+async def _get_search_token(session: CurlAsyncSession) -> str | None:
+    """Return a valid search TKN, minting (and caching) one if needed."""
+    global _token_cache
+    if _token_cache and (time.monotonic() - _token_cache[1]) < _TOKEN_TTL:
+        return _token_cache[0]
+
+    r1 = await session.post(
+        _UMS_URL, headers={"Content-Type": "application/json", "ATK": _ATK},
+        data="{}", timeout=12,
+    )
+    j1 = r1.json()
+    itk, ip = j1.get("ITK"), j1.get("b")
+    if not itk or not ip:
+        raise ScraperBlocked(f"UMS no ITK/b: {str(j1)[:80]}")
+
+    autk = _enc_fsearch(f"EMT|{_PSP_STATIC}|{ip}|{itk}")
+    r2 = await session.post(
+        _PSP_URL, headers={"Content-Type": "application/json", "autk": autk},
+        json={"UserName": "EMT", "ITK": _enc_fsearch(itk), "IP": _enc_fsearch(ip)},
+        timeout=12,
+    )
+    stk = (r2.json() or {}).get("STK")
+    if not stk:
+        raise ScraperBlocked(f"PSP no STK: {str(r2.text)[:80]}")
+
+    _token_cache = (stk, time.monotonic())
+    return stk
 
 _AUTOSUGGEST_URL = "https://www.easemytrip.com/api/Flight/GetAutoSuggestNew"
 _AUTOSUGGEST_HEADERS = {
@@ -66,13 +137,17 @@ async def _resolve_iata_city(iata: str) -> tuple[str, str]:
     if key in _CITY_CACHE:
         return _CITY_CACHE[key]
 
-    try:
-        async with CurlAsyncSession(impersonate="chrome") as s:
+    async def _do(proxy):
+        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _AUTOSUGGEST_URL, headers=_AUTOSUGGEST_HEADERS,
                 json={"Prefix": iata}, timeout=8,
             )
-        items = r.json() if isinstance(r.json(), list) else []
+        return r.json()
+
+    try:
+        parsed = await with_proxy_fallback("emt_autosuggest", _do)
+        items = parsed if isinstance(parsed, list) else []
         for item in items:
             city_field = item.get("City", "")   # e.g. "New Delhi(DEL)"
             if f"({key})" in city_field:
@@ -142,12 +217,15 @@ async def search_flights(
     cabin_class: str = "economy",
     nonstop_only: bool = False,
 ) -> list[dict]:
-    """Search one-way domestic flights on EaseMyTrip."""
+    """Search one-way flights on EaseMyTrip (domestic or international)."""
     cabin_code = _CABIN_CODE.get(cabin_class.lower(), 0)
     ts = int(time.time() * 1000)
+    # Previously hardcoded True, which broke every international route. Detect from
+    # the airport codes; unknown codes default to domestic (the common case).
+    is_domestic = is_domestic_iata(from_airport, to_airport)
 
-    # No TKN needed — including it causes prices to be hidden at bundle level.
-    # Prices are at segment level (j[0].s[i].TF) regardless of TKN.
+    # TKN is required (see _get_search_token); filled in per-attempt inside _do
+    # so a stale/rejected token can be re-minted on the proxy retry.
     payload = {
         "org": from_airport.upper(),
         "dept": to_airport.upper(),
@@ -158,7 +236,7 @@ async def search_flights(
         "arrDT": "",
         "userid": "",
         "IsDoubelSeat": False,
-        "isDomestic": True,
+        "isDomestic": is_domestic,
         "isOneway": True,
         "airline": "undefined",
         "Cabin": cabin_code,
@@ -177,20 +255,43 @@ async def search_flights(
         "IpAddress": "",
         "LoginKey": "",
         "UUID": "",
+        "TKN": "",
         "FareTypeUI": 0,
     }
 
+    async def _do(proxy):
+        # "TOKEN NOT VALID" is a stale/expired token, NOT an IP block — re-mint
+        # and retry once on the *same* connection (near-instant on the direct
+        # path) before with_proxy_fallback escalates to the slow proxy retries.
+        # Jumping straight to proxy would re-run the UMS+PSP handshake over the
+        # proxy and burn the whole 25s budget before the fresh-token search lands.
+        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+            for token_attempt in range(2):
+                payload["TKN"] = await _get_search_token(s)
+                r = await s.post(
+                    _BASE,
+                    headers=_HEADERS,
+                    params={"_": ts, "ngsw-bypass": "true"},
+                    json=payload,
+                    timeout=25,
+                )
+                r.raise_for_status()
+                j = r.json()
+                # A valid search returns a JSON object. A bare string
+                # ("TOKEN NOT VALID", block bodies) means the token was rejected.
+                if isinstance(j, str):
+                    _invalidate_token()         # force a fresh mint next call
+                    if token_attempt == 0:
+                        continue                # retry once on this connection
+                    # A freshly minted token was also rejected → treat as a real
+                    # block so with_proxy_fallback rotates to a proxy exit IP.
+                    raise ScraperBlocked(f"AirBus_New string response: {j[:60]}")
+                return j
+
     try:
-        async with CurlAsyncSession(impersonate="chrome") as s:
-            r = await s.post(
-                _BASE,
-                headers=_HEADERS,
-                params={"_": ts, "ngsw-bypass": "true"},
-                json=payload,
-                timeout=25,
-            )
-        r.raise_for_status()
-        raw = r.json()
+        # Cap the retry loop at 25s (< FlightService's 30s merge budget) so this
+        # provider's proxy retries can never time out the shared gather.
+        raw = await asyncio.wait_for(with_proxy_fallback("emt_flights", _do), timeout=25.0)
         listing_url = await _build_listing_url(from_airport, to_airport, depart_date, adults)
         flights = _extract_flights(raw, from_airport, to_airport, depart_date, adults, listing_url)
         if nonstop_only:

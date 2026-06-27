@@ -7,12 +7,15 @@ IATA resolution: EaseMyTrip autosuggest API.
   Response City field format: "New Delhi(DEL)" → extract 3-letter code.
 No hardcoded values — cache populated on first lookup.
 """
+import asyncio
 import logging
 import re as _re
 import httpx
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
 from app.config import settings
+from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
+from app.services.geo import iata_of as geo_iata, country_of, country_of_iata
 
 logger = logging.getLogger(__name__)
 
@@ -39,18 +42,45 @@ def _build_headers() -> dict:
 _IATA_CACHE: dict[str, str] = {}
 
 
+def _country_matches(city: str, code: str) -> bool:
+    """
+    True unless the candidate airport is in a *different* known country than the
+    city. Rejects cross-country garbage (e.g. 'Kasol' → KUL/Kuala Lumpur) while
+    giving the benefit of the doubt when either side's country is unknown.
+    """
+    expected = country_of(city)
+    if not expected:
+        return True                      # no expectation → accept
+    actual = country_of_iata(code)
+    if actual is None:
+        return True                      # unknown airport country → accept
+    return actual == expected
+
+
 async def resolve_iata(city: str) -> str | None:
     """
-    Resolve city name → IATA code via EaseMyTrip autosuggest API.
-    Response City field format: "New Delhi(DEL)" — IATA extracted from parentheses.
-    Results cached in-memory after first call.
+    Resolve city name → IATA code (the single shared flight-location resolver).
+
+    Order: in-memory cache → static geo table (instant, offline, incl. nearest
+    airport for airport-less towns) → EaseMyTrip autosuggest → Gotogate
+    searchLocations. Every live candidate is country-validated against the city's
+    known country so a confident wrong-country match can never win. The static
+    table removes the single point of failure that once caused 'no flights'.
+    Results (including misses) cached in-memory.
     """
     key = city.lower().strip()
     if key in _IATA_CACHE:
         return _IATA_CACHE[key]
 
-    try:
-        async with CurlAsyncSession(impersonate="chrome") as s:
+    static = geo_iata(city)
+    if static:
+        _IATA_CACHE[key] = static
+        logger.info("[flights] IATA '%s' → %s (static)", city, static)
+        return static
+
+    # ── Fallback source 1: EaseMyTrip autosuggest (validated) ────────────────
+    async def _do(proxy):
+        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _EMT_AUTOSUGGEST,
                 headers={
@@ -64,29 +94,40 @@ async def resolve_iata(city: str) -> str | None:
                 json={"Prefix": city},
                 timeout=8,
             )
-        items = r.json() if isinstance(r.json(), list) else []
-        for item in items:
-            city_field = item.get("City") or ""   # e.g. "New Delhi(DEL)"
-            country    = (item.get("Country") or "").lower()
-            m = _re.search(r'\(([A-Z]{3})\)', city_field)
-            if m:
+        return r.json()
+
+    try:
+        parsed = await with_proxy_fallback("flights_booking", _do)
+        items = parsed if isinstance(parsed, list) else []
+        # Prefer Indian airports, then any — but only when the country is consistent.
+        for india_only in (True, False):
+            for item in items:
+                city_field = item.get("City") or ""   # e.g. "New Delhi(DEL)"
+                country    = (item.get("Country") or "").lower()
+                if india_only and country not in ("india", "in"):
+                    continue
+                m = _re.search(r'\(([A-Z]{3})\)', city_field)
+                if not m:
+                    continue
                 code = m.group(1)
-                # Prefer Indian airports; fall back to any
-                if country in ("india", "in"):
-                    _IATA_CACHE[key] = code
-                    logger.info("[flights] IATA '%s' → %s", city, code)
-                    return code
-        # Second pass: accept any country
-        for item in items:
-            city_field = item.get("City") or ""
-            m = _re.search(r'\(([A-Z]{3})\)', city_field)
-            if m:
-                code = m.group(1)
+                if not _country_matches(city, code):
+                    continue
                 _IATA_CACHE[key] = code
-                logger.info("[flights] IATA '%s' → %s", city, code)
+                logger.info("[flights] IATA '%s' → %s (emt)", city, code)
                 return code
     except Exception as e:
         logger.warning("[flights] IATA autocomplete '%s': %s", city, e)
+
+    # ── Fallback source 2: Gotogate searchLocations (validated) ──────────────
+    try:
+        from app.services.gotogate.flights import resolve_iata as gotogate_resolve
+        code = await gotogate_resolve(city)
+        if code and _country_matches(city, code):
+            _IATA_CACHE[key] = code
+            logger.info("[flights] IATA '%s' → %s (gotogate)", city, code)
+            return code
+    except Exception as e:
+        logger.warning("[flights] gotogate IATA fallback '%s': %s", city, e)
 
     _IATA_CACHE[key] = None
     return None
@@ -106,8 +147,10 @@ async def search_flights(
     sort: str = "CHEAPEST",
 ) -> list[dict]:
     """Search one-way flights. Returns normalized list sorted by sort param."""
-    try:
-        async with CurlAsyncSession(impersonate="chrome") as s:
+    async def _do(proxy):
+        # Tighter per-request timeout (12s) so several fresh-IP proxy retries fit
+        # inside this scraper's own budget instead of hanging on one slow attempt.
+        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.get(
                 _BASE,
                 headers=_build_headers(),
@@ -124,10 +167,26 @@ async def search_flights(
                     "aid": settings.booking_affiliate_id,
                     "enableVI": "1",
                 },
-                timeout=20,
+                timeout=12,
             )
         r.raise_for_status()
-        offers = r.json().get("flightOffers") or []
+        j = r.json()
+        # A genuine "no flights" response still carries the flightOffers key (empty
+        # list). Its absence means a WAF/error body, not real emptiness — treat as
+        # a block so the proxy retry fires and it isn't reported as "0 results".
+        if "flightOffers" not in j:
+            raise ScraperBlocked("flightOffers key missing")
+        return j
+
+    try:
+        # 4 fresh-IP attempts for the brittle WAF, but cap the whole retry loop at
+        # 25s (< the 30s FlightService merge budget) so Booking's retries can never
+        # time out the shared gather and zero EMT/Gotogate too.
+        raw = await asyncio.wait_for(
+            with_proxy_fallback("flights_booking", _do, proxy_attempts=4),
+            timeout=25.0,
+        )
+        offers = raw.get("flightOffers") or []
         return [_normalise_offer(o, depart_date, adults) for o in offers]
     except Exception as e:
         logger.warning("[flights_booking] %s→%s on %s: %s", from_airport, to_airport, depart_date, e)

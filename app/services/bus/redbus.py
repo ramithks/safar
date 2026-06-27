@@ -8,6 +8,8 @@ import logging
 from datetime import datetime
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
+from app.services.scraper_proxy import with_proxy_fallback
+
 logger = logging.getLogger(__name__)
 
 _BASE = "https://www.redbus.in"
@@ -41,8 +43,8 @@ async def search_city(name: str) -> list[dict]:
     Resolve a city name to RedBus city/area IDs.
     Returns [{id, name, type, boarding_points: [{id, name}]}]
     """
-    try:
-        async with CurlAsyncSession(impersonate="chrome") as s:
+    async def _do(proxy):
+        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.get(
                 f"{_BASE}/rpw/api/citySuggestion",
                 headers=_HEADERS,
@@ -50,7 +52,10 @@ async def search_city(name: str) -> list[dict]:
                 timeout=20,
             )
         r.raise_for_status()
-        docs = r.json().get("response", {}).get("docs", [])
+        return r.json()
+
+    try:
+        docs = (await with_proxy_fallback("redbus", _do)).get("response", {}).get("docs", [])
         return [
             {
                 "id": d["ID"],
@@ -98,8 +103,8 @@ async def search_buses(
     except ValueError:
         doj = date
 
-    try:
-        async with CurlAsyncSession(impersonate="chrome") as s:
+    async def _do(proxy):
+        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 f"{_BASE}/rpw/api/searchResults",
                 headers=_HEADERS,
@@ -115,7 +120,10 @@ async def search_buses(
                 timeout=25,
             )
         r.raise_for_status()
-        data = r.json().get("data", {})
+        return r.json()
+
+    try:
+        data = (await with_proxy_fallback("redbus", _do)).get("data", {})
         inventories = data.get("inventories") or []
         # Build a search-level booking URL for this route+date
         search_url = _build_search_url(from_city_id, to_city_id, doj, from_city_name, to_city_name)

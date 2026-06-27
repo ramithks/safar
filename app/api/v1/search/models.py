@@ -10,8 +10,21 @@ class FlightSearchRequest(BaseModel):
     adults: int = Field(1, ge=1, le=9)
     cabin_class: str = Field("ECONOMY", examples=["ECONOMY", "BUSINESS", "FIRST"])
     sort: str = Field("CHEAPEST", description="CHEAPEST | FASTEST | BEST")
+    budget: Optional[str] = Field(
+        None,
+        description="low | mid | high — when set, dictates sort (low→cheapest, mid→best, high→fastest) and overrides `sort`.",
+    )
+    from_iata: Optional[str] = Field(
+        None,
+        description="Pre-resolved origin IATA from /autocomplete/airports — skips re-resolution.",
+        examples=["DEL"],
+    )
+    to_iata: Optional[str] = Field(
+        None,
+        description="Pre-resolved destination IATA from /autocomplete/airports — skips re-resolution.",
+        examples=["GOI"],
+    )
     nonstop_only: bool = False
-    limit: int = Field(20, ge=1, le=50)
 
 
 class HotelSearchRequest(BaseModel):
@@ -22,8 +35,13 @@ class HotelSearchRequest(BaseModel):
     adults: int = Field(2, ge=1, le=9)
     children: int = Field(0, ge=0, le=4)
     budget: str = Field("mid", description="low | mid | high")
+    travel_type: Optional[str] = Field(
+        None,
+        description="solo | couple | friends | family. Drives property type "
+        "(solo+low→hostels, couple/family→no hostels, high→resorts/hotels). "
+        "Derived from adults when omitted.",
+    )
     sort: str = Field("recommended", description="recommended | price_asc | price_desc | rating")
-    limit: int = Field(20, ge=1, le=50)
 
 
 class BusSearchRequest(BaseModel):

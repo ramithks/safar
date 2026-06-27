@@ -157,3 +157,8 @@ cython_debug/
 .claude/
 coolify.env
 .env.bak.492016
+
+# Generated scraper/route evaluation artifacts (regenerate via tests/)
+result_test.json
+result_gold.json
+scraper_health.json
