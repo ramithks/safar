@@ -180,6 +180,21 @@ class FlightService:
         # provider for upstream). sort_flights sinks unpriced flights to the bottom.
         merged = sort_flights(merged, eff_sort)
 
+        # Every provider returns price fields as the fare for ALL searched adults
+        # (Booking/Gotogate sum per-traveler prices; EMT fares scale with px). The
+        # app shows these per person ("/person"), so normalise to a per-person fare
+        # here — the single point where the passenger count is known. Keeping the
+        # existing keys (no new fields) means already-shipped app versions render
+        # the correct per-head price without any client change. Booking URLs still
+        # carry the full party via their own `adults` param.
+        pax = max(adults, 1)
+        if pax > 1:
+            for f in merged:
+                for key in ("price_total", "price_base_fare", "price_tax"):
+                    val = f.get(key)
+                    if val:
+                        f[key] = round(val / pax)
+
         return {
             "flights": merged,
             "from_iata": from_iata,
