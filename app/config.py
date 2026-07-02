@@ -71,7 +71,8 @@ class Settings(BaseSettings):
     # Bulk Explore Seeder — shared secret for POST /api/v1/bulk-generate-explore
     bulk_explore_api_key: Optional[str] = None
 
-    # Proxy — used as fallback when Instagram rate-limits or blocks direct requests
+    # Rotating proxy — Instagram requests go through this FIRST so Instagram
+    # never sees (and blocks) the server's own IP. Direct is the fallback.
     # Format: http://user:pass@host:port/
     instagram_proxy_url: Optional[str] = None
 

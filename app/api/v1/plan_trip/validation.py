@@ -18,6 +18,10 @@ from difflib import SequenceMatcher
 
 _MAX_SAME_CATEGORY = 2
 
+# Hard ceiling on activities per day — 4+ places in one day isn't realistically
+# doable, and users flagged overpacked days. Prompt asks for 2-3; this enforces it.
+_MAX_ACTIVITIES_PER_DAY = 3
+
 # Suffixes that indicate a "revisit" — normalized away before dup comparison
 _REVISIT_TOKENS = frozenset({
     "revisit", "again", "repeat", "return", "part 2", "second visit",
@@ -177,9 +181,9 @@ def trip_health_check(days: list[dict]) -> dict:
 
         # Activity overload
         non_dup = [a for a in acts if not a.get("_duplicate")]
-        if len(non_dup) > 4:
+        if len(non_dup) > _MAX_ACTIVITIES_PER_DAY:
             issues.append(
-                f"Day {day.get('day')}: {len(non_dup)} activities — max 4 recommended"
+                f"Day {day.get('day')}: {len(non_dup)} activities — max {_MAX_ACTIVITIES_PER_DAY} recommended"
             )
 
         # Closed attractions
@@ -243,8 +247,8 @@ def enforce_category_diversity(days: list[dict]) -> int:
 
 def auto_fix_trip(days: list[dict]) -> int:
     """
-    Remove flagged duplicates, cap days at 4 activities, then enforce category diversity.
-    Returns total count of activities removed.
+    Remove flagged duplicates, cap days at _MAX_ACTIVITIES_PER_DAY activities,
+    then enforce category diversity. Returns total count of activities removed.
     """
     removed = 0
     for day in days:
@@ -252,10 +256,10 @@ def auto_fix_trip(days: list[dict]) -> int:
         deduped = [a for a in acts if not a.pop("_duplicate", False)]
         removed += len(acts) - len(deduped)
 
-        if len(deduped) > 4:
+        if len(deduped) > _MAX_ACTIVITIES_PER_DAY:
             deduped.sort(key=lambda a: a.get("confidence_score", 0.5), reverse=True)
-            removed += len(deduped) - 4
-            deduped = deduped[:4]
+            removed += len(deduped) - _MAX_ACTIVITIES_PER_DAY
+            deduped = deduped[:_MAX_ACTIVITIES_PER_DAY]
 
         day["activities"] = deduped
 

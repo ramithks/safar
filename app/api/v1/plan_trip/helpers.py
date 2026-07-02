@@ -171,6 +171,17 @@ def clean_city(name: str) -> str:
     return name.split(",")[0].strip() if name else name
 
 
+def stable_seed(*parts) -> int:
+    """
+    Deterministic 31-bit seed from request parameters, so identical filters
+    produce the identical Gemini output across processes and restarts
+    (Python's built-in hash() is salted per process — unusable for this).
+    """
+    import hashlib
+    key = "|".join(str(p).lower().strip() for p in parts)
+    return int(hashlib.md5(key.encode()).hexdigest()[:8], 16) & 0x7FFFFFFF
+
+
 def build_date_context(start_date: str | None, end_date: str | None, destination: str | None) -> str:
     if not start_date:
         return ""
@@ -199,7 +210,9 @@ def compute_trip_intelligence(itinerary: dict, budget: str, days: int, ceiling_p
     day_plans = itinerary.get("days") or []
     acts_per_day = [len([a for a in (d.get("activities") or []) if a.get("type") != "hotel"]) for d in day_plans]
     avg_acts = sum(acts_per_day) / max(len(day_plans), 1)
-    pace = "Relaxed" if avg_acts <= 2.5 else "Moderate" if avg_acts <= 4.5 else "Packed"
+    # Days are capped at 3 activities, so calibrate: ≤2.2 avg is relaxed,
+    # up to the cap is moderate, anything that slipped past the cap is packed.
+    pace = "Relaxed" if avg_acts <= 2.2 else "Moderate" if avg_acts <= 3.0 else "Packed"
 
     total_dist, dist_count = 0.0, 0
     for d in day_plans:

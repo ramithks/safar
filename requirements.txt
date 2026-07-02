@@ -17,8 +17,9 @@ pydantic==2.10.4
 python-dotenv==1.0.1
 
 # Video download (fallback chain)
-yt-dlp==2025.1.15
-gallery-dl==1.28.2
+# Keep these fresh — Instagram breaks old extractor versions within months.
+yt-dlp==2026.6.9
+gallery-dl==1.32.5
 
 # Video processing
 scenedetect[opencv]==0.6.4

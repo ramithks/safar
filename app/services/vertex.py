@@ -102,6 +102,7 @@ async def vertex_generate(
     model: str = MODEL_NAME,
     response_mime_type: str | None = None,
     temperature: float | None = None,
+    seed: int | None = None,
     max_output_tokens: int | None = None,
     timeout: float = 120.0,
 ) -> str:
@@ -128,6 +129,8 @@ async def vertex_generate(
         gc["responseMimeType"] = response_mime_type
     if temperature is not None:
         gc["temperature"] = temperature
+    if seed is not None:
+        gc["seed"] = seed
     if max_output_tokens:
         gc["maxOutputTokens"] = max_output_tokens
     body["generationConfig"] = gc

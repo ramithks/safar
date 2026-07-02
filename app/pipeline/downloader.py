@@ -1,15 +1,18 @@
 """
 Video downloader with a fallback chain (no auth/cookies required):
-  1. yt-dlp         — most reliable; fast-fails on explicit login-required errors
-  2. embed-scraper  — pure httpx, scrapes Instagram's embed page for the CDN video URL
-  3. gallery-dl     — different HTTP extraction path; runs with a hard timeout
+  1. yt-dlp          — most reliable; fast-fails on explicit login-required errors
+  2. embed-scraper   — pure httpx, scrapes Instagram's embed page for the CDN video URL
+  3. graphql-scraper — Instagram's public GraphQL endpoint (PolarisPostActionLoadPostQuery)
+  4. gallery-dl      — different HTTP extraction path; runs with a hard timeout
 
-Each downloader is first attempted WITHOUT a proxy.
-If the error is a 429 / login-required / connection-blocked, the same downloader
-is immediately retried WITH the rotating proxy (INSTAGRAM_PROXY_URL env var).
+PROXY-FIRST: when INSTAGRAM_PROXY_URL is configured, every downloader goes
+through the rotating proxy first so Instagram never sees (and rate-limits/blocks)
+the server's own IP. A direct attempt is only the fallback for when the proxy
+itself is down or exhausted.
 """
 import os
 import re
+import json
 import time
 import random
 import asyncio
@@ -52,39 +55,22 @@ def _random_ua() -> str:
 
 # ─── Error classification ────────────────────────────────────────────────────────
 
-# Strings in error messages that indicate Instagram is blocking/rate-limiting.
-# These trigger a proxy retry rather than waiting or skipping to the next library.
-_PROXY_TRIGGER_HINTS = (
-    "login required",
-    "login page",
-    "rate-limit reached or login required",
-    "use --cookies",
-    "netrc",
-    "429",
-    "too many requests",
-    "not available",
-    "connection refused",
-    "connection reset",
-    "remotedisconnected",
-    "ssl",
-)
-
-
-def _should_use_proxy(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(hint in msg for hint in _PROXY_TRIGGER_HINTS)
-
-
 def _is_auth_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(h in msg for h in ("login required", "login page", "use --cookies", "netrc"))
 
 
 class DownloadError(Exception):
-    """Raised when all downloaders have failed."""
-    def __init__(self, message: str, retryable: bool = False):
+    """Raised when all downloaders have failed.
+
+    fatal=True means the failure is definitive for the post itself (e.g. it has
+    no video at all) — the fallback chain stops immediately instead of burning
+    time on downloaders that cannot succeed either.
+    """
+    def __init__(self, message: str, retryable: bool = False, fatal: bool = False):
         super().__init__(message)
         self.retryable = retryable
+        self.fatal = fatal
 
 
 class DownloadResult:
@@ -297,6 +283,95 @@ def _embed_scrape_download(url: str, output_dir: str, proxy: Optional[str] = Non
     return DownloadResult(file_path=output_path, caption=caption)
 
 
+# ─── GraphQL scraper (Instagram's public post query, no cookies) ────────────────
+
+_IG_APP_ID = "936619743392459"                       # instagram.com web app id
+_IG_GRAPHQL_DOC_ID = "8845758582119845"              # PolarisPostActionLoadPostQueryQuery
+
+
+def _graphql_download(url: str, output_dir: str, proxy: Optional[str] = None) -> DownloadResult:
+    """
+    Fetch the post via Instagram's public GraphQL endpoint — the same query the
+    web client issues for logged-out users. Works for public posts; also tells
+    us definitively when a post has no video (image/carousel post).
+    """
+    shortcode = _extract_shortcode(url)
+    if not shortcode:
+        raise DownloadError("graphql: could not extract shortcode", retryable=False)
+
+    headers = {
+        "User-Agent": _random_ua(),
+        "Accept": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-IG-App-ID": _IG_APP_ID,
+        "X-FB-Friendly-Name": "PolarisPostActionLoadPostQueryQuery",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://www.instagram.com",
+        "Referer": f"https://www.instagram.com/reel/{shortcode}/",
+    }
+    payload = {
+        "variables": json.dumps({
+            "shortcode": shortcode,
+            "fetch_tagged_user_count": None,
+            "hoisted_comment_id": None,
+            "hoisted_reply_id": None,
+        }),
+        "doc_id": _IG_GRAPHQL_DOC_ID,
+    }
+
+    client_kwargs: dict = {"timeout": 30, "follow_redirects": True}
+    if proxy:
+        client_kwargs["proxy"] = proxy
+
+    with httpx.Client(**client_kwargs) as client:
+        resp = client.post("https://www.instagram.com/graphql/query", data=payload, headers=headers)
+
+    if resp.status_code in (401, 403, 429):
+        raise DownloadError(f"graphql: HTTP {resp.status_code} (blocked)", retryable=True)
+    if resp.status_code != 200:
+        raise DownloadError(f"graphql: HTTP {resp.status_code}", retryable=True)
+
+    try:
+        media = (resp.json().get("data") or {}).get("xdt_shortcode_media") or {}
+    except Exception:
+        raise DownloadError("graphql: non-JSON response (likely blocked)", retryable=True)
+
+    if not media:
+        raise DownloadError("graphql: no media in response (private or deleted post?)", retryable=True)
+    if not media.get("is_video"):
+        raise DownloadError("This Instagram post is not a video (image post)", retryable=False, fatal=True)
+
+    video_url = media.get("video_url")
+    if not video_url:
+        raise DownloadError("graphql: media has no video_url", retryable=True)
+
+    caption: Optional[str] = None
+    try:
+        edges = (media.get("edge_media_to_caption") or {}).get("edges") or []
+        if edges:
+            caption = edges[0]["node"]["text"]
+    except Exception:
+        pass
+    duration = media.get("video_duration")
+
+    output_path = os.path.join(output_dir, "video.mp4")
+    logger.info(f"graphql: downloading CDN video for {shortcode}")
+
+    dl_kwargs: dict = {"timeout": 120, "follow_redirects": True,
+                       "headers": {"User-Agent": headers["User-Agent"]}}
+    if proxy:
+        dl_kwargs["proxy"] = proxy
+
+    with httpx.Client(**dl_kwargs) as client:
+        with client.stream("GET", video_url) as stream:
+            stream.raise_for_status()
+            with open(output_path, "wb") as fh:
+                for chunk in stream.iter_bytes(chunk_size=65536):
+                    fh.write(chunk)
+
+    return DownloadResult(file_path=output_path, duration_seconds=duration, caption=caption)
+
+
 # ─── gallery-dl (with hard timeout) ─────────────────────────────────────────────
 
 _GALLERY_DL_TIMEOUT = 60  # seconds; abort if stalled on 429 waits
@@ -366,10 +441,13 @@ def _gallerydl_download(url: str, output_dir: str, proxy: Optional[str] = None) 
 
 # ─── Fallback chain ─────────────────────────────────────────────────────────────
 
+# (label, module attribute name) — resolved via globals() at call time so
+# unittest.mock.patch on the module attribute affects the chain.
 _DOWNLOADERS = [
-    ("yt-dlp", _ytdlp_download),
-    ("embed-scraper", _embed_scrape_download),
-    ("gallery-dl", _gallerydl_download),
+    ("yt-dlp", "_ytdlp_download"),
+    ("embed-scraper", "_embed_scrape_download"),
+    ("graphql", "_graphql_download"),
+    ("gallery-dl", "_gallerydl_download"),
 ]
 
 
@@ -384,82 +462,78 @@ def _attempt(name: str, fn, url: str, output_dir: str, proxy: Optional[str]) -> 
     return result
 
 
+def _try_downloader(name: str, fn, url: str, output_dir: str,
+                    proxy: Optional[str], label: str) -> DownloadResult:
+    """
+    Run one downloader under a single proxy mode, with retries for retryable
+    errors. Returns a DownloadResult or raises the last error.
+    Fatal errors (definitive verdicts about the post itself) propagate as-is.
+    """
+    last: Optional[Exception] = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            logger.info(f"[{name}] {label} attempt {attempt + 1} for {url}")
+            result = _attempt(name, fn, url, output_dir, proxy=proxy)
+            logger.info(f"[{name}] success ({label}): {result.file_path}")
+            return result
+        except DownloadError as exc:
+            if exc.fatal:
+                logger.warning(f"[{name}] fatal ({label}): {exc}")
+                raise
+            last = exc
+            if not exc.retryable:
+                logger.warning(f"[{name}] non-retryable ({label}): {exc}")
+                break
+        except Exception as exc:
+            last = exc
+            if _is_auth_error(exc):
+                logger.warning(f"[{name}] auth error ({label}): {exc}")
+                break
+            logger.warning(f"[{name}] {label} attempt {attempt + 1} unexpected error: {exc}")
+
+        if attempt < MAX_RETRIES:
+            delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+            logger.warning(f"[{name}] {label} attempt {attempt + 1} failed, retry in {delay}s: {last}")
+            time.sleep(delay)
+
+    assert last is not None
+    raise last
+
+
 def download_video(url: str, output_dir: str) -> DownloadResult:
     """
     For each downloader:
-      1. Try WITHOUT proxy (with jitter delay + UA rotation).
-      2. If 429 / login-required / connection blocked → immediately retry WITH proxy.
-      3. Move to next downloader if both attempts fail.
+      1. Try WITH the rotating proxy first (if configured) — Instagram
+         rate-limits/blocks server IPs fast; the proxy exists precisely so
+         Instagram never sees our own IP.
+      2. Fall back to a direct attempt (proxy down/exhausted).
+      3. Move to the next downloader if both modes fail.
 
-    Raises DownloadError if all downloaders × both proxy modes fail.
+    Raises DownloadError if all downloaders × both modes fail; the message
+    carries every downloader's last error for debugging.
     """
     os.makedirs(output_dir, exist_ok=True)
     proxy = _get_proxy_url()
-    last_error: Optional[Exception] = None
+    modes = [("proxy", proxy), ("direct", None)] if proxy else [("direct", None)]
+    failures: dict[str, str] = {}   # per-downloader last error, for the final report
 
-    for name, fn in _DOWNLOADERS:
-        # ── Pass 1: no proxy ───────────────────────────────────────────────────
-        direct_error: Optional[Exception] = None
-        for attempt in range(MAX_RETRIES + 1):
+    for name, fn_attr in _DOWNLOADERS:
+        fn = globals()[fn_attr]
+        for label, mode_proxy in modes:
             try:
-                logger.info(f"[{name}] direct attempt {attempt + 1} for {url}")
-                result = _attempt(name, fn, url, output_dir, proxy=None)
-                logger.info(f"[{name}] success (direct): {result.file_path}")
-                return result
+                return _try_downloader(name, fn, url, output_dir, mode_proxy, label)
             except DownloadError as exc:
-                direct_error = exc
-                last_error = exc
-                if not exc.retryable:
-                    logger.warning(f"[{name}] non-retryable: {exc}")
-                    break
-                if attempt < MAX_RETRIES:
-                    delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
-                    logger.warning(f"[{name}] direct attempt {attempt + 1} failed, retry in {delay}s: {exc}")
-                    time.sleep(delay)
-                else:
-                    logger.warning(f"[{name}] direct attempts exhausted: {exc}")
+                if exc.fatal:
+                    # Definitive verdict about the post itself (e.g. no video) —
+                    # no other downloader or mode can succeed, stop the chain.
+                    raise
+                failures[name] = str(exc)
             except Exception as exc:
-                direct_error = exc
-                last_error = exc
-                if _is_auth_error(exc):
-                    logger.warning(f"[{name}] auth error (direct): {exc}")
-                    break
-                logger.warning(f"[{name}] direct attempt {attempt + 1} unexpected error: {exc}")
-                if attempt < MAX_RETRIES:
-                    delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
-                    time.sleep(delay)
+                failures[name] = str(exc)
 
-        # ── Pass 2: proxy fallback (only if proxy is configured and error warrants it) ──
-        if proxy and direct_error and _should_use_proxy(direct_error):
-            logger.info(f"[{name}] switching to proxy due to: {direct_error}")
-            for attempt in range(MAX_RETRIES + 1):
-                try:
-                    logger.info(f"[{name}] proxy attempt {attempt + 1} for {url}")
-                    result = _attempt(name, fn, url, output_dir, proxy=proxy)
-                    logger.info(f"[{name}] success (proxy): {result.file_path}")
-                    return result
-                except DownloadError as exc:
-                    last_error = exc
-                    if not exc.retryable:
-                        logger.warning(f"[{name}] proxy non-retryable: {exc}")
-                        break
-                    if attempt < MAX_RETRIES:
-                        delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
-                        logger.warning(f"[{name}] proxy attempt {attempt + 1} failed, retry in {delay}s: {exc}")
-                        time.sleep(delay)
-                    else:
-                        logger.warning(f"[{name}] proxy attempts exhausted: {exc}")
-                except Exception as exc:
-                    last_error = exc
-                    logger.warning(f"[{name}] proxy attempt {attempt + 1} unexpected error: {exc}")
-                    if attempt < MAX_RETRIES:
-                        delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
-                        time.sleep(delay)
-        elif proxy and direct_error:
-            logger.debug(f"[{name}] error does not warrant proxy retry: {direct_error}")
-
+    detail = " | ".join(f"{n}: {e}" for n, e in failures.items()) or "no downloaders ran"
     raise DownloadError(
-        f"All downloaders failed. Last error: {last_error}",
+        f"All downloaders failed. {detail}",
         retryable=True,
     )
 

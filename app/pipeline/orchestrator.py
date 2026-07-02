@@ -547,6 +547,8 @@ def _build_summary(timeline: list[LocationSegment]) -> ReelSummary:
 
 def _classify_download_error(message: str) -> str:
     msg = message.lower()
+    if "not a video" in msg:
+        return "REEL_NO_VIDEO"
     if "private" in msg or "login" in msg or "authentication" in msg:
         return "REEL_ACCESS_DENIED"
     if "not found" in msg or "404" in msg or "does not exist" in msg:
