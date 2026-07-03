@@ -30,6 +30,7 @@ from .helpers import (
     rank_hotels,
     with_retry,
     clean_city,
+    stable_seed,
 )
 from .validation import validate_route
 
@@ -85,8 +86,12 @@ CRITICAL RULES:
 5. Cab/shared_cab/auto/walk: needs_live_search=false.
 6. International: set is_international=true, provide complete visa guidance.
 7. needs_live_search=true ONLY for bus/train/flight.
-8. search_params origin/destination must be BARE city names — NO state/country suffix.
-   CORRECT: "origin": "Aut"   WRONG: "origin": "Aut, Himachal Pradesh"
+8. search_params origin/destination must be BARE city names — NO state/country suffix,
+   and NEVER a station/terminal name. The leg's from/to may name the station, but
+   search_params must use the CITY the station is in.
+   CORRECT: "origin": "Aut"     WRONG: "origin": "Aut, Himachal Pradesh"
+   CORRECT: "origin": "Delhi"   WRONG: "origin": "Hazrat Nizamuddin"
+   CORRECT: "destination": "Agra"   WRONG: "destination": "Agra Cantt"
 9. COMPLETE PIPELINE: Every journey MUST have first-mile and last-mile legs.
    - FIRST LEG: auto/cab/metro from user's location → departure station/bus stand
    - LAST LEG: shared_cab/cab/auto from arrival point → accommodation area (needs_live_search: false)
@@ -128,7 +133,13 @@ Return ONLY valid JSON (no markdown):
   ]
 }}"""
 
+    # Deterministic: same origin/destination/filters → same route plan.
+    route_seed = stable_seed(
+        body.origin, body.destination, budget, body.travelers,
+        ",".join(sorted(body.transport_modes or [])), body.departure_date or "",
+    )
     raw = await with_retry(vertex_generate, prompt, response_mime_type="application/json",
+                           temperature=0.0, seed=route_seed,
                            timeout=120.0, max_retries=2)
     if not raw:
         return {}
@@ -582,6 +593,20 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
             _enqueue("train", o, resolve_station_async, o)
             _enqueue("train", d, resolve_station_async, d)
 
+    # Trip-level city station codes — fallback for train legs whose leg-level
+    # search cities are station names that resolve to non-searchable alias codes
+    # (e.g. "Hazrat Nizamuddin" → HNZM returns 0 trains; "Delhi" → NDLS works).
+    _trip_o = clean_city(body.origin)
+    _trip_d = clean_city(body.destination)
+    _train_leg_count = sum(
+        1 for leg in legs
+        if leg.get("mode", "").lower() in ("train", "railway")
+        and leg.get("needs_live_search") and departure_date
+    )
+    if _train_leg_count:
+        _enqueue("train", _trip_o, resolve_station_async, _trip_o)
+        _enqueue("train", _trip_d, resolve_station_async, _trip_d)
+
     if _resolve_coros:
         _resolve_results = await asyncio.gather(*_resolve_coros, return_exceptions=True)
     else:
@@ -654,10 +679,18 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
                 # Persist resolved codes back to search_params so booking URL builder can use them
                 sp["from_station_code"] = from_code
                 sp["to_station_code"]   = to_code
+                # Trip-level city codes as a 0-results fallback — only safe when
+                # this is the journey's sole train leg (otherwise the trip-level
+                # pair could describe a different segment).
+                fb_from = fb_to = None
+                if _train_leg_count == 1:
+                    fb_from = resolved.get(f"train|{_trip_o.lower()}")
+                    fb_to   = resolved.get(f"train|{_trip_d.lower()}")
                 live_meta.append((i, "train"))
                 live_coros.append(with_retry(
                     _railway.search, origin_s, dest_s, departure_date,
                     from_code=from_code, to_code=to_code,
+                    fallback_from=fb_from, fallback_to=fb_to,
                     fallback={"trains": [], "resolved": False},
                 ))
             else:
@@ -787,6 +820,12 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
 
         elif mode_type == "train":
             trains = result.get("trains") or []
+            # The search may have succeeded via fallback codes — sync them back
+            # into search_params so the booking URL uses the codes that worked.
+            _sp = legs[leg_idx].get("search_params") or {}
+            if trains and result.get("from_code") and result.get("to_code"):
+                _sp["from_station_code"] = result["from_code"]
+                _sp["to_station_code"]   = result["to_code"]
             for t in trains:
                 t["departed"] = _train_has_departed(t, departure_date)
             upcoming = [t for t in trains if not t["departed"]]

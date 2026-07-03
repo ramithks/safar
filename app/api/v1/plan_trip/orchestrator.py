@@ -28,6 +28,7 @@ from .helpers import (
     nearest_neighbor_sort,
     compute_trip_intelligence,
     with_retry,
+    stable_seed,
 )
 from .hydration import batch_hydrate_days
 from .validation import (
@@ -55,7 +56,9 @@ TASK: Create a rich {days}-day itinerary for {destination}.
 
 RULES:
 - Each day covers ONE geographic area/neighborhood — ALL activities on a single day must be within 5 km of each other. No cross-city or cross-region days.
-- Each day: at least 1 food + 1 attraction + 1 other. MAX 4 activities per day.
+- Each day: EXACTLY 2 or 3 activities — NEVER more than 3. A real traveler cannot properly
+  experience 4+ places in one day. Prefer 3 (1 food + 1 attraction + 1 other); use 2 for
+  days with a long trek/experience that fills most of the day.
 - Do NOT include hotel check-in/check-out as an activity.
 - For candidates, use exact place_id and set source: "google_places".
 - Up to 1 ai_suggested place per day if it adds real value (place_id: null, source: "ai_suggested").
@@ -144,6 +147,9 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
         for cat, places in (candidates or {}).items()
         for p in places
     ]
+    # Stable ordering — Places API result order shifts between calls, and a
+    # reordered candidate list changes the prompt, defeating seeded sampling.
+    all_candidates.sort(key=lambda c: (c["cat"], c["name"]))
     dest_photo_ref = (
         (candidates.get("attractions") or [{}])[0].get("photo_reference")
         or (candidates.get("hidden_gems") or [{}])[0].get("photo_reference")
@@ -184,8 +190,19 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
         interests=", ".join(body.interests) or "general sightseeing",
     )
 
+    # Deterministic sampling: identical filters → identical itinerary.
+    # temperature=0 removes sampling randomness; the seed pins tie-breaks.
+    itinerary_seed = stable_seed(
+        body.destination, body.days, safe_budget, body.travelers,
+        ",".join(sorted(body.interests or [])), body.start_date or "",
+    )
     async with (trace.track("gemini") if trace else _noop()):
-        raw = await with_retry(vertex_generate, prompt, response_mime_type="application/json", timeout=180.0)
+        raw = await with_retry(
+            vertex_generate, prompt,
+            response_mime_type="application/json",
+            temperature=0.0, seed=itinerary_seed,
+            timeout=180.0,
+        )
     if not raw:
         raise HTTPException(502, "AI trip generation failed after retries")
     ai_json = extract_json(raw)

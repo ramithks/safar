@@ -61,6 +61,9 @@ def _pick_best_station(stations: list[dict], query: str) -> str | None:
       +1.0  city contains query or query contains city
       +0.3  majorStn: true (the "All stations" aggregate entry)
       +0.2  stationName contains query
+      ×0.5  entry has no city field — these are alias/aggregate entries whose
+            codes are often NOT searchable (e.g. "Hazrat Nizamuddin" → HNZM,
+            which returns 0 trains; the real searchable code is NZM).
     Returns None if best score is 0 (no relevant match).
     """
     q = query.lower().strip()
@@ -76,13 +79,15 @@ def _pick_best_station(stations: list[dict], query: str) -> str | None:
         score = 0.0
         if city == q:
             score = 2.0
-        elif q in city or city in q:
+        elif city and (q in city or city in q):
             score = 1.0
         elif q in name:
             score = 0.2
 
         if major:
             score += 0.3
+        if not city and not major:
+            score *= 0.5
 
         if score > best_score:
             best_score = score
@@ -339,10 +344,18 @@ class RailwayService:
         date: str,
         from_code: str | None = None,
         to_code: str | None = None,
+        fallback_from: str | None = None,
+        fallback_to: str | None = None,
     ) -> dict:
         """
         Search trains between two cities. Caller can provide station codes directly
         (from Gemini) to avoid the city→code lookup.
+
+        fallback_from/fallback_to: alternate station codes (usually resolved from
+        the trip-level city names) retried when the primary codes return 0 trains —
+        autosuggest sometimes yields non-searchable alias codes for station-name
+        queries (e.g. "Hazrat Nizamuddin" → HNZM, 0 trains, vs NZM/NDLS, 63 trains).
+
         Returns {"trains": [...], "from_code": str, "to_code": str, "resolved": bool}
         """
         # India-only: refuse cross-border even when codes are supplied by Gemini.
@@ -357,14 +370,27 @@ class RailwayService:
         fc = from_code or city_to_station_code(origin)
         tc = to_code or city_to_station_code(destination)
 
-        if not fc or not to_code and not tc:
+        if not fc or not tc:
             return {
                 "trains": [], "from_code": fc, "to_code": tc,
                 "resolved": False,
                 "note": "No railway station found — this area may not have rail connectivity",
             }
 
-        trains = await search_trains(fc, tc or "", date)
+        trains = await search_trains(fc, tc, date)
+
+        if not trains:
+            ffc = fallback_from or fc
+            ftc = fallback_to or tc
+            if (ffc, ftc) != (fc, tc):
+                logger.info(
+                    "[railway] 0 trains for %s→%s — retrying with fallback codes %s→%s",
+                    fc, tc, ffc, ftc,
+                )
+                retry = await search_trains(ffc, ftc, date)
+                if retry:
+                    trains, fc, tc = retry, ffc, ftc
+
         return {
             "trains": trains,
             "from_code": fc,
