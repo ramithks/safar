@@ -1,24 +1,24 @@
 """
-Video downloader with a fallback chain (no auth/cookies required):
-  1. yt-dlp          — most reliable; fast-fails on explicit login-required errors
-  2. embed-scraper   — pure httpx, scrapes Instagram's embed page for the CDN video URL
-  3. graphql-scraper — Instagram's public GraphQL endpoint (PolarisPostActionLoadPostQuery)
-  4. gallery-dl      — different HTTP extraction path; runs with a hard timeout
+Video downloader with a fallback chain (strictly no auth/cookies/tokens):
+  1. downreels       — third-party fetch API (downreels.com); does the Instagram
+                       access on ITS servers, so IG blocks don't apply to us
+  2. videodropper    — third-party fetch API behind fastvideosave.net; same
+                       server-side-access advantage as downreels
+  3. yt-dlp          — direct extraction; fails fast on login-required errors
+  4. embed-scraper   — pure httpx, scrapes Instagram's embed page for the CDN URL
 
-PROXY-FIRST: when INSTAGRAM_PROXY_URL is configured, every downloader goes
-through the rotating proxy first so Instagram never sees (and rate-limits/blocks)
-the server's own IP. A direct attempt is only the fallback for when the proxy
-itself is down or exhausted.
+PROXY-ONLY: when INSTAGRAM_PROXY_URL is configured, every attempt goes through
+the rotating proxy — Instagram has the server's own IP blocked, so a direct
+attempt can never succeed; it only leaks our IP and wastes time. The rotating
+proxy hands out a fresh exit IP per connection, so reliability comes from more
+retries through the proxy, not from a direct fallback.
 """
 import os
 import re
-import json
 import time
 import random
 import asyncio
 import logging
-import threading
-from pathlib import Path
 from typing import Optional
 
 import yt_dlp
@@ -26,8 +26,11 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 1            # retries per (downloader, proxy-mode) pair
-RETRY_DELAYS = [5, 15]    # seconds between retries
+MAX_RETRIES_DIRECT = 1     # retries per downloader without a proxy
+MAX_RETRIES_PROXY = 3      # retries per downloader through the rotating proxy —
+                           # each retry opens a new connection = fresh exit IP,
+                           # so every extra retry is a fresh shot past an IP block
+RETRY_DELAYS = [3, 5, 8]   # seconds between retries (fresh IP needs no long cooldown)
 
 # ─── User-Agent pool ─────────────────────────────────────────────────────────────
 # Rotate across realistic mobile + desktop UAs to reduce fingerprinting.
@@ -165,9 +168,12 @@ def _ytdlp_download(url: str, output_dir: str, proxy: Optional[str] = None) -> D
             caption = info.get("description") or info.get("title") or None
     except Exception as exc:
         if _is_auth_error(exc):
+            # "login required" / "empty media response" is IP-reputation-based
+            # for public posts: on a rotating proxy a retry gets a fresh exit
+            # IP and often succeeds, so only give up when there is no proxy.
             raise DownloadError(
                 f"yt-dlp: Instagram login required: {exc}",
-                retryable=False,
+                retryable=proxy is not None,
             )
         raise
 
@@ -211,7 +217,10 @@ def _embed_scrape_download(url: str, output_dir: str, proxy: Optional[str] = Non
     if not shortcode:
         raise DownloadError("embed-scraper: could not extract shortcode", retryable=False)
 
-    embed_url = f"https://www.instagram.com/reel/{shortcode}/embed/captioned/"
+    embed_urls = [
+        f"https://www.instagram.com/reel/{shortcode}/embed/captioned/",
+        f"https://www.instagram.com/reel/{shortcode}/embed/",
+    ]
     headers = {
         "User-Agent": _random_ua(),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -225,41 +234,48 @@ def _embed_scrape_download(url: str, output_dir: str, proxy: Optional[str] = Non
     if proxy:
         client_kwargs["proxy"] = proxy
 
-    with httpx.Client(**client_kwargs) as client:
-        resp = client.get(embed_url)
-
-    if resp.status_code == 429:
-        raise DownloadError("embed-scraper: 429 rate limit", retryable=True)
-    if resp.status_code != 200:
-        raise DownloadError(
-            f"embed-scraper: HTTP {resp.status_code}", retryable=True
-        )
-
-    html = resp.text
-
     caption: Optional[str] = None
-    m = re.search(r'"caption"\s*:\s*"([^"]*)"', html)
-    if m:
-        caption = m.group(1)
-
     video_url: Optional[str] = None
-    for pattern in _VIDEO_URL_PATTERNS:
-        m = re.search(pattern, html)
-        if m:
-            video_url = _unescape_url(m.group(1))
-            break
+    last_status: Optional[int] = None
 
-    if not video_url:
-        for script_content in re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL):
+    with httpx.Client(**client_kwargs) as client:
+        for embed_url in embed_urls:
+            resp = client.get(embed_url)
+            last_status = resp.status_code
+            if resp.status_code != 200:
+                continue
+
+            html = resp.text
+
+            if caption is None:
+                m = re.search(r'"caption"\s*:\s*"([^"]*)"', html)
+                if m:
+                    caption = m.group(1)
+
             for pattern in _VIDEO_URL_PATTERNS:
-                m = re.search(pattern, script_content)
+                m = re.search(pattern, html)
                 if m:
                     video_url = _unescape_url(m.group(1))
                     break
+
+            if not video_url:
+                for script_content in re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL):
+                    for pattern in _VIDEO_URL_PATTERNS:
+                        m = re.search(pattern, script_content)
+                        if m:
+                            video_url = _unescape_url(m.group(1))
+                            break
+                    if video_url:
+                        break
+
             if video_url:
                 break
 
     if not video_url:
+        if last_status == 429:
+            raise DownloadError("embed-scraper: 429 rate limit", retryable=True)
+        if last_status != 200:
+            raise DownloadError(f"embed-scraper: HTTP {last_status}", retryable=True)
         raise DownloadError("embed-scraper: could not find video URL in embed page", retryable=True)
 
     output_path = os.path.join(output_dir, "video.mp4")
@@ -283,82 +299,28 @@ def _embed_scrape_download(url: str, output_dir: str, proxy: Optional[str] = Non
     return DownloadResult(file_path=output_path, caption=caption)
 
 
-# ─── GraphQL scraper (Instagram's public post query, no cookies) ────────────────
+# ─── third-party fetch APIs (no cookies/tokens; IG access happens on THEIR side) ─
+#
+# These resolvers make the Instagram request from their OWN infrastructure and
+# hand us back a direct CDN URL, so our IP reputation is irrelevant. Only the
+# final CDN download runs through us (and the proxy, when configured).
 
-_IG_APP_ID = "936619743392459"                       # instagram.com web app id
-_IG_GRAPHQL_DOC_ID = "8845758582119845"              # PolarisPostActionLoadPostQueryQuery
+_DOWNREELS_API = "https://downreels.com/api/fetch.php"
+_VIDEODROPPER_API = "https://api.videodropper.app/allinone"
+# AES-128-ECB key + PKCS7, hex output — fastvideosave.net encrypts the reel URL
+# into the `url` request header this way (no token/cookie; key is baked into
+# their public JS bundle). Verified reproducing their sample header 2026-07-05.
+_VIDEODROPPER_KEY = b"qwertyuioplkjhgf"
 
 
-def _graphql_download(url: str, output_dir: str, proxy: Optional[str] = None) -> DownloadResult:
-    """
-    Fetch the post via Instagram's public GraphQL endpoint — the same query the
-    web client issues for logged-out users. Works for public posts; also tells
-    us definitively when a post has no video (image/carousel post).
-    """
-    shortcode = _extract_shortcode(url)
-    if not shortcode:
-        raise DownloadError("graphql: could not extract shortcode", retryable=False)
-
-    headers = {
-        "User-Agent": _random_ua(),
-        "Accept": "*/*",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-IG-App-ID": _IG_APP_ID,
-        "X-FB-Friendly-Name": "PolarisPostActionLoadPostQueryQuery",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": "https://www.instagram.com",
-        "Referer": f"https://www.instagram.com/reel/{shortcode}/",
+def _stream_cdn_to_file(video_url: str, output_path: str, user_agent: str,
+                        proxy: Optional[str]) -> None:
+    """Stream a resolved CDN video URL to disk (through the proxy if given)."""
+    dl_kwargs: dict = {
+        "timeout": 120,
+        "follow_redirects": True,
+        "headers": {"User-Agent": user_agent},
     }
-    payload = {
-        "variables": json.dumps({
-            "shortcode": shortcode,
-            "fetch_tagged_user_count": None,
-            "hoisted_comment_id": None,
-            "hoisted_reply_id": None,
-        }),
-        "doc_id": _IG_GRAPHQL_DOC_ID,
-    }
-
-    client_kwargs: dict = {"timeout": 30, "follow_redirects": True}
-    if proxy:
-        client_kwargs["proxy"] = proxy
-
-    with httpx.Client(**client_kwargs) as client:
-        resp = client.post("https://www.instagram.com/graphql/query", data=payload, headers=headers)
-
-    if resp.status_code in (401, 403, 429):
-        raise DownloadError(f"graphql: HTTP {resp.status_code} (blocked)", retryable=True)
-    if resp.status_code != 200:
-        raise DownloadError(f"graphql: HTTP {resp.status_code}", retryable=True)
-
-    try:
-        media = (resp.json().get("data") or {}).get("xdt_shortcode_media") or {}
-    except Exception:
-        raise DownloadError("graphql: non-JSON response (likely blocked)", retryable=True)
-
-    if not media:
-        raise DownloadError("graphql: no media in response (private or deleted post?)", retryable=True)
-    if not media.get("is_video"):
-        raise DownloadError("This Instagram post is not a video (image post)", retryable=False, fatal=True)
-
-    video_url = media.get("video_url")
-    if not video_url:
-        raise DownloadError("graphql: media has no video_url", retryable=True)
-
-    caption: Optional[str] = None
-    try:
-        edges = (media.get("edge_media_to_caption") or {}).get("edges") or []
-        if edges:
-            caption = edges[0]["node"]["text"]
-    except Exception:
-        pass
-    duration = media.get("video_duration")
-
-    output_path = os.path.join(output_dir, "video.mp4")
-    logger.info(f"graphql: downloading CDN video for {shortcode}")
-
-    dl_kwargs: dict = {"timeout": 120, "follow_redirects": True,
-                       "headers": {"User-Agent": headers["User-Agent"]}}
     if proxy:
         dl_kwargs["proxy"] = proxy
 
@@ -369,74 +331,116 @@ def _graphql_download(url: str, output_dir: str, proxy: Optional[str] = None) ->
                 for chunk in stream.iter_bytes(chunk_size=65536):
                     fh.write(chunk)
 
-    return DownloadResult(file_path=output_path, duration_seconds=duration, caption=caption)
+
+def _downreels_download(url: str, output_dir: str, proxy: Optional[str] = None) -> DownloadResult:
+    """Resolve the CDN video URL via downreels.com's public fetch API."""
+    shortcode = _extract_shortcode(url)
+    if not shortcode:
+        raise DownloadError("downreels: could not extract shortcode", retryable=False)
+
+    canonical = f"https://www.instagram.com/reel/{shortcode}/"
+    user_agent = _random_ua()
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "*/*",
+        "Content-Type": "application/json",
+        "Origin": "https://downreels.com",
+        "Referer": "https://downreels.com/en/download-video-instagram/",
+    }
+
+    client_kwargs: dict = {"timeout": 45, "follow_redirects": True}
+    if proxy:
+        client_kwargs["proxy"] = proxy
+
+    with httpx.Client(**client_kwargs) as client:
+        resp = client.post(_DOWNREELS_API, json={"url": canonical}, headers=headers)
+
+    if resp.status_code == 429:
+        raise DownloadError("downreels: 429 rate limit", retryable=True)
+    if resp.status_code != 200:
+        raise DownloadError(f"downreels: HTTP {resp.status_code}", retryable=True)
+
+    try:
+        data = resp.json()
+    except Exception:
+        raise DownloadError("downreels: non-JSON response", retryable=True)
+
+    if data.get("status") != "ok":
+        raise DownloadError(f"downreels: status={data.get('status')!r}", retryable=True)
+
+    videos = data.get("videos") or []
+    video_url: Optional[str] = None
+    for item in videos:
+        if item.get("url"):
+            video_url = item["url"]
+            if item.get("quality") == "HD":
+                break
+    if not video_url:
+        raise DownloadError("downreels: no video URL in response", retryable=True)
+
+    output_path = os.path.join(output_dir, "video.mp4")
+    logger.info(f"downreels: downloading CDN video for {shortcode}")
+    _stream_cdn_to_file(video_url, output_path, user_agent, proxy)
+    return DownloadResult(file_path=output_path)
 
 
-# ─── gallery-dl (with hard timeout) ─────────────────────────────────────────────
+def _videodropper_encrypt_url(reel_url: str) -> str:
+    """Reproduce fastvideosave.net's `url` header: AES-128-ECB + PKCS7, hex."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.padding import PKCS7
 
-_GALLERY_DL_TIMEOUT = 60  # seconds; abort if stalled on 429 waits
+    padder = PKCS7(128).padder()
+    padded = padder.update(reel_url.encode()) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(_VIDEODROPPER_KEY), modes.ECB()).encryptor()
+    return (encryptor.update(padded) + encryptor.finalize()).hex()
 
 
-def _gallerydl_download(url: str, output_dir: str, proxy: Optional[str] = None) -> DownloadResult:
-    """
-    Uses gallery-dl with a hard wall-clock timeout so 429-induced sleeps
-    cannot block the worker indefinitely.
-    """
-    import gallery_dl
+def _videodropper_download(url: str, output_dir: str, proxy: Optional[str] = None) -> DownloadResult:
+    """Resolve the CDN video URL via videodropper.app (fastvideosave.net's API)."""
+    shortcode = _extract_shortcode(url)
+    if not shortcode:
+        raise DownloadError("videodropper: could not extract shortcode", retryable=False)
 
-    result_holder: dict = {}
-    exc_holder: dict = {}
+    canonical = f"https://www.instagram.com/reel/{shortcode}/"
+    user_agent = _random_ua()
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "*/*",
+        "Origin": "https://fastvideosave.net",
+        "Referer": "https://fastvideosave.net/",
+        "url": _videodropper_encrypt_url(canonical),
+    }
 
-    def _run():
-        try:
-            gallery_dl.config.clear()
-            gallery_dl.config.set((), "base-directory", output_dir)
-            gallery_dl.config.set((), "filename", "gdl_video")
-            gallery_dl.config.set(("extractor", "instagram"), "videos", True)
-            gallery_dl.config.set(("extractor", "instagram"), "reels", True)
-            gallery_dl.config.set(("downloader",), "part", False)
-            gallery_dl.config.set(("extractor",), "sleep-request", 0)
-            gallery_dl.config.set(("extractor",), "retries", 0)
-            gallery_dl.config.set(
-                ("extractor", "instagram"),
-                "user-agent",
-                _random_ua(),
-            )
-            if proxy:
-                gallery_dl.config.set((), "proxy", proxy)
+    client_kwargs: dict = {"timeout": 45, "follow_redirects": True}
+    if proxy:
+        client_kwargs["proxy"] = proxy
 
-            before = set(os.listdir(output_dir))
-            job = gallery_dl.job.DownloadJob(url)
-            job.run()
-            after = set(os.listdir(output_dir))
+    with httpx.Client(**client_kwargs) as client:
+        resp = client.get(_VIDEODROPPER_API, headers=headers)
 
-            video_extensions = {".mp4", ".webm", ".mkv", ".mov", ".avi"}
-            for fname in after - before:
-                if Path(fname).suffix.lower() in video_extensions:
-                    result_holder["path"] = os.path.join(output_dir, fname)
-                    return
+    if resp.status_code == 429:
+        raise DownloadError("videodropper: 429 rate limit", retryable=True)
+    if resp.status_code != 200:
+        raise DownloadError(f"videodropper: HTTP {resp.status_code}", retryable=True)
 
-            exc_holder["error"] = DownloadError("gallery-dl: no video file found after download")
-        except Exception as exc:
-            exc_holder["error"] = exc
+    try:
+        data = resp.json()
+    except Exception:
+        raise DownloadError("videodropper: non-JSON response", retryable=True)
 
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-    thread.join(timeout=_GALLERY_DL_TIMEOUT)
+    videos = data.get("video") or []
+    video_url: Optional[str] = None
+    for item in videos:
+        if item.get("video"):
+            video_url = item["video"]
+            break
+    if not video_url:
+        raise DownloadError("videodropper: no video URL in response", retryable=True)
 
-    if thread.is_alive():
-        raise DownloadError(
-            f"gallery-dl: timed out after {_GALLERY_DL_TIMEOUT}s (likely stalled on 429)",
-            retryable=True,
-        )
-
-    if "error" in exc_holder:
-        raise exc_holder["error"]
-
-    if "path" not in result_holder:
-        raise DownloadError("gallery-dl: completed but no video file found")
-
-    return DownloadResult(file_path=result_holder["path"])
+    output_path = os.path.join(output_dir, "video.mp4")
+    logger.info(f"videodropper: downloading CDN video for {shortcode}")
+    _stream_cdn_to_file(video_url, output_path, user_agent, proxy)
+    return DownloadResult(file_path=output_path)
 
 
 # ─── Fallback chain ─────────────────────────────────────────────────────────────
@@ -444,10 +448,10 @@ def _gallerydl_download(url: str, output_dir: str, proxy: Optional[str] = None) 
 # (label, module attribute name) — resolved via globals() at call time so
 # unittest.mock.patch on the module attribute affects the chain.
 _DOWNLOADERS = [
+    ("downreels", "_downreels_download"),
+    ("videodropper", "_videodropper_download"),
     ("yt-dlp", "_ytdlp_download"),
     ("embed-scraper", "_embed_scrape_download"),
-    ("graphql", "_graphql_download"),
-    ("gallery-dl", "_gallerydl_download"),
 ]
 
 
@@ -469,8 +473,9 @@ def _try_downloader(name: str, fn, url: str, output_dir: str,
     errors. Returns a DownloadResult or raises the last error.
     Fatal errors (definitive verdicts about the post itself) propagate as-is.
     """
+    max_retries = MAX_RETRIES_PROXY if proxy else MAX_RETRIES_DIRECT
     last: Optional[Exception] = None
-    for attempt in range(MAX_RETRIES + 1):
+    for attempt in range(max_retries + 1):
         try:
             logger.info(f"[{name}] {label} attempt {attempt + 1} for {url}")
             result = _attempt(name, fn, url, output_dir, proxy=proxy)
@@ -486,12 +491,14 @@ def _try_downloader(name: str, fn, url: str, output_dir: str,
                 break
         except Exception as exc:
             last = exc
-            if _is_auth_error(exc):
+            # Auth walls are IP-reputation-based; retrying through the rotating
+            # proxy gets a fresh exit IP, so only give up when running direct.
+            if _is_auth_error(exc) and not proxy:
                 logger.warning(f"[{name}] auth error ({label}): {exc}")
                 break
             logger.warning(f"[{name}] {label} attempt {attempt + 1} unexpected error: {exc}")
 
-        if attempt < MAX_RETRIES:
+        if attempt < max_retries:
             delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
             logger.warning(f"[{name}] {label} attempt {attempt + 1} failed, retry in {delay}s: {last}")
             time.sleep(delay)
@@ -502,34 +509,32 @@ def _try_downloader(name: str, fn, url: str, output_dir: str,
 
 def download_video(url: str, output_dir: str) -> DownloadResult:
     """
-    For each downloader:
-      1. Try WITH the rotating proxy first (if configured) — Instagram
-         rate-limits/blocks server IPs fast; the proxy exists precisely so
-         Instagram never sees our own IP.
-      2. Fall back to a direct attempt (proxy down/exhausted).
-      3. Move to the next downloader if both modes fail.
+    Runs the fallback chain. When a proxy is configured, EVERY attempt goes
+    through it — the server's own IP is blocked by Instagram, so a direct
+    fallback can never succeed; it only leaks our IP and wastes time. Each
+    proxy retry opens a fresh connection (= fresh exit IP), so reliability
+    comes from retries through the proxy, not from a direct mode.
 
-    Raises DownloadError if all downloaders × both modes fail; the message
-    carries every downloader's last error for debugging.
+    Raises DownloadError if all downloaders fail; the message carries every
+    downloader's last error for debugging.
     """
     os.makedirs(output_dir, exist_ok=True)
     proxy = _get_proxy_url()
-    modes = [("proxy", proxy), ("direct", None)] if proxy else [("direct", None)]
+    label = "proxy" if proxy else "direct"
     failures: dict[str, str] = {}   # per-downloader last error, for the final report
 
     for name, fn_attr in _DOWNLOADERS:
         fn = globals()[fn_attr]
-        for label, mode_proxy in modes:
-            try:
-                return _try_downloader(name, fn, url, output_dir, mode_proxy, label)
-            except DownloadError as exc:
-                if exc.fatal:
-                    # Definitive verdict about the post itself (e.g. no video) —
-                    # no other downloader or mode can succeed, stop the chain.
-                    raise
-                failures[name] = str(exc)
-            except Exception as exc:
-                failures[name] = str(exc)
+        try:
+            return _try_downloader(name, fn, url, output_dir, proxy, label)
+        except DownloadError as exc:
+            if exc.fatal:
+                # Definitive verdict about the post itself (e.g. no video) —
+                # no other downloader can succeed, stop the chain.
+                raise
+            failures[name] = str(exc)
+        except Exception as exc:
+            failures[name] = str(exc)
 
     detail = " | ".join(f"{n}: {e}" for n, e in failures.items()) or "no downloaders ran"
     raise DownloadError(
