@@ -32,6 +32,12 @@ MAX_RETRIES_PROXY = 3      # retries per downloader through the rotating proxy �
                            # so every extra retry is a fresh shot past an IP block
 RETRY_DELAYS = [3, 5, 8]   # seconds between retries (fresh IP needs no long cooldown)
 
+# CDN streaming: connect (incl. TLS handshake) must fail fast — a stalled
+# handshake through the rotating proxy otherwise eats the whole timeout budget
+# before the retry (= fresh exit IP) gets a chance. read is per-chunk, so 60s
+# still tolerates a slow stream.
+_CDN_TIMEOUT = httpx.Timeout(connect=15, read=60, write=60, pool=15)
+
 # ─── User-Agent pool ─────────────────────────────────────────────────────────────
 # Rotate across realistic mobile + desktop UAs to reduce fingerprinting.
 
@@ -230,7 +236,11 @@ def _embed_scrape_download(url: str, output_dir: str, proxy: Optional[str] = Non
         "Sec-Fetch-Site": "none",
     }
 
-    client_kwargs: dict = {"timeout": 30, "follow_redirects": True, "headers": headers}
+    client_kwargs: dict = {
+        "timeout": httpx.Timeout(connect=15, read=30, write=30, pool=15),
+        "follow_redirects": True,
+        "headers": headers,
+    }
     if proxy:
         client_kwargs["proxy"] = proxy
 
@@ -282,7 +292,7 @@ def _embed_scrape_download(url: str, output_dir: str, proxy: Optional[str] = Non
     logger.info(f"embed-scraper: downloading CDN video for {shortcode}")
 
     dl_kwargs: dict = {
-        "timeout": 120,
+        "timeout": _CDN_TIMEOUT,
         "follow_redirects": True,
         "headers": {"User-Agent": headers["User-Agent"]},
     }
@@ -317,7 +327,7 @@ def _stream_cdn_to_file(video_url: str, output_path: str, user_agent: str,
                         proxy: Optional[str]) -> None:
     """Stream a resolved CDN video URL to disk (through the proxy if given)."""
     dl_kwargs: dict = {
-        "timeout": 120,
+        "timeout": _CDN_TIMEOUT,
         "follow_redirects": True,
         "headers": {"User-Agent": user_agent},
     }
@@ -348,7 +358,10 @@ def _downreels_download(url: str, output_dir: str, proxy: Optional[str] = None) 
         "Referer": "https://downreels.com/en/download-video-instagram/",
     }
 
-    client_kwargs: dict = {"timeout": 45, "follow_redirects": True}
+    client_kwargs: dict = {
+        "timeout": httpx.Timeout(connect=15, read=45, write=45, pool=15),
+        "follow_redirects": True,
+    }
     if proxy:
         client_kwargs["proxy"] = proxy
 
@@ -411,7 +424,10 @@ def _videodropper_download(url: str, output_dir: str, proxy: Optional[str] = Non
         "url": _videodropper_encrypt_url(canonical),
     }
 
-    client_kwargs: dict = {"timeout": 45, "follow_redirects": True}
+    client_kwargs: dict = {
+        "timeout": httpx.Timeout(connect=15, read=45, write=45, pool=15),
+        "follow_redirects": True,
+    }
     if proxy:
         client_kwargs["proxy"] = proxy
 
