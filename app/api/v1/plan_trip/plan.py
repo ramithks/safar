@@ -311,6 +311,63 @@ async def run_plan(body: PlanRequest, user_id: str) -> dict:
     return merged
 
 
+def _to_numeric(v):
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(v):
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _hotel_master_rows(merged: dict, fallback_destination: str) -> list[dict]:
+    """Map the live scraper hotels in going.hotels.items to hotels-table rows,
+    deduped by (source, hotel_id)."""
+    hotels_block = (merged.get("going") or {}).get("hotels") or {}
+    destination = hotels_block.get("destination") or fallback_destination
+    now = datetime.utcnow().isoformat()
+
+    rows: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for h in hotels_block.get("items") or []:
+        source, hotel_id, name = h.get("source"), h.get("hotel_id"), h.get("name")
+        if not source or not hotel_id or not name:
+            continue
+        key = (str(source), str(hotel_id))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "source": str(source),
+            "source_hotel_id": str(hotel_id),
+            "name": name,
+            "address": h.get("address") or None,
+            "city": h.get("city") or destination,
+            "destination": destination,
+            "lat": _to_numeric(h.get("lat")),
+            "lon": _to_numeric(h.get("lon")),
+            "star_rating": _to_numeric(h.get("star_rating")),
+            "review_score": _to_numeric(h.get("review_score")),
+            "review_count": _to_int(h.get("review_count")),
+            "review_label": h.get("review_label") or None,
+            "property_type": h.get("property_type") or None,
+            "amenities": h.get("amenities") if isinstance(h.get("amenities"), (list, dict)) else None,
+            "photos": h.get("photos") if isinstance(h.get("photos"), (list, dict)) else None,
+            "booking_url": h.get("booking_url") or None,
+            "map_url": h.get("map_url") or None,
+            "description": h.get("description") or None,
+            "quality_score": _to_numeric(h.get("quality_score")),
+            "last_seen_at": now,
+            "updated_at": now,
+        })
+    return rows
+
+
 async def _save_trip(user_id: str, body: PlanRequest, merged: dict, end_date: str | None) -> None:
     try:
         db = get_db()
@@ -344,12 +401,6 @@ async def _save_trip(user_id: str, body: PlanRequest, merged: dict, end_date: st
             logger.warning("[plan] Auto-save: trips insert returned no id")
             return
 
-        def _to_numeric(v):
-            try:
-                return float(v) if v is not None else None
-            except (TypeError, ValueError):
-                return None
-
         await loop.run_in_executor(None, lambda: (
             db.table("trip_journey").insert({
                 "trip_id": trip_id,
@@ -382,6 +433,20 @@ async def _save_trip(user_id: str, body: PlanRequest, merged: dict, end_date: st
                 "currency_info": merged.get("currency_info") or {},
             }).execute()
         ))
+
+        # Grow the hotels master table with whatever the live scrapers returned.
+        # Prices stay in trip_journey (date-specific); this only stores identity.
+        try:
+            hotel_rows = _hotel_master_rows(merged, body.destination)
+            if hotel_rows:
+                await loop.run_in_executor(None, lambda: (
+                    db.table("hotels")
+                    .upsert(hotel_rows, on_conflict="source,source_hotel_id")
+                    .execute()
+                ))
+                logger.info("[plan] Upserted %d hotels into master table", len(hotel_rows))
+        except Exception as e:
+            logger.warning("[plan] Hotel master upsert failed: %s", e)
 
     except Exception as e:
         logger.warning("[plan] Failed to auto-save trip: %s", e)
