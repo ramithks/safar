@@ -12,8 +12,23 @@ import html
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlencode
 
 SOURCE = "gostops"
+
+# UTM tags on outbound booking links — agreed with goSTOPS so their analytics
+# attribute referral traffic to us. utm_content carries the hostel slug for
+# per-property reporting; our GA fires a matching booking_click event.
+_UTM_PARAMS = {
+    "utm_source": "travbuddy",
+    "utm_medium": "referral",
+    "utm_campaign": "workstations",
+}
+
+
+def booking_url(city_slug: str, hostel_slug: str) -> str:
+    qs = urlencode({**_UTM_PARAMS, "utm_content": hostel_slug})
+    return f"https://gostops.com/stay/{city_slug}/{hostel_slug}?{qs}"
 
 _TAG_RE = re.compile(r"<[^>]+>")
 
@@ -137,7 +152,7 @@ def hostel_row(cat: dict, detail: Optional[dict] = None) -> dict:
             "email": detail.get("email"),
             "starting_price": _num(detail.get("startingPrice")) or row["starting_price"],
             "pvtroom_starting_price": _num(detail.get("pvtroom_starting_price")),
-            "booking_url": f"https://gostops.com/stay/{detail.get('city_slug') or city}/{detail.get('hostel_slug')}",
+            "booking_url": booking_url(detail.get("city_slug") or city, detail.get("hostel_slug")),
         })
         if meta.get("google_review_link"):
             row["map_url"] = row["map_url"] or meta.get("google_review_link")
