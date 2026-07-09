@@ -6,6 +6,7 @@ from app.api.v1.search.endpoint import router as search_router
 from app.api.v1.autocomplete.endpoint import router as autocomplete_router
 from app.api.v1.onboarding.endpoint import router as onboarding_router
 from app.api.v1.discover.endpoint import router as discover_router
+from app.api.v1.hostels.endpoint import router as hostels_router
 from app.api.v1.users.endpoint import router as users_router
 from app.api.v1.reels.endpoint import router as reels_router
 from app.api.v1.reels.analyze import router as reels_analyze_router
@@ -25,6 +26,7 @@ router.include_router(search_router)
 router.include_router(autocomplete_router)
 router.include_router(onboarding_router)
 router.include_router(discover_router)
+router.include_router(hostels_router)
 router.include_router(users_router)
 router.include_router(reels_router)
 router.include_router(reels_analyze_router, tags=["reels"])
