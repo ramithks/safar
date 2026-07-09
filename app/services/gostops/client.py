@@ -19,6 +19,7 @@ import json
 import logging
 import re
 from typing import Any, Optional
+from urllib.parse import quote, urlencode
 
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
@@ -145,7 +146,7 @@ def _looks_like_detail(d: dict) -> bool:
 
 async def hostel_detail(city_slug: str, hostel_slug: str) -> dict:
     """Fetch and parse a hostel's static detail object."""
-    url = f"{_SITE}/stay/{city_slug}/{hostel_slug}"
+    url = f"{_SITE}/stay/{quote(city_slug, safe='')}/{quote(hostel_slug, safe='')}"
     async with CurlAsyncSession() as s:
         try:
             r = await s.get(url, headers=_rsc_headers(), timeout=_TIMEOUT)
@@ -163,10 +164,8 @@ async def live_rooms(hostel_slug: str, check_in: str, check_out: str) -> dict:
     Dates are 'YYYY-MM-DD'. Returns the raw `data` object
     ({hotel_rooms, coupon_code_applied, identifier}).
     """
-    url = (
-        f"{_API}/api/core/v4/get-rooms-list/"
-        f"?hostel_slug={hostel_slug}&check_in={check_in}&check_out={check_out}"
-    )
+    qs = urlencode({"hostel_slug": hostel_slug, "check_in": check_in, "check_out": check_out})
+    url = f"{_API}/api/core/v4/get-rooms-list/?{qs}"
     return _unwrap(await _get_json(url, _api_headers()), url)
 
 
@@ -174,11 +173,13 @@ async def availability(
     hostel_slug: str, check_in: str, check_out: str, rateplan_id: str
 ) -> dict:
     """Per-night beds-available + price calendar for one rate plan."""
-    url = (
-        f"{_API}/api/core/v3/check-rooms-availability/"
-        f"?hostel_slug={hostel_slug}&check_in={check_in}"
-        f"&check_out={check_out}&rateplan_id={rateplan_id}"
-    )
+    qs = urlencode({
+        "hostel_slug": hostel_slug,
+        "check_in": check_in,
+        "check_out": check_out,
+        "rateplan_id": rateplan_id,
+    })
+    url = f"{_API}/api/core/v3/check-rooms-availability/?{qs}"
     return _unwrap(await _get_json(url, _api_headers()), url)
 
 
@@ -190,9 +191,12 @@ async def activities(
     page: int = 1,
 ) -> dict:
     """Experiences / cabs / scooty tied to a hostel. Keyed by numeric hostel_id."""
-    url = (
-        f"{_API}/api/activity/v5/activities/"
-        f"?hostel_id={hostel_id}&check_in_date={check_in}"
-        f"&check_out_date={check_out}&activity_type={activity_type}&page={page}"
-    )
+    qs = urlencode({
+        "hostel_id": hostel_id,
+        "check_in_date": check_in,
+        "check_out_date": check_out,
+        "activity_type": activity_type,
+        "page": page,
+    })
+    url = f"{_API}/api/activity/v5/activities/?{qs}"
     return _unwrap(await _get_json(url, _api_headers()), url)

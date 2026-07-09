@@ -177,11 +177,19 @@ def normalize_rooms(data: dict, hostel_slug: str) -> dict:
         price = cheapest["_total"] if cheapest else None
         if price is not None and (lowest is None or price < lowest):
             lowest = price
+        sold_out = bool(room.get("is_sold_out"))
+        units = room.get("max_rooms_can_book")
         rooms_out.append({
             "room_id": room.get("room_id"),
             "name": room.get("roomtype_name"),
-            "is_sold_out": bool(room.get("is_sold_out")),
-            "max_rooms_can_book": room.get("max_rooms_can_book"),
+            "availability": {
+                "is_available": not sold_out,
+                # beds for dorms, rooms for privates — goSTOPS uses one counter
+                "units_left": units,
+                "available_on_other_dates": bool(room.get("is_rooms_available_on_other_dates")),
+            },
+            "is_sold_out": sold_out,
+            "max_rooms_can_book": units,
             "images": [i.get("image") for i in (room.get("room_images") or []) if i.get("image")],
             "amenities": [a.get("amenity") for a in (room.get("amenities") or []) if a.get("amenity")],
             "cancellable_until": room.get("cancellable_until"),
@@ -200,6 +208,41 @@ def normalize_rooms(data: dict, hostel_slug: str) -> dict:
             "description": coupon.get("discount_display") or coupon.get("long_description"),
         } if coupon else None,
         "rooms": rooms_out,
+    }
+
+
+def normalize_availability(data: dict, hostel_slug: str, rateplan_id: str) -> dict:
+    """Map check-rooms-availability `data` to a per-night calendar.
+
+    One entry per night of the stay: beds left and the discounted per-night
+    price for both the cancellable and non-refundable plans. `is_available`
+    on the envelope is true only if every night has stock.
+    """
+    nights: list[dict] = []
+    for n in data.get("hotel_rooms") or []:
+        beds = n.get("beds_available")
+        nights.append({
+            "date": n.get("date"),
+            "beds_available": beds,
+            "is_available": bool(beds),
+            "is_cancellable": bool(n.get("is_cancellable")),
+            "price_before_tax": _num(
+                n.get("amount_before_tax_after_discount") or n.get("amount_before_tax")
+            ),
+            "nonrefundable_price_before_tax": _num(
+                n.get("nr_amount_before_tax_after_discount") or n.get("nr_amount_before_tax")
+            ),
+        })
+
+    return {
+        "source": SOURCE,
+        "hostel_slug": hostel_slug,
+        "rateplan_id": rateplan_id,
+        "currency": "INR",
+        "is_available": bool(nights) and all(x["is_available"] for x in nights),
+        "min_beds_available": min((x["beds_available"] or 0) for x in nights) if nights else 0,
+        "coupon_code": data.get("coupon_code_applied"),
+        "nights": nights,
     }
 
 
