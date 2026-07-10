@@ -9,7 +9,9 @@ sync and callers hop through run_in_executor — same pattern as supervisor.py.
 import logging
 from datetime import datetime, timezone
 
-from app.db.client import get_db
+import httpx
+
+from app.db.client import get_db, reset_db
 from .models import SCHEMA_VERSION, TripState
 from .patch import PatchOp, apply_patches
 
@@ -56,7 +58,30 @@ def append_events(
     """
     Apply patches to the stored snapshot and append one event row.
     Returns the updated state dict.
+
+    Retries once on transport-level failures with a fresh client: the writes
+    here are POSTs, which the client-level retry wrapper deliberately skips.
+    Retrying the whole function is safe because it re-reads the snapshot and
+    the pipeline emits absolute `set` patches (re-applying is a no-op).
     """
+    try:
+        return _append_events_once(trip_id, actor, patches, phase, reasoning)
+    except httpx.TransportError as exc:
+        logger.warning(
+            "[trip-state] %s persisting events for %s — retrying on a fresh client",
+            type(exc).__name__, trip_id,
+        )
+        reset_db()
+        return _append_events_once(trip_id, actor, patches, phase, reasoning)
+
+
+def _append_events_once(
+    trip_id: str,
+    actor: str,
+    patches: list[PatchOp],
+    phase: str | None,
+    reasoning: str | None,
+) -> dict:
     db = get_db()
     row = get_trip_state(trip_id)
     if row is None:

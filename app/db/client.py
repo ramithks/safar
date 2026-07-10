@@ -60,13 +60,32 @@ def _install_retry(session: httpx.Client, attempts: int = 3) -> None:
     session._tb_retry = True  # type: ignore[attr-defined]
 
 
+def _force_http1(session: httpx.Client) -> None:
+    """
+    postgrest builds its sync client with http2=True. HTTP/2 multiplexes every
+    request over one connection, and httpcore's sync HTTP/2 stack STORES a read
+    error and re-raises it for all later requests on that connection — one
+    EAGAIN poisons every write after it (observed as cascading `[Errno 35]`
+    failures). HTTP/1.1 gives one request per pooled connection and clean
+    recovery, at no practical cost for PostgREST traffic.
+    """
+    try:
+        session._transport = httpx.HTTPTransport(
+            http2=False,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("[db] could not force http/1.1: %s", exc)
+
+
 def _wrap_client(client: Client) -> Client:
-    """Install the retry wrapper on the client's REST + Storage sessions."""
+    """Install the retry wrapper + HTTP/1.1 transport on REST/Storage sessions."""
     for name in ("postgrest", "storage"):
         try:
             sub = getattr(client, name, None)
             session = getattr(sub, "session", None)
-            if session is not None:
+            if isinstance(session, httpx.Client):
+                _force_http1(session)
                 _install_retry(session)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("[db] could not install retry on %s: %s", name, exc)
@@ -79,6 +98,15 @@ def get_db() -> Client:
     if not settings.supabase_url or not settings.supabase_service_key:
         raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
     return _wrap_client(create_client(settings.supabase_url, settings.supabase_service_key))
+
+
+def reset_db() -> None:
+    """
+    Drop the cached service-role client so the next get_db() builds a fresh one
+    with a clean connection pool — for callers recovering from transport-level
+    failures that may have poisoned the pool.
+    """
+    get_db.cache_clear()
 
 
 def get_user_db(token: str) -> Client:

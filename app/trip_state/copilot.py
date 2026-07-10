@@ -18,6 +18,8 @@ Intents:
   answer_question         — answer anything about the plan, grounded in state.
   select_transport_option — pick a specific ride on one leg (mode + index).
   select_hotel            — pick a different hotel from the fetched candidates.
+  search_hotels           — LIVE hotel re-search near a landmark/area
+                            ("hotels near Mall Road") → replaces /stay/hotels.
   set_title               — rename the trip.
   unsupported             — graceful "here's what I can do" reply.
 """
@@ -42,6 +44,7 @@ _INTENT_SCHEMA = {
                 "answer_question",
                 "select_transport_option",
                 "select_hotel",
+                "search_hotels",
                 "set_title",
                 "unsupported",
             ],
@@ -50,6 +53,7 @@ _INTENT_SCHEMA = {
         "mode": {"type": "STRING", "enum": ["flight", "train", "bus"], "nullable": True},
         "option_index": {"type": "INTEGER", "nullable": True},
         "hotel_index": {"type": "INTEGER", "nullable": True},
+        "hotel_query": {"type": "STRING", "nullable": True},
         "title": {"type": "STRING", "nullable": True},
         "reply": {"type": "STRING"},
     },
@@ -168,6 +172,20 @@ def _state_summary(state: dict) -> str:
             title = d.get("title") or d.get("theme") or ""
             n = len(d.get("activities") or d.get("items") or [])
             lines.append(f"  Day {i + 1}: {title} ({n} activities)")
+
+    weather = state.get("weather") or {}
+    if weather.get("daily"):
+        header = (
+            "Weather at the destination RIGHT NOW (trip is too far out for a forecast)"
+            if weather.get("is_preview")
+            else "Weather forecast for the trip dates"
+        )
+        lines.append(f"{header} — {weather.get('summary')}:")
+        for d in weather["daily"][:8]:
+            lines.append(
+                f"  {d.get('date')}: {d.get('label')}, "
+                f"{d.get('temp_min')}–{d.get('temp_max')}°C, rain {d.get('precip_prob')}%"
+            )
     return "\n".join(lines)
 
 
@@ -190,11 +208,17 @@ async def route_intent(message: str, state: dict) -> dict:
         "lists. Pick the option that best matches what they asked for. The "
         "reply will be replaced by the handler, keep it short.\n"
         "- select_hotel: pick a different hotel by index from the candidates.\n"
+        "- search_hotels: the user wants hotels the list doesn't cover — near a "
+        "landmark/area ('hotels near Mall Road', 'stays close to the beach') or "
+        "just fresh options ('show me more hotels'). Set hotel_query to the "
+        "landmark/area phrase only (e.g. 'Mall Road'), or empty for a general "
+        "re-search. This triggers a LIVE search — the reply will be replaced by "
+        "the handler, keep it short.\n"
         "- set_title: rename the trip.\n"
         "- unsupported: ONLY structural edits that truly can't be done "
         "(change destination/dates, add days, regenerate the itinerary). "
         "Reply warmly with what IS possible right now: answer questions, swap "
-        "rides on any leg, swap the hotel, rename the trip.\n\n"
+        "rides on any leg, search/swap hotels, rename the trip.\n\n"
         "Examples:\n"
         "- 'find me a better/cheaper bus' → select_transport_option on the bus "
         "leg: scan the numbered list and pick the strongest option that differs "
@@ -203,6 +227,11 @@ async def route_intent(message: str, state: dict) -> dict:
         "with that option's index.\n"
         "- 'is the bus overnight?' / 'what's the cheapest way there?' → "
         "answer_question, citing concrete options and fares.\n"
+        "- 'will it rain?' / 'what should I pack?' → answer_question, grounded "
+        "in the weather block when present.\n"
+        "- 'show me hotels near Mall Road' → search_hotels, hotel_query 'Mall "
+        "Road'. 'Any hotels closer to the lake?' → search_hotels, hotel_query "
+        "'the lake'.\n"
         "- 'add one more day in Manali' → unsupported.\n"
         "select_transport_option MUST include direction, mode and option_index; "
         "if you can't determine them, use answer_question and tell the user "
@@ -214,6 +243,42 @@ async def route_intent(message: str, state: dict) -> dict:
         prompt, tier="brain", response_schema=_INTENT_SCHEMA,
         temperature=0.2, max_output_tokens=512, timeout=30.0,
     )
+
+
+def _live_total(state: dict) -> int:
+    """
+    Live-priced total, mirroring what the workspace UI shows: the picked ride
+    on every bookable leg (both directions) × travelers, plus the selected
+    hotel × nights. Estimated food/activities/misc are deliberately excluded.
+    """
+    req = state.get("request") or {}
+    travelers = max(int(req.get("travelers") or 1), 1)
+    nights = max(int(req.get("stay_nights") or 1), 1)
+
+    per_person = 0.0
+    for direction in ("going", "return"):
+        j = _journey(state, direction)
+        leg_modes = [
+            (leg.get("mode") or "").lower()
+            for leg in (j.get("legs") or [])
+            if (leg.get("mode") or "").lower() in _MODE_KEYS
+        ]
+        # No legs metadata → buckets are alternatives; count only the first
+        # bucket that has a recommendation.
+        modes = list(dict.fromkeys(leg_modes)) or [
+            m for m in _MODE_KEYS if (j.get(_MODE_KEYS[m]) or {}).get("recommended")
+        ][:1]
+        for mode in modes:
+            rec = (j.get(_MODE_KEYS[mode]) or {}).get("recommended")
+            if rec:
+                per_person += _fare_per_person(mode, rec) or 0
+
+    total = per_person * travelers
+    hotel = (state.get("stay") or {}).get("selected") or {}
+    price = hotel.get("price_per_night") or hotel.get("price")
+    if isinstance(price, (int, float)) and price > 0:
+        total += price * nights
+    return round(total)
 
 
 # ── Cost recompute ──────────────────────────────────────────────────────────────
@@ -331,8 +396,9 @@ def handle_select_option(
     if direction == "going":
         new_costs = _recompute_costs(state)
         patches.append(PatchOp(op="set", path="/costs", value=new_costs))
-        if new_costs.get("total"):
-            reply += f" Trip total is now ₹{new_costs['total']:,}."
+    live = _live_total(state)
+    if live:
+        reply += f" Rides + stay now ₹{live:,} at live prices."
     return patches, reply
 
 
@@ -351,8 +417,10 @@ def handle_select_hotel(state: dict, index: int) -> tuple[list[PatchOp], str]:
     if isinstance(price, (int, float)) and price > 0:
         new_costs = _recompute_stay_costs(state.get("costs") or {}, travelers, price * nights)
         patches.append(PatchOp(op="set", path="/costs", value=new_costs))
-        if new_costs.get("total"):
-            reply += f" Trip total is now ₹{new_costs['total']:,}."
+        state.setdefault("stay", {})["selected"] = hotel  # so the live total sees the swap
+        live = _live_total(state)
+        if live:
+            reply += f" Rides + stay now ₹{live:,} at live prices."
     return patches, reply
 
 
@@ -406,6 +474,13 @@ async def apply_edit(
             reply = handler_reply or reply
         elif kind == "select_hotel" and intent.get("hotel_index") is not None:
             patches, handler_reply = handle_select_hotel(state, int(intent["hotel_index"]))
+            reply = handler_reply or reply
+        elif kind == "search_hotels":
+            from .hotel_search import handle_search_hotels
+
+            patches, handler_reply = await handle_search_hotels(
+                state, (intent.get("hotel_query") or "").strip()
+            )
             reply = handler_reply or reply
         elif kind == "set_title" and intent.get("title"):
             patches = [PatchOp(op="set", path="/meta/title", value=intent["title"])]

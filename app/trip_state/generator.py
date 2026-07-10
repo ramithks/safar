@@ -61,6 +61,9 @@ class _Emitter:
     def __init__(self, trip_id: str):
         self.trip_id = trip_id
         self._loop = asyncio.get_event_loop()
+        # Weather runs in parallel with supervisor phases; append_events is a
+        # read-modify-write on the snapshot, so emits must never interleave.
+        self._lock = asyncio.Lock()
 
     async def __call__(
         self,
@@ -70,6 +73,18 @@ class _Emitter:
         progress: int,
         reasoning: str | None = None,
         actor: str = "supervisor",
+    ) -> None:
+        async with self._lock:
+            await self._emit(phase, label, patches, progress, reasoning, actor)
+
+    async def _emit(
+        self,
+        phase: str,
+        label: str,
+        patches: list[PatchOp],
+        progress: int,
+        reasoning: str | None,
+        actor: str,
     ) -> None:
         if patches:
             await self._loop.run_in_executor(
@@ -91,13 +106,33 @@ def _section_patches(state_dict: dict, sections: list[str]) -> list[PatchOp]:
     return [PatchOp(op="set", path=f"/{s}", value=state_dict[s]) for s in sections]
 
 
+async def _fetch_and_emit_weather(trip_id: str, body: PlanRequest, emit: "_Emitter") -> None:
+    """Runs alongside the supervisor; weather is optional and never blocks the plan."""
+    from app.services.weather import get_trip_weather
+
+    try:
+        weather = await get_trip_weather(
+            body.destination, body.departure_date, days=body.days
+        )
+        if weather.get("daily"):
+            await emit(
+                "weather_ready", f"Weather in {weather.get('location') or body.destination}",
+                [PatchOp(op="set", path="/weather", value=weather)],
+                50, actor="weather",
+            )
+    except Exception as exc:  # noqa: BLE001 — weather is a nice-to-have
+        logger.warning("[trip-state] weather fetch failed for %s: %s", trip_id, exc)
+
+
 async def run_generation(trip_id: str, body: PlanRequest, user_id: str) -> None:
     """Run the full plan pipeline for a trip, streaming patches as agents finish."""
     from app.agents.supervisor import supervisor_run
 
     emit = _Emitter(trip_id)
+    weather_task: asyncio.Task | None = None
     try:
         await emit("understanding", "Understanding your trip", [], 5)
+        weather_task = asyncio.create_task(_fetch_and_emit_weather(trip_id, body, emit))
 
         async def on_phase(tag: str, result, error) -> None:
             if error is not None:
@@ -147,6 +182,13 @@ async def run_generation(trip_id: str, body: PlanRequest, user_id: str) -> None:
                 )
 
         merged = await supervisor_run(body, user_id, on_phase=on_phase)
+
+        # Weather must land before "complete" — the SSE stream closes on it.
+        if weather_task is not None:
+            try:
+                await asyncio.wait_for(weather_task, timeout=10)
+            except Exception:  # noqa: BLE001 — optional section
+                pass
 
         # Authoritative final pass — budget interventions may have reshuffled
         # transport/costs after the early events, so re-set every section from
