@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     # Path to a service account JSON key; leave unset to use ADC
     google_application_credentials: Optional[str] = None
 
+    # LLM gateway tiers — model IDs live in config ONLY (never hardcode at call
+    # sites). "brain" handles reasoning-heavy calls (itinerary, journey tradeoffs,
+    # re-ranking); "muscle" handles high-volume schema-bound transforms
+    # (extraction, tagging, onboarding). Swap to gemini-3.5-flash /
+    # gemini-3.1-flash-lite via env once regional availability is confirmed.
+    vertex_model_brain: str = "gemini-2.5-flash"
+    vertex_model_muscle: str = "gemini-2.5-flash-lite"
+
     # Vertex fallback account — tried only when the primary project returns 429
     # (RESOURCE_EXHAUSTED). Lets a rate-limited Gemini call retry instantly against
     # a second project's independent quota. Both optional; omit to disable fallback.

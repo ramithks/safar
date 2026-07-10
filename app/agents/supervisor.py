@@ -246,12 +246,40 @@ def _assemble_costs(merged: dict) -> dict:
 
 # ── Main supervisor entry point ────────────────────────────────────────────────
 
-async def supervisor_run(body: PlanRequest, user_id: str) -> dict:
+async def _phase_wrap(tag: str, coro, on_phase):
+    """
+    Await an agent coroutine and fire the on_phase callback the moment it
+    finishes — this is what lets the streaming pipeline emit transport/itinerary
+    patches while the other agents are still running. Exceptions are returned
+    (not raised) to mirror gather(return_exceptions=True).
+    """
+    try:
+        res = await coro
+    except Exception as e:  # noqa: BLE001 — mirrored into results like gather does
+        if on_phase:
+            try:
+                await on_phase(tag, None, e)
+            except Exception as cb_err:  # noqa: BLE001 — callback must never kill the plan
+                logger.warning("[supervisor] on_phase(%s) failed: %s", tag, cb_err)
+        return e
+    if on_phase:
+        try:
+            await on_phase(tag, res, None)
+        except Exception as cb_err:  # noqa: BLE001
+            logger.warning("[supervisor] on_phase(%s) failed: %s", tag, cb_err)
+    return res
+
+
+async def supervisor_run(body: PlanRequest, user_id: str, on_phase=None) -> dict:
     """
     Full plan orchestration with budget supervision.
 
     Drop-in replacement for run_plan() in plan.py.
     Adds a budget-intervention layer between merge and return.
+
+    on_phase: optional async callback (tag, result, error) fired as each agent
+    completes — tags: "journey", "itinerary", "return_journey". Used by the
+    Trip State streaming pipeline; blocking callers just omit it.
     """
     stay_nights = max(1, body.days - 1)   # e.g. 4-day trip → 3 hotel nights
 
@@ -300,11 +328,15 @@ async def supervisor_run(body: PlanRequest, user_id: str) -> dict:
     shared_profile = await loop.run_in_executor(None, fetch_user_profile, _db, user_id)
 
     coros = [
-        run_plan_journey(journey_req, user_id, profile=shared_profile),
-        run_plan_trip(trip_req, user_id, trace=trace, profile=shared_profile),
+        _phase_wrap("journey", run_plan_journey(journey_req, user_id, profile=shared_profile), on_phase),
+        _phase_wrap("itinerary", run_plan_trip(trip_req, user_id, trace=trace, profile=shared_profile), on_phase),
     ]
     if return_journey_req:
-        coros.append(run_plan_journey(return_journey_req, user_id, profile=shared_profile))
+        coros.append(_phase_wrap(
+            "return_journey",
+            run_plan_journey(return_journey_req, user_id, profile=shared_profile),
+            on_phase,
+        ))
 
     logger.info(
         "[supervisor] %s → %s (%dd, %s budget, %d travelers) — launching agents",

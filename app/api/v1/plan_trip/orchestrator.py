@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 from fastapi import HTTPException
 
 from app.db.client import get_db
-from app.services.vertex import vertex_generate, extract_json
+from app.services.vertex import brain as vertex_brain, extract_json
 from app.services.places import discover_places
 from app.core.timing import RequestTrace
 
@@ -198,7 +198,7 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
     )
     async with (trace.track("gemini") if trace else _noop()):
         raw = await with_retry(
-            vertex_generate, prompt,
+            vertex_brain, prompt,
             response_mime_type="application/json",
             temperature=0.0, seed=itinerary_seed,
             timeout=180.0,

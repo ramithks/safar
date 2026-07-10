@@ -14,7 +14,7 @@ deterministic (cheapest/best-by-sort) recommendation.
 import json
 import logging
 
-from app.services.vertex import vertex_generate, extract_json
+from app.services.vertex import brain as vertex_brain, extract_json
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +105,7 @@ async def _recommend(
     )
 
     try:
-        raw = await vertex_generate(
+        raw = await vertex_brain(
             prompt,
             response_mime_type="application/json",
             temperature=0.3,

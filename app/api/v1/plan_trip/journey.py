@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from fastapi import HTTPException
 
 from app.db.client import get_db
-from app.services.vertex import vertex_generate, extract_json
+from app.services.vertex import brain as vertex_brain, extract_json
 from app.services.transport import TransportService
 from app.services.hotels import HotelService
 from app.services.flights import FlightService, budget_to_sort, sort_flights
@@ -138,7 +138,7 @@ Return ONLY valid JSON (no markdown):
         body.origin, body.destination, budget, body.travelers,
         ",".join(sorted(body.transport_modes or [])), body.departure_date or "",
     )
-    raw = await with_retry(vertex_generate, prompt, response_mime_type="application/json",
+    raw = await with_retry(vertex_brain, prompt, response_mime_type="application/json",
                            temperature=0.0, seed=route_seed,
                            timeout=120.0, max_retries=2)
     if not raw:
