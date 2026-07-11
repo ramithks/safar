@@ -6,7 +6,7 @@ Bus search:      POST /rpw/api/searchResults  (query params + JSON filter body)
 """
 import logging
 from datetime import datetime
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from app.services.curl_pool import get_curl_session
 
 from app.services.scraper_proxy import with_proxy_fallback
 
@@ -44,7 +44,7 @@ async def search_city(name: str) -> list[dict]:
     Returns [{id, name, type, boarding_points: [{id, name}]}]
     """
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.get(
                 f"{_BASE}/rpw/api/citySuggestion",
                 headers=_HEADERS,
@@ -104,7 +104,7 @@ async def search_buses(
         doj = date
 
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 f"{_BASE}/rpw/api/searchResults",
                 headers=_HEADERS,

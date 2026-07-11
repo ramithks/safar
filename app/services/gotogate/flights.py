@@ -21,7 +21,7 @@ import re
 import uuid
 from datetime import datetime
 
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from app.services.curl_pool import get_curl_session
 
 from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
 
@@ -108,7 +108,7 @@ async def resolve_iata(city: str) -> str | None:
         return _IATA_CACHE[key]
 
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _SEARCH_LOCATIONS_URL,
                 headers=_loc_headers(),
@@ -203,7 +203,7 @@ async def search_flights(
         variables["sortTypeCode"] = sort_code
 
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _SEARCH_URL,
                 headers=_search_headers(),
@@ -298,11 +298,27 @@ def _normalise(trip: dict, from_iata: str, to_iata: str, adults: int) -> dict | 
         "duration_min": duration_min,
         "stops": len(segments) - 1,
         "cabin_class": first.get("cabinClassName") or "ECONOMY",
+        "baggage_kg": _checked_baggage_kg(trip),
         "price_total": price_total,
         "currency": currency,
         "booking_url": trip.get("shareableUrl"),
         "source": "gotogate",
     }
+
+
+def _checked_baggage_kg(trip: dict) -> int | None:
+    """Included checked-baggage allowance in kg (trip level, else first bound)."""
+    candidates = [trip.get("includedCheckedBaggage")]
+    for bound in (trip.get("bounds") or []):
+        candidates.append(bound.get("includedCheckedBaggage"))
+    for bag in candidates:
+        if not isinstance(bag, dict):
+            continue
+        weight = bag.get("weight")
+        unit = (bag.get("weightUnit") or "").upper()
+        if isinstance(weight, (int, float)) and weight > 0 and unit in ("", "KG", "KILOGRAM", "KILOGRAMS"):
+            return int(weight)
+    return None
 
 
 def _duration(dep: str | None, arr: str | None) -> int | None:

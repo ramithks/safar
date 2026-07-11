@@ -18,7 +18,7 @@ import logging
 import uuid
 from datetime import datetime
 
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from app.services.curl_pool import get_curl_session
 
 from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
 from app.services.hotels_filters import classify_property_type
@@ -86,7 +86,7 @@ async def resolve_location(city_name: str) -> dict | None:
         return _LOC_CACHE[key]
 
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.get(_AUTOCOMPLETE, headers=_headers(),
                             params={"query": city_name, "size": 10}, timeout=10)
         if r.status_code != 200:
@@ -223,7 +223,7 @@ async def search_hotels(
     }
 
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(_BASE, headers=_headers(), json=payload, timeout=25)
         if r.status_code != 200:
             raise ScraperBlocked(f"HTTP {r.status_code}")

@@ -8,6 +8,7 @@ sync and callers hop through run_in_executor — same pattern as supervisor.py.
 """
 import logging
 import random
+import ssl
 import threading
 import time
 from datetime import datetime, timezone
@@ -103,7 +104,7 @@ def append_events(
         for attempt in range(1, _MAX_APPEND_ATTEMPTS + 1):
             try:
                 return _append_events_once(trip_id, actor, patches, phase, reasoning)
-            except httpx.TransportError as exc:
+            except (httpx.TransportError, ssl.SSLError) as exc:
                 last_exc = exc
                 logger.warning(
                     "[trip-state] %s persisting events for %s — retrying on a fresh client (%d/%d)",

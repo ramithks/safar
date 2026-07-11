@@ -11,7 +11,7 @@ import asyncio
 import logging
 import re as _re
 import httpx
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from app.services.curl_pool import get_curl_session
 
 from app.config import settings
 from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
@@ -80,7 +80,7 @@ async def resolve_iata(city: str) -> str | None:
 
     # ── Fallback source 1: EaseMyTrip autosuggest (validated) ────────────────
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _EMT_AUTOSUGGEST,
                 headers={
@@ -150,7 +150,7 @@ async def search_flights(
     async def _do(proxy):
         # Tighter per-request timeout (12s) so several fresh-IP proxy retries fit
         # inside this scraper's own budget instead of hanging on one slow attempt.
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.get(
                 _BASE,
                 headers=_build_headers(),

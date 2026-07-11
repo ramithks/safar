@@ -83,6 +83,8 @@ _INTENT_SCHEMA = {
                 "select_transport_option",
                 "select_hotel",
                 "search_hotels",
+                "add_activities",
+                "add_waypoint",
                 "set_title",
                 "unsupported",
             ],
@@ -90,9 +92,18 @@ _INTENT_SCHEMA = {
         "direction": {"type": "STRING", "enum": ["going", "return"], "nullable": True},
         "mode": {"type": "STRING", "enum": ["flight", "train", "bus"], "nullable": True},
         "option_index": {"type": "INTEGER", "nullable": True},
+        "prefer": {
+            "type": "STRING", "nullable": True,
+            "enum": ["cheapest", "fastest", "earliest", "latest", "most_baggage", "highest_rated"],
+        },
         "hotel_index": {"type": "INTEGER", "nullable": True},
         "hotel_query": {"type": "STRING", "nullable": True},
         "hotel_filters": _HOTEL_FILTERS_SCHEMA,
+        "day_index": {"type": "INTEGER", "nullable": True},
+        "activity_query": {"type": "STRING", "nullable": True},
+        "count": {"type": "INTEGER", "nullable": True},
+        "waypoint_city": {"type": "STRING", "nullable": True},
+        "waypoint_days": {"type": "INTEGER", "nullable": True},
         "title": {"type": "STRING", "nullable": True},
         "reply": {"type": "STRING"},
     },
@@ -156,6 +167,29 @@ def _route_lines(state: dict, direction: str) -> list[str]:
     return out
 
 
+def _baggage_kg(option: dict) -> float | None:
+    for k in ("baggage_kg", "checked_baggage_kg", "free_baggage_kg"):
+        v = option.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return v
+    return None
+
+
+def _extra_detail(mode: str, option: dict) -> str:
+    """Axis-specific detail the router uses to honour 'more luggage', 'best
+    rated', etc. — appended to each numbered option line."""
+    bits: list[str] = []
+    if mode == "flight":
+        bag = _baggage_kg(option)
+        bits.append(f"baggage {bag:g}kg" if bag else "baggage n/a")
+        if option.get("stops") is not None:
+            bits.append("non-stop" if not option.get("stops") else f"{option['stops']} stop")
+    rating = option.get("rating") or option.get("review_score")
+    if isinstance(rating, (int, float)) and rating > 0:
+        bits.append(f"rated {rating:g}")
+    return (" · " + " · ".join(bits)) if bits else ""
+
+
 def _option_lines(state: dict, direction: str, per_mode: int = 10) -> list[str]:
     j = _journey(state, direction)
     out: list[str] = []
@@ -168,7 +202,8 @@ def _option_lines(state: dict, direction: str, per_mode: int = 10) -> list[str]:
             fare = _fare_per_person(mode, it)
             star = "  ← current pick" if it.get("is_recommended") else ""
             out.append(
-                f"  [{i}] {_option_name(mode, it)} · {_option_times(it)} · ₹{round(fare)}/person{star}"
+                f"  [{i}] {_option_name(mode, it)} · {_option_times(it)} · "
+                f"₹{round(fare)}/person{_extra_detail(mode, it)}{star}"
             )
         if len(items) > per_mode:
             out.append(f"  …and {len(items) - per_mode} more (indices up to {len(items) - 1})")
@@ -228,10 +263,35 @@ def _state_summary(state: dict) -> str:
     return "\n".join(lines)
 
 
-async def route_intent(message: str, state: dict) -> dict:
+def _recent_history(trip_id: str, limit: int = 6) -> str:
+    """Last few copilot turns for this trip → a compact transcript the router
+    uses for continuity ('make it cheaper', 'add more there'). User turns carry
+    the message in `reasoning`; the assistant reply is the event `label`."""
+    try:
+        events = store.get_events(trip_id)
+    except Exception:  # noqa: BLE001 — history is a nice-to-have, never block an edit
+        return ""
+    turns: list[str] = []
+    for ev in events:
+        if ev.get("phase") != "copilot_edit":
+            continue
+        user_msg = (ev.get("reasoning") or "").strip()
+        reply = (ev.get("label") or "").strip()
+        if user_msg:
+            turns.append(f"User: {user_msg}")
+        if reply:
+            turns.append(f"Copilot: {reply}")
+    return "\n".join(turns[-(limit * 2):])
+
+
+async def route_intent(message: str, state: dict, history: str = "") -> dict:
     prompt = (
         "You are the copilot for a travel-planning workspace. Classify the "
         "user's message into one intent and write the reply.\n\n"
+        + (f"RECENT CONVERSATION (oldest first, for continuity — resolve "
+           f"follow-ups like 'a cheaper one' or 'add more there' against it):\n"
+           f"{history}\n\n" if history else "")
+        +
         "CRITICAL context: the trip below may be a MULTI-LEG route — e.g. a "
         "train leg followed by a bus leg. Those are parts of ONE journey, not "
         "alternative routes. 'Switch to the train' therefore usually makes no "
@@ -242,10 +302,14 @@ async def route_intent(message: str, state: dict) -> dict:
         "(2-4 sentences, specific numbers/names, no fluff). Use general travel "
         "knowledge where the summary is silent, and say so.\n"
         "- select_transport_option: the user wants a specific ride on a leg "
-        "(e.g. 'take the 11pm Volvo', 'a cheaper bus', 'the earlier train'). "
-        "Set direction (going/return), mode, and option_index from the numbered "
-        "lists. Pick the option that best matches what they asked for. The "
-        "reply will be replaced by the handler, keep it short.\n"
+        "(e.g. 'take the 11pm Volvo', 'a cheaper bus', 'the earlier train', 'a "
+        "flight with more luggage'). Set direction (going/return), mode, and "
+        "option_index from the numbered lists. Pick the option that best matches "
+        "what they asked for — the option lines include fare, timing, rating and "
+        "(for flights) baggage allowance, so honour 'more luggage/baggage' by "
+        "choosing the highest-baggage flight, 'cheaper' by fare, etc. Also set "
+        "`prefer` to the axis they cared about. The reply will be replaced by "
+        "the handler, keep it short.\n"
         "- select_hotel: pick a different hotel by index from the candidates.\n"
         "- search_hotels: the user wants hotels the list doesn't cover — near a "
         "landmark/area ('hotels near Mall Road', 'stays close to the beach'), "
@@ -267,11 +331,25 @@ async def route_intent(message: str, state: dict) -> dict:
         "sort ('cheapest first' → price_asc, 'best rated' → rating). This "
         "triggers a LIVE search — the reply will be replaced by the handler, "
         "keep it short.\n"
+        "- add_activities: the user wants MORE spots/places in the itinerary "
+        "('add more spots', 'more things to do on day 2', 'add some cafes', "
+        "'this day feels empty'). Set day_index (0-based) if they named a "
+        "specific day, else leave null. Set activity_query to the KIND of spot "
+        "they want ('cafes', 'waterfalls', 'adventure', 'nightlife') or empty "
+        "for general additions. Set count if they gave a number. The reply is "
+        "replaced by the handler — keep it short.\n"
+        "- add_waypoint: the user wants to add a STOPOVER CITY between origin and "
+        "destination ('add Nainital in between', 'can we stop in Jaipur on the "
+        "way', 'include Rishikesh en route'). Set waypoint_city to that city, and "
+        "waypoint_days if they said how long to spend there (default 1). This "
+        "re-routes the trip and builds an itinerary for the stop — the reply is "
+        "replaced by the handler, keep it short.\n"
         "- set_title: rename the trip.\n"
-        "- unsupported: ONLY structural edits that truly can't be done "
-        "(change destination/dates, add days, regenerate the itinerary). "
+        "- unsupported: ONLY edits that truly can't be done (change the main "
+        "destination or dates, regenerate the whole itinerary from scratch). "
         "Reply warmly with what IS possible right now: answer questions, swap "
-        "rides on any leg, search/swap hotels, rename the trip.\n\n"
+        "rides on any leg, search/swap hotels, add spots or a stopover city, "
+        "rename the trip.\n\n"
         "Examples:\n"
         "- 'find me a better/cheaper bus' → select_transport_option on the bus "
         "leg: scan the numbered list and pick the strongest option that differs "
@@ -291,7 +369,14 @@ async def route_intent(message: str, state: dict) -> dict:
         "- 'a top-rated hostel near Anjuna with free cancellation' → "
         "search_hotels, hotel_query 'Anjuna', hotel_filters "
         "{property_types:['hostel'], min_review_score:9, free_cancellation:true}.\n"
-        "- 'add one more day in Manali' → unsupported.\n"
+        "- 'add more spots to day 2' → add_activities, day_index 1. 'add a few "
+        "cafes' → add_activities, activity_query 'cafes'. 'this itinerary is "
+        "thin, add more' → add_activities.\n"
+        "- 'add Nainital in between' / 'can we stop in Rishikesh on the way' → "
+        "add_waypoint, waypoint_city 'Nainital'/'Rishikesh'.\n"
+        "- 'a flight with more baggage allowance' → select_transport_option, "
+        "mode flight, prefer most_baggage, option_index of the highest-baggage "
+        "flight in the list.\n"
         "select_transport_option MUST include direction, mode and option_index; "
         "if you can't determine them, use answer_question and tell the user "
         "which numbered option you'd suggest instead.\n\n"
@@ -314,9 +399,12 @@ def _live_total(state: dict) -> int:
     travelers = max(int(req.get("travelers") or 1), 1)
     nights = max(int(req.get("stay_nights") or 1), 1)
 
+    journeys = [_journey(state, "going"), _journey(state, "return")]
+    journeys += (state.get("transport") or {}).get("onward_segments") or []
     per_person = 0.0
-    for direction in ("going", "return"):
-        j = _journey(state, direction)
+    for j in journeys:
+        if not j:
+            continue
         leg_modes = [
             (leg.get("mode") or "").lower()
             for leg in (j.get("legs") or [])
@@ -371,6 +459,22 @@ def _recompute_costs(state: dict) -> dict:
         per_person += fare
         leg_fares[f"leg{i + 1}_{mode}"] = round(fare)
         seen_modes.add(mode)
+
+    # Waypoint stopovers add onward segments (city→destination) that are part of
+    # the outbound cost. Each segment is priced like its own mini-journey.
+    for s_idx, seg in enumerate((state.get("transport") or {}).get("onward_segments") or []):
+        seg_modes: set[str] = set()
+        for i, leg in enumerate(seg.get("legs") or []):
+            mode = (leg.get("mode") or "").lower()
+            if mode not in _MODE_KEYS or mode in seg_modes:
+                continue
+            rec = (seg.get(_MODE_KEYS[mode]) or {}).get("recommended")
+            if not rec:
+                continue
+            fare = _fare_per_person(mode, rec) or 0
+            per_person += fare
+            leg_fares[f"onward{s_idx + 1}_leg{i + 1}_{mode}"] = round(fare)
+            seg_modes.add(mode)
 
     if not legs:  # single-hop journey: use whichever bucket holds the pick
         for mode, key in _MODE_KEYS.items():
@@ -498,8 +602,37 @@ def _persist_and_broadcast(trip_id: str, patches: list[PatchOp], reply: str, mes
     })
 
 
+def _auto_select_top_hotel(
+    state: dict, patches: list[PatchOp], reply: str,
+) -> tuple[list[PatchOp], str]:
+    """When a hotel search was driven by a real constraint (cheapest, under ₹X,
+    with a pool…), the list is already ranked for that constraint, so lock the
+    top result in as the stay — that's the "edit that in stay" the user expects,
+    not just a refreshed list. Costs follow the swap."""
+    hotels = next(
+        (p.value for p in patches if p.path == "/stay/hotels" and p.value), None
+    )
+    if not hotels:
+        return patches, reply
+    top = hotels[0]
+    req = state.get("request") or {}
+    travelers = req.get("travelers") or 1
+    nights = req.get("stay_nights") or 1
+    price = top.get("price_per_night") or top.get("price")
+    patches = list(patches) + [PatchOp(op="set", path="/stay/selected", value=top)]
+    state.setdefault("stay", {})["selected"] = top
+    name = top.get("name") or "the top match"
+    reply = f"{reply} I've set {name} as your stay — swap to any of the others in the Stays tab."
+    if isinstance(price, (int, float)) and price > 0:
+        new_costs = _recompute_stay_costs(state.get("costs") or {}, travelers, price * nights)
+        patches.append(PatchOp(op="set", path="/costs", value=new_costs))
+        state["costs"] = new_costs
+    return patches, reply
+
+
 async def apply_edit(
     trip_id: str, message: str, state: dict, action: dict | None = None,
+    user_id: str = "",
 ) -> dict:
     """Route + apply an edit. Returns {reply, patches, applied}.
 
@@ -519,7 +652,8 @@ async def apply_edit(
             int(action.get("index") or 0),
         )
     else:
-        intent = await route_intent(message, state)
+        history = _recent_history(trip_id)
+        intent = await route_intent(message, state, history=history)
         kind = intent.get("intent")
         reply = intent.get("reply") or ""
 
@@ -541,6 +675,30 @@ async def apply_edit(
                 state,
                 (intent.get("hotel_query") or "").strip(),
                 raw_filters=intent.get("hotel_filters"),
+            )
+            reply = handler_reply or reply
+            # A constrained search ("cheapest", "under 1000", "with a pool")
+            # should also update the picked stay, not just the candidate list.
+            if patches and intent.get("hotel_filters"):
+                patches, reply = _auto_select_top_hotel(state, patches, reply)
+        elif kind == "add_activities":
+            from .structural import handle_add_activities
+
+            day_index = intent.get("day_index")
+            patches, handler_reply = await handle_add_activities(
+                state,
+                int(day_index) if day_index is not None else None,
+                (intent.get("activity_query") or "").strip(),
+                intent.get("count"),
+            )
+            reply = handler_reply or reply
+        elif kind == "add_waypoint" and intent.get("waypoint_city"):
+            from .structural import handle_add_waypoint
+
+            patches, handler_reply = await handle_add_waypoint(
+                state, user_id,
+                intent["waypoint_city"],
+                intent.get("waypoint_days"),
             )
             reply = handler_reply or reply
         elif kind == "set_title" and intent.get("title"):

@@ -17,6 +17,7 @@ older queued patches.
 """
 import asyncio
 import logging
+import ssl
 
 import httpx
 import sentry_sdk
@@ -91,7 +92,7 @@ async def _flush_one(
             )
             logger.info("[trip-state] background flush landed for %s (%s)", trip_id, phase)
             return
-        except httpx.TransportError as exc:
+        except (httpx.TransportError, ssl.SSLError) as exc:
             if asyncio.get_running_loop().time() >= deadline:
                 logger.error(
                     "[trip-state] background flush gave up for %s (%s) after %ss: %s",

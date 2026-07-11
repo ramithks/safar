@@ -10,7 +10,7 @@ depending on FlixBus's current coverage in India.
 """
 import logging
 from datetime import datetime
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from app.services.curl_pool import get_curl_session
 
 from app.services.scraper_proxy import with_proxy_fallback
 
@@ -48,7 +48,7 @@ async def search_city(name: str, country: str = "in") -> list[dict]:
     Returns [{id, name, lat, lon, country}]
     """
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.get(
                 _AUTOCOMPLETE_URL,
                 headers=_AUTOCOMPLETE_HEADERS,
@@ -107,7 +107,7 @@ async def search_buses(
         return []
 
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.get(
                 _SEARCH_URL,
                 headers=_SEARCH_HEADERS,

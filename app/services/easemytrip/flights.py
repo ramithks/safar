@@ -14,7 +14,7 @@ import logging
 import re
 import time
 import urllib.parse
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from app.services.curl_pool import get_curl_session, CurlAsyncSession
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.padding import PKCS7
 
@@ -138,7 +138,7 @@ async def _resolve_iata_city(iata: str) -> tuple[str, str]:
         return _CITY_CACHE[key]
 
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _AUTOSUGGEST_URL, headers=_AUTOSUGGEST_HEADERS,
                 json={"Prefix": iata}, timeout=8,
@@ -265,7 +265,7 @@ async def search_flights(
         # path) before with_proxy_fallback escalates to the slow proxy retries.
         # Jumping straight to proxy would re-run the UMS+PSP handshake over the
         # proxy and burn the whole 25s budget before the fresh-token search lands.
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             for token_attempt in range(2):
                 payload["TKN"] = await _get_search_token(s)
                 r = await s.post(

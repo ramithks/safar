@@ -156,6 +156,7 @@ async def edit_trip(request: Request, trip_id: str, body: EditRequest, user=Depe
         result = await apply_edit(
             trip_id, message, row["state"],
             action=body.action.model_dump() if body.action else None,
+            user_id=str(user.id),
         )
         return result
     except Exception as exc:  # noqa: BLE001

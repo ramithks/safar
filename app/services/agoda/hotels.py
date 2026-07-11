@@ -19,7 +19,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from app.services.curl_pool import get_curl_session
 
 from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
 
@@ -151,7 +151,7 @@ async def resolve_city_id(city_name: str) -> int | None:
     }
 
     async def _do(proxy):
-        async with CurlAsyncSession(proxy=proxy) as s:
+        async with get_curl_session(proxy=proxy) as s:
             r = await s.get(_SUGGEST, headers=_suggest_headers(), params=params,
                             impersonate="chrome", timeout=10)
         if r.status_code != 200:
@@ -380,7 +380,7 @@ async def search_hotels(
     }
 
     async def _do(proxy):
-        async with CurlAsyncSession(proxy=proxy) as s:
+        async with get_curl_session(proxy=proxy) as s:
             r = await s.post(_BASE, headers=_headers(city_id), json=payload,
                              impersonate="chrome", timeout=25)
         if r.status_code != 200:

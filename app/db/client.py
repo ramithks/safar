@@ -13,7 +13,10 @@ methods so a half-sent write is never replayed.
 """
 import asyncio
 import logging
+import random
+import ssl
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -37,6 +40,44 @@ async def run_db(fn, *args):
     """Run a sync DB callable on the dedicated DB executor. `get_db()` must be
     called INSIDE `fn` (clients are per-thread and must not cross threads)."""
     return await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, fn, *args)
+
+
+# Transient failures that mean "the connection died, retry on a fresh one" —
+# broader than _RETRYABLE below because it also covers the raw ssl.SSLError
+# (SSLV3_ALERT_BAD_RECORD_MAC) the curl_cffi scraper fd churn induces, which
+# httpx doesn't always normalise into a TransportError.
+_WRITE_RETRYABLE = (httpx.TransportError, ssl.SSLError, ConnectionError)
+
+
+def _resilient(fn, label: str, max_seconds: float):
+    """Run `fn` (a sync DB op), retrying on a FRESH client through the
+    multi-second TLS-corruption windows the scrapers induce, until it lands or
+    `max_seconds` elapses. Runs entirely on one executor thread, so reset_db()
+    rebuilds *this* thread's client before each retry — same recovery the
+    trip_state append loop uses. IDEMPOTENT ops only (upsert on a stable key):
+    a retry may re-send a request whose response was merely lost."""
+    deadline = time.monotonic() + max_seconds
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return fn()
+        except _WRITE_RETRYABLE as exc:
+            if time.monotonic() >= deadline:
+                logger.error("[db] %s gave up after %.0fs: %s", label, max_seconds, exc)
+                raise
+            logger.warning(
+                "[db] %s transient %s — fresh client, retry %d",
+                label, type(exc).__name__, attempt,
+            )
+            reset_db()
+            time.sleep(min(0.3 * (2 ** (attempt - 1)), 5.0) + random.uniform(0, 0.3))
+
+
+async def run_db_resilient(fn, *, label: str, max_seconds: float = 180.0):
+    """`run_db` for IDEMPOTENT writes that must survive an SSL-corruption storm.
+    Off the request path (call from a background task) — it can retry for minutes."""
+    return await run_db(lambda: _resilient(fn, label, max_seconds))
 
 # Transport-level errors that mean the connection died, not that the server
 # rejected the request — safe to retry on a fresh connection.

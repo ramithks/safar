@@ -27,6 +27,7 @@ and adjusts cost figures rather than silently returning an unaffordable plan.
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from uuid import uuid4
 
 from .budget_agent import budget_agent_check
 from app.api.v1.plan_trip.constraints import validate_trip
@@ -37,7 +38,7 @@ from app.api.v1.plan_trip.budget import compute_detailed_budget
 from app.api.v1.plan_trip.helpers import CURRENCY_CONFIG, fetch_user_profile
 from app.core.timing import RequestTrace
 from app.core.background import spawn_background
-from app.db.client import get_db, run_db
+from app.db.client import get_db, run_db, run_db_resilient
 
 logger = logging.getLogger(__name__)
 
@@ -462,8 +463,12 @@ async def supervisor_run(body: PlanRequest, user_id: str, on_phase=None) -> dict
             if k in merged
         }
 
-        trip_row = await run_db(lambda: (
-            get_db().table("trips").insert({
+        # Client-generated id → idempotent upsert, so the resilient retry can
+        # re-send through a TLS-corruption storm without duplicating the trip.
+        trip_id = str(uuid4())
+        await run_db_resilient(lambda: (
+            get_db().table("trips").upsert({
+                "id": trip_id,
                 "user_id": user_id,
                 "title": merged.get("trip_name") or body.destination,
                 "destination": body.destination,
@@ -473,18 +478,14 @@ async def supervisor_run(body: PlanRequest, user_id: str, on_phase=None) -> dict
                 "currency": merged.get("currency") or "INR",
                 "itinerary_data": itinerary_data,
                 "is_public": False,
-            }).execute()
-        ))
+            }, on_conflict="id").execute()
+        ), label="supervisor.trips")
 
-        trip_id = (trip_row.data or [{}])[0].get("id")
-        if trip_id:
-            merged["trip_id"] = trip_id
-            spawn_background(
-                _save_trip_journey(user_id, body, merged, end_date, trip_id),
-                name=f"save_trip_journey:{trip_id}",
-            )
-        else:
-            logger.warning("[supervisor] Auto-save: trips insert returned no id")
+        merged["trip_id"] = trip_id
+        spawn_background(
+            _save_trip_journey(user_id, body, merged, end_date, trip_id),
+            name=f"save_trip_journey:{trip_id}",
+        )
 
     except Exception as e:
         logger.warning("[supervisor] Failed to auto-save trip: %s", e)
@@ -516,8 +517,10 @@ async def _save_trip_journey(user_id: str, body: PlanRequest, merged: dict, end_
             "intervention": costs.get("intervention"),
         }
 
-        await run_db(lambda: (
-            get_db().table("trip_journey").insert({
+        journey_id = str(uuid4())
+        await run_db_resilient(lambda: (
+            get_db().table("trip_journey").upsert({
+                "id": journey_id,
                 "trip_id": trip_id,
                 "user_id": user_id,
                 "origin": body.origin,
@@ -549,8 +552,8 @@ async def _save_trip_journey(user_id: str, body: PlanRequest, merged: dict, end_
                 "supervisor_action": costs.get("intervention"),
                 "budget_status": budget_status,
                 "trip_validation": merged.get("trip_validation"),
-            }).execute()
-        ))
+            }, on_conflict="id").execute()
+        ), label="supervisor.trip_journey")
 
     except Exception as e:
         logger.warning("[supervisor] Failed to auto-save trip: %s", e)

@@ -25,8 +25,10 @@ from .journey import run_plan_journey
 from .orchestrator import run_plan_trip
 from .budget import compute_detailed_budget
 from app.core.timing import RequestTrace
+from uuid import uuid4
+
 from app.core.background import spawn_background
-from app.db.client import get_db, run_db
+from app.db.client import get_db, run_db, run_db_resilient
 
 logger = logging.getLogger(__name__)
 
@@ -380,8 +382,15 @@ async def _save_trip(user_id: str, body: PlanRequest, merged: dict, end_date: st
             if k in merged
         }
 
-        trip_row = await run_db(lambda: (
-            get_db().table("trips").insert({
+        # Client-generated ids make both writes idempotent upserts, so the
+        # resilient retry can safely re-send a request whose response was lost to
+        # a TLS-corruption storm without creating duplicate rows.
+        trip_id = str(uuid4())
+        journey_id = str(uuid4())
+
+        await run_db_resilient(lambda: (
+            get_db().table("trips").upsert({
+                "id": trip_id,
                 "user_id": user_id,
                 "title": merged.get("trip_name") or body.destination,
                 "destination": body.destination,
@@ -391,16 +400,12 @@ async def _save_trip(user_id: str, body: PlanRequest, merged: dict, end_date: st
                 "currency": merged.get("currency") or "INR",
                 "itinerary_data": itinerary_data,
                 "is_public": False,
-            }).execute()
-        ))
+            }, on_conflict="id").execute()
+        ), label="save_trip.trips")
 
-        trip_id = (trip_row.data or [{}])[0].get("id")
-        if not trip_id:
-            logger.warning("[plan] Auto-save: trips insert returned no id")
-            return
-
-        await run_db(lambda: (
-            get_db().table("trip_journey").insert({
+        await run_db_resilient(lambda: (
+            get_db().table("trip_journey").upsert({
+                "id": journey_id,
                 "trip_id": trip_id,
                 "user_id": user_id,
                 "origin": body.origin,
@@ -429,19 +434,19 @@ async def _save_trip(user_id: str, body: PlanRequest, merged: dict, end_date: st
                 "documents_needed": merged.get("documents_needed") or [],
                 "health_requirements": merged.get("health_requirements") or [],
                 "currency_info": merged.get("currency_info") or {},
-            }).execute()
-        ))
+            }, on_conflict="id").execute()
+        ), label="save_trip.trip_journey")
 
         # Grow the hotels master table with whatever the live scrapers returned.
         # Prices stay in trip_journey (date-specific); this only stores identity.
         try:
             hotel_rows = _hotel_master_rows(merged, body.destination)
             if hotel_rows:
-                await run_db(lambda: (
+                await run_db_resilient(lambda: (
                     get_db().table("hotels")
                     .upsert(hotel_rows, on_conflict="source,source_hotel_id")
                     .execute()
-                ))
+                ), label="save_trip.hotels")
                 logger.info("[plan] Upserted %d hotels into master table", len(hotel_rows))
         except Exception as e:
             logger.warning("[plan] Hotel master upsert failed: %s", e)

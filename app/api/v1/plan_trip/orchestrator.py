@@ -7,12 +7,13 @@ Caller: endpoint.py (POST /plan-trip).
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
 from fastapi import HTTPException
 
-from app.db.client import get_db, run_db
+from app.db.client import get_db, run_db, run_db_resilient
 from app.services.vertex import brain as vertex_brain, extract_json
 from app.services.places import discover_places
 from app.core.timing import RequestTrace
@@ -57,9 +58,11 @@ TASK: Create a rich {days}-day itinerary for {destination}.
 
 RULES:
 - Each day covers ONE geographic area/neighborhood — ALL activities on a single day must be within 5 km of each other. No cross-city or cross-region days.
-- Each day: EXACTLY 2 or 3 activities — NEVER more than 3. A real traveler cannot properly
-  experience 4+ places in one day. Prefer 3 (1 food + 1 attraction + 1 other); use 2 for
-  days with a long trek/experience that fills most of the day.
+- Each day: 3 to 5 activities that flow geographically through the day (a full,
+  well-paced day — morning attraction, lunch spot, afternoon sight, evening
+  experience). Use 5 for dense areas, drop to 3 (or 2) only when a long
+  trek/experience genuinely fills most of the day. Do NOT pad with filler — every
+  spot must be worth a real traveler's time.
 - Do NOT include hotel check-in/check-out as an activity.
 - For candidates, use exact place_id and set source: "google_places".
 - Up to 1 ai_suggested place per day if it adds real value (place_id: null, source: "ai_suggested").
@@ -70,7 +73,7 @@ RULES:
 - best_time must be precise — the system uses it to assign visit times:
   "Morning" = before noon | "Afternoon" = noon–5 PM | "Evening" = after 5 PM | "Anytime" = flexible.
   Sunset viewpoints MUST be "Evening". Dawn/sunrise viewpoints MUST be "Morning". Treks MUST be "Morning".
-- Category diversity: spread across Nature (Viewpoint/Trek/Waterfall/Beach/Park), Culture (Museum/Temple/Landmark/Gallery), Food (Cafe/Restaurant/Street Food), Nightlife (Bar/Rooftop). NEVER use the same category more than twice across the whole trip.
+- Category diversity: spread across Nature (Viewpoint/Trek/Waterfall/Beach/Park), Culture (Museum/Temple/Landmark/Gallery), Food (Cafe/Restaurant/Street Food), Nightlife (Bar/Rooftop). Keep each day varied; avoid leaning on any single category across the whole trip.
 - No revisit days. Every day must have genuinely different experiences. Day {days} should feel as fresh as Day 1.
 - If it is a hill/village destination, do NOT suggest clubs, nightclubs, or urban nightlife. Use local cafes and stargazing instead.
 
@@ -263,14 +266,16 @@ async def _db_writes(user_id: str, body: PlanTripRequest, itinerary: dict) -> No
         trip_start = datetime.fromisoformat(body.start_date) if body.start_date else datetime.now()
         trip_end = datetime.fromisoformat(body.end_date) if body.end_date else trip_start + timedelta(days=body.days)
         if not body.skip_user_trips:
-            await run_db(lambda: (
-                get_db().table("internal_trip_logs").insert({
+            log_id = str(uuid4())
+            await run_db_resilient(lambda: (
+                get_db().table("internal_trip_logs").upsert({
+                    "id": log_id,
                     "user_id": user_id,
                     "destination": body.destination,
                     "days": body.days,
                     "itinerary_data": itinerary,
-                }).execute()
-            ))
+                }, on_conflict="id").execute()
+            ), label="plan_trip.internal_trip_logs")
     except Exception as e:
         logger.warning("[plan_trip] DB write error (non-fatal): %s", e)
 

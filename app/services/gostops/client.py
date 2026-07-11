@@ -21,7 +21,7 @@ import re
 from typing import Any, Optional
 from urllib.parse import quote, urlencode
 
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from app.services.curl_pool import get_curl_session
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ def _rsc_headers() -> dict:
 
 
 async def _get_json(url: str, headers: dict) -> Any:
-    async with CurlAsyncSession() as s:
+    async with get_curl_session() as s:
         try:
             r = await s.get(url, headers=headers, timeout=_TIMEOUT)
         except Exception as exc:  # network / TLS / timeout
@@ -147,7 +147,7 @@ def _looks_like_detail(d: dict) -> bool:
 async def hostel_detail(city_slug: str, hostel_slug: str) -> dict:
     """Fetch and parse a hostel's static detail object."""
     url = f"{_SITE}/stay/{quote(city_slug, safe='')}/{quote(hostel_slug, safe='')}"
-    async with CurlAsyncSession() as s:
+    async with get_curl_session() as s:
         try:
             r = await s.get(url, headers=_rsc_headers(), timeout=_TIMEOUT)
         except Exception as exc:

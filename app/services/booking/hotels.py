@@ -32,7 +32,8 @@ from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
 logger = logging.getLogger(__name__)
 
 try:
-    from curl_cffi.requests import AsyncSession as CurlAsyncSession
+    from curl_cffi.requests import AsyncSession as CurlAsyncSession  # noqa: F401 — _CURL_AVAILABLE probe
+    from app.services.curl_pool import get_curl_session
     _CURL_AVAILABLE = True
 except ImportError:
     _CURL_AVAILABLE = False
@@ -204,7 +205,7 @@ async def resolve_dest_id(city_name: str) -> tuple[int | None, str, str]:
             "query": _AUTOCOMPLETE_GQL_QUERY,
         }
         async def _do(proxy):
-            async with CurlAsyncSession(proxy=proxy) as s:
+            async with get_curl_session(proxy=proxy) as s:
                 r = await s.post(
                     f"{_GRAPHQL_URL}?lang=en-us",
                     headers={**_AUTOCOMPLETE_GQL_HEADERS, "x-booking-pageview-id": pageview_id},
@@ -363,7 +364,7 @@ async def _run_fullsearch(
     }
 
     async def _do(proxy):
-        async with CurlAsyncSession(proxy=proxy) as s:
+        async with get_curl_session(proxy=proxy) as s:
             resp = await s.post(
                 gql_url,
                 headers=gql_headers,
