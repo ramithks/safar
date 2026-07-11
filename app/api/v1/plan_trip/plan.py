@@ -145,6 +145,12 @@ def _shape_journey(j: dict, include_hotels: bool = False) -> dict:
     if train_journey and train_journey.get("feasible"):
         block["train_journey"] = train_journey
 
+    # Direct flight alternative (present only when the route was ground-only and
+    # a flyable pair returned live flights) — lets the UI offer "Fly instead".
+    flight_journey = j.get("flight_journey")
+    if flight_journey and flight_journey.get("items"):
+        block["flight_journey"] = flight_journey
+
     if include_hotels:
         dh = j.get("destination_hotels") or {}
         hotel_items = dh.get("hotels") or []

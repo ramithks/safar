@@ -33,14 +33,15 @@ _DEFAULT_CONFIDENCE = 0.7
 
 # ── Weights ────────────────────────────────────────────────────────────────────
 HOTEL_RANK_WEIGHTS = {
-    "price": 0.25,
+    "price": 0.22,
     "rating": 0.20,
     "reviews": 0.10,
     "distance": 0.15,
     "provider": 0.10,
     "images": 0.08,
     "amenities": 0.07,
-    "freshness": 0.05,
+    "freshness": 0.03,
+    "flexibility": 0.05,   # free cancellation / no prepayment — de-risks the booking
 }
 HOTEL_QUALITY_WEIGHTS = {
     "photos": 0.22,
@@ -51,11 +52,12 @@ HOTEL_QUALITY_WEIGHTS = {
     "description": 0.10,
 }
 FLIGHT_RANK_WEIGHTS = {
-    "price": 0.40,
+    "price": 0.37,
     "duration": 0.30,
     "stops": 0.15,
     "provider": 0.10,
-    "departure": 0.05,
+    "departure": 0.03,
+    "baggage": 0.05,   # checked-baggage allowance — a real cost signal for many
 }
 FLIGHT_QUALITY_WEIGHTS = {
     "price": 0.30,
@@ -126,8 +128,10 @@ def score_hotels(hotels: list[dict]) -> list[dict]:
 
     prices = [p for p in (_hotel_price(h) for h in hotels) if p and p > 0]
     lo_p, hi_p = (min(prices), max(prices)) if prices else (0.0, 0.0)
+    cheapest = lo_p if prices else None
     dists = [d for d in (_f(h.get("distance_km")) for h in hotels) if d is not None]
     hi_d = max(dists) if dists else 0.0
+    lo_d = min(dists) if dists else 0.0
 
     for h in hotels:
         price = _hotel_price(h)
@@ -138,12 +142,15 @@ def score_hotels(hotels: list[dict]) -> list[dict]:
         dist = _f(h.get("distance_km"))
         confidence = _HOTEL_PROVIDER_CONFIDENCE.get(h.get("source"), _DEFAULT_CONFIDENCE)
         has_desc = bool(h.get("description") or h.get("review_label"))
+        flexible = bool(h.get("free_cancellation"))
+        no_prepay = bool(h.get("no_prepayment"))
+        breakfast = bool(h.get("is_breakfast_included") or h.get("meal_plan"))
 
         # Freshness proxy: a live price + flexible cancellation + in-stock signals
         # a current, bookable listing (we have no scrape timestamp per hotel).
         freshness = (
             0.5 * (price is not None)
-            + 0.3 * bool(h.get("free_cancellation"))
+            + 0.3 * flexible
             + 0.2 * _hotel_available(h)
         )
 
@@ -157,6 +164,7 @@ def score_hotels(hotels: list[dict]) -> list[dict]:
                 "images": _log_scale(photos, cap=6),
                 "amenities": _log_scale(amenities, cap=15),
                 "freshness": freshness,
+                "flexibility": (0.7 * flexible) + (0.3 * no_prepay),
             },
             HOTEL_RANK_WEIGHTS,
         )
@@ -173,6 +181,26 @@ def score_hotels(hotels: list[dict]) -> list[dict]:
         )
         h["quality_score"] = quality
         h["rank_score"] = rank
+
+        # Human-readable "why" chips derived from the same signals — surfaced in
+        # the UI + fed to the copilot so a pick reads as concretely justified.
+        tags: list[str] = []
+        if price and cheapest is not None:
+            if price <= cheapest * 1.02:
+                tags.append("Lowest price")
+            elif price <= cheapest * 1.15:
+                tags.append(f"₹{round(price - cheapest)} over cheapest")
+        if dist is not None and dist <= max(lo_d + 0.3, 1.0):
+            tags.append("Closest to centre")
+        if rating is not None and rating >= 9 and reviews >= 50:
+            tags.append("Top rated")
+        elif rating is not None and rating >= 8:
+            tags.append("Highly rated")
+        if flexible:
+            tags.append("Free cancellation")
+        if breakfast:
+            tags.append("Breakfast included")
+        h["why_tags"] = tags[:4]
 
     hotels.sort(key=lambda x: x.get("rank_score", 0.0), reverse=True)
     return hotels
@@ -210,6 +238,7 @@ def score_flights(flights: list[dict]) -> list[dict]:
 
     prices = [p for p in (_f(f.get("price_total")) for f in flights) if p and p > 0]
     lo_p, hi_p = (min(prices), max(prices)) if prices else (0.0, 0.0)
+    cheapest = lo_p if prices else None
     durs = [d for d in (_f(f.get("duration_min")) for f in flights) if d and d > 0]
     lo_d, hi_d = (min(durs), max(durs)) if durs else (0.0, 0.0)
 
@@ -219,6 +248,7 @@ def score_flights(flights: list[dict]) -> list[dict]:
         stops = int(f.get("stops") or 0)
         confidence = _FLIGHT_PROVIDER_CONFIDENCE.get(f.get("source"), _DEFAULT_CONFIDENCE)
         seats = _f(f.get("seats_available"))
+        baggage = _f(f.get("baggage_kg"))
         directness = 1.0 if stops == 0 else max(0.0, 1.0 - 0.35 * stops)
         dep = _dep_convenience(f)
 
@@ -229,6 +259,8 @@ def score_flights(flights: list[dict]) -> list[dict]:
                 "stops": directness,
                 "provider": confidence,
                 "departure": dep,
+                # 0kg/None → 0.3 neutral; 15kg+ saturates to 1.0.
+                "baggage": _minmax(baggage, 0.0, 20.0) if baggage else 0.3,
             },
             FLIGHT_RANK_WEIGHTS,
         )
@@ -244,5 +276,21 @@ def score_flights(flights: list[dict]) -> list[dict]:
         )
         f["quality_score"] = quality
         f["rank_score"] = rank
+
+        tags: list[str] = []
+        if price and cheapest is not None:
+            if price <= cheapest * 1.02:
+                tags.append("Lowest fare")
+            elif price <= cheapest * 1.15:
+                tags.append(f"₹{round(price - cheapest)} over cheapest")
+        if stops == 0:
+            tags.append("Non-stop")
+        if dur is not None and durs and dur <= lo_d * 1.05:
+            tags.append("Fastest")
+        if baggage and baggage >= 15:
+            tags.append(f"{baggage:g}kg baggage")
+        if seats is not None and 0 < seats <= 5:
+            tags.append(f"Only {int(seats)} seats left")
+        f["why_tags"] = tags[:4]
 
     return flights

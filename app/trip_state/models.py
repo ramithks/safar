@@ -51,6 +51,14 @@ class TripDestination(BaseModel):
 class TripTransport(BaseModel):
     going: dict = Field(default_factory=dict)
     return_journey: dict = Field(default_factory=dict)
+    # Stopover legs added mid-plan: `going` becomes origin→firstStop and each
+    # onward segment carries the next hop (…→destination). First-class so the
+    # UI renders the WHOLE outbound route, not just the first leg. `outbound_chain`
+    # is the ordered city breadcrumb [origin, …stops…, destination] for a compact
+    # "trip goes A → B → C" summary.
+    onward_segments: list[dict] = Field(default_factory=list)
+    outbound_chain: list[str] = Field(default_factory=list)
+    waypoints: list[str] = Field(default_factory=list)
     journey_summary: Optional[str] = None
     total_distance_km: Any = None
     total_duration_approx: Optional[str] = None

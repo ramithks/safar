@@ -238,6 +238,16 @@ async def run_generation(trip_id: str, body: PlanRequest, user_id: str) -> None:
         )
         logger.info("[trip-state] generation complete for %s", trip_id)
 
+        # Learn this traveller's durable preferences from the finished plan so
+        # their next trip + copilot session starts warm. Best-effort, off the
+        # critical path — a memory failure must not touch the completed trip.
+        try:
+            from app.services.user_memory import distill_from_trip
+
+            await distill_from_trip(user_id, fd)
+        except Exception as exc:  # noqa: BLE001 — memory is advisory
+            logger.warning("[trip-state] memory distill failed for %s: %s", trip_id, exc)
+
     except Exception as exc:  # noqa: BLE001 — stream must terminate cleanly
         logger.error("[trip-state] generation failed for %s: %s", trip_id, exc, exc_info=True)
         sentry_sdk.capture_exception(exc)

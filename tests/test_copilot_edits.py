@@ -17,6 +17,10 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+async def _noop_async(*args, **kwargs):
+    return None
+
+
 # ── Itinerary cap is no longer squeezed to 2-3 ───────────────────────────────
 
 def test_full_day_of_five_activities_survives_autofix():
@@ -159,19 +163,56 @@ def test_handle_add_waypoint_splices_city(monkeypatch):
     assert new_req["waypoints"] == ["Nainital"]
     assert new_req["days"] == 5                         # 4 + 1 waypoint day
     assert any(p.path == "/transport/onward_segments" for p in patches)
+    # The full outbound route is a first-class, render-visible breadcrumb so the
+    # destination leg never "disappears" when a stopover is added.
+    chain = next(p.value for p in patches if p.path == "/transport/outbound_chain")
+    assert chain == ["Bhiwani", "Nainital", "Meghalaya"]
+    assert "Bhiwani → Nainital → Meghalaya" in reply
     assert "Nainital" in reply
 
 
-# ── Chat history is compact and only surfaces copilot turns ──────────────────
+# ── Structured (non-LLM) stay selection — the user edits stays themselves ─────
+
+def test_select_hotel_action_updates_stay_without_llm(monkeypatch):
+    # If the LLM router were ever hit this would raise — proving the action path
+    # is fully deterministic.
+    async def _boom(*a, **k):
+        raise AssertionError("router must not be called for a structured action")
+
+    import app.trip_state.generator as gen
+
+    monkeypatch.setattr(copilot, "route_intent", _boom)
+    monkeypatch.setattr(copilot, "_persist_chat", _noop_async)
+    monkeypatch.setattr(copilot.store, "append_events", lambda *a, **k: None)
+    monkeypatch.setattr(gen, "publish_event", lambda *a, **k: None)
+
+    state = {
+        "request": {"travelers": 2, "stay_nights": 3},
+        "costs": {"breakdown": {"transport": 4000}},
+        "stay": {"hotels": [
+            {"name": "Budget Inn", "price_per_night": 900},
+            {"name": "Lake View Resort", "price_per_night": 2500},
+        ]},
+    }
+    result = _run(copilot.apply_edit(
+        "t1", "", state, action={"type": "select_hotel", "hotel_index": 1}, user_id="",
+    ))
+    assert result["intent"] == "select_hotel"
+    assert result["applied"] is True
+    selected = next(p["value"] for p in result["patches"] if p["path"] == "/stay/selected")
+    assert selected["name"] == "Lake View Resort"
+
+
+# ── Chat history reads the durable transcript (user + assistant turns) ────────
 
 def test_recent_history_formats_turns(monkeypatch):
-    events = [
-        {"phase": "itinerary_ready", "label": "built", "reasoning": None},
-        {"phase": "copilot_edit", "label": "Found 3 stays.", "reasoning": "cheapest hotel"},
-        {"phase": "copilot_edit", "label": "Locked in the 8pm Volvo.", "reasoning": "cheaper bus"},
+    messages = [
+        {"role": "user", "content": "cheapest hotel", "intent": None},
+        {"role": "assistant", "content": "Found 3 stays.", "intent": "search_hotels"},
+        {"role": "user", "content": "cheaper bus", "intent": None},
+        {"role": "assistant", "content": "Locked in the 8pm Volvo.", "intent": "select_transport_option"},
     ]
-    monkeypatch.setattr(copilot.store, "get_events", lambda trip_id: events)
+    monkeypatch.setattr(copilot.store, "get_chat", lambda trip_id, limit=12: messages)
     hist = copilot._recent_history("t1")
     assert "User: cheapest hotel" in hist
     assert "Copilot: Locked in the 8pm Volvo." in hist
-    assert "built" not in hist   # non-copilot phases excluded

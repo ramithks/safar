@@ -86,8 +86,13 @@ _INTENT_SCHEMA = {
                 "add_activities",
                 "add_waypoint",
                 "set_title",
+                "clarify",
                 "unsupported",
             ],
+        },
+        "clarify_options": {
+            "type": "ARRAY", "nullable": True,
+            "items": {"type": "STRING"},
         },
         "direction": {"type": "STRING", "enum": ["going", "return"], "nullable": True},
         "mode": {"type": "STRING", "enum": ["flight", "train", "bus"], "nullable": True},
@@ -265,29 +270,29 @@ def _state_summary(state: dict) -> str:
 
 def _recent_history(trip_id: str, limit: int = 6) -> str:
     """Last few copilot turns for this trip → a compact transcript the router
-    uses for continuity ('make it cheaper', 'add more there'). User turns carry
-    the message in `reasoning`; the assistant reply is the event `label`."""
+    uses for continuity ('make it cheaper', 'add more there'). Reads the durable
+    chat log, which records both the user's messages and the assistant replies."""
     try:
-        events = store.get_events(trip_id)
+        messages = store.get_chat(trip_id, limit=limit * 2)
     except Exception:  # noqa: BLE001 — history is a nice-to-have, never block an edit
         return ""
     turns: list[str] = []
-    for ev in events:
-        if ev.get("phase") != "copilot_edit":
+    for m in messages:
+        content = (m.get("content") or "").strip()
+        if not content:
             continue
-        user_msg = (ev.get("reasoning") or "").strip()
-        reply = (ev.get("label") or "").strip()
-        if user_msg:
-            turns.append(f"User: {user_msg}")
-        if reply:
-            turns.append(f"Copilot: {reply}")
-    return "\n".join(turns[-(limit * 2):])
+        who = "User" if m.get("role") == "user" else "Copilot"
+        turns.append(f"{who}: {content}")
+    return "\n".join(turns)
 
 
-async def route_intent(message: str, state: dict, history: str = "") -> dict:
+async def route_intent(message: str, state: dict, history: str = "", memory: str = "") -> dict:
     prompt = (
         "You are the copilot for a travel-planning workspace. Classify the "
         "user's message into one intent and write the reply.\n\n"
+        + (f"WHAT WE KNOW ABOUT THIS TRAVELLER (from past trips — use it to make "
+           f"replies and picks feel personal, but never contradict what they ask "
+           f"for now):\n{memory}\n\n" if memory else "")
         + (f"RECENT CONVERSATION (oldest first, for continuity — resolve "
            f"follow-ups like 'a cheaper one' or 'add more there' against it):\n"
            f"{history}\n\n" if history else "")
@@ -341,10 +346,25 @@ async def route_intent(message: str, state: dict, history: str = "") -> dict:
         "- add_waypoint: the user wants to add a STOPOVER CITY between origin and "
         "destination ('add Nainital in between', 'can we stop in Jaipur on the "
         "way', 'include Rishikesh en route'). Set waypoint_city to that city, and "
-        "waypoint_days if they said how long to spend there (default 1). This "
-        "re-routes the trip and builds an itinerary for the stop — the reply is "
-        "replaced by the handler, keep it short.\n"
+        "waypoint_days to how long to spend there. IMPORTANT: if the user named a "
+        "city but did NOT say how many days (and it isn't clear from the recent "
+        "conversation), do NOT guess — use the `clarify` intent to ask 'How many "
+        "days would you like in {city}?' with clarify_options ['1 day','2 days',"
+        "'3 days']. Only route to add_waypoint once the number of days is known "
+        "(e.g. they answer '2 days' or originally said 'stop in Jaipur for 2 "
+        "days'). This re-routes the trip and builds an itinerary for the stop — "
+        "the reply is replaced by the handler, keep it short.\n"
         "- set_title: rename the trip.\n"
+        "- clarify: the request is genuinely ambiguous or underspecified and "
+        "guessing would risk the wrong change — you can't tell which leg/day/"
+        "hotel they mean, the ask is contradictory, or it's too vague to act on "
+        "('make it better', 'change the hotel' with several equally-likely reads, "
+        "'fix the timings'). Ask ONE short, friendly clarifying question in "
+        "`reply` and put 2-3 concrete choices in `clarify_options` (short phrases "
+        "the user can tap, e.g. ['The way there', 'The way back'] or ['Cheaper "
+        "stay', 'Closer to the beach', 'Higher rated']). Prefer acting when the "
+        "intent is reasonably clear — only clarify when a wrong guess would "
+        "actually cost the user.\n"
         "- unsupported: ONLY edits that truly can't be done (change the main "
         "destination or dates, regenerate the whole itinerary from scratch). "
         "Reply warmly with what IS possible right now: answer questions, swap "
@@ -372,8 +392,12 @@ async def route_intent(message: str, state: dict, history: str = "") -> dict:
         "- 'add more spots to day 2' → add_activities, day_index 1. 'add a few "
         "cafes' → add_activities, activity_query 'cafes'. 'this itinerary is "
         "thin, add more' → add_activities.\n"
-        "- 'add Nainital in between' / 'can we stop in Rishikesh on the way' → "
-        "add_waypoint, waypoint_city 'Nainital'/'Rishikesh'.\n"
+        "- 'add Nainital in between' (no duration given) → clarify, reply 'How "
+        "many days would you like in Nainital?', clarify_options ['1 day','2 "
+        "days','3 days']. Then '2 days' (with Nainital in the recent "
+        "conversation) → add_waypoint, waypoint_city 'Nainital', waypoint_days 2. "
+        "'stop in Rishikesh for 2 days on the way' → add_waypoint directly, "
+        "waypoint_city 'Rishikesh', waypoint_days 2.\n"
         "- 'a flight with more baggage allowance' → select_transport_option, "
         "mode flight, prefer most_baggage, option_index of the highest-baggage "
         "flight in the list.\n"
@@ -565,6 +589,62 @@ def handle_select_option(
     return patches, reply
 
 
+def handle_select_flight_journey(state: dict) -> tuple[list[PatchOp], str]:
+    """Switch the outbound to the direct-flight alternative the journey builder
+    attached (`going.flight_journey`). Rebuilds `going` as a flight-only journey
+    (so all existing cost/selection logic just works) and stashes the ground
+    route so the user can switch back."""
+    going = dict(_journey(state, "going"))
+    fj = going.get("flight_journey") or {}
+    items = fj.get("items") or []
+    if not items:
+        return [], "I don't have a direct flight option for this trip yet."
+    if going.get("ground_route_backup"):
+        return [], "You're already on the direct flight. Want me to switch back to the train + bus route?"
+
+    rec = fj.get("recommended") or items[0]
+    new_going = {
+        "legs": [{"mode": "flight", "from": fj.get("from"), "to": fj.get("to")}],
+        "flights": {"items": items, "recommended": rec},
+        "summary": {"duration": fj.get("total_duration_display"), "has_real_data": True},
+        "flight_journey": fj,                       # keep so the card can still render
+        "ground_route_backup": {k: v for k, v in going.items() if k != "ground_route_backup"},
+    }
+    state.setdefault("transport", {})["going"] = new_going
+    patches = [PatchOp(op="set", path="/transport/going", value=new_going)]
+    new_costs = _recompute_costs(state)
+    patches.append(PatchOp(op="set", path="/costs", value=new_costs))
+
+    fare = round(_fare_per_person("flight", rec) or 0)
+    reply = (
+        f"Switched to the direct flight — {_option_name('flight', rec)} "
+        f"({_option_times(rec)}, ₹{fare}/person)."
+    )
+    live = _live_total(state)
+    if live:
+        reply += f" Rides + stay now ₹{live:,} at live prices."
+    return patches, reply
+
+
+def handle_restore_ground_route(state: dict) -> tuple[list[PatchOp], str]:
+    """Revert a flight-swap back to the originally-planned train/bus route."""
+    going = dict(_journey(state, "going"))
+    backup = going.get("ground_route_backup")
+    if not backup:
+        return [], "You're already on the train + bus route."
+    restored = dict(backup)
+    restored["flight_journey"] = going.get("flight_journey") or backup.get("flight_journey")
+    state.setdefault("transport", {})["going"] = restored
+    patches = [PatchOp(op="set", path="/transport/going", value=restored)]
+    new_costs = _recompute_costs(state)
+    patches.append(PatchOp(op="set", path="/costs", value=new_costs))
+    reply = "Switched back to the train + bus route."
+    live = _live_total(state)
+    if live:
+        reply += f" Rides + stay now ₹{live:,} at live prices."
+    return patches, reply
+
+
 def handle_select_hotel(state: dict, index: int) -> tuple[list[PatchOp], str]:
     hotels = (state.get("stay") or {}).get("hotels") or []
     if not (0 <= index < len(hotels)):
@@ -588,6 +668,53 @@ def handle_select_hotel(state: dict, index: int) -> tuple[list[PatchOp], str]:
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────────
+
+async def _record_edit_signals(user_id: str, kind: str | None, intent: dict) -> None:
+    """Turn a concrete copilot edit into durable preference signals. Best-effort;
+    swallows everything so it can never affect the edit."""
+    signals: dict[str, Any] = {}
+    filters = intent.get("hotel_filters") or {}
+    if kind == "search_hotels":
+        if filters.get("property_types"):
+            signals["hotel_property_types"] = filters["property_types"]
+        if filters.get("facilities"):
+            signals["amenities"] = filters["facilities"]
+    elif kind == "select_transport_option" and intent.get("prefer"):
+        signals["transport_pref"] = intent["prefer"]
+    elif kind == "add_activities" and (intent.get("activity_query") or "").strip():
+        signals["interests"] = [intent["activity_query"].strip()]
+
+    if not signals:
+        return
+    try:
+        from app.services.user_memory import record_signals
+
+        await record_signals(user_id, signals)
+    except Exception as exc:  # noqa: BLE001 — never affect the edit
+        logger.warning("[trip-state] signal capture failed: %s", exc)
+
+
+async def _persist_chat(
+    trip_id: str, message: str, reply: str, kind: str | None, meta: dict | None = None,
+) -> None:
+    """Record the turn in the durable chat log so it survives a refresh. Both
+    the user message (when present — structured UI actions carry none) and the
+    assistant reply are stored. Best-effort: a chat-log write must never fail an
+    edit, so transport failures are swallowed (the state edit already succeeded
+    and was broadcast)."""
+    from app.db.client import run_db
+
+    def _write() -> None:
+        if message:
+            store.append_chat(trip_id, "user", message)
+        if reply:
+            store.append_chat(trip_id, "assistant", reply, intent=kind, meta=meta)
+
+    try:
+        await run_db(_write)
+    except Exception as exc:  # noqa: BLE001 — a chat-log write must never block the edit
+        logger.warning("[trip-state] chat-log write failed for %s: %s", trip_id, exc)
+
 
 def _persist_and_broadcast(trip_id: str, patches: list[PatchOp], reply: str, message: str) -> None:
     from .generator import publish_event
@@ -634,14 +761,17 @@ async def apply_edit(
     trip_id: str, message: str, state: dict, action: dict | None = None,
     user_id: str = "",
 ) -> dict:
-    """Route + apply an edit. Returns {reply, patches, applied}.
+    """Route + apply an edit. Returns {reply, intent, applied, patches, clarify_options}.
 
-    `action` is a structured UI command that bypasses the LLM router:
+    `action` is a structured UI command that bypasses the LLM router (deterministic,
+    instant — the user driving the workspace directly):
       {"type": "select_transport_option", "direction", "mode", "index"}
+      {"type": "select_hotel", "hotel_index"}
     """
     patches: list[PatchOp] = []
     reply = ""
     kind = None
+    clarify_options: list[str] = []
 
     if action and action.get("type") == "select_transport_option":
         kind = "select_transport_option"
@@ -651,9 +781,24 @@ async def apply_edit(
             str(action.get("mode") or ""),
             int(action.get("index") or 0),
         )
+    elif action and action.get("type") == "select_hotel":
+        # User picked a stay directly from the Stays tab — deterministic, no LLM.
+        kind = "select_hotel"
+        patches, reply = handle_select_hotel(
+            state, int(action.get("hotel_index") or action.get("index") or 0),
+        )
+    elif action and action.get("type") == "select_flight_journey":
+        kind = "select_flight_journey"
+        patches, reply = handle_select_flight_journey(state)
+    elif action and action.get("type") == "restore_ground_route":
+        kind = "restore_ground_route"
+        patches, reply = handle_restore_ground_route(state)
     else:
+        from app.services.user_memory import get_memory, memory_grounding
+
         history = _recent_history(trip_id)
-        intent = await route_intent(message, state, history=history)
+        memory = memory_grounding(await get_memory(user_id)) if user_id else ""
+        intent = await route_intent(message, state, history=history, memory=memory)
         kind = intent.get("intent")
         reply = intent.get("reply") or ""
 
@@ -704,6 +849,16 @@ async def apply_edit(
         elif kind == "set_title" and intent.get("title"):
             patches = [PatchOp(op="set", path="/meta/title", value=intent["title"])]
             reply = f"Renamed your trip to “{intent['title']}”."
+        elif kind == "clarify":
+            # Ambiguous request — the copilot asks instead of guessing. No patches;
+            # the UI renders clarify_options as quick-reply chips.
+            clarify_options = [
+                o for o in (intent.get("clarify_options") or []) if isinstance(o, str) and o.strip()
+            ][:3]
+
+        # Learn from concrete edits so future trips/sessions start warmer.
+        if user_id and patches:
+            await _record_edit_signals(user_id, kind, intent)
 
     if patches:
         import httpx
@@ -740,9 +895,17 @@ async def apply_edit(
                 flush.enqueue(trip_id, "user", patches, phase="copilot_edit", reasoning=message)
                 _broadcast_only()
 
+    # Record the turn in the durable chat transcript (every turn, incl. pure
+    # Q&A / clarify that produced no patches) so the thread survives a refresh.
+    await _persist_chat(
+        trip_id, message, reply, kind,
+        meta={"clarify_options": clarify_options} if clarify_options else None,
+    )
+
     return {
         "reply": reply,
         "intent": kind,
         "applied": bool(patches),
         "patches": [p.model_dump(mode="json") for p in patches],
+        "clarify_options": clarify_options,
     }

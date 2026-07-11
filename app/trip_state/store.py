@@ -238,3 +238,43 @@ def get_events(trip_id: str, after_seq: int = 0) -> list[dict]:
         .execute()
     )
     return res.data or []
+
+
+# ── Copilot chat transcript ──────────────────────────────────────────────────
+# A linear, append-only log separate from the patch/CAS machinery above. It has
+# no snapshot to reconcile, so it needs neither the per-trip lock nor CAS — a
+# plain INSERT / ordered SELECT. Every copilot turn (user message + assistant
+# reply, including pure Q&A) lands here so the thread survives a refresh.
+
+def append_chat(
+    trip_id: str,
+    role: str,
+    content: str,
+    intent: str | None = None,
+    meta: dict | None = None,
+) -> None:
+    """Append one chat message (role: 'user' | 'assistant')."""
+    if not content:
+        return
+    db = get_db()
+    db.table("copilot_messages").insert({
+        "trip_id": trip_id,
+        "role": role,
+        "content": content,
+        "intent": intent,
+        "meta": meta or {},
+    }).execute()
+
+
+def get_chat(trip_id: str, limit: int = 100) -> list[dict]:
+    """Return the trip's chat transcript, oldest first (last `limit` messages)."""
+    db = get_db()
+    res = (
+        db.table("copilot_messages")
+        .select("role, content, intent, meta, created_at")
+        .eq("trip_id", trip_id)
+        .order("id", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return list(reversed(res.data or []))

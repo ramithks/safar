@@ -31,11 +31,17 @@ router = APIRouter()
 
 
 class EditAction(BaseModel):
-    """Structured UI command that bypasses the LLM intent router."""
+    """Structured UI command that bypasses the LLM intent router — deterministic,
+    instant edits the user drives directly from the workspace.
+
+      {"type": "select_transport_option", "direction", "mode", "index"}
+      {"type": "select_hotel", "hotel_index"}
+    """
     type: str
     direction: str | None = None
     mode: str | None = None
     index: int | None = None
+    hotel_index: int | None = None
 
 
 class EditRequest(BaseModel):
@@ -91,6 +97,16 @@ async def get_trip(trip_id: str, user=Depends(require_user)):
         "last_seq": row["last_seq"],
         "state": row["state"],
     }
+
+
+@router.get("/trip-state/{trip_id}/chat")
+async def get_trip_chat(trip_id: str, user=Depends(require_user), limit: int = 100):
+    """Durable copilot chat transcript — the frontend loads this on mount to
+    rehydrate the thread after a refresh."""
+    row = await _get_row(trip_id)
+    _authorize_read(row, str(user.id))
+    messages = await run_db(store.get_chat, trip_id, min(max(limit, 1), 300))
+    return {"trip_id": trip_id, "messages": messages}
 
 
 @router.get("/trip-state/{trip_id}/stream")
@@ -163,3 +179,54 @@ async def edit_trip(request: Request, trip_id: str, body: EditRequest, user=Depe
         logger.error("[trip-state] edit failed for %s: %s", trip_id, exc, exc_info=True)
         sentry_sdk.capture_exception(exc)
         raise HTTPException(status_code=500, detail="Edit failed. Please try again.") from exc
+
+
+@router.post("/trip-state/{trip_id}/edit/stream")
+@limiter.limit("60/hour")
+async def edit_trip_stream(request: Request, trip_id: str, body: EditRequest, user=Depends(require_user)):
+    """
+    Streaming copilot edit — same routing/handlers as /edit, but the reply lands
+    as an SSE stream so it types out live (the copilot is the workspace's main
+    brain, and should feel like one). Emits `token` chunks for the reply, then a
+    single `done` event carrying the authoritative patches + intent + clarify
+    options. Persistence (chat + patches) happens inside apply_edit, once.
+    """
+    row = await _get_row(trip_id)
+    _authorize_write(row, str(user.id))
+    message = body.message.strip()[:500]
+    if not message and body.action is None:
+        raise HTTPException(status_code=400, detail="Say what you'd like to change.")
+    action = body.action.model_dump() if body.action else None
+    user_id = str(user.id)
+    state = row["state"]
+
+    async def event_source():
+        try:
+            result = await apply_edit(trip_id, message, state, action=action, user_id=user_id)
+        except Exception as exc:  # noqa: BLE001 — stream must terminate cleanly
+            logger.error("[trip-state] stream edit failed for %s: %s", trip_id, exc, exc_info=True)
+            sentry_sdk.capture_exception(exc)
+            yield sse_event("error", {"detail": "Edit failed. Please try again."})
+            return
+
+        reply = result.get("reply") or ""
+        # Type the reply out word-by-word for a live feel. (Latency to first
+        # token is the router call; this is the visible "thinking out loud".)
+        words = reply.split(" ")
+        for i, word in enumerate(words):
+            yield sse_event("token", {"text": word if i == 0 else " " + word})
+            await asyncio.sleep(0.02)
+
+        yield sse_event("done", {
+            "reply": reply,
+            "intent": result.get("intent"),
+            "applied": result.get("applied"),
+            "patches": result.get("patches") or [],
+            "clarify_options": result.get("clarify_options") or [],
+        })
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

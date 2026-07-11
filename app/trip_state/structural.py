@@ -279,11 +279,26 @@ async def handle_add_waypoint(
 
     # ── Request: record the stopover and grow the trip length ────────────────────
     new_req = dict(req)
-    new_req["waypoints"] = list(req.get("waypoints") or []) + [city]
+    waypoints = list(req.get("waypoints") or []) + [city]
+    new_req["waypoints"] = waypoints
     new_req["days"] = int(req.get("days") or len(existing_days) or 1) + len(wp_days_list)
     new_req["stay_nights"] = int(req.get("stay_nights") or 1) + wp_days
     state["request"] = new_req
     patches.append(PatchOp(op="set", path="/request", value=new_req))
+
+    # ── Route contract: ordered city breadcrumb + waypoints, so the UI renders
+    #    the WHOLE outbound trip (origin → …stops… → destination), not just the
+    #    first leg that landed in transport.going. ─────────────────────────────────
+    if routed:
+        outbound_chain = [origin, *waypoints, destination]
+        transport = state.setdefault("transport", {})
+        transport["outbound_chain"] = outbound_chain
+        transport["waypoints"] = waypoints
+        transport["journey_summary"] = " → ".join(outbound_chain)
+        patches.append(PatchOp(op="set", path="/transport/outbound_chain", value=outbound_chain))
+        patches.append(PatchOp(op="set", path="/transport/waypoints", value=waypoints))
+        patches.append(PatchOp(op="set", path="/transport/journey_summary",
+                               value=" → ".join(outbound_chain)))
 
     # ── Reprice (transport recompute now folds in the onward segment) ────────────
     if routed:
@@ -303,7 +318,11 @@ async def handle_add_waypoint(
             + (f" ({', '.join(n for n in spot_names if n)})" if spot_names else "")
         )
     if routed:
-        bits.append(f"re-routed the trip {origin} → {city} → {destination}")
+        full_route = " → ".join([origin, *(new_req.get("waypoints") or [city]), destination])
+        bits.append(
+            f"re-routed your trip as {full_route} — the {city} → {destination} leg is "
+            "still there as an onward hop, and both halves are live-priced"
+        )
     if not bits:
         return [], (
             f"I couldn't pull live routes or spots for {city} right now — "
