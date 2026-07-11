@@ -24,7 +24,7 @@ from app.api.v1.plan_trip.models import PlanRequest
 from app.api.v1.plan_trip.plan import _shape_journey
 from app.config import settings
 
-from . import store
+from . import flush, store
 from .models import trip_state_from_merged
 from .patch import PatchOp
 
@@ -61,11 +61,12 @@ def read_events(trip_id: str, start: int = 0) -> list[dict]:
 class _Emitter:
     """Persists patches to the event log, then publishes to the live stream.
 
-    Persistence failures on intermediate events must not kill the generation:
-    the live stream (Redis) still gets the event, and the unpersisted patches
-    are carried forward and folded into the next successful append, so the
-    stored snapshot converges. Only a `critical=True` emit (the final
-    authoritative one) propagates the failure.
+    Persistence failures must not kill the generation: the live stream (Redis)
+    still gets the event, and the unpersisted patches are carried forward and
+    folded into the next successful append, so the stored snapshot converges.
+    A `critical=True` emit (the final authoritative one — there is no "next
+    emit" after it) hands its patches to the background flush queue instead,
+    which retries for minutes.
     """
 
     def __init__(self, trip_id: str):
@@ -112,12 +113,16 @@ class _Emitter:
                 self._pending = []
             except httpx.TransportError as exc:
                 if critical:
-                    raise
-                self._pending = to_persist
-                logger.warning(
-                    "[trip-state] %s persisting %s for %s — deferring %d patches to next emit",
-                    type(exc).__name__, phase, self.trip_id, len(to_persist),
-                )
+                    flush.enqueue(
+                        self.trip_id, actor, to_persist, phase=phase, reasoning=reasoning
+                    )
+                    self._pending = []
+                else:
+                    self._pending = to_persist
+                    logger.warning(
+                        "[trip-state] %s persisting %s for %s — deferring %d patches to next emit",
+                        type(exc).__name__, phase, self.trip_id, len(to_persist),
+                    )
         publish_event(self.trip_id, {
             "phase": phase,
             "label": label,

@@ -548,9 +548,39 @@ async def apply_edit(
             reply = f"Renamed your trip to “{intent['title']}”."
 
     if patches:
+        import httpx
+
         from app.db.client import run_db
 
-        await run_db(lambda: _persist_and_broadcast(trip_id, patches, reply, message))
+        from . import flush
+
+        def _broadcast_only() -> None:
+            from .generator import publish_event
+
+            publish_event(trip_id, {
+                "phase": "copilot_edit",
+                "label": reply,
+                "progress": 100,
+                "patches": [p.model_dump(mode="json") for p in patches],
+                "reasoning": message,
+            })
+
+        if flush.has_pending(trip_id):
+            # Earlier patches for this trip are still queued — writing now
+            # would land BEFORE them and get overwritten. Join the queue.
+            flush.enqueue(trip_id, "user", patches, phase="copilot_edit", reasoning=message)
+            _broadcast_only()
+        else:
+            try:
+                await run_db(lambda: _persist_and_broadcast(trip_id, patches, reply, message))
+            except httpx.TransportError:
+                # DB unreachable (transient TLS-corruption windows — see
+                # db/client.py). The edit itself succeeded: broadcast it now so
+                # live viewers update, and let the background flusher make the
+                # snapshot converge. Failing the request would tell the user
+                # their edit was lost when it wasn't.
+                flush.enqueue(trip_id, "user", patches, phase="copilot_edit", reasoning=message)
+                _broadcast_only()
 
     return {
         "reply": reply,
