@@ -1,7 +1,8 @@
 """
-Supabase client singletons.
+Supabase clients.
 
-- `get_db()`       → service role client (bypasses RLS, for server-side DB ops)
+- `get_db()`       → service role client (bypasses RLS, for server-side DB ops),
+                     ONE PER THREAD — see get_db docstring.
 - `get_user_db(token)` → anon client scoped to a user JWT (respects RLS)
 
 Both clients auto-retry transient "Server disconnected" errors. Supabase's edge
@@ -10,14 +11,29 @@ connection fails with `httpx.RemoteProtocolError` *before* the request reaches
 PostgREST. Retrying with a fresh connection fixes it. We only retry idempotent
 methods so a half-sent write is never replayed.
 """
+import asyncio
 import logging
-from functools import lru_cache
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 from supabase import create_client, Client
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Dedicated executor for ALL sync Supabase calls made from async code. Two
+# threads → at most two per-thread clients, instead of one per default-executor
+# thread (which is also busy with video downloads and other blocking work).
+# Keeping DB sockets on their own threads narrows exposure to the fd churn the
+# curl_cffi scrapers produce during teardown.
+_DB_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tb-db")
+
+
+async def run_db(fn, *args):
+    """Run a sync DB callable on the dedicated DB executor. `get_db()` must be
+    called INSIDE `fn` (clients are per-thread and must not cross threads)."""
+    return await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, fn, *args)
 
 # Transport-level errors that mean the connection died, not that the server
 # rejected the request — safe to retry on a fresh connection.
@@ -92,21 +108,35 @@ def _wrap_client(client: Client) -> Client:
     return client
 
 
-@lru_cache(maxsize=1)
+# One service-role client PER THREAD. A single process-wide client shared
+# across executor threads corrupted the TLS stream under concurrent writes
+# (server answers SSLV3_ALERT_BAD_RECORD_MAC → cascading ReadErrors that
+# poisoned every in-flight caller, observed 2026-07-11 during trip generation:
+# the generator's emit and the supervisor's on_phase write simultaneously).
+# Executor threads are pooled and bounded, so the client count is too.
+_thread_local = threading.local()
+
+
 def get_db() -> Client:
-    """Service role Supabase client — reused across requests."""
-    if not settings.supabase_url or not settings.supabase_service_key:
-        raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
-    return _wrap_client(create_client(settings.supabase_url, settings.supabase_service_key))
+    """Service role Supabase client — one per thread, reused across requests."""
+    client = getattr(_thread_local, "client", None)
+    if client is None:
+        if not settings.supabase_url or not settings.supabase_service_key:
+            raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
+        client = _wrap_client(
+            create_client(settings.supabase_url, settings.supabase_service_key)
+        )
+        _thread_local.client = client
+    return client
 
 
 def reset_db() -> None:
     """
-    Drop the cached service-role client so the next get_db() builds a fresh one
-    with a clean connection pool — for callers recovering from transport-level
-    failures that may have poisoned the pool.
+    Drop the CURRENT THREAD's service-role client so its next get_db() builds a
+    fresh one with a clean connection pool — for callers recovering from
+    transport-level failures that may have poisoned the pool.
     """
-    get_db.cache_clear()
+    _thread_local.client = None
 
 
 def get_user_db(token: str) -> Client:

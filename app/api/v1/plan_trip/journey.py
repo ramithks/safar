@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 
 from fastapi import HTTPException
 
-from app.db.client import get_db
+from app.db.client import get_db, run_db
 from app.services.vertex import brain as vertex_brain, extract_json
 from app.services.transport import TransportService
 from app.services.hotels import HotelService
@@ -534,11 +534,11 @@ async def _explain_picks(
 # ── Main handler ──────────────────────────────────────────────────────────────
 
 async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict | None = None) -> dict:
-    db = get_db()
     safe_budget = body.budget if body.budget in ("low", "mid", "high") else "mid"
 
     if profile is None:
-        profile = await asyncio.get_event_loop().run_in_executor(None, fetch_user_profile, db, user_id)
+        # get_db() inside the DB executor thread — clients must not cross threads.
+        profile = await run_db(lambda: fetch_user_profile(get_db(), user_id))
     currency_code = (profile.get("currency") or "inr").lower()
     ci = CURRENCY_CONFIG.get(currency_code) or CURRENCY_CONFIG["inr"]
     symbol = ci["symbol"]

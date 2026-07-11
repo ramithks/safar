@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 from fastapi import HTTPException
 
-from app.db.client import get_db
+from app.db.client import get_db, run_db
 from app.services.vertex import brain as vertex_brain, extract_json
 from app.services.places import discover_places
 from app.core.timing import RequestTrace
@@ -103,26 +103,23 @@ Return ONLY valid JSON (no markdown):
 
 
 async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace | None = None, profile: dict | None = None) -> dict:
-    db = get_db()
     safe_budget = body.budget if body.budget in ("low", "mid", "high") else "mid"
     date_ctx = build_date_context(body.start_date, body.end_date, body.destination)
 
     # ── Phase 1: profile + places + memory (parallel) ─────────────────────────
     async with (trace.track("phase1_parallel") if trace else _noop()):
         if profile is None:
-            (profile,), (candidates, memory_ctx) = await asyncio.gather(
-                asyncio.gather(
-                    asyncio.get_event_loop().run_in_executor(None, fetch_user_profile, db, user_id),
-                ),
-                asyncio.gather(
-                    with_retry(discover_places, body.destination, fallback={}),
-                    asyncio.get_event_loop().run_in_executor(None, fetch_memory_context, db, user_id, body.destination),
-                ),
+            # get_db() runs INSIDE the DB executor thread — clients are
+            # per-thread and must never cross the loop→executor boundary.
+            profile, candidates, memory_ctx = await asyncio.gather(
+                run_db(lambda: fetch_user_profile(get_db(), user_id)),
+                with_retry(discover_places, body.destination, fallback={}),
+                run_db(lambda: fetch_memory_context(get_db(), user_id, body.destination)),
             )
         else:
             candidates, memory_ctx = await asyncio.gather(
                 with_retry(discover_places, body.destination, fallback={}),
-                asyncio.get_event_loop().run_in_executor(None, fetch_memory_context, db, user_id, body.destination),
+                run_db(lambda: fetch_memory_context(get_db(), user_id, body.destination)),
             )
 
     # Default to INR (not USD) so the itinerary's currency matches the journey
@@ -171,7 +168,7 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
             "days": [],
             "include_itinerary": False,
         }
-        asyncio.create_task(_db_writes(db, user_id, body, result))
+        asyncio.create_task(_db_writes(user_id, body, result))
         return result
 
     # ── Phase 3: Gemini itinerary ─────────────────────────────────────────────
@@ -255,18 +252,18 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
         logger.debug(trace.summary())
 
     # ── Phase 6: DB writes (fire-and-forget) ──────────────────────────────────
-    asyncio.create_task(_db_writes(db, user_id, body, ai_json))
+    asyncio.create_task(_db_writes(user_id, body, ai_json))
 
     return ai_json
 
 
-async def _db_writes(db, user_id: str, body: PlanTripRequest, itinerary: dict) -> None:
+async def _db_writes(user_id: str, body: PlanTripRequest, itinerary: dict) -> None:
     try:
         trip_start = datetime.fromisoformat(body.start_date) if body.start_date else datetime.now()
         trip_end = datetime.fromisoformat(body.end_date) if body.end_date else trip_start + timedelta(days=body.days)
         if not body.skip_user_trips:
-            await asyncio.get_event_loop().run_in_executor(None, lambda: (
-                db.table("internal_trip_logs").insert({
+            await run_db(lambda: (
+                get_db().table("internal_trip_logs").insert({
                     "user_id": user_id,
                     "destination": body.destination,
                     "days": body.days,

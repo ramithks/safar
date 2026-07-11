@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from app.core.limiter import limiter
 from app.core.sse import sse_event
+from app.db.client import run_db
 from app.deps.auth import require_user
 from app.api.v1.plan_trip.models import PlanRequest
 from app.trip_state import empty_trip_state
@@ -52,8 +53,7 @@ def _authorize_write(row: dict, user_id: str) -> None:
 
 
 async def _get_row(trip_id: str) -> dict:
-    loop = asyncio.get_event_loop()
-    row = await loop.run_in_executor(None, store.get_trip_state, trip_id)
+    row = await run_db(store.get_trip_state, trip_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Trip not found")
     return row
@@ -73,10 +73,7 @@ async def create_trip(request: Request, body: PlanRequest, user=Depends(require_
         "budget_tier": body.budget,
         "interests": body.interests,
     })
-    loop = asyncio.get_event_loop()
-    trip_id = await loop.run_in_executor(
-        None, store.create_trip_state, str(user.id), state
-    )
+    trip_id = await run_db(store.create_trip_state, str(user.id), state)
     asyncio.create_task(run_generation(trip_id, body, str(user.id)))
     logger.info("[trip-state] %s → %s queued as %s", body.origin, body.destination, trip_id)
     return {"trip_id": trip_id, "status": "planning"}
@@ -112,7 +109,7 @@ async def stream_trip(trip_id: str, user=Depends(require_user), after: int = 0):
         # If Redis was flushed (restart), replay from the durable event log.
         buffered = await loop.run_in_executor(None, read_events, trip_id, cursor)
         if not buffered and cursor == 0 and row["last_seq"] > 0:
-            db_events = await loop.run_in_executor(None, store.get_events, trip_id, 0)
+            db_events = await run_db(store.get_events, trip_id, 0)
             for ev in db_events:
                 yield sse_event("patch", {
                     "phase": ev.get("phase") or "replay",

@@ -18,14 +18,16 @@ Intents:
   answer_question         — answer anything about the plan, grounded in state.
   select_transport_option — pick a specific ride on one leg (mode + index).
   select_hotel            — pick a different hotel from the fetched candidates.
-  search_hotels           — LIVE hotel re-search near a landmark/area
-                            ("hotels near Mall Road") → replaces /stay/hotels.
+  search_hotels           — LIVE hotel re-search near a landmark/area with
+                            optional canonical filters ("pet-friendly hostels
+                            under ₹1500 near Mall Road") → replaces /stay/hotels.
   set_title               — rename the trip.
   unsupported             — graceful "here's what I can do" reply.
 """
 import logging
 from typing import Any
 
+from app.services.hotels_filters import FACILITY_SYNONYMS, MEAL_SYNONYMS, PROPERTY_TYPES
 from app.services.vertex import generate_json
 
 from . import store
@@ -34,6 +36,42 @@ from .patch import PatchOp
 logger = logging.getLogger(__name__)
 
 _MODE_KEYS = {"flight": "flights", "train": "trains", "bus": "buses"}
+
+# Canonical hotel-filter vocabulary for the search_hotels intent — enums come
+# straight from hotels_filters so the router can never invent a key the
+# backend drops. Values are sanitized again server-side before use.
+_HOTEL_FILTERS_SCHEMA = {
+    "type": "OBJECT",
+    "nullable": True,
+    "properties": {
+        "property_types": {
+            "type": "ARRAY", "nullable": True,
+            "items": {"type": "STRING", "enum": sorted(PROPERTY_TYPES)},
+        },
+        "price_min": {"type": "NUMBER", "nullable": True},
+        "price_max": {"type": "NUMBER", "nullable": True},
+        "min_review_score": {"type": "NUMBER", "nullable": True},
+        "star_ratings": {"type": "ARRAY", "nullable": True, "items": {"type": "INTEGER"}},
+        "facilities": {
+            "type": "ARRAY", "nullable": True,
+            "items": {"type": "STRING", "enum": sorted(FACILITY_SYNONYMS)},
+        },
+        "meals": {
+            "type": "ARRAY", "nullable": True,
+            "items": {"type": "STRING", "enum": list(MEAL_SYNONYMS)},
+        },
+        "free_cancellation": {"type": "BOOLEAN", "nullable": True},
+        "no_prepayment": {"type": "BOOLEAN", "nullable": True},
+        "breakfast_included": {"type": "BOOLEAN", "nullable": True},
+        "couple_friendly": {"type": "BOOLEAN", "nullable": True},
+        "pet_friendly": {"type": "BOOLEAN", "nullable": True},
+        "max_distance_km": {"type": "NUMBER", "nullable": True},
+        "sort": {
+            "type": "STRING", "nullable": True,
+            "enum": ["price_asc", "price_desc", "recommended", "rating"],
+        },
+    },
+}
 
 _INTENT_SCHEMA = {
     "type": "OBJECT",
@@ -54,6 +92,7 @@ _INTENT_SCHEMA = {
         "option_index": {"type": "INTEGER", "nullable": True},
         "hotel_index": {"type": "INTEGER", "nullable": True},
         "hotel_query": {"type": "STRING", "nullable": True},
+        "hotel_filters": _HOTEL_FILTERS_SCHEMA,
         "title": {"type": "STRING", "nullable": True},
         "reply": {"type": "STRING"},
     },
@@ -209,11 +248,25 @@ async def route_intent(message: str, state: dict) -> dict:
         "reply will be replaced by the handler, keep it short.\n"
         "- select_hotel: pick a different hotel by index from the candidates.\n"
         "- search_hotels: the user wants hotels the list doesn't cover — near a "
-        "landmark/area ('hotels near Mall Road', 'stays close to the beach') or "
-        "just fresh options ('show me more hotels'). Set hotel_query to the "
-        "landmark/area phrase only (e.g. 'Mall Road'), or empty for a general "
-        "re-search. This triggers a LIVE search — the reply will be replaced by "
-        "the handler, keep it short.\n"
+        "landmark/area ('hotels near Mall Road', 'stays close to the beach'), "
+        "with specific constraints ('hostels under 1500 with wifi', 'a 5-star "
+        "resort with a pool'), or just fresh options ('show me more hotels'). "
+        "Set hotel_query to the landmark/area phrase only (e.g. 'Mall Road'), "
+        "or empty for a general re-search. Put every constraint the user "
+        "stated into hotel_filters — set ONLY what they asked for, never guess: "
+        "property_types (hostel/homestay/guesthouse/hotel/resort/apartment/"
+        "villa/vacation_home/bnb); price_min/price_max in ₹ per night ('under "
+        "2000' → price_max 2000); min_review_score on a 0-10 scale ('good' 7, "
+        "'very good' 8, 'wonderful/top rated' 9); star_ratings ('4 star or "
+        "better' → [4,5]); facilities (canonical keys, e.g. pool, wifi, "
+        "parking, spa, gym, beachfront, sea_view, mountain_view, kitchen, "
+        "balcony, air_conditioning, bonfire, hot_tub, wheelchair_accessible, "
+        "twin_beds, double_bed); meals (breakfast_included/half_board/"
+        "full_board/all_inclusive); booleans free_cancellation, no_prepayment, "
+        "breakfast_included, couple_friendly, pet_friendly; max_distance_km; "
+        "sort ('cheapest first' → price_asc, 'best rated' → rating). This "
+        "triggers a LIVE search — the reply will be replaced by the handler, "
+        "keep it short.\n"
         "- set_title: rename the trip.\n"
         "- unsupported: ONLY structural edits that truly can't be done "
         "(change destination/dates, add days, regenerate the itinerary). "
@@ -232,6 +285,12 @@ async def route_intent(message: str, state: dict) -> dict:
         "- 'show me hotels near Mall Road' → search_hotels, hotel_query 'Mall "
         "Road'. 'Any hotels closer to the lake?' → search_hotels, hotel_query "
         "'the lake'.\n"
+        "- 'pet-friendly resorts under 8000 with a pool' → search_hotels, "
+        "hotel_filters {property_types:['resort'], price_max:8000, "
+        "pet_friendly:true, facilities:['pool']}.\n"
+        "- 'a top-rated hostel near Anjuna with free cancellation' → "
+        "search_hotels, hotel_query 'Anjuna', hotel_filters "
+        "{property_types:['hostel'], min_review_score:9, free_cancellation:true}.\n"
         "- 'add one more day in Manali' → unsupported.\n"
         "select_transport_option MUST include direction, mode and option_index; "
         "if you can't determine them, use answer_question and tell the user "
@@ -479,7 +538,9 @@ async def apply_edit(
             from .hotel_search import handle_search_hotels
 
             patches, handler_reply = await handle_search_hotels(
-                state, (intent.get("hotel_query") or "").strip()
+                state,
+                (intent.get("hotel_query") or "").strip(),
+                raw_filters=intent.get("hotel_filters"),
             )
             reply = handler_reply or reply
         elif kind == "set_title" and intent.get("title"):
@@ -487,12 +548,9 @@ async def apply_edit(
             reply = f"Renamed your trip to “{intent['title']}”."
 
     if patches:
-        import asyncio
+        from app.db.client import run_db
 
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None, lambda: _persist_and_broadcast(trip_id, patches, reply, message)
-        )
+        await run_db(lambda: _persist_and_broadcast(trip_id, patches, reply, message))
 
     return {
         "reply": reply,

@@ -36,7 +36,7 @@ from app.api.v1.plan_trip.orchestrator import run_plan_trip
 from app.api.v1.plan_trip.budget import compute_detailed_budget
 from app.api.v1.plan_trip.helpers import CURRENCY_CONFIG, fetch_user_profile
 from app.core.timing import RequestTrace
-from app.db.client import get_db
+from app.db.client import get_db, run_db
 
 logger = logging.getLogger(__name__)
 
@@ -323,9 +323,8 @@ async def supervisor_run(body: PlanRequest, user_id: str, on_phase=None) -> dict
 
     # ── Phase 1: Fetch shared profile once, then run all agents in parallel ──────
     trace = RequestTrace(f"supervisor_{user_id[:8]}")
-    _db = get_db()
-    loop = asyncio.get_event_loop()
-    shared_profile = await loop.run_in_executor(None, fetch_user_profile, _db, user_id)
+    # get_db() inside the DB executor thread — clients must not cross threads.
+    shared_profile = await run_db(lambda: fetch_user_profile(get_db(), user_id))
 
     coros = [
         _phase_wrap("journey", run_plan_journey(journey_req, user_id, profile=shared_profile), on_phase),
@@ -454,9 +453,6 @@ async def supervisor_run(body: PlanRequest, user_id: str, on_phase=None) -> dict
 
     # ── Phase 5: DB writes — save trip synchronously to get trip_id ─────────────
     try:
-        db = get_db()
-        loop = asyncio.get_event_loop()
-
         itinerary_data = {
             k: merged[k]
             for k in ("trip_name", "destination", "destination_description",
@@ -465,8 +461,8 @@ async def supervisor_run(body: PlanRequest, user_id: str, on_phase=None) -> dict
             if k in merged
         }
 
-        trip_row = await loop.run_in_executor(None, lambda: (
-            db.table("trips").insert({
+        trip_row = await run_db(lambda: (
+            get_db().table("trips").insert({
                 "user_id": user_id,
                 "title": merged.get("trip_name") or body.destination,
                 "destination": body.destination,
@@ -494,9 +490,6 @@ async def supervisor_run(body: PlanRequest, user_id: str, on_phase=None) -> dict
 
 async def _save_trip_journey(user_id: str, body: PlanRequest, merged: dict, end_date: str | None, trip_id: str) -> None:
     try:
-        db = get_db()
-        loop = asyncio.get_event_loop()
-
         def _to_numeric(v):
             try:
                 return float(v) if v is not None else None
@@ -519,8 +512,8 @@ async def _save_trip_journey(user_id: str, body: PlanRequest, merged: dict, end_
             "intervention": costs.get("intervention"),
         }
 
-        await loop.run_in_executor(None, lambda: (
-            db.table("trip_journey").insert({
+        await run_db(lambda: (
+            get_db().table("trip_journey").insert({
                 "trip_id": trip_id,
                 "user_id": user_id,
                 "origin": body.origin,

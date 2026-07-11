@@ -14,8 +14,11 @@ import asyncio
 import json
 import logging
 
+import httpx
 import redis as redis_lib
 import sentry_sdk
+
+from app.db.client import run_db
 
 from app.api.v1.plan_trip.models import PlanRequest
 from app.api.v1.plan_trip.plan import _shape_journey
@@ -56,14 +59,24 @@ def read_events(trip_id: str, start: int = 0) -> list[dict]:
 
 
 class _Emitter:
-    """Persists patches to the event log, then publishes to the live stream."""
+    """Persists patches to the event log, then publishes to the live stream.
+
+    Persistence failures on intermediate events must not kill the generation:
+    the live stream (Redis) still gets the event, and the unpersisted patches
+    are carried forward and folded into the next successful append, so the
+    stored snapshot converges. Only a `critical=True` emit (the final
+    authoritative one) propagates the failure.
+    """
 
     def __init__(self, trip_id: str):
         self.trip_id = trip_id
-        self._loop = asyncio.get_event_loop()
         # Weather runs in parallel with supervisor phases; append_events is a
         # read-modify-write on the snapshot, so emits must never interleave.
         self._lock = asyncio.Lock()
+        # Patches whose persist failed, ordered oldest-first. Folded into the
+        # next append (their per-event actor/phase granularity is lost — the
+        # snapshot result is identical since later sets of a path win).
+        self._pending: list[PatchOp] = []
 
     async def __call__(
         self,
@@ -73,9 +86,10 @@ class _Emitter:
         progress: int,
         reasoning: str | None = None,
         actor: str = "supervisor",
+        critical: bool = False,
     ) -> None:
         async with self._lock:
-            await self._emit(phase, label, patches, progress, reasoning, actor)
+            await self._emit(phase, label, patches, progress, reasoning, actor, critical)
 
     async def _emit(
         self,
@@ -85,14 +99,25 @@ class _Emitter:
         progress: int,
         reasoning: str | None,
         actor: str,
+        critical: bool,
     ) -> None:
-        if patches:
-            await self._loop.run_in_executor(
-                None,
-                lambda: store.append_events(
-                    self.trip_id, actor, patches, phase=phase, reasoning=reasoning
-                ),
-            )
+        to_persist = self._pending + patches
+        if to_persist:
+            try:
+                await run_db(
+                    lambda: store.append_events(
+                        self.trip_id, actor, to_persist, phase=phase, reasoning=reasoning
+                    )
+                )
+                self._pending = []
+            except httpx.TransportError as exc:
+                if critical:
+                    raise
+                self._pending = to_persist
+                logger.warning(
+                    "[trip-state] %s persisting %s for %s — deferring %d patches to next emit",
+                    type(exc).__name__, phase, self.trip_id, len(to_persist),
+                )
         publish_event(self.trip_id, {
             "phase": phase,
             "label": label,
@@ -204,6 +229,7 @@ async def run_generation(trip_id: str, body: PlanRequest, user_id: str) -> None:
                 "itinerary", "costs", "documents", "agent_meta",
             ]),
             100,
+            critical=True,
         )
         logger.info("[trip-state] generation complete for %s", trip_id)
 

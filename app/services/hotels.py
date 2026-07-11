@@ -24,7 +24,8 @@ from app.core.metrics import METRICS
 from app.services.scoring import score_hotels
 from app.services.hotels_filters import (
     budget_to_hotel_sort, derive_travel_type, preferred_types,
-    filter_and_rank_by_persona,
+    filter_and_rank_by_persona, sanitize_hotel_filters, apply_hotel_filters,
+    sort_hotels,
 )
 from app.services.hotels_destination import normalize_destination, distance_km_for
 
@@ -64,6 +65,7 @@ class HotelService:
         sort: str | None = None,
         max_distance_km: float | None = None,
         currency_code: str = "inr",
+        filters: dict | None = None,
     ) -> dict:
         from datetime import datetime
         try:
@@ -76,10 +78,19 @@ class HotelService:
         dest  = normalize_destination(destination)
         city  = dest.query
 
+        # Explicit user filters (canonical vocabulary, see hotels_filters) are
+        # HARD and override the persona/budget soft heuristics they overlap:
+        # explicit property types replace the persona matrix, an explicit price
+        # range disables the budget tier's price band, an explicit sort beats
+        # the budget→sort mapping.
+        filters        = sanitize_hotel_filters(filters)
+        explicit_types = filters.get("property_types")
+        explicit_price = "price_min" in filters or "price_max" in filters
+
         # Persona + budget drive property type; budget drives sort (budget wins).
         persona      = derive_travel_type(adults, travel_type)
-        ptypes       = preferred_types(persona, budget)
-        canonical_sort = budget_to_hotel_sort(budget) or sort or "recommended"
+        ptypes       = explicit_types or preferred_types(persona, budget)
+        canonical_sort = filters.get("sort") or budget_to_hotel_sort(budget) or sort or "recommended"
 
         emt_r, booking_r, agoda_r, ixigo_r = await asyncio.gather(
             breaker_emt.call(
@@ -120,7 +131,11 @@ class HotelService:
             raw = len(result)
             # Per-provider contribution to this search (drives avg_result_count).
             METRICS.record_search(name, raw_count=raw, deduped_count=raw)
-            budget_filtered = _filter_by_budget(result, budget, currency_code)
+            # With explicit filters the budget band moves AFTER the hard filters
+            # (see below) — pre-dropping here would starve them: a mid-tier band
+            # would remove the only ₹16k sea-view resort before the facility
+            # filter ever saw it.
+            budget_filtered = result if filters else _filter_by_budget(result, budget, currency_code)
             all_hotels.extend(budget_filtered)
             sources.append(name)
             return f"✓ {len(budget_filtered)}/{raw}"
@@ -142,6 +157,7 @@ class HotelService:
         if not all_hotels:
             return {"hotels": [], "source": "none", "nights": nights,
                     "travel_type": persona, "property_types": ptypes,
+                    "filters_applied": filters or None, "filters_relaxed": False,
                     "destination": dest.display_name, "dest_class": dest.dest_class}
 
         total_raw = len(all_hotels)
@@ -154,17 +170,37 @@ class HotelService:
         # composite (price+rating+reviews+distance+provider+images+amenities+
         # freshness) — replaces the old richness-only ordering.
         scored = score_hotels(nearby)
+        # Hard user filters FIRST — the soft persona/budget shaping below must
+        # never starve an explicit request (e.g. couple/mid prefers hotels, but
+        # "free cancellation" may only match a hostel). If nothing survives,
+        # fall back to the unfiltered pool with filters_relaxed=True so callers
+        # can say so instead of showing an empty screen.
+        filtered = apply_hotel_filters(scored, filters)
+        relaxed = bool(filters) and not filtered
+        if relaxed:
+            filtered = scored
         # Soft persona filter: keep the persona's preferred property types (never
         # empties); a STABLE sort by persona tier preserves rank_score order within
         # each tier, so preferred types lead and the best-scored lead within them.
-        persona_filtered = filter_and_rank_by_persona(scored, persona, budget)
-        hotels_with_map = [_add_map_url(h) for h in persona_filtered]
+        # Explicit property types skip it — the hard filter above was the request.
+        if not explicit_types:
+            filtered = filter_and_rank_by_persona(filtered, persona, budget)
+        if filters and not explicit_price and not relaxed:
+            # Budget band was skipped per-source when filters exist; re-apply it
+            # softly (never empties) so the tier still shapes prices unless the
+            # user set an explicit price range.
+            filtered = _filter_by_budget(filtered, budget, currency_code)
+        if filters.get("sort"):
+            filtered = sort_hotels(filtered, filters["sort"])
+        hotels_with_map = [_add_map_url(h) for h in filtered]
         return {
             "hotels": hotels_with_map,
             "source": "+".join(sources),
             "nights": nights,
             "travel_type": persona,
             "property_types": ptypes,
+            "filters_applied": filters or None,
+            "filters_relaxed": relaxed,
             "destination": dest.display_name,
             "dest_class": dest.dest_class,
         }

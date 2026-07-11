@@ -25,7 +25,7 @@ from .journey import run_plan_journey
 from .orchestrator import run_plan_trip
 from .budget import compute_detailed_budget
 from app.core.timing import RequestTrace
-from app.db.client import get_db
+from app.db.client import get_db, run_db
 
 logger = logging.getLogger(__name__)
 
@@ -370,9 +370,6 @@ def _hotel_master_rows(merged: dict, fallback_destination: str) -> list[dict]:
 
 async def _save_trip(user_id: str, body: PlanRequest, merged: dict, end_date: str | None) -> None:
     try:
-        db = get_db()
-        loop = asyncio.get_event_loop()
-
         # Slim itinerary_data: only the AI-generated day-by-day plan, not the full blob
         itinerary_data = {
             k: merged[k]
@@ -382,8 +379,8 @@ async def _save_trip(user_id: str, body: PlanRequest, merged: dict, end_date: st
             if k in merged
         }
 
-        trip_row = await loop.run_in_executor(None, lambda: (
-            db.table("trips").insert({
+        trip_row = await run_db(lambda: (
+            get_db().table("trips").insert({
                 "user_id": user_id,
                 "title": merged.get("trip_name") or body.destination,
                 "destination": body.destination,
@@ -401,8 +398,8 @@ async def _save_trip(user_id: str, body: PlanRequest, merged: dict, end_date: st
             logger.warning("[plan] Auto-save: trips insert returned no id")
             return
 
-        await loop.run_in_executor(None, lambda: (
-            db.table("trip_journey").insert({
+        await run_db(lambda: (
+            get_db().table("trip_journey").insert({
                 "trip_id": trip_id,
                 "user_id": user_id,
                 "origin": body.origin,
@@ -439,8 +436,8 @@ async def _save_trip(user_id: str, body: PlanRequest, merged: dict, end_date: st
         try:
             hotel_rows = _hotel_master_rows(merged, body.destination)
             if hotel_rows:
-                await loop.run_in_executor(None, lambda: (
-                    db.table("hotels")
+                await run_db(lambda: (
+                    get_db().table("hotels")
                     .upsert(hotel_rows, on_conflict="source,source_hotel_id")
                     .execute()
                 ))
