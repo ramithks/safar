@@ -112,5 +112,15 @@ class Settings(BaseSettings):
     # CORS — comma-separated list of allowed origins, or "*" for all
     allowed_origins: str = "*"
 
+    # Threads (and thus thread-local Supabase clients) for the dedicated DB
+    # executor. Caps concurrent DB ops per process; raise to relieve /plan
+    # contention, but each thread holds its own connection pool.
+    db_executor_workers: int = 4
+
+    # Hard ceiling (seconds) on any single request before the server returns 504.
+    # Backstops per-endpoint timeouts so a wedged scraper/upstream can't pin a
+    # worker connection open forever. 0 disables the middleware.
+    request_timeout_seconds: float = 210.0
+
 
 settings = Settings()

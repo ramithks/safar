@@ -22,12 +22,15 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Dedicated executor for ALL sync Supabase calls made from async code. Two
-# threads → at most two per-thread clients, instead of one per default-executor
-# thread (which is also busy with video downloads and other blocking work).
-# Keeping DB sockets on their own threads narrows exposure to the fd churn the
-# curl_cffi scrapers produce during teardown.
-_DB_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tb-db")
+# Dedicated executor for ALL sync Supabase calls made from async code, isolated
+# from the default executor (busy with video downloads / curl_cffi scrapers whose
+# fd churn corrupted shared TLS). Each thread gets its OWN thread-local client
+# (see get_db), so N threads = N independent connection pools — no shared socket
+# to corrupt. Sized so a couple of concurrent /plan requests (3-4 DB writes each)
+# don't serialize behind one another. Override with DB_EXECUTOR_WORKERS.
+_DB_EXECUTOR = ThreadPoolExecutor(
+    max_workers=settings.db_executor_workers, thread_name_prefix="tb-db"
+)
 
 
 async def run_db(fn, *args):

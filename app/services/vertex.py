@@ -23,6 +23,7 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleAuthRequest
 import google.auth
 from app.config import settings
+from app.core.async_http import loop_client
 
 # Legacy alias — prefer brain()/muscle() below; model IDs come from config.
 MODEL_NAME = settings.vertex_model_brain
@@ -45,10 +46,19 @@ def _regions() -> list[str]:
     return ordered
 
 # ── Shared HTTP client ────────────────────────────────────────────────────────
-_http_client = httpx.AsyncClient(
-    timeout=180.0,
-    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-)
+# Bound to the running event loop — see app.core.async_http for why a plain
+# module-level client breaks under Celery's per-task asyncio.run() loops.
+_clients_by_loop: dict[int, httpx.AsyncClient] = {}
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    return loop_client(
+        _clients_by_loop,
+        lambda: httpx.AsyncClient(
+            timeout=180.0,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        ),
+    )
 
 # ── Token cache ───────────────────────────────────────────────────────────────
 _token_cache: dict = {"token": None, "expiry": 0.0, "project_id": ""}
@@ -160,7 +170,7 @@ async def vertex_generate(
             f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}"
             f"/locations/{location}/publishers/google/models/{model}:generateContent"
         )
-        r = await _http_client.post(url, headers=headers, json=body, timeout=timeout)
+        r = await _get_http_client().post(url, headers=headers, json=body, timeout=timeout)
 
         if r.status_code in (429, 503) and attempt < max_attempts - 1:
             next_location = regions[(attempt + 1) % n_regions]

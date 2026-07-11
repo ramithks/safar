@@ -36,6 +36,7 @@ from app.api.v1.plan_trip.orchestrator import run_plan_trip
 from app.api.v1.plan_trip.budget import compute_detailed_budget
 from app.api.v1.plan_trip.helpers import CURRENCY_CONFIG, fetch_user_profile
 from app.core.timing import RequestTrace
+from app.core.background import spawn_background
 from app.db.client import get_db, run_db
 
 logger = logging.getLogger(__name__)
@@ -478,7 +479,10 @@ async def supervisor_run(body: PlanRequest, user_id: str, on_phase=None) -> dict
         trip_id = (trip_row.data or [{}])[0].get("id")
         if trip_id:
             merged["trip_id"] = trip_id
-            asyncio.create_task(_save_trip_journey(user_id, body, merged, end_date, trip_id))
+            spawn_background(
+                _save_trip_journey(user_id, body, merged, end_date, trip_id),
+                name=f"save_trip_journey:{trip_id}",
+            )
         else:
             logger.warning("[supervisor] Auto-save: trips insert returned no id")
 

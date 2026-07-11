@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.core.background import spawn_background
 from app.core.limiter import limiter
 from app.core.sse import sse_event
 from app.db.client import run_db
@@ -74,7 +75,7 @@ async def create_trip(request: Request, body: PlanRequest, user=Depends(require_
         "interests": body.interests,
     })
     trip_id = await run_db(store.create_trip_state, str(user.id), state)
-    asyncio.create_task(run_generation(trip_id, body, str(user.id)))
+    spawn_background(run_generation(trip_id, body, str(user.id)), name=f"trip_gen:{trip_id}")
     logger.info("[trip-state] %s → %s queued as %s", body.origin, body.destination, trip_id)
     return {"trip_id": trip_id, "status": "planning"}
 

@@ -25,6 +25,7 @@ from .journey import run_plan_journey
 from .orchestrator import run_plan_trip
 from .budget import compute_detailed_budget
 from app.core.timing import RequestTrace
+from app.core.background import spawn_background
 from app.db.client import get_db, run_db
 
 logger = logging.getLogger(__name__)
@@ -306,7 +307,7 @@ async def run_plan(body: PlanRequest, user_id: str) -> dict:
     )
 
     # ── Auto-save to trips table (fire-and-forget) ────────────────────────────
-    asyncio.create_task(_save_trip(user_id, body, merged, end_date))
+    spawn_background(_save_trip(user_id, body, merged, end_date), name=f"save_trip:{user_id}")
 
     return merged
 

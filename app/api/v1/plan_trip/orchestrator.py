@@ -16,6 +16,7 @@ from app.db.client import get_db, run_db
 from app.services.vertex import brain as vertex_brain, extract_json
 from app.services.places import discover_places
 from app.core.timing import RequestTrace
+from app.core.background import spawn_background
 
 from .models import PlanTripRequest
 from .helpers import (
@@ -168,7 +169,7 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
             "days": [],
             "include_itinerary": False,
         }
-        asyncio.create_task(_db_writes(user_id, body, result))
+        spawn_background(_db_writes(user_id, body, result), name=f"db_writes:{user_id}")
         return result
 
     # ── Phase 3: Gemini itinerary ─────────────────────────────────────────────
@@ -252,7 +253,7 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
         logger.debug(trace.summary())
 
     # ── Phase 6: DB writes (fire-and-forget) ──────────────────────────────────
-    asyncio.create_task(_db_writes(user_id, body, ai_json))
+    spawn_background(_db_writes(user_id, body, ai_json), name=f"db_writes:{user_id}")
 
     return ai_json
 

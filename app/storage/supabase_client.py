@@ -8,16 +8,16 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_client = None
-
-
 def _get_client():
-    global _client
-    if _client is None:
-        from supabase import create_client
-        from app.config import settings
-        _client = create_client(settings.supabase_url, settings.supabase_service_key)
-    return _client
+    """Thread-local, retry-wrapped, HTTP/1.1 service-role client.
+
+    Previously a process-wide `create_client()` singleton shared across executor
+    threads — the exact pattern that corrupted the TLS stream under concurrent
+    writes (SSLV3_ALERT_BAD_RECORD_MAC). Delegating to `db.client.get_db()` gives
+    one client PER THREAD plus the stale-connection retry wrapper.
+    """
+    from app.db.client import get_db
+    return get_db()
 
 
 def get_cached_scan(reel_url: str) -> dict | None:
