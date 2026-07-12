@@ -81,6 +81,8 @@ _INTENT_SCHEMA = {
             "enum": [
                 "answer_question",
                 "select_transport_option",
+                "select_flight_journey",
+                "restore_ground_route",
                 "select_hotel",
                 "search_hotels",
                 "add_activities",
@@ -143,10 +145,11 @@ def _option_name(mode: str, option: dict) -> str:
 
 
 def _clock(value: Any) -> str | None:
-    """'2026-07-17 23:15:00' → '23:15'; '04:20' stays as-is."""
+    """'2026-07-17 23:15:00' → '23:15'; '2026-07-17T23:15:00' → '23:15' (flights
+    use the ISO 'T' separator); '04:20' stays as-is."""
     if not isinstance(value, str) or not value:
         return None
-    tail = value.split(" ")[-1]
+    tail = value.split(" ")[-1].split("T")[-1]
     return tail[:5] if ":" in tail else value
 
 
@@ -315,6 +318,18 @@ async def route_intent(message: str, state: dict, history: str = "", memory: str
         "choosing the highest-baggage flight, 'cheaper' by fare, etc. Also set "
         "`prefer` to the axis they cared about. The reply will be replaced by "
         "the handler, keep it short.\n"
+        "- select_flight_journey: the user wants to FLY this trip instead of the "
+        "planned ground route ('I want a flight', 'can we fly', 'book me a "
+        "flight', 'fly instead', 'is there a flight', 'flight from <origin> to "
+        "<destination>'). This switches the whole outbound to a direct flight "
+        "between the trip's OWN origin and destination (it does NOT change where "
+        "the trip goes). Use this WHENEVER they ask to fly, even if they restate "
+        "the cities — do NOT call it unsupported just because they named the "
+        "origin/destination. The handler live-searches the flight; reply is "
+        "replaced, keep it short.\n"
+        "- restore_ground_route: the user wants to go back to the train/bus route "
+        "after switching to the flight ('back to train', 'don't fly', 'switch "
+        "back to the bus').\n"
         "- select_hotel: pick a different hotel by index from the candidates.\n"
         "- search_hotels: the user wants hotels the list doesn't cover — near a "
         "landmark/area ('hotels near Mall Road', 'stays close to the beach'), "
@@ -365,12 +380,16 @@ async def route_intent(message: str, state: dict, history: str = "", memory: str
         "stay', 'Closer to the beach', 'Higher rated']). Prefer acting when the "
         "intent is reasonably clear — only clarify when a wrong guess would "
         "actually cost the user.\n"
-        "- unsupported: ONLY edits that truly can't be done (change the main "
-        "destination or dates, regenerate the whole itinerary from scratch). "
-        "Reply warmly with what IS possible right now: answer questions, swap "
-        "rides on any leg, search/swap hotels, add spots or a stopover city, "
-        "rename the trip.\n\n"
+        "- unsupported: ONLY edits that truly can't be done — change the main "
+        "destination to a DIFFERENT city, change the dates, or regenerate the "
+        "whole itinerary from scratch. NOTE: 'I want a flight' / 'flight from A "
+        "to B' is NOT unsupported — it's select_flight_journey (switching the "
+        "existing trip to fly). Reply warmly with what IS possible right now: "
+        "answer questions, fly the trip or swap rides on any leg, search/swap "
+        "hotels, add spots or a stopover city, rename the trip.\n\n"
         "Examples:\n"
+        "- 'i want a flight' / 'can we fly to <destination>' / 'flight from "
+        "hyderabad to udaipur' → select_flight_journey.\n"
         "- 'find me a better/cheaper bus' → select_transport_option on the bus "
         "leg: scan the numbered list and pick the strongest option that differs "
         "from the current pick (weigh fare, rating, sensible timings).\n"
@@ -589,18 +608,50 @@ def handle_select_option(
     return patches, reply
 
 
-def handle_select_flight_journey(state: dict) -> tuple[list[PatchOp], str]:
-    """Switch the outbound to the direct-flight alternative the journey builder
-    attached (`going.flight_journey`). Rebuilds `going` as a flight-only journey
-    (so all existing cost/selection logic just works) and stashes the ground
-    route so the user can switch back."""
+async def _live_flight_journey(state: dict) -> dict | None:
+    """Live-search a direct origin→destination flight and build a flight bundle,
+    for trips whose stored plan predates the always-on flight alternative (or
+    where the planner chose a ground route). Best-effort; returns None on miss."""
+    req = state.get("request") or {}
+    origin, dest = req.get("origin"), req.get("destination")
+    date = req.get("departure_date")
+    if not (origin and dest and date):
+        return None
+    travelers = max(int(req.get("travelers") or 1), 1)
+    budget = req.get("budget_tier") or "mid"
+    try:
+        from app.api.v1.plan_trip.journey import _build_flight_journey_bundle
+        from app.services.flights import FlightService, budget_to_sort
+
+        result = await FlightService().search(
+            origin, dest, date, adults=travelers, sort=budget_to_sort(budget),
+        )
+        return _build_flight_journey_bundle(result, travelers, origin, dest, budget)
+    except Exception as exc:  # noqa: BLE001 — advisory, never fatal
+        logger.warning("[copilot] live flight search failed: %s", exc)
+        return None
+
+
+async def handle_select_flight_journey(state: dict) -> tuple[list[PatchOp], str]:
+    """Switch the outbound to a direct flight. Uses the bundle the journey builder
+    attached (`going.flight_journey`) when present, else LIVE-searches one so this
+    works on any trip. Rebuilds `going` as a flight-only journey (existing cost/
+    selection logic then just works) and stashes the ground route to switch back."""
     going = dict(_journey(state, "going"))
+    if going.get("ground_route_backup"):
+        return [], "You're already on the direct flight. Say “back to train + bus” to switch back."
+
     fj = going.get("flight_journey") or {}
     items = fj.get("items") or []
     if not items:
-        return [], "I don't have a direct flight option for this trip yet."
-    if going.get("ground_route_backup"):
-        return [], "You're already on the direct flight. Want me to switch back to the train + bus route?"
+        fj = await _live_flight_journey(state) or {}
+        items = fj.get("items") or []
+    if not items:
+        req = state.get("request") or {}
+        return [], (
+            f"I couldn't find any direct flights for {req.get('origin')} → "
+            f"{req.get('destination')} on your dates."
+        )
 
     rec = fj.get("recommended") or items[0]
     new_going = {
@@ -830,7 +881,7 @@ async def apply_edit(
         )
     elif action and action.get("type") == "select_flight_journey":
         kind = "select_flight_journey"
-        patches, reply = handle_select_flight_journey(state)
+        patches, reply = await handle_select_flight_journey(state)
     elif action and action.get("type") == "restore_ground_route":
         kind = "restore_ground_route"
         patches, reply = handle_restore_ground_route(state)
@@ -850,6 +901,12 @@ async def apply_edit(
                 intent["mode"],
                 int(intent.get("option_index") or 0),
             )
+            reply = handler_reply or reply
+        elif kind == "select_flight_journey":
+            patches, handler_reply = await handle_select_flight_journey(state)
+            reply = handler_reply or reply
+        elif kind == "restore_ground_route":
+            patches, handler_reply = handle_restore_ground_route(state)
             reply = handler_reply or reply
         elif kind == "select_hotel" and intent.get("hotel_index") is not None:
             patches, handler_reply = handle_select_hotel(state, int(intent["hotel_index"]))
