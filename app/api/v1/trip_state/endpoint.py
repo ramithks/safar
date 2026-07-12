@@ -223,6 +223,7 @@ async def edit_trip_stream(request: Request, trip_id: str, body: EditRequest, us
             "applied": result.get("applied"),
             "patches": result.get("patches") or [],
             "clarify_options": result.get("clarify_options") or [],
+            "cards": result.get("cards") or [],
         })
 
     return StreamingResponse(

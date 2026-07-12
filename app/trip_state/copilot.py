@@ -667,6 +667,47 @@ def handle_select_hotel(state: dict, index: int) -> tuple[list[PatchOp], str]:
     return patches, reply
 
 
+# ── Rich cards for the chat (carousels) ─────────────────────────────────────────
+
+def _card_image(item: dict) -> str | None:
+    photos = item.get("photos")
+    first_photo = photos[0] if isinstance(photos, list) and photos else None
+    return item.get("photo_url") or first_photo or item.get("image") or None
+
+
+def _hotel_cards(state: dict, limit: int = 8) -> list[dict]:
+    """Compact, tappable hotel cards for the chat carousel — mirrors what the
+    Stays tab shows, so the user can pick a stay right from the conversation."""
+    stay = state.get("stay") or {}
+    hotels = stay.get("hotels") or []
+    selected_name = (stay.get("selected") or {}).get("name")
+    items: list[dict] = []
+    for i, h in enumerate(hotels[:limit]):
+        price = h.get("price_per_night") or h.get("price")
+        items.append({
+            "index": i,
+            "title": h.get("name"),
+            "subtitle": h.get("address") or h.get("city") or h.get("area"),
+            "image": _card_image(h),
+            "price": f"₹{round(price):,}/night" if isinstance(price, (int, float)) and price > 0 else None,
+            "rating": h.get("review_score") or h.get("star_rating"),
+            "badges": [t for t in (h.get("why_tags") or []) if isinstance(t, str)][:2],
+            "selected": bool(selected_name) and h.get("name") == selected_name,
+            "action": {"type": "select_hotel", "hotel_index": i},
+        })
+    if not items:
+        return []
+    return [{"kind": "hotel", "title": f"{len(hotels)} stays to choose from", "items": items}]
+
+
+def _build_cards(kind: str | None, state: dict) -> list[dict]:
+    """Structured, tappable result cards the chat renders as carousels. Returns
+    [] when the intent doesn't have visual results worth surfacing."""
+    if kind in ("search_hotels", "select_hotel"):
+        return _hotel_cards(state)
+    return []
+
+
 # ── Entry point ─────────────────────────────────────────────────────────────────
 
 async def _record_edit_signals(user_id: str, kind: str | None, intent: dict) -> None:
@@ -908,4 +949,5 @@ async def apply_edit(
         "applied": bool(patches),
         "patches": [p.model_dump(mode="json") for p in patches],
         "clarify_options": clarify_options,
+        "cards": _build_cards(kind, state),
     }
