@@ -667,8 +667,9 @@ async def handle_select_flight_journey(state: dict) -> tuple[list[PatchOp], str]
     patches.append(PatchOp(op="set", path="/costs", value=new_costs))
 
     fare = round(_fare_per_person("flight", rec) or 0)
+    route = f"{fj.get('from')} → {fj.get('to')}"
     reply = (
-        f"Switched to the direct flight — {_option_name('flight', rec)} "
+        f"Switched to the direct flight {route} — {_option_name('flight', rec)} "
         f"({_option_times(rec)}, ₹{fare}/person)."
     )
     live = _live_total(state)
