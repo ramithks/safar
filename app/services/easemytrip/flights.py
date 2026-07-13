@@ -385,10 +385,14 @@ def _parse_new_format(
         stp_raw = bundle.get("stp")
         stops = int(stp_raw) if stp_raw is not None else (len(fl_indices) - 1)
 
+        legs      = [dct.get(str(i)) or {} for i in fl_indices]
         first_leg = dct.get(str(fl_indices[0]))
         last_leg  = dct.get(str(fl_indices[-1]))
         if not first_leg:
             continue
+
+        # Connection airports for multi-leg flights (where you change planes).
+        layover_airports = [_resolve(lg.get("DT", "")) for lg in legs[:-1] if lg.get("DT")]
 
         ac  = first_leg.get("AC", "")
         fn  = first_leg.get("FN", "")
@@ -440,9 +444,31 @@ def _parse_new_format(
             "currency": "INR",
             "booking_url": emt_search_url,
             "source": "easemytrip",
+            # ── Enriched signals (fields absent from EMT's listing response —
+            # aircraft/co2/refundability — are detail-call only, so omitted) ──
+            "cabin_baggage_kg": _safe_int(first_leg.get("HBW")),
+            "fare_type": seg.get("FareTypeUI") or None,          # Regular / Corporate / Student
+            "savings": _safe_int(seg.get("Saving")) or None,
+            "departure_terminal": first_leg.get("DTER") or None,
+            "arrival_terminal": (last_leg or first_leg).get("ATER") or None,
+            "self_transfer": _truthy(first_leg.get("IsSelfT")),
+            "layover_airports": layover_airports or None,
         })
 
     return results
+
+
+def _truthy(v) -> bool | None:
+    """EMT flags come as bool / 0-1 / 'true'-'R'-'Y'. Normalise to bool, None if absent."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "y", "yes", "r", "refundable")
+    return None
 
 
 def _parse_emt_datetime(date_str: str, time_str: str) -> str | None:

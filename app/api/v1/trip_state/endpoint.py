@@ -31,17 +31,22 @@ router = APIRouter()
 
 
 class EditAction(BaseModel):
-    """Structured UI command that bypasses the LLM intent router — deterministic,
+    """Structured UI command that bypasses the LLM agent — deterministic,
     instant edits the user drives directly from the workspace.
 
       {"type": "select_transport_option", "direction", "mode", "index"}
+      {"type": "select_leg_option", "leg_id", "mode", "index", "hop_index"?}
       {"type": "select_hotel", "hotel_index"}
+      {"type": "select_stop_hotel", "stop_id", "hotel_index"}
     """
     type: str
     direction: str | None = None
     mode: str | None = None
     index: int | None = None
     hotel_index: int | None = None
+    leg_id: str | None = None
+    hop_index: int | None = None
+    stop_id: str | None = None
 
 
 class EditRequest(BaseModel):
@@ -88,14 +93,19 @@ async def create_trip(request: Request, body: PlanRequest, user=Depends(require_
 
 @router.get("/trip-state/{trip_id}")
 async def get_trip(trip_id: str, user=Depends(require_user)):
+    from app.trip_state.graph import projected_state
+
     row = await _get_row(trip_id)
     _authorize_read(row, str(user.id))
+    # Regenerate the compatibility projections (transport/itinerary/costs and the
+    # DERIVED recommendation) from the canonical graph on every read — nothing
+    # derived is served from a stored snapshot. No-op for graph-less legacy trips.
     return {
         "trip_id": row["id"],
         "status": row["status"],
         "visibility": row["visibility"],
         "last_seq": row["last_seq"],
-        "state": row["state"],
+        "state": projected_state(row["state"] or {}),
     }
 
 
@@ -185,11 +195,13 @@ async def edit_trip(request: Request, trip_id: str, body: EditRequest, user=Depe
 @limiter.limit("60/hour")
 async def edit_trip_stream(request: Request, trip_id: str, body: EditRequest, user=Depends(require_user)):
     """
-    Streaming copilot edit — same routing/handlers as /edit, but the reply lands
-    as an SSE stream so it types out live (the copilot is the workspace's main
-    brain, and should feel like one). Emits `token` chunks for the reply, then a
-    single `done` event carrying the authoritative patches + intent + clarify
-    options. Persistence (chat + patches) happens inside apply_edit, once.
+    Streaming copilot edit — same agent/handlers as /edit, but progress lands
+    live. The agent may chain many tool calls for one message; each completed
+    step is emitted as a `step` event (label + its patches) THE MOMENT it lands,
+    so the board fills in while the agent keeps working. Then `token` chunks
+    type out the final reply, and a single `done` event carries the
+    authoritative result. Persistence (chat + patches) happens inside
+    apply_edit, once.
     """
     row = await _get_row(trip_id)
     _authorize_write(row, str(user.id))
@@ -201,8 +213,34 @@ async def edit_trip_stream(request: Request, trip_id: str, body: EditRequest, us
     state = row["state"]
 
     async def event_source():
+        steps: asyncio.Queue = asyncio.Queue()
+        # apply_edit awaits between tool calls on this same loop, so a plain
+        # put_nowait from the callback is safe (no cross-thread hops).
+        task = asyncio.create_task(apply_edit(
+            trip_id, message, state, action=action, user_id=user_id,
+            on_step=lambda step: steps.put_nowait(step),
+        ))
+
+        def _step_event(step: dict) -> str:
+            return sse_event("step", {
+                "label": step.get("label") or "",
+                "tool": step.get("tool"),
+                "patches": [p.model_dump(mode="json") for p in (step.get("patches") or [])],
+            })
+
+        # Relay steps live until the run finishes, then drain any stragglers.
+        while not task.done():
+            getter = asyncio.ensure_future(steps.get())
+            done, _ = await asyncio.wait({getter, task}, return_when=asyncio.FIRST_COMPLETED)
+            if getter in done:
+                yield _step_event(getter.result())
+            else:
+                getter.cancel()
+        while not steps.empty():
+            yield _step_event(steps.get_nowait())
+
         try:
-            result = await apply_edit(trip_id, message, state, action=action, user_id=user_id)
+            result = task.result()
         except Exception as exc:  # noqa: BLE001 — stream must terminate cleanly
             logger.error("[trip-state] stream edit failed for %s: %s", trip_id, exc, exc_info=True)
             sentry_sdk.capture_exception(exc)
@@ -211,7 +249,7 @@ async def edit_trip_stream(request: Request, trip_id: str, body: EditRequest, us
 
         reply = result.get("reply") or ""
         # Type the reply out word-by-word for a live feel. (Latency to first
-        # token is the router call; this is the visible "thinking out loud".)
+        # token is the agent run; the steps above are the visible progress.)
         words = reply.split(" ")
         for i, word in enumerate(words):
             yield sse_event("token", {"text": word if i == 0 else " " + word})
@@ -223,6 +261,7 @@ async def edit_trip_stream(request: Request, trip_id: str, body: EditRequest, us
             "applied": result.get("applied"),
             "patches": result.get("patches") or [],
             "clarify_options": result.get("clarify_options") or [],
+            "steps": result.get("steps") or [],
             "cards": result.get("cards") or [],
         })
 

@@ -32,7 +32,7 @@ from uuid import uuid4
 from .budget_agent import budget_agent_check
 from app.api.v1.plan_trip.constraints import validate_trip
 from app.api.v1.plan_trip.models import PlanRequest, PlanJourneyRequest, PlanTripRequest
-from app.api.v1.plan_trip.journey import run_plan_journey
+from app.api.v1.plan_trip.journey import run_plan_journey, reverse_route_plan
 from app.api.v1.plan_trip.orchestrator import run_plan_trip
 from app.api.v1.plan_trip.budget import compute_detailed_budget
 from app.api.v1.plan_trip.helpers import CURRENCY_CONFIG, fetch_user_profile
@@ -333,10 +333,13 @@ async def supervisor_run(body: PlanRequest, user_id: str, on_phase=None) -> dict
         _phase_wrap("itinerary", run_plan_trip(trip_req, user_id, trace=trace, profile=shared_profile), on_phase),
     ]
     if return_journey_req:
+        # Compute the return in parallel, but DON'T narrate it yet (on_phase=None):
+        # if the outbound turns out to be a multi-hop route we re-plan the return
+        # to mirror it, then fire the phase once with the final version.
         coros.append(_phase_wrap(
             "return_journey",
             run_plan_journey(return_journey_req, user_id, profile=shared_profile),
-            on_phase,
+            None,
         ))
 
     logger.info(
@@ -356,6 +359,34 @@ async def supervisor_run(body: PlanRequest, user_id: str, on_phase=None) -> dict
     journey_result       = results[0]
     trip_result          = results[1]
     return_journey_result = results[2] if return_journey_req else None
+
+    # ── Phase 1b: mirror the return to the outbound's hubs on multi-hop routes ──
+    # The way back should retrace A→B→C→D as D→C→B→A rather than being planned
+    # independently (which can pick different hubs). Only fires for genuine
+    # multi-hop outbounds; single-hop trips keep the parallel result untouched.
+    if return_journey_req:
+        mirror = (
+            reverse_route_plan(journey_result)
+            if journey_result and not isinstance(journey_result, Exception)
+            else None
+        )
+        if mirror:
+            try:
+                mirrored = await run_plan_journey(
+                    return_journey_req, user_id, profile=shared_profile, forced_route=mirror,
+                )
+                if mirrored and not isinstance(mirrored, Exception):
+                    return_journey_result = mirrored
+                    logger.info("[supervisor] return journey mirrored to outbound hubs")
+            except Exception as e:  # noqa: BLE001 — keep the independent return on failure
+                logger.warning("[supervisor] return mirror failed: %s", str(e)[:120])
+        # Narrate the return once, now that it's settled.
+        if on_phase:
+            exc = return_journey_result if isinstance(return_journey_result, Exception) else None
+            try:
+                await on_phase("return_journey", None if exc else return_journey_result, exc)
+            except Exception as cb_err:  # noqa: BLE001 — callback must never kill the plan
+                logger.warning("[supervisor] on_phase(return_journey) failed: %s", cb_err)
 
     # ── Phase 2: Merge ────────────────────────────────────────────────────────
     merged: dict = {}

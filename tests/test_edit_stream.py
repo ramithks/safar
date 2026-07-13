@@ -47,7 +47,7 @@ def test_edit_stream_emits_tokens_then_done(monkeypatch):
         lambda trip_id: {"id": trip_id, "user_id": "user-abc", "visibility": "private", "state": {}},
     )
 
-    async def fake_apply_edit(trip_id, message, state, action=None, user_id=""):
+    async def fake_apply_edit(trip_id, message, state, action=None, user_id="", on_step=None):
         return {
             "reply": "Locked in the cheaper bus.",
             "intent": "select_transport_option",
@@ -81,7 +81,7 @@ def test_edit_stream_clarify_carries_options(monkeypatch):
         lambda trip_id: {"id": trip_id, "user_id": "user-abc", "visibility": "private", "state": {}},
     )
 
-    async def fake_apply_edit(trip_id, message, state, action=None, user_id=""):
+    async def fake_apply_edit(trip_id, message, state, action=None, user_id="", on_step=None):
         return {
             "reply": "How many days would you like in Goa?",
             "intent": "clarify",
@@ -99,3 +99,47 @@ def test_edit_stream_clarify_carries_options(monkeypatch):
     assert done["intent"] == "clarify"
     assert done["clarify_options"] == ["1 day", "2 days", "3 days"]
     assert done["applied"] is False
+
+
+def test_edit_stream_relays_agent_steps_live(monkeypatch):
+    """A multi-step agent run emits one `step` event per completed action —
+    each carrying its own patches — BEFORE the reply tokens and `done`."""
+    from app.trip_state.patch import PatchOp
+
+    monkeypatch.setattr(
+        ep.store, "get_trip_state",
+        lambda trip_id: {"id": trip_id, "user_id": "user-abc", "visibility": "private", "state": {}},
+    )
+
+    async def fake_apply_edit(trip_id, message, state, action=None, user_id="", on_step=None):
+        on_step({"label": "Added the Mumbai → Goa leg.", "tool": "add_leg",
+                 "patches": [PatchOp(op="set", path="/graph", value={"nodes": []})]})
+        on_step({"label": "Added a 2-day itinerary for Goa.", "tool": "add_stop_itinerary",
+                 "patches": [PatchOp(op="set", path="/itinerary/days", value=[])]})
+        return {
+            "reply": "Your loop is built.",
+            "intent": "multi_edit",
+            "applied": True,
+            "patches": [],
+            "clarify_options": [],
+            "steps": ["Added the Mumbai → Goa leg.", "Added a 2-day itinerary for Goa."],
+        }
+
+    monkeypatch.setattr(ep, "apply_edit", fake_apply_edit)
+
+    tid = "5e9e3cce-9647-43d2-bacf-60480509e080"
+    with TestClient(app) as client:
+        res = client.post(f"/api/v1/trip-state/{tid}/edit/stream", json={"message": "goa then more"})
+
+    events = _parse_sse(res.text)
+    kinds = [ev for ev, _ in events]
+    steps = [d for ev, d in events if ev == "step"]
+    assert len(steps) == 2
+    assert steps[0]["label"] == "Added the Mumbai → Goa leg."
+    assert steps[0]["patches"][0]["path"] == "/graph"
+    assert steps[1]["tool"] == "add_stop_itinerary"
+    # Steps land before the reply starts typing; done carries the step list.
+    assert kinds.index("step") < kinds.index("token")
+    done = next(d for ev, d in events if ev == "done")
+    assert done["steps"] == ["Added the Mumbai → Goa leg.", "Added a 2-day itinerary for Goa."]
+    assert done["intent"] == "multi_edit"

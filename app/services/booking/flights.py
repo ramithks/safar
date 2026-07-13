@@ -209,6 +209,14 @@ def _normalise_offer(offer: dict, depart_date: str = "", adults: int = 1) -> dic
     total_sec = seg.get("totalTime") or 0
     stops = len(legs) - 1
 
+    # Connection airports for multi-leg flights (where you change planes).
+    layover_airports = [
+        (lg.get("arrivalAirport") or {}).get("code")
+        for lg in legs[:-1] if (lg.get("arrivalAirport") or {}).get("code")
+    ]
+    checked_kg, cabin_kg = _offer_baggage(offer)
+    branded = offer.get("brandedFareInfo") or {}
+
     from_ap = (seg.get("departureAirport") or {}).get("code") or ""
     to_ap   = (seg.get("arrivalAirport")   or {}).get("code") or ""
     token   = offer.get("token") or ""
@@ -242,4 +250,34 @@ def _normalise_offer(offer: dict, depart_date: str = "", adults: int = 1) -> dic
         "currency": (price_bd.get("total") or {}).get("currencyCode", "INR"),
         "booking_token": token,
         "booking_url": booking_url,
+        "source": "booking",
+        # ── Enriched signals ──
+        "baggage_kg": checked_kg,
+        "cabin_baggage_kg": cabin_kg,
+        "fare_type": branded.get("fareName") or None,       # e.g. "SpiceSaver"
+        "layover_airports": layover_airports or None,
     }
+
+
+def _offer_baggage(offer: dict) -> tuple[int | None, int | None]:
+    """(checked_kg, cabin_kg) from includedProducts, falling back to the branded
+    fare's baggage features. Both providers surface the same allowance two ways."""
+    checked = cabin = None
+    segs = (offer.get("includedProducts") or {}).get("segments") or []
+    for lug in (segs[0] if segs else []):
+        t, w = lug.get("luggageType"), lug.get("maxWeightPerPiece")
+        if t == "CHECKED_IN" and isinstance(w, (int, float)):
+            checked = int(w)
+        elif t == "HAND" and isinstance(w, (int, float)):
+            cabin = int(w)
+    if checked is None or cabin is None:
+        for feat in ((offer.get("brandedFareInfo") or {}).get("features") or []):
+            if feat.get("availability") != "INCLUDED":
+                continue
+            w = (feat.get("baggageInfo") or {}).get("weight")
+            fn = feat.get("featureName")
+            if fn == "CHECK_BAGGAGE" and checked is None and isinstance(w, (int, float)):
+                checked = int(w)
+            elif fn == "CABIN_BAGGAGE" and cabin is None and isinstance(w, (int, float)):
+                cabin = int(w)
+    return checked, cabin

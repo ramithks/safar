@@ -151,6 +151,56 @@ Return ONLY valid JSON (no markdown):
         return {}
 
 
+def _is_multihop_route(route: dict) -> bool:
+    """True when a route has 2+ live intercity legs — the case where the return
+    should retrace the same hubs instead of being planned from scratch."""
+    legs = route.get("legs") or []
+    intercity = [
+        leg for leg in legs
+        if leg.get("needs_live_search")
+        and str(leg.get("mode", "")).lower() in ("bus", "train", "railway", "flight")
+    ]
+    return len(intercity) >= 2
+
+
+def reverse_route_plan(outbound_route: dict) -> dict | None:
+    """Mirror the outbound route for the way back: reverse the leg order and
+    swap each leg's from/to (and its search_params) so A→B→C→D becomes D→C→B→A.
+
+    The route planner is deterministic PER DIRECTION (seeded on origin→dest), so
+    planning the return independently can pick a different decomposition than the
+    outbound. Reversing the outbound instead makes the return retrace the same
+    hubs. Returns None when the outbound isn't a genuine multi-hop route or a leg
+    is missing its endpoints — the caller then falls back to independent planning.
+    """
+    if not _is_multihop_route(outbound_route):
+        return None
+    legs = outbound_route.get("legs") or []
+    mirrored: list[dict] = []
+    for i, leg in enumerate(reversed(legs)):
+        frm, to = leg.get("to"), leg.get("from")
+        if not frm or not to:
+            return None
+        sp = leg.get("search_params") or {}
+        mirrored.append({
+            "leg": i + 1,
+            "from": frm,
+            "to": to,
+            "mode": leg.get("mode"),
+            "duration_approx": leg.get("duration_approx"),
+            "distance_km": leg.get("distance_km"),
+            "tips": leg.get("tips"),
+            "needs_live_search": leg.get("needs_live_search", True),
+            "search_params": {
+                "origin": sp.get("destination") or frm,
+                "destination": sp.get("origin") or to,
+                "mode_type": sp.get("mode_type") or leg.get("mode"),
+            },
+        })
+    return {"legs": mirrored, "is_international": outbound_route.get("is_international", False),
+            "mirrored_from_outbound": True}
+
+
 # ── Booking URL builder ────────────────────────────────────────────────────────
 
 def _leg_booking_url(leg: dict, live_result: dict, departure_date: str) -> str | None:
@@ -534,7 +584,10 @@ async def _explain_picks(
 
 # ── Main handler ──────────────────────────────────────────────────────────────
 
-async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict | None = None) -> dict:
+async def run_plan_journey(
+    body: PlanJourneyRequest, user_id: str, profile: dict | None = None,
+    forced_route: dict | None = None,
+) -> dict:
     safe_budget = body.budget if body.budget in ("low", "mid", "high") else "mid"
 
     if profile is None:
@@ -544,8 +597,10 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
     ci = CURRENCY_CONFIG.get(currency_code) or CURRENCY_CONFIG["inr"]
     symbol = ci["symbol"]
 
-    # Phase 1 — Gemini plans route with intermediate hubs
-    route_plan = await _gemini_plan_route(body, safe_budget, symbol, currency_code)
+    # Phase 1 — plan the route. Normally Gemini decomposes it into hubs; a caller
+    # can force a route instead (the return journey passes the outbound reversed
+    # so the way back retraces the same hubs).
+    route_plan = forced_route or await _gemini_plan_route(body, safe_budget, symbol, currency_code)
     if not route_plan:
         raise HTTPException(502, "Route planning failed — AI could not plan this journey")
 
@@ -892,7 +947,7 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
     _rec_hotel: dict | None = None
     _hotel_pool: list[dict] = []
     if hotel_result and not isinstance(hotel_result, Exception):
-        _hotel_pool = rank_hotels(hotel_result.get("hotels") or [])
+        _hotel_pool = rank_hotels(hotel_result.get("hotels") or [], safe_budget)
         _rec_hotel = _pick_recommended_hotel(_hotel_pool, safe_budget)
         if _rec_hotel:
             for h in _hotel_pool:

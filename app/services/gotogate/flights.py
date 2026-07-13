@@ -255,6 +255,18 @@ def _normalise(trip: dict, from_iata: str, to_iata: str, adults: int) -> dict | 
     carrier = first.get("marketingCarrier") or {}
     logo = carrier.get("logo") or {}
 
+    # Connection detail: change airports + total wait between segments.
+    layover_airports: list[str] = []
+    layover_minutes = 0
+    for i in range(len(segments) - 1):
+        stop = (segments[i].get("destination") or {})
+        code = stop.get("airportCode") or stop.get("code")
+        if code:
+            layover_airports.append(code)
+        gap = _duration(segments[i].get("arrivedAt"), segments[i + 1].get("departuredAt"))
+        if gap:
+            layover_minutes += gap
+
     dep_at = first.get("departuredAt")
     arr_at = last.get("arrivedAt")
     duration_min = _duration(dep_at, arr_at)
@@ -303,6 +315,11 @@ def _normalise(trip: dict, from_iata: str, to_iata: str, adults: int) -> dict | 
         "currency": currency,
         "booking_url": trip.get("shareableUrl"),
         "source": "gotogate",
+        # ── Enriched signals ──
+        "cabin_baggage_kg": _cabin_baggage_kg(trip),
+        "fare_tags": trip.get("tripTags") or None,      # ["PRICE","WEIGHTED"] → cheapest / best value
+        "layover_airports": layover_airports or None,
+        "layover_minutes": layover_minutes or None,
     }
 
 
@@ -317,6 +334,20 @@ def _checked_baggage_kg(trip: dict) -> int | None:
         weight = bag.get("weight")
         unit = (bag.get("weightUnit") or "").upper()
         if isinstance(weight, (int, float)) and weight > 0 and unit in ("", "KG", "KILOGRAM", "KILOGRAMS"):
+            return int(weight)
+    return None
+
+
+def _cabin_baggage_kg(trip: dict) -> int | None:
+    """Included cabin/carry-on allowance in kg (trip level, else first bound)."""
+    candidates = [trip.get("includedCabinBaggage")]
+    for bound in (trip.get("bounds") or []):
+        candidates.append(bound.get("includedCabinBaggage"))
+    for bag in candidates:
+        if not isinstance(bag, dict):
+            continue
+        weight = bag.get("weight")
+        if isinstance(weight, (int, float)) and weight > 0:
             return int(weight)
     return None
 

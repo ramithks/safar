@@ -174,14 +174,15 @@ def test_handle_add_waypoint_splices_city(monkeypatch):
 # ── Structured (non-LLM) stay selection — the user edits stays themselves ─────
 
 def test_select_hotel_action_updates_stay_without_llm(monkeypatch):
-    # If the LLM router were ever hit this would raise — proving the action path
+    # If the LLM agent were ever hit this would raise — proving the action path
     # is fully deterministic.
     async def _boom(*a, **k):
-        raise AssertionError("router must not be called for a structured action")
+        raise AssertionError("the agent must not be called for a structured action")
 
+    import app.trip_state.agent as agent_mod
     import app.trip_state.generator as gen
 
-    monkeypatch.setattr(copilot, "route_intent", _boom)
+    monkeypatch.setattr(agent_mod, "run_agent", _boom)
     monkeypatch.setattr(copilot, "_persist_chat", _noop_async)
     monkeypatch.setattr(copilot.store, "append_events", lambda *a, **k: None)
     monkeypatch.setattr(gen, "publish_event", lambda *a, **k: None)

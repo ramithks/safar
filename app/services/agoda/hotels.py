@@ -55,25 +55,67 @@ _QUERY = """query citySearch($CitySearchRequest: CitySearchRequest!, $ContentSum
         informationSummary {
           displayName
           rating
+          propertyType
+          accommodationType
           propertyLinks { propertyPage }
           geoInfo { latitude longitude }
           address { countryCode country { id name } city { id name } area { id name } }
         }
-        reviews { cumulative { reviewCount score } }
-        images { hotelImages { urls { value } } }
+        reviews {
+          cumulative { reviewCount score }
+          contentReview {
+            demographics { groups { id grades { id score } } }
+            summaries {
+              recommendationScores { recommendationScore }
+              snippets { demographicName reviewer reviewRating snippet }
+            }
+          }
+        }
+        images { hotelImages { caption urls { value } } }
         facilities { name }
+        localInformation {
+          landmarks {
+            transportation { landmarkName distanceInM }
+            topLandmark { landmarkName distanceInM }
+          }
+          hasAirportTransfer
+        }
+        highlight {
+          cityCenter { distanceFromCityCenter }
+          hasNearbyPublicTransportation
+        }
+        familyFeatures { hasChildrenFreePolicy hasKidsPool hasKidsClub }
+        propertyEngagement { todayBooking peopleLooking }
+        enrichment {
+          topSellingPoint { tspType value }
+          isPopular
+          roomInformation {
+            cheapestRoomSizeSqm
+            facilities { propertyFacilityName symbol }
+          }
+        }
       }
       pricing {
         isAvailable
+        growthProgramInfo { badges }
+        payment {
+          cancellation { cancellationType freeCancellationDate }
+          payLater { isEligible }
+          payAtHotel { isEligible }
+        }
         offers {
           roomOffers {
             room {
+              availableRooms
+              consolidatedAppliedDiscount { totalDiscountJacketMessage }
               pricing {
                 currency
                 price {
-                  perRoomPerNight { exclusive { display } inclusive { display } }
-                  perBook { exclusive { display } inclusive { display } }
+                  perRoomPerNight { exclusive { display crossedOutPrice originalPrice } inclusive { display } }
+                  perBook { exclusive { display } inclusive { display crossedOutPrice } }
+                  totalDiscount
                 }
+                channelDiscountSummary { channelDiscountBreakdown { discountPercent } }
               }
             }
           }
@@ -401,21 +443,70 @@ async def search_hotels(
         return []
 
 
+# Agoda review facet id → our canonical subscore key.
+_AGODA_FACETS = {
+    "overall": "overall", "cleanliness": "cleanliness", "location": "location",
+    "valueForMoney": "value", "staffPerformance": "staff", "facilities": "facilities",
+}
+
+
+def _agoda_subscores(content: dict) -> dict:
+    """Average each review facet across Agoda's demographic groups → 0..10
+    subscores (cleanliness/location/value/staff/facilities) the recommender can
+    turn into 'guests love the location' style reasons instead of one flat 8.5."""
+    acc: dict[str, list[float]] = {}
+    for cr in (content.get("reviews") or {}).get("contentReview") or []:
+        for group in (cr.get("demographics") or {}).get("groups") or []:
+            for grade in group.get("grades") or []:
+                key = _AGODA_FACETS.get(grade.get("id"))
+                score = _to_float(grade.get("score"))
+                if key and score is not None:
+                    acc.setdefault(key, []).append(score)
+    return {k: round(sum(v) / len(v), 1) for k, v in acc.items() if v}
+
+
+def _agoda_landmarks(content: dict) -> list[dict]:
+    """Nearby transport hubs + top landmarks with metre distances — the raw
+    material for '450 m from HITEC City Station' style location context."""
+    lm = (content.get("localInformation") or {}).get("landmarks") or {}
+    out: list[dict] = []
+    for kind, key in (("transport", "transportation"), ("landmark", "topLandmark")):
+        for it in lm.get(key) or []:
+            name, dist = it.get("landmarkName"), _to_float(it.get("distanceInM"))
+            if name and dist is not None:
+                out.append({"name": name, "distance_m": round(dist), "type": kind})
+    return sorted(out, key=lambda x: x["distance_m"])[:6]
+
+
 def _normalise(p: dict, checkin: str, checkout: str, nights: int) -> dict:
     from app.services.hotels_filters import classify_property_type
     content = p.get("content") or {}
     info = content.get("informationSummary") or {}
     addr = info.get("address") or {}
     geo = info.get("geoInfo") or {}
+    pricing = p.get("pricing") or {}
     cum = ((content.get("reviews") or {}).get("cumulative")) or {}
 
-    # cheapest exclusive per-room-per-night + per-book across offers/rooms
+    # cheapest exclusive per-room-per-night + per-book across offers/rooms, while
+    # tracking the winning room's pricing story (original price, discount) + the
+    # scarcity/discount signals booking sites use to build "you save ₹X" cards.
     prpn: list[float] = []
     per_book: list[float] = []
     currency = "INR"
-    for off in (p.get("pricing") or {}).get("offers") or []:
+    best_excl: dict | None = None
+    best_display: float | None = None
+    avail_rooms: list[int] = []
+    discount_label = None
+    for off in pricing.get("offers") or []:
         for ro in off.get("roomOffers") or []:
-            pricings = (ro.get("room") or {}).get("pricing") or []
+            room = ro.get("room") or {}
+            ar = room.get("availableRooms")
+            if isinstance(ar, int) and ar > 0:
+                avail_rooms.append(ar)
+            jacket = (room.get("consolidatedAppliedDiscount") or {}).get("totalDiscountJacketMessage")
+            if jacket and not discount_label:
+                discount_label = jacket
+            pricings = room.get("pricing") or []
             if isinstance(pricings, dict):          # tolerate either shape
                 pricings = [pricings]
             for pr in pricings:
@@ -423,12 +514,63 @@ def _normalise(p: dict, checkin: str, checkout: str, nights: int) -> dict:
                     continue
                 currency = pr.get("currency") or currency
                 price = pr.get("price") or {}
-                n = ((price.get("perRoomPerNight") or {}).get("exclusive") or {}).get("display")
+                excl = (price.get("perRoomPerNight") or {}).get("exclusive") or {}
+                n = excl.get("display")
                 b = ((price.get("perBook") or {}).get("exclusive") or {}).get("display")
                 if isinstance(n, (int, float)):
                     prpn.append(n)
+                    if best_display is None or n < best_display:
+                        best_display, best_excl = n, excl
                 if isinstance(b, (int, float)):
                     per_book.append(b)
+
+    # Pricing story from the cheapest room: original (crossed-out) vs final.
+    price_original = savings = discount_pct = None
+    if best_excl:
+        orig = _to_float(best_excl.get("crossedOutPrice") or best_excl.get("originalPrice"))
+        final = _to_float(best_excl.get("display"))
+        if orig and final and orig > final:
+            price_original, savings = round(orig), round(orig - final)
+            discount_pct = round((orig - final) / orig * 100)
+
+    # Flexibility (removes booking fear) — free cancellation + pay-at-hotel.
+    pay = pricing.get("payment") or {}
+    cancel = pay.get("cancellation") or {}
+    free_cancellation = cancel.get("cancellationType") == "FreeCancellation"
+
+    # Room-level facilities → strong differentiators (private pool, balcony).
+    enrich = content.get("enrichment") or {}
+    room_info = enrich.get("roomInformation") or {}
+    room_facilities = [
+        f.get("propertyFacilityName") for f in (room_info.get("facilities") or [])
+        if isinstance(f, dict) and f.get("propertyFacilityName")
+    ]
+    rf_blob = " ".join(room_facilities).lower()
+
+    tsp_list = enrich.get("topSellingPoint") or []
+    tsp = tsp_list[0] if tsp_list else {}
+
+    subscores = _agoda_subscores(content)
+    landmarks = _agoda_landmarks(content)
+    nearest_transport = next((lm for lm in landmarks if lm["type"] == "transport"), None)
+    dist_centre_m = _to_float(((content.get("highlight") or {}).get("cityCenter") or {}).get("distanceFromCityCenter"))
+
+    # Review snippet + recommendation score (social proof / persuasion).
+    snippet = rec_score = None
+    creviews = (content.get("reviews") or {}).get("contentReview") or []
+    if creviews:
+        summ = creviews[0].get("summaries") or {}
+        snips = summ.get("snippets") or []
+        if snips:
+            s0 = snips[0]
+            snippet = {"text": s0.get("snippet"), "reviewer": s0.get("reviewer"),
+                       "rating": _to_float(s0.get("reviewRating")), "demographic": s0.get("demographicName")}
+        rscores = summ.get("recommendationScores") or []
+        if rscores:
+            rec_score = rscores[0].get("recommendationScore")
+
+    fam = content.get("familyFeatures") or {}
+    engagement = content.get("propertyEngagement") or {}
 
     photos = []
     for img in ((content.get("images") or {}).get("hotelImages")) or []:
@@ -466,6 +608,33 @@ def _normalise(p: dict, checkin: str, checkout: str, nights: int) -> dict:
         "booking_url": booking_url,
         "property_type": classify_property_type({"name": info.get("displayName")}),
         "source": "agoda",
+        # ── Enriched signals (for smarter, reason-driven recommendations) ──
+        "subscores": subscores or None,                 # {cleanliness, location, value, staff, facilities}
+        "recommendation_score": rec_score,              # 0..100 "% recommend"
+        "review_snippet": snippet,
+        "landmarks": landmarks or None,                 # [{name, distance_m, type}]
+        "nearest_transport": nearest_transport,         # {name, distance_m}
+        "distance_km": round(dist_centre_m / 1000, 1) if dist_centre_m else None,
+        "room_size_sqm": _to_float(room_info.get("cheapestRoomSizeSqm")),
+        "room_facilities": room_facilities or None,
+        "has_private_pool": "private pool" in rf_blob or None,
+        "free_wifi": ("wi-fi" in rf_blob and "free" in rf_blob) or None,
+        "free_cancellation": free_cancellation or None,
+        "free_cancellation_until": cancel.get("freeCancellationDate"),
+        "pay_at_hotel": bool((pay.get("payAtHotel") or {}).get("isEligible")) or None,
+        "price_original": price_original,
+        "savings": savings,
+        "discount_pct": discount_pct,
+        "discount_label": discount_label,               # e.g. "Rs. 1,007 applied"
+        "available_rooms": min(avail_rooms) if avail_rooms else None,   # scarcity
+        "social_proof": engagement.get("todayBooking"),  # "Booked 3 times today"
+        "people_looking": engagement.get("peopleLooking") or None,
+        "badges": (pricing.get("growthProgramInfo") or {}).get("badges") or None,  # ["AGODA_PREFERRED"]
+        "top_selling_point": ({"type": tsp.get("tspType"), "value": _to_float(tsp.get("value"))}
+                              if tsp.get("tspType") else None),
+        "is_popular": enrich.get("isPopular") or None,
+        "family_friendly": bool(fam.get("hasChildrenFreePolicy") or fam.get("hasKidsPool")) or None,
+        "has_airport_transfer": bool((content.get("localInformation") or {}).get("hasAirportTransfer")) or None,
     }
 
 

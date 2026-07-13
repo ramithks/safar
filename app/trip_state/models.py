@@ -104,6 +104,12 @@ class TripState(BaseModel):
     documents: TripDocuments = Field(default_factory=TripDocuments)
     weather: dict = Field(default_factory=dict)
     agent_meta: AgentMeta = Field(default_factory=AgentMeta)
+    # Canonical multi-city trip graph (nodes=stops, edges=legs). Empty for trips
+    # that predate it — lazily derived from the legacy transport/itinerary fields
+    # on first builder edit (see app.trip_state.graph). The transport/itinerary
+    # blocks above are compatibility projections of this graph. See
+    # docs/trip_graph.md.
+    graph: dict = Field(default_factory=dict)
 
 
 def _now() -> str:

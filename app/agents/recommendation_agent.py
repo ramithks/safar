@@ -92,12 +92,30 @@ async def _recommend(
 
     numbered = [{"index": i, **c} for i, c in enumerate(candidates)]
     traveller = (context or {}).get("traveller_memory")
+    budget = (context or {}).get("budget")
+    budget_rule = ""
+    if budget == "low":
+        budget_rule = (
+            "This traveller explicitly chose a LOW budget — the options are sorted "
+            "cheapest-first. DEFAULT to the cheapest one; only move up if a small "
+            "premium clearly buys much better location or quality, and then name the "
+            "extra rupees. NEVER call a pick 'budget-friendly', 'cheapest', 'most "
+            "affordable' or similar unless it is genuinely the lowest-priced option "
+            "in the list.\n\n"
+        )
+    elif budget == "high":
+        budget_rule = (
+            "This traveller chose a HIGH budget — lead with quality, comfort and "
+            "location; price is a minor factor. Still flag if a pick is unusually "
+            "pricey versus the rest.\n\n"
+        )
     prompt = (
         f"You are TravBuddy's travel booking assistant. {intro}\n\n"
         f"Trip context: {json.dumps(context, ensure_ascii=False)}\n\n"
         + (f"What we know about this traveller (personalise the pick + the reason, "
            f"but never override the trip's explicit constraints): {traveller}\n\n"
            if traveller else "")
+        + budget_rule
         + f"Available {kind} options (0-indexed, already roughly sorted by value; "
         f"each carries `why_tags` — precomputed strengths you can lean on):\n"
         f"{json.dumps(numbered, ensure_ascii=False)}\n\n"

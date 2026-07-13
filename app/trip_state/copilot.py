@@ -2,9 +2,12 @@
 Copilot edit engine — turns a natural-language command (or a structured UI
 action) into TripState patches.
 
-Flow: command + state summary → edit-intent router (brain tier, structured
-output) → typed intent → handler computes patches over data ALREADY in state
-(no re-scraping, no regeneration) → patches persisted + returned.
+Free-text messages go to the AGENT LOOP (app.trip_state.agent): the model
+plans a sequence of tool calls, executes them against the live handlers below,
+observes what happened, and re-plans until the whole request is done — so a
+compound message ("Goa from Mumbai, 2 days there, then Indore…") becomes a
+chain of real actions, not one intent. Handlers stay pure functions
+state → patches; this module owns them plus persistence/broadcast.
 
 Structured actions from the UI (e.g. tapping a ride on the journey board)
 skip the LLM entirely and go straight to the handler — deterministic, instant.
@@ -13,22 +16,11 @@ The transport model is LEG-AWARE: a journey is a chain of legs
 (auto → train → auto → bus → cab) and each bookable leg (train/bus/flight)
 has its own options bucket. Picking a train and picking a bus are choices on
 DIFFERENT legs of one route, not alternative routes.
-
-Intents:
-  answer_question         — answer anything about the plan, grounded in state.
-  select_transport_option — pick a specific ride on one leg (mode + index).
-  select_hotel            — pick a different hotel from the fetched candidates.
-  search_hotels           — LIVE hotel re-search near a landmark/area with
-                            optional canonical filters ("pet-friendly hostels
-                            under ₹1500 near Mall Road") → replaces /stay/hotels.
-  set_title               — rename the trip.
-  unsupported             — graceful "here's what I can do" reply.
 """
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from app.services.hotels_filters import FACILITY_SYNONYMS, MEAL_SYNONYMS, PROPERTY_TYPES
-from app.services.vertex import generate_json
 
 from . import store
 from .patch import PatchOp
@@ -72,51 +64,6 @@ _HOTEL_FILTERS_SCHEMA = {
         },
     },
 }
-
-_INTENT_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "intent": {
-            "type": "STRING",
-            "enum": [
-                "answer_question",
-                "select_transport_option",
-                "select_flight_journey",
-                "restore_ground_route",
-                "select_hotel",
-                "search_hotels",
-                "add_activities",
-                "add_waypoint",
-                "set_title",
-                "clarify",
-                "unsupported",
-            ],
-        },
-        "clarify_options": {
-            "type": "ARRAY", "nullable": True,
-            "items": {"type": "STRING"},
-        },
-        "direction": {"type": "STRING", "enum": ["going", "return"], "nullable": True},
-        "mode": {"type": "STRING", "enum": ["flight", "train", "bus"], "nullable": True},
-        "option_index": {"type": "INTEGER", "nullable": True},
-        "prefer": {
-            "type": "STRING", "nullable": True,
-            "enum": ["cheapest", "fastest", "earliest", "latest", "most_baggage", "highest_rated"],
-        },
-        "hotel_index": {"type": "INTEGER", "nullable": True},
-        "hotel_query": {"type": "STRING", "nullable": True},
-        "hotel_filters": _HOTEL_FILTERS_SCHEMA,
-        "day_index": {"type": "INTEGER", "nullable": True},
-        "activity_query": {"type": "STRING", "nullable": True},
-        "count": {"type": "INTEGER", "nullable": True},
-        "waypoint_city": {"type": "STRING", "nullable": True},
-        "waypoint_days": {"type": "INTEGER", "nullable": True},
-        "title": {"type": "STRING", "nullable": True},
-        "reply": {"type": "STRING"},
-    },
-    "required": ["intent", "reply"],
-}
-
 
 # ── Reading the state ───────────────────────────────────────────────────────────
 
@@ -223,7 +170,8 @@ def _state_summary(state: dict) -> str:
     costs = state.get("costs") or {}
     breakdown = costs.get("breakdown") or {}
     hotels = (state.get("stay") or {}).get("hotels") or []
-    selected_hotel = ((state.get("stay") or {}).get("selected") or {}).get("name")
+    selected = (state.get("stay") or {}).get("selected") or {}
+    selected_hotel = selected.get("name")
     days = (state.get("itinerary") or {}).get("days") or []
 
     lines = [
@@ -241,13 +189,36 @@ def _state_summary(state: dict) -> str:
             f"Costs: total ₹{costs.get('total')} (₹{costs.get('per_person')}/person) — "
             + ", ".join(f"{k} ₹{v}" for k, v in breakdown.items() if v)
         )
-    if selected_hotel:
-        lines.append(f"Selected hotel: {selected_hotel}")
+    if selected:
+        sp = selected.get("price_per_night") or selected.get("price")
+        why = (selected.get("ai_reason") or "").strip()
+        line = f"Selected hotel: {selected_hotel}"
+        if sp:
+            line += f" — ₹{sp}/night"
+        if why:
+            line += f". Why it was recommended: {why}"
+        lines.append(line)
     if hotels:
-        lines.append("Hotel candidates (index: name — ₹/night):")
+        def _num(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        priced = [
+            (p, h.get("name")) for h in hotels
+            if (p := _num(h.get("price_per_night") or h.get("price"))) is not None and p > 0
+        ]
+        if priced:
+            cheapest_price, cheapest_name = min(priced, key=lambda x: x[0])
+            lines.append(
+                f"Cheapest available stay: {cheapest_name} at ₹{cheapest_price:g}/night "
+                "(state the true cheapest honestly — never call a pricier pick the cheapest)."
+            )
+        lines.append("Hotel candidates (index: name — ₹/night; ✓ = current pick):")
         for i, h in enumerate(hotels[:10]):
             price = h.get("price_per_night") or h.get("price") or "?"
-            lines.append(f"  [{i}] {h.get('name')} — {price}")
+            mark = " ✓" if h.get("name") == selected_hotel else ""
+            lines.append(f"  [{i}] {h.get('name')} — {price}{mark}")
     if days:
         lines.append("Itinerary:")
         for i, d in enumerate(days):
@@ -287,149 +258,6 @@ def _recent_history(trip_id: str, limit: int = 6) -> str:
         who = "User" if m.get("role") == "user" else "Copilot"
         turns.append(f"{who}: {content}")
     return "\n".join(turns)
-
-
-async def route_intent(message: str, state: dict, history: str = "", memory: str = "") -> dict:
-    prompt = (
-        "You are the copilot for a travel-planning workspace. Classify the "
-        "user's message into one intent and write the reply.\n\n"
-        + (f"WHAT WE KNOW ABOUT THIS TRAVELLER (from past trips — use it to make "
-           f"replies and picks feel personal, but never contradict what they ask "
-           f"for now):\n{memory}\n\n" if memory else "")
-        + (f"RECENT CONVERSATION (oldest first, for continuity — resolve "
-           f"follow-ups like 'a cheaper one' or 'add more there' against it):\n"
-           f"{history}\n\n" if history else "")
-        +
-        "CRITICAL context: the trip below may be a MULTI-LEG route — e.g. a "
-        "train leg followed by a bus leg. Those are parts of ONE journey, not "
-        "alternative routes. 'Switch to the train' therefore usually makes no "
-        "sense; the user picks a specific option WITHIN a leg instead.\n\n"
-        "Intents:\n"
-        "- answer_question: any question about the trip, route, timings, costs, "
-        "places, weather, or logistics. Answer it directly from the summary "
-        "(2-4 sentences, specific numbers/names, no fluff). Use general travel "
-        "knowledge where the summary is silent, and say so.\n"
-        "- select_transport_option: the user wants a specific ride on a leg "
-        "(e.g. 'take the 11pm Volvo', 'a cheaper bus', 'the earlier train', 'a "
-        "flight with more luggage'). Set direction (going/return), mode, and "
-        "option_index from the numbered lists. Pick the option that best matches "
-        "what they asked for — the option lines include fare, timing, rating and "
-        "(for flights) baggage allowance, so honour 'more luggage/baggage' by "
-        "choosing the highest-baggage flight, 'cheaper' by fare, etc. Also set "
-        "`prefer` to the axis they cared about. The reply will be replaced by "
-        "the handler, keep it short.\n"
-        "- select_flight_journey: the user wants to FLY this trip instead of the "
-        "planned ground route ('I want a flight', 'can we fly', 'book me a "
-        "flight', 'fly instead', 'is there a flight', 'flight from <origin> to "
-        "<destination>'). This switches the whole outbound to a direct flight "
-        "between the trip's OWN origin and destination (it does NOT change where "
-        "the trip goes). Use this WHENEVER they ask to fly, even if they restate "
-        "the cities — do NOT call it unsupported just because they named the "
-        "origin/destination. The handler live-searches the flight; reply is "
-        "replaced, keep it short.\n"
-        "- restore_ground_route: the user wants to go back to the train/bus route "
-        "after switching to the flight ('back to train', 'don't fly', 'switch "
-        "back to the bus').\n"
-        "- select_hotel: pick a different hotel by index from the candidates.\n"
-        "- search_hotels: the user wants hotels the list doesn't cover — near a "
-        "landmark/area ('hotels near Mall Road', 'stays close to the beach'), "
-        "with specific constraints ('hostels under 1500 with wifi', 'a 5-star "
-        "resort with a pool'), or just fresh options ('show me more hotels'). "
-        "Set hotel_query to the landmark/area phrase only (e.g. 'Mall Road'), "
-        "or empty for a general re-search. Put every constraint the user "
-        "stated into hotel_filters — set ONLY what they asked for, never guess: "
-        "property_types (hostel/homestay/guesthouse/hotel/resort/apartment/"
-        "villa/vacation_home/bnb); price_min/price_max in ₹ per night ('under "
-        "2000' → price_max 2000); min_review_score on a 0-10 scale ('good' 7, "
-        "'very good' 8, 'wonderful/top rated' 9); star_ratings ('4 star or "
-        "better' → [4,5]); facilities (canonical keys, e.g. pool, wifi, "
-        "parking, spa, gym, beachfront, sea_view, mountain_view, kitchen, "
-        "balcony, air_conditioning, bonfire, hot_tub, wheelchair_accessible, "
-        "twin_beds, double_bed); meals (breakfast_included/half_board/"
-        "full_board/all_inclusive); booleans free_cancellation, no_prepayment, "
-        "breakfast_included, couple_friendly, pet_friendly; max_distance_km; "
-        "sort ('cheapest first' → price_asc, 'best rated' → rating). This "
-        "triggers a LIVE search — the reply will be replaced by the handler, "
-        "keep it short.\n"
-        "- add_activities: the user wants MORE spots/places in the itinerary "
-        "('add more spots', 'more things to do on day 2', 'add some cafes', "
-        "'this day feels empty'). Set day_index (0-based) if they named a "
-        "specific day, else leave null. Set activity_query to the KIND of spot "
-        "they want ('cafes', 'waterfalls', 'adventure', 'nightlife') or empty "
-        "for general additions. Set count if they gave a number. The reply is "
-        "replaced by the handler — keep it short.\n"
-        "- add_waypoint: the user wants to add a STOPOVER CITY between origin and "
-        "destination ('add Nainital in between', 'can we stop in Jaipur on the "
-        "way', 'include Rishikesh en route'). Set waypoint_city to that city, and "
-        "waypoint_days to how long to spend there. IMPORTANT: if the user named a "
-        "city but did NOT say how many days (and it isn't clear from the recent "
-        "conversation), do NOT guess — use the `clarify` intent to ask 'How many "
-        "days would you like in {city}?' with clarify_options ['1 day','2 days',"
-        "'3 days']. Only route to add_waypoint once the number of days is known "
-        "(e.g. they answer '2 days' or originally said 'stop in Jaipur for 2 "
-        "days'). This re-routes the trip and builds an itinerary for the stop — "
-        "the reply is replaced by the handler, keep it short.\n"
-        "- set_title: rename the trip.\n"
-        "- clarify: the request is genuinely ambiguous or underspecified and "
-        "guessing would risk the wrong change — you can't tell which leg/day/"
-        "hotel they mean, the ask is contradictory, or it's too vague to act on "
-        "('make it better', 'change the hotel' with several equally-likely reads, "
-        "'fix the timings'). Ask ONE short, friendly clarifying question in "
-        "`reply` and put 2-3 concrete choices in `clarify_options` (short phrases "
-        "the user can tap, e.g. ['The way there', 'The way back'] or ['Cheaper "
-        "stay', 'Closer to the beach', 'Higher rated']). Prefer acting when the "
-        "intent is reasonably clear — only clarify when a wrong guess would "
-        "actually cost the user.\n"
-        "- unsupported: ONLY edits that truly can't be done — change the main "
-        "destination to a DIFFERENT city, change the dates, or regenerate the "
-        "whole itinerary from scratch. NOTE: 'I want a flight' / 'flight from A "
-        "to B' is NOT unsupported — it's select_flight_journey (switching the "
-        "existing trip to fly). Reply warmly with what IS possible right now: "
-        "answer questions, fly the trip or swap rides on any leg, search/swap "
-        "hotels, add spots or a stopover city, rename the trip.\n\n"
-        "Examples:\n"
-        "- 'i want a flight' / 'can we fly to <destination>' / 'flight from "
-        "hyderabad to udaipur' → select_flight_journey.\n"
-        "- 'find me a better/cheaper bus' → select_transport_option on the bus "
-        "leg: scan the numbered list and pick the strongest option that differs "
-        "from the current pick (weigh fare, rating, sensible timings).\n"
-        "- 'take the 11 pm volvo' / 'the earlier train' → select_transport_option "
-        "with that option's index.\n"
-        "- 'is the bus overnight?' / 'what's the cheapest way there?' → "
-        "answer_question, citing concrete options and fares.\n"
-        "- 'will it rain?' / 'what should I pack?' → answer_question, grounded "
-        "in the weather block when present.\n"
-        "- 'show me hotels near Mall Road' → search_hotels, hotel_query 'Mall "
-        "Road'. 'Any hotels closer to the lake?' → search_hotels, hotel_query "
-        "'the lake'.\n"
-        "- 'pet-friendly resorts under 8000 with a pool' → search_hotels, "
-        "hotel_filters {property_types:['resort'], price_max:8000, "
-        "pet_friendly:true, facilities:['pool']}.\n"
-        "- 'a top-rated hostel near Anjuna with free cancellation' → "
-        "search_hotels, hotel_query 'Anjuna', hotel_filters "
-        "{property_types:['hostel'], min_review_score:9, free_cancellation:true}.\n"
-        "- 'add more spots to day 2' → add_activities, day_index 1. 'add a few "
-        "cafes' → add_activities, activity_query 'cafes'. 'this itinerary is "
-        "thin, add more' → add_activities.\n"
-        "- 'add Nainital in between' (no duration given) → clarify, reply 'How "
-        "many days would you like in Nainital?', clarify_options ['1 day','2 "
-        "days','3 days']. Then '2 days' (with Nainital in the recent "
-        "conversation) → add_waypoint, waypoint_city 'Nainital', waypoint_days 2. "
-        "'stop in Rishikesh for 2 days on the way' → add_waypoint directly, "
-        "waypoint_city 'Rishikesh', waypoint_days 2.\n"
-        "- 'a flight with more baggage allowance' → select_transport_option, "
-        "mode flight, prefer most_baggage, option_index of the highest-baggage "
-        "flight in the list.\n"
-        "select_transport_option MUST include direction, mode and option_index; "
-        "if you can't determine them, use answer_question and tell the user "
-        "which numbered option you'd suggest instead.\n\n"
-        f"TRIP SUMMARY:\n{_state_summary(state)}\n\n"
-        f"USER MESSAGE: {message}"
-    )
-    return await generate_json(
-        prompt, tier="brain", response_schema=_INTENT_SCHEMA,
-        temperature=0.2, max_output_tokens=512, timeout=30.0,
-    )
 
 
 def _live_total(state: dict) -> int:
@@ -852,12 +680,17 @@ def _auto_select_top_hotel(
 
 async def apply_edit(
     trip_id: str, message: str, state: dict, action: dict | None = None,
-    user_id: str = "",
+    user_id: str = "", on_step: Callable[[dict], None] | None = None,
 ) -> dict:
-    """Route + apply an edit. Returns {reply, intent, applied, patches, clarify_options}.
+    """Route + apply an edit. Returns
+    {reply, intent, applied, patches, clarify_options, steps, cards}.
 
-    `action` is a structured UI command that bypasses the LLM router (deterministic,
-    instant — the user driving the workspace directly):
+    Free-text messages run the agent loop (app.trip_state.agent) — possibly many
+    tool calls. `on_step` fires after each one that changed the trip
+    ({"label", "patches", "tool"}) so callers can stream live progress.
+
+    `action` is a structured UI command that bypasses the LLM entirely
+    (deterministic, instant — the user driving the workspace directly):
       {"type": "select_transport_option", "direction", "mode", "index"}
       {"type": "select_hotel", "hotel_index"}
     """
@@ -865,6 +698,8 @@ async def apply_edit(
     reply = ""
     kind = None
     clarify_options: list[str] = []
+    steps: list[str] = []
+    tools_used: list[str] = []
 
     if action and action.get("type") == "select_transport_option":
         kind = "select_transport_option"
@@ -873,6 +708,28 @@ async def apply_edit(
             str(action.get("direction") or "going"),
             str(action.get("mode") or ""),
             int(action.get("index") or 0),
+        )
+    elif action and action.get("type") == "select_leg_option":
+        # Pick a ride on ANY graph leg (multi-city) — deterministic, no LLM.
+        from .builder import handle_select_leg_option
+
+        kind = "select_leg_option"
+        patches, reply = handle_select_leg_option(
+            state,
+            action.get("leg_id"),
+            str(action.get("mode") or ""),
+            int(action.get("index") or 0),
+            hop_index=int(action.get("hop_index") or 0),
+        )
+    elif action and action.get("type") == "select_stop_hotel":
+        # Pick the stay for one stop of a multi-city trip — deterministic, no LLM.
+        from .builder import handle_select_stop_hotel
+
+        kind = "select_stop_hotel"
+        patches, reply = handle_select_stop_hotel(
+            state,
+            str(action.get("stop_id") or action.get("stop_city") or ""),
+            int(action.get("hotel_index") or action.get("index") or 0),
         )
     elif action and action.get("type") == "select_hotel":
         # User picked a stay directly from the Stays tab — deterministic, no LLM.
@@ -889,75 +746,20 @@ async def apply_edit(
     else:
         from app.services.user_memory import get_memory, memory_grounding
 
+        from .agent import run_agent
+
         history = _recent_history(trip_id)
         memory = memory_grounding(await get_memory(user_id)) if user_id else ""
-        intent = await route_intent(message, state, history=history, memory=memory)
-        kind = intent.get("intent")
-        reply = intent.get("reply") or ""
-
-        if kind == "select_transport_option" and intent.get("mode") is not None:
-            patches, handler_reply = handle_select_option(
-                state,
-                intent.get("direction") or "going",
-                intent["mode"],
-                int(intent.get("option_index") or 0),
-            )
-            reply = handler_reply or reply
-        elif kind == "select_flight_journey":
-            patches, handler_reply = await handle_select_flight_journey(state)
-            reply = handler_reply or reply
-        elif kind == "restore_ground_route":
-            patches, handler_reply = handle_restore_ground_route(state)
-            reply = handler_reply or reply
-        elif kind == "select_hotel" and intent.get("hotel_index") is not None:
-            patches, handler_reply = handle_select_hotel(state, int(intent["hotel_index"]))
-            reply = handler_reply or reply
-        elif kind == "search_hotels":
-            from .hotel_search import handle_search_hotels
-
-            patches, handler_reply = await handle_search_hotels(
-                state,
-                (intent.get("hotel_query") or "").strip(),
-                raw_filters=intent.get("hotel_filters"),
-            )
-            reply = handler_reply or reply
-            # A constrained search ("cheapest", "under 1000", "with a pool")
-            # should also update the picked stay, not just the candidate list.
-            if patches and intent.get("hotel_filters"):
-                patches, reply = _auto_select_top_hotel(state, patches, reply)
-        elif kind == "add_activities":
-            from .structural import handle_add_activities
-
-            day_index = intent.get("day_index")
-            patches, handler_reply = await handle_add_activities(
-                state,
-                int(day_index) if day_index is not None else None,
-                (intent.get("activity_query") or "").strip(),
-                intent.get("count"),
-            )
-            reply = handler_reply or reply
-        elif kind == "add_waypoint" and intent.get("waypoint_city"):
-            from .structural import handle_add_waypoint
-
-            patches, handler_reply = await handle_add_waypoint(
-                state, user_id,
-                intent["waypoint_city"],
-                intent.get("waypoint_days"),
-            )
-            reply = handler_reply or reply
-        elif kind == "set_title" and intent.get("title"):
-            patches = [PatchOp(op="set", path="/meta/title", value=intent["title"])]
-            reply = f"Renamed your trip to “{intent['title']}”."
-        elif kind == "clarify":
-            # Ambiguous request — the copilot asks instead of guessing. No patches;
-            # the UI renders clarify_options as quick-reply chips.
-            clarify_options = [
-                o for o in (intent.get("clarify_options") or []) if isinstance(o, str) and o.strip()
-            ][:3]
-
-        # Learn from concrete edits so future trips/sessions start warmer.
-        if user_id and patches:
-            await _record_edit_signals(user_id, kind, intent)
+        agent_result = await run_agent(
+            message, state, user_id,
+            history=history, memory=memory, on_step=on_step,
+        )
+        kind = agent_result["intent"]
+        reply = agent_result["reply"]
+        patches = agent_result["patches"]
+        clarify_options = agent_result["clarify_options"]
+        steps = agent_result["steps"]
+        tools_used = agent_result["tools_used"]
 
     if patches:
         import httpx
@@ -996,16 +798,23 @@ async def apply_edit(
 
     # Record the turn in the durable chat transcript (every turn, incl. pure
     # Q&A / clarify that produced no patches) so the thread survives a refresh.
-    await _persist_chat(
-        trip_id, message, reply, kind,
-        meta={"clarify_options": clarify_options} if clarify_options else None,
-    )
+    meta: dict = {}
+    if clarify_options:
+        meta["clarify_options"] = clarify_options
+    if steps:
+        meta["steps"] = steps
+    await _persist_chat(trip_id, message, reply, kind, meta=meta or None)
 
+    # A multi-tool run surfaces hotel cards if ANY step touched stays.
+    card_kind = kind if kind in ("search_hotels", "select_hotel") else next(
+        (t for t in tools_used if t in ("search_hotels", "select_hotel")), None,
+    )
     return {
         "reply": reply,
         "intent": kind,
         "applied": bool(patches),
         "patches": [p.model_dump(mode="json") for p in patches],
         "clarify_options": clarify_options,
-        "cards": _build_cards(kind, state),
+        "steps": steps,
+        "cards": _build_cards(card_kind, state),
     }
