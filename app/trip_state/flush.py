@@ -29,7 +29,10 @@ from .patch import PatchOp
 
 logger = logging.getLogger(__name__)
 
-_MAX_RETRY_SECONDS = 300
+# Storms have been observed lasting 10+ minutes (sustained scraper bursts
+# during multi-city edits) — 300s gave up mid-storm and LOST the patches,
+# which is what turned a slow write into a corrupted trip on refresh.
+_MAX_RETRY_SECONDS = 1800
 _queue: asyncio.Queue | None = None
 _worker: asyncio.Task | None = None
 # Jobs in flight per trip. Only touched from the event loop — no locking needed.

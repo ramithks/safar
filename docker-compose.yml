@@ -57,5 +57,26 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  beat:
+    build: .
+    # Scheduler for the recommendation-engine nightly/weekly jobs (schedule lives in
+    # app.workers.celery_app.beat_schedule). ONE beat instance only — never scale >1
+    # or jobs double-fire. The worker service above executes what beat enqueues.
+    command: celery -A app.workers.celery_app.celery_app beat --loglevel=info --schedule=/tmp/travbuddy/celerybeat-schedule
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - TEMP_DIR=/tmp/travbuddy
+      - PLACES_CACHE_DIR=/tmp/travbuddy/places_cache
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcp_key.json
+      - GCP_PROJECT=${GCP_PROJECT}
+      - GCP_LOCATION=${GCP_LOCATION:-us-central1}
+    volumes:
+      - /tmp/travbuddy:/tmp/travbuddy
+      - /home/sahilverma/travbuddy_backend.json:/secrets/gcp_key.json:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   redis_data:

@@ -1,10 +1,15 @@
 """
-Trip State V2 API — persistent trips, streaming patch events, copilot edits.
+Trip State API — persistent trips, streaming patch events, copilot edits.
 
-  POST /trip-state                → create trip + start generation, returns trip_id
-  GET  /trip-state/{id}           → current TripState snapshot
-  GET  /trip-state/{id}/stream    → SSE: replay + live patch events
-  POST /trip-state/{id}/edit      → copilot command → patches
+Routes are RELATIVE; the same router is mounted twice:
+  /api/v1/trip-state/*   → original mount (kept for existing clients)
+  /api/v2/plan/*         → the v2 planner surface the website uses
+(/api/v1/plan stays the classic one-shot planner the mobile app runs on.)
+
+  POST  {base}              → create trip + start generation, returns trip_id
+  GET   {base}/{id}         → current TripState snapshot
+  GET   {base}/{id}/stream  → SSE: replay + live patch events
+  POST  {base}/{id}/edit    → copilot command → patches
 """
 import asyncio
 import json
@@ -25,6 +30,7 @@ from app.trip_state import empty_trip_state
 from app.trip_state import store
 from app.trip_state.copilot import apply_edit
 from app.trip_state.generator import read_events, run_generation
+from app.trip_state.patch import PatchOp, apply_patches
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -64,14 +70,40 @@ def _authorize_write(row: dict, user_id: str) -> None:
         raise HTTPException(status_code=403, detail="Not your trip")
 
 
+def _overlay_stream_events(trip_id: str, state: dict) -> dict:
+    """Read-repair: the DB snapshot can run BEHIND the live Redis stream while
+    persistence rides out a TLS storm (see flush.py — writes are queued and
+    retried for minutes). Serving or editing the stale snapshot then corrupts
+    the trip: edits re-derive the graph from a state missing earlier edits.
+    Every streamed patch is an idempotent `set` in emit order, so replaying the
+    whole stream over the snapshot always converges to the live trip."""
+    try:
+        events = read_events(trip_id, 0)
+    except Exception as exc:  # noqa: BLE001 — repair is best-effort, never 500 a read
+        logger.warning("[trip-state] stream overlay unavailable for %s: %s", trip_id, exc)
+        return state
+    for ev in events:
+        try:
+            patches = [PatchOp(**p) for p in (ev.get("patches") or [])]
+            if patches:
+                apply_patches(state, patches, actor="supervisor")
+        except Exception as exc:  # noqa: BLE001 — one bad event must not drop the rest
+            logger.warning("[trip-state] skipped stream event during overlay of %s: %s", trip_id, exc)
+    return state
+
+
 async def _get_row(trip_id: str) -> dict:
     row = await run_db(store.get_trip_state, trip_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Trip not found")
+    row["state"] = _overlay_stream_events(trip_id, row["state"] or {})
+    meta = (row["state"].get("meta") or {})
+    if meta.get("status"):
+        row["status"] = meta["status"]
     return row
 
 
-@router.post("/trip-state")
+@router.post("")
 @limiter.limit("10/hour")
 async def create_trip(request: Request, body: PlanRequest, user=Depends(require_user)):
     """Create a persistent trip and kick off streaming generation."""
@@ -91,7 +123,7 @@ async def create_trip(request: Request, body: PlanRequest, user=Depends(require_
     return {"trip_id": trip_id, "status": "planning"}
 
 
-@router.get("/trip-state/{trip_id}")
+@router.get("/{trip_id}")
 async def get_trip(trip_id: str, user=Depends(require_user)):
     from app.trip_state.graph import projected_state
 
@@ -109,7 +141,7 @@ async def get_trip(trip_id: str, user=Depends(require_user)):
     }
 
 
-@router.get("/trip-state/{trip_id}/chat")
+@router.get("/{trip_id}/chat")
 async def get_trip_chat(trip_id: str, user=Depends(require_user), limit: int = 100):
     """Durable copilot chat transcript — the frontend loads this on mount to
     rehydrate the thread after a refresh."""
@@ -119,7 +151,7 @@ async def get_trip_chat(trip_id: str, user=Depends(require_user), limit: int = 1
     return {"trip_id": trip_id, "messages": messages}
 
 
-@router.get("/trip-state/{trip_id}/stream")
+@router.get("/{trip_id}/stream")
 async def stream_trip(trip_id: str, user=Depends(require_user), after: int = 0):
     """
     SSE stream of patch events. Replays the Redis buffer from `after`, then
@@ -169,7 +201,7 @@ async def stream_trip(trip_id: str, user=Depends(require_user), after: int = 0):
     )
 
 
-@router.post("/trip-state/{trip_id}/edit")
+@router.post("/{trip_id}/edit")
 @limiter.limit("60/hour")
 async def edit_trip(request: Request, trip_id: str, body: EditRequest, user=Depends(require_user)):
     """Copilot command → intent router → patches over existing state."""
@@ -191,7 +223,7 @@ async def edit_trip(request: Request, trip_id: str, body: EditRequest, user=Depe
         raise HTTPException(status_code=500, detail="Edit failed. Please try again.") from exc
 
 
-@router.post("/trip-state/{trip_id}/edit/stream")
+@router.post("/{trip_id}/edit/stream")
 @limiter.limit("60/hour")
 async def edit_trip_stream(request: Request, trip_id: str, body: EditRequest, user=Depends(require_user)):
     """

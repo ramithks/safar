@@ -181,7 +181,24 @@ class TransportService:
             else:
                 output[key] = result or {"resolved": False}
 
+        # Training-data flywheel: persist every scraped option, async + best-effort.
+        # Never blocks or fails search — a logging-only side channel.
+        self._persist_transport(origin, destination, date, output)
         return output
+
+    @staticmethod
+    def _persist_transport(origin: str, destination: str, date: str, output: dict) -> None:
+        try:
+            import asyncio
+            from app.reco.transport_store import save_transport_options
+            asyncio.create_task(save_transport_options(
+                origin, destination, date,
+                flights=(output.get("flights") or {}).get("flights") or [],
+                trains=(output.get("trains") or {}).get("trains") or [],
+                buses=(output.get("buses") or {}).get("buses") or [],
+            ))
+        except Exception:  # noqa: BLE001 — persistence is best-effort, never fatal
+            pass
 
 
 def _pick_city_id(cities: list[dict]) -> int | None:

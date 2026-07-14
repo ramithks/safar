@@ -20,6 +20,10 @@ celery_app = Celery(
     "travbuddy",
     broker=settings.redis_url,
     backend=settings.redis_url,
+    # Task modules the worker must import so their @task functions register. Without
+    # this, tasks defined outside celery_app.py (e.g. the recommendation workers) are
+    # never discovered and beat's schedule fires into the void.
+    include=["app.workers.reco_tasks"],
 )
 
 
@@ -50,6 +54,21 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,           # one task at a time per worker process
     worker_concurrency=settings.celery_worker_concurrency,  # cap concurrent workers (rate-limit protection)
     result_expires=86400,                   # results kept for 24 hours
+    # Recommendation-engine nightly/weekly maintenance (docs/recommendation_engine.md
+    # Part 9.3 / 14.3). Defined here — not in reco_tasks — so `celery beat` sees the
+    # schedule from conf regardless of task-module import order. Task functions are
+    # registered via `include` above and executed by the worker.
+    beat_schedule={
+        "reco-expected-price-nightly": {
+            "task": "travbuddy.reco.refresh_expected_price", "schedule": 24 * 3600,
+        },
+        "reco-destination-priors-nightly": {
+            "task": "travbuddy.reco.refresh_destination_priors", "schedule": 24 * 3600,
+        },
+        "reco-fit-centroids-weekly": {
+            "task": "travbuddy.reco.fit_centroids", "schedule": 7 * 24 * 3600,
+        },
+    },
 )
 
 

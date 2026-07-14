@@ -24,6 +24,7 @@ live in the copilot/builder handlers.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -37,6 +38,12 @@ logger = logging.getLogger(__name__)
 _BUDGET_PREFER = {"low": "cheapest", "mid": "balanced", "high": "fastest"}
 
 _MODES = ("flight", "train", "bus")
+
+# Cap stored options per mode per hop. Providers return 40+ items each; storing
+# every raw payload across a 6-leg trip makes the snapshot row enormous — big
+# enough that persisting it through a flaky TLS window keeps failing. 15 keeps
+# every option the UI/agent actually offers while bounding the row size.
+MAX_OPTIONS_PER_MODE = 15
 
 
 # ── Domain objects ──────────────────────────────────────────────────────────────
@@ -199,10 +206,109 @@ def hop_from_journey_block(block: dict, from_city: str, to_city: str, date: str 
     options: list[TransportOption] = []
     for mode in _MODES:
         bucket = (block.get({"flight": "flights", "train": "trains", "bus": "buses"}[mode]) or {})
-        items = bucket.get("items") or []
+        items = (bucket.get("items") or [])[:MAX_OPTIONS_PER_MODE]
         for i, it in enumerate(items):
             options.append(option_from_item(mode, it, f"{mode}-{i}"))
     return RouteHop(from_city=from_city, to_city=to_city, date=date, options=options)
+
+
+# ── Availability (seats) ─────────────────────────────────────────────────────────
+
+def option_is_available(mode: str, item: dict) -> bool:
+    """Whether an option still has bookable seats, judged from provider fields
+    (trains: available_classes; buses/flights: seat counts). Unknown data means
+    available — an option is only demoted on positive evidence it's full."""
+    item = item or {}
+    if mode == "train":
+        saw_info = False
+        for c in item.get("available_classes") or []:
+            seats = c.get("available_seats")
+            if isinstance(seats, (int, float)):
+                saw_info = True
+                if seats > 0:
+                    return True
+            avail = str(c.get("availability") or c.get("display") or "").upper()
+            if avail:
+                saw_info = True
+                if avail.startswith(("AVAILABLE", "AVL")):
+                    return True
+        # Classes that carry NO availability info (just fares) say nothing about
+        # seats — only an all-WL/REGRET train is treated as full.
+        return not saw_info
+    seats = item.get("available_seats", item.get("seats_available"))
+    if isinstance(seats, (int, float)):
+        return seats > 0
+    return True
+
+
+def _sold_out(o: TransportOption) -> int:
+    return 0 if option_is_available(o.mode, o.raw or {}) else 1
+
+
+# ── Travel-time arithmetic ───────────────────────────────────────────────────────
+
+def _parse_dt(s: str | None) -> Optional[datetime]:
+    """Full datetime when the string carries a date ('2026-07-19 20:35', ISO)."""
+    if not isinstance(s, str) or len(s) < 10 or s[4:5] != "-":
+        return None
+    try:
+        return datetime.fromisoformat(s.strip().replace(" ", "T")[:19])
+    except ValueError:
+        return None
+
+
+def _parse_clock(s: str | None) -> Optional[int]:
+    """Minutes-since-midnight from a time-of-day string ('20:35', '…T20:35')."""
+    if not isinstance(s, str):
+        return None
+    tail = s.split(" ")[-1].split("T")[-1]
+    parts = tail.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]) * 60 + int(parts[1][:2])
+    except ValueError:
+        return None
+
+
+def shift_date(date_str: str | None, n: int) -> str | None:
+    if not date_str:
+        return None
+    try:
+        return (datetime.strptime(date_str[:10], "%Y-%m-%d") + timedelta(days=n)).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def option_day_span(o: TransportOption) -> int:
+    """Calendar days this ride crosses (0 = same-day, 1 = overnight, 2 = a two-
+    day train). Prefers real departure/arrival dates; falls back to departure
+    clock + duration to count midnight crossings."""
+    dep, arr = _parse_dt(o.departure), _parse_dt(o.arrival)
+    if dep and arr and arr >= dep:
+        return (arr.date() - dep.date()).days
+    mins = int(o.duration_min or 0)
+    if mins <= 0:
+        return 0
+    start = _parse_clock(o.departure)
+    if start is not None:
+        return (start + mins) // 1440
+    return mins // 1440
+
+
+def leg_travel_days(leg: TripLeg, prefer: str | None = None, budget: str | None = None) -> int:
+    """Days between departing on this leg and arriving at its destination, using
+    the selected/recommended ride per hop. This is what lets the date cascade
+    place a two-day journey's arrival two days later instead of same-day."""
+    route = active_route(leg, prefer, budget)
+    if not route:
+        return 0
+    total = 0
+    for i in range(len(route.hops)):
+        opt = selected_option_for_hop(leg, route, i, prefer, budget)
+        if opt:
+            total += option_day_span(opt)
+    return total
 
 
 # ── Ranking engine — DERIVED recommendation (never persisted) ────────────────────
@@ -221,14 +327,16 @@ def _mode_rank(mode: str) -> int:
 def rank_options(options: list[TransportOption], prefer: str | None = None,
                  budget: str | None = None) -> list[TransportOption]:
     """Order the options on a hop by the chosen axis. Pure — computes the
-    suggestion, stores nothing."""
+    suggestion, stores nothing. Options with no bookable seats left sort after
+    every available one regardless of axis — a sold-out ride is never the
+    recommendation."""
     axis = _prefer_for(prefer, budget)
 
     def cost_key(o: TransportOption) -> tuple:
-        return (o.fare_per_person or 1e12, o.duration_min or 1e12, _mode_rank(o.mode))
+        return (_sold_out(o), o.fare_per_person or 1e12, o.duration_min or 1e12, _mode_rank(o.mode))
 
     def time_key(o: TransportOption) -> tuple:
-        return (o.duration_min or 1e12, o.fare_per_person or 1e12, _mode_rank(o.mode))
+        return (_sold_out(o), o.duration_min or 1e12, o.fare_per_person or 1e12, _mode_rank(o.mode))
 
     def bal_key(o: TransportOption) -> tuple:
         # Balanced: normalise fare & duration into a blended score.
@@ -236,7 +344,7 @@ def rank_options(options: list[TransportOption], prefer: str | None = None,
         durs = [x.duration_min for x in options if x.duration_min] or [1]
         f = (o.fare_per_person or max(fares)) / max(fares)
         d = (o.duration_min or max(durs)) / max(durs)
-        return (0.6 * f + 0.4 * d, _mode_rank(o.mode))
+        return (_sold_out(o), 0.6 * f + 0.4 * d, _mode_rank(o.mode))
 
     key = {"cheapest": cost_key, "fastest": time_key, "earliest": time_key}.get(axis, bal_key)
     return sorted(options, key=key)
@@ -422,6 +530,8 @@ def _leg_chain_hops(block: dict, from_city: str, to_city: str,
         per_mode_idx: dict[str, int] = {}
         for mode, it in mode_items:
             i = per_mode_idx.get(mode, 0)
+            if i >= MAX_OPTIONS_PER_MODE and not it.get("is_recommended"):
+                continue  # bound the stored row; a user pick always survives
             per_mode_idx[mode] = i + 1
             oid = f"{mode}-{i}"
             options.append(option_from_item(mode, it, oid))
@@ -687,8 +797,14 @@ def _project_journey_block(leg: TripLeg, prefer: str | None, budget: str | None)
         out: dict = {}
         pick = selected_option_for_hop(leg, route, hop_index, prefer, budget)
         for mode in _MODES:
-            items = [dict(o.raw, is_recommended=(pick is not None and o.id == pick.id))
-                     for o in hop.options if o.mode == mode]
+            items = []
+            for o in hop.options:
+                if o.mode != mode:
+                    continue
+                it = dict(o.raw, is_recommended=(pick is not None and o.id == pick.id))
+                if _sold_out(o):
+                    it["sold_out"] = True
+                items.append(it)
             if items:
                 key = {"flight": "flights", "train": "trains", "bus": "buses"}[mode]
                 out[key] = {
@@ -704,13 +820,44 @@ def _project_journey_block(leg: TripLeg, prefer: str | None, budget: str | None)
             {"from": h.from_city, "to": h.to_city, **bucketize(h, i)}
             for i, h in enumerate(route.hops)
         ]
+
+    # Per-hop breakdown of the ride actually in force, with real cities, mode and
+    # calendar dates — so the UI can render "Manali → Delhi (bus, overnight) then
+    # Delhi → Pune (train, arrives +1 day)" instead of flattening a multi-mode
+    # journey into one ambiguous row.
+    segments: list[dict] = []
+    cursor = leg.date
+    for i, h in enumerate(route.hops):
+        opt = selected_option_for_hop(leg, route, i, prefer, budget)
+        seg_date = h.date or cursor
+        span = option_day_span(opt) if opt else 0
+        segments.append({
+            "from": h.from_city,
+            "to": h.to_city,
+            "date": seg_date,
+            "arrival_date": shift_date(seg_date, span) or seg_date,
+            "mode": opt.mode if opt else None,
+            "operator": opt.operator if opt else None,
+            "departure": opt.departure if opt else None,
+            "arrival": opt.arrival if opt else None,
+            "fare_per_person": opt.fare_per_person if opt else None,
+            "day_span": span,
+        })
+        cursor = shift_date(seg_date, span) or seg_date
+    if segments:
+        block["segments"] = segments
+        label = segments[0]["from"]
+        for s in segments:
+            label += f" → {s['to']}" + (f" ({s['mode']})" if s.get("mode") else "")
+        block["route_label"] = label
     return block
 
 
 # Keys the projection computes; everything ELSE on an original legacy block
 # (flight_journey, ground_route_backup, reasoning, journey_options, hotels,
 # train_journey…) is preserved verbatim when re-emitting.
-_PROJECTED_KEYS = {"leg_id", "date", "legs", "hops", "flights", "trains", "buses", "via_gateway", "summary"}
+_PROJECTED_KEYS = {"leg_id", "date", "legs", "hops", "flights", "trains", "buses",
+                   "via_gateway", "summary", "segments", "route_label"}
 
 
 def _merged_block(original: dict | None, projected: dict) -> dict:

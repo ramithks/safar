@@ -193,6 +193,12 @@ class HotelService:
         if filters.get("sort"):
             filtered = sort_hotels(filtered, filters["sort"])
         hotels_with_map = [_add_map_url(h) for h in filtered]
+
+        # Grow the hotels master table with whatever came back — async, best-effort,
+        # so EVERY hotel fetch persists (workspace copilot search included), not just
+        # the /plan path. Idempotent upsert on (source, source_hotel_id).
+        self._persist_master(hotels_with_map, dest.display_name)
+
         return {
             "hotels": hotels_with_map,
             "source": "+".join(sources),
@@ -204,6 +210,18 @@ class HotelService:
             "destination": dest.display_name,
             "dest_class": dest.dest_class,
         }
+
+
+    @staticmethod
+    def _persist_master(hotels: list[dict], destination: str) -> None:
+        try:
+            import asyncio
+            from app.services.hotel_store import save_hotels_master
+            asyncio.create_task(save_hotels_master(hotels, destination))
+        except RuntimeError:
+            pass  # no running loop (e.g. sync context) — skip, non-critical
+        except Exception:  # noqa: BLE001 — persistence must never break search
+            pass
 
 
 def _add_map_url(hotel: dict) -> dict:
@@ -262,75 +280,113 @@ def _filter_by_budget(hotels: list[dict], budget: str, currency_code: str = "inr
     return filtered if filtered else hotels
 
 
+# Metadata carried across duplicate providers onto the representative row when it's
+# missing the field. Includes the enriched signals the parsers now emit (subscores,
+# pricing story, scarcity, social proof, landmarks) — a hotel that's bare on the
+# cheapest provider still shows the richest provider's metadata. Price + booking_url
+# are NEVER borrowed (they must stay from the same provider), so what we display
+# always matches the link we send the user to.
+_MERGE_FIELDS = (
+    # original set
+    "amenities", "review_label", "free_cancellation", "free_cancellation_until",
+    "meal_plan", "highlights", "couple_friendly", "distance_km",
+    "no_prepayment", "is_breakfast_included", "checkin_time", "checkout_time",
+    # rating/identity (fill if the cheap provider didn't carry them)
+    "review_score", "review_count", "star_rating", "property_type", "description",
+    "address", "lat", "lon",
+    # enriched signals (Agoda/Booking parser enrichment)
+    "subscores", "recommendation_score", "review_snippet", "landmarks",
+    "nearest_transport", "room_facilities", "has_private_pool", "room_size_sqm",
+    "free_wifi", "social_proof", "people_looking", "badges", "top_selling_point",
+    "is_popular", "family_friendly", "has_airport_transfer",
+    "price_original", "savings", "discount_pct", "discount_label", "available_rooms",
+)
+
+
+def _hotel_price(h: dict) -> float | None:
+    try:
+        v = h.get("price_per_night") or h.get("estimated_price_per_night")
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _deduplicate_by_name(hotels: list[dict]) -> list[dict]:
     """
-    Remove near-duplicate entries (same hotel listed by multiple sources).
-    When duplicates exist, keep the entry with the most data:
-    booking_url + price_per_night + photos score highest.
-    Enrichment fields (amenities, review_label, free_cancellation, etc.) are
-    merged from the loser into the winner so no data is discarded.
+    Collapse the same hotel listed by multiple sources into one row.
+
+    Representative = the CHEAPEST *bookable* listing (booking_url + a live price), so
+    a budget traveller isn't shown a pricier duplicate just because it had richer
+    metadata — and the price we display always matches the link we send them to.
+    Ties, and groups with no bookable listing, fall back to the RICHEST listing.
+    Every other listing's metadata is then unioned onto the representative
+    (``_MERGE_FIELDS`` + photos up to 6), so no scraped signal is discarded.
     """
     def _richness(h: dict) -> int:
         return (
             bool(h.get("booking_url")) * 10
-            + bool(h.get("price_per_night") or h.get("estimated_price_per_night")) * 5
+            + bool(_hotel_price(h)) * 5
             + min(len(h.get("photos") or []), 5)
             + bool(h.get("address")) * 2
             + bool(h.get("review_score") or h.get("star_rating") or h.get("google_rating"))
         )
 
+    def _bookable(h: dict) -> bool:
+        return bool(h.get("booking_url")) and (_hotel_price(h) or 0) > 0
+
     def _norm(name: str) -> str:
         """Normalize hotel name for dedup — strip spaces/punctuation, first 24 chars."""
         return "".join(c for c in (name or "").lower() if c.isalnum())[:24]
 
-    # Fields to carry over from the loser if the winner is missing them
-    _MERGE_FIELDS = (
-        "amenities", "review_label", "free_cancellation", "free_cancellation_until",
-        "meal_plan", "highlights", "couple_friendly", "distance_km",
-        "no_prepayment", "is_breakfast_included", "checkin_time", "checkout_time",
-    )
+    def _better(cand: dict, cur: dict) -> bool:
+        """Is `cand` a better representative of the same hotel than `cur`?
+        Cheapest bookable wins (consistent price↔link); else richest."""
+        cb, rb = _bookable(cand), _bookable(cur)
+        if cb != rb:
+            return cb                      # a bookable listing beats a non-bookable one
+        if cb and rb:
+            pc, pr = _hotel_price(cand), _hotel_price(cur)
+            if pc is not None and pr is not None and pc != pr:
+                return pc < pr             # both bookable → the cheaper one represents
+        return _richness(cand) > _richness(cur)
 
-    seen: dict[str, dict] = {}
+    def _absorb(winner: dict, other: dict) -> None:
+        for field in _MERGE_FIELDS:
+            if not winner.get(field) and other.get(field) not in (None, "", [], {}):
+                winner[field] = other[field]
+        w_photos = winner.get("photos") or []
+        if len(w_photos) < 6:
+            for p in (other.get("photos") or []):
+                if p not in w_photos:
+                    w_photos.append(p)
+                if len(w_photos) >= 6:
+                    break
+            winner["photos"] = w_photos
+
+    # Group by normalized name, preserving first-seen order.
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
     for h in hotels:
         key = _norm(h.get("name", ""))
         if not key:
             continue
-        if key not in seen or _richness(h) > _richness(seen[key]):
-            if key in seen:
-                # Merge enrichment fields from the old winner into the new winner
-                old = seen[key]
-                for field in _MERGE_FIELDS:
-                    if not h.get(field) and old.get(field):
-                        h[field] = old[field]
-                # Merge photos if the new winner has fewer than 6 photos
-                h_photos = h.get("photos") or []
-                old_photos = old.get("photos") or []
-                if len(h_photos) < 6 and old_photos:
-                    for p in old_photos:
-                        if p not in h_photos:
-                            h_photos.append(p)
-                        if len(h_photos) >= 6:
-                            break
-                    h["photos"] = h_photos
-            seen[key] = h
-        else:
-            # Current entry lost — merge its enrichment into the existing winner
-            winner = seen[key]
-            for field in _MERGE_FIELDS:
-                if not winner.get(field) and h.get(field):
-                    winner[field] = h[field]
-            # Merge photos if the winner has fewer than 6 photos
-            winner_photos = winner.get("photos") or []
-            h_photos = h.get("photos") or []
-            if len(winner_photos) < 6 and h_photos:
-                for p in h_photos:
-                    if p not in winner_photos:
-                        winner_photos.append(p)
-                    if len(winner_photos) >= 6:
-                        break
-                winner["photos"] = winner_photos
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(h)
 
-    # Sort: richest entries first (booking_url > price > photos)
-    result = list(seen.values())
+    result: list[dict] = []
+    for key in order:
+        members = groups[key]
+        winner = members[0]
+        for m in members[1:]:
+            if _better(m, winner):
+                winner = m
+        for m in members:
+            if m is not winner:
+                _absorb(winner, m)
+        result.append(winner)
+
+    # Richest first (a stable starting order; score_hotels re-sorts by rank_score next).
     result.sort(key=_richness, reverse=True)
     return result

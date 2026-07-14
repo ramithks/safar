@@ -15,6 +15,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from app.api.v1.router import router
+from app.api.v2.router import router as router_v2
 from app.config import settings
 from app.core.limiter import limiter
 from app.core.timeout import TimeoutMiddleware
@@ -90,6 +91,7 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(router_v2)
 
 
 # ── Exception handlers ───────────────────────────────────────────────────────────

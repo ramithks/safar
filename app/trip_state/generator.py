@@ -30,7 +30,10 @@ from .patch import PatchOp
 
 logger = logging.getLogger(__name__)
 
-STREAM_TTL_SECONDS = 3600
+# 24h: the stream doubles as the read-repair source when DB persistence rides
+# out a TLS storm (endpoint._overlay_stream_events) — it must outlive any storm
+# plus the user coming back later the same day.
+STREAM_TTL_SECONDS = 86400
 _redis: redis_lib.Redis | None = None
 
 
@@ -237,6 +240,12 @@ async def run_generation(trip_id: str, body: PlanRequest, user_id: str) -> None:
             critical=True,
         )
         logger.info("[trip-state] generation complete for %s", trip_id)
+
+        # Mirror the finished trip into the shared `trips` table so it appears
+        # in My Trips next to classic /plan trips. Best-effort by design.
+        from .my_trips import upsert_my_trip
+
+        await upsert_my_trip(trip_id, user_id, fd)
 
         # Learn this traveller's durable preferences from the finished plan so
         # their next trip + copilot session starts warm. Best-effort, off the

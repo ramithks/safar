@@ -79,6 +79,15 @@ def _plus_days(date_str: str | None, n: int) -> str | None:
         return None
 
 
+def _days_between(a: str | None, b: str | None) -> int | None:
+    try:
+        da = datetime.strptime((a or "")[:10], "%Y-%m-%d")
+        db = datetime.strptime((b or "")[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+    return (db - da).days
+
+
 def _ensure_node(graph: G.TripGraph, city: str, role_hint: str) -> G.TripStop:
     """Find the node for `city`, creating it if new. `role_hint` is used only when
     creating: the very first node is always the origin."""
@@ -92,6 +101,55 @@ def _ensure_node(graph: G.TripGraph, city: str, role_hint: str) -> G.TripStop:
     )
     graph.nodes.append(node)
     return node
+
+
+def _anchor_origin(graph: G.TripGraph, req: dict) -> None:
+    """An empty graph must anchor on request.origin BEFORE any edited city gets
+    a node — otherwise (e.g. editing against a degraded snapshot that lost its
+    transport blocks) the first city the user mentions becomes the 'origin',
+    return legs attach to the wrong node, and the whole chain walks backwards."""
+    if graph.nodes:
+        return
+    origin = (req.get("origin") or "").strip()
+    if origin:
+        _ensure_node(graph, origin, role_hint="origin")
+
+
+def _resolve_from_node(graph: G.TripGraph, city: str) -> G.TripStop:
+    """The node a new leg leaves FROM: the LATEST visit of that city in travel
+    order. A city can legitimately appear twice (Udaipur → Jaipur → Udaipur →
+    Delhi) — resolving to the first visit would prune the wrong onward leg."""
+    key = geo.normalize(city)
+    ordered, _, _ = G.ordered_path(graph)
+    matches = [n for n in ordered if (n.normalized_city or geo.normalize(n.city)) == key]
+    if matches:
+        return matches[-1]
+    return _ensure_node(graph, city, role_hint="stop")
+
+
+def _resolve_to_node(graph: G.TripGraph, from_node: G.TripStop, city: str) -> G.TripStop:
+    """The node a new leg arrives AT. The origin always merges (a leg home is
+    the return); a city with no inbound leg merges (new, or rejoining after its
+    old inbound was displaced). A city already reached by another leg becomes a
+    NEW visit node — a revisit is two stops, not a cycle: a cycle can't be
+    walked, so its legs silently vanish from the projected journey."""
+    node = graph.node_by_city(city)
+    if node is None:
+        return _ensure_node(graph, city, role_hint="stop")
+    if node.role == "origin" or node.id == from_node.id:
+        return node
+    has_inbound = any(
+        e.to_node_id == node.id and e.from_node_id != node.id for e in graph.edges
+    )
+    if not has_inbound:
+        return node
+    revisit = G.TripStop(
+        id=_next_stop_id(graph), city=city.strip(),
+        normalized_city=geo.normalize(city), role="stop",
+        coordinates=node.coordinates,
+    )
+    graph.nodes.append(revisit)
+    return revisit
 
 
 async def _geocode_nodes(graph: G.TripGraph) -> None:
@@ -112,32 +170,62 @@ async def _geocode_nodes(graph: G.TripGraph) -> None:
         logger.warning("[builder] geocoding stops failed: %s", exc)
 
 
+def _stamp_hop_dates(leg: G.TripLeg) -> None:
+    """Date every hop of every route cumulatively: hop N departs when hop N-1's
+    ride actually arrives (a 2-day train pushes the connecting bus 2 days out,
+    not onto the same calendar day)."""
+    for route in leg.routes:
+        cursor = leg.date
+        for hop in route.hops:
+            hop.date = cursor
+            best = G.recommended_option(hop)
+            if best:
+                cursor = _plus_days(cursor, G.option_day_span(best)) or cursor
+
+
 def _resequence_dates(graph: G.TripGraph, start_date: str | None) -> None:
-    """Re-sort nodes into travel order, then walk them assigning arrival/departure
-    dates from each stop's nights and stamp every outbound leg's date from its
-    origin node's departure. Ordering first is what keeps a mid-trip-inserted
-    stop's dates (and everything derived from them) correct."""
+    """Re-sort nodes into travel order, then walk the path assigning each stop's
+    arrival/departure from the previous stop's departure PLUS the leg's real
+    travel time (a 39-hour Pune→Manali journey arrives 2 days after it leaves,
+    and every later date — stays, onward legs, the return — shifts with it).
+    Ordering first is what keeps a mid-trip-inserted stop's dates correct."""
     G.order_nodes_along_path(graph)
-    cursor = start_date
-    for node in graph.nodes:
-        node.arrival_date = cursor
-        node.departure_date = _plus_days(cursor, max(int(node.nights or 0), 0)) or cursor
-        cursor = node.departure_date
-    for leg in graph.edges:
-        src = graph.node(leg.from_node_id)
+    ordered, outbound, inbound = G.ordered_path(graph)
+    if not ordered:
+        return
+
+    origin = ordered[0]
+    origin.arrival_date = start_date
+    origin.departure_date = _plus_days(start_date, max(int(origin.nights or 0), 0)) or start_date
+
+    prev = origin
+    for leg in outbound:
+        leg.date = prev.departure_date
+        _stamp_hop_dates(leg)
+        dst = graph.node(leg.to_node_id)
+        if dst is None:
+            continue
+        dst.arrival_date = _plus_days(leg.date, G.leg_travel_days(leg)) or leg.date
+        dst.departure_date = _plus_days(dst.arrival_date, max(int(dst.nights or 0), 0)) or dst.arrival_date
+        prev = dst
+
+    # The return leaves when the traveller is done at its departure city.
+    if inbound:
+        src = graph.node(inbound.from_node_id)
         if src and src.departure_date:
-            leg.date = src.departure_date
-        for route in leg.routes:
-            for hop in route.hops:
-                hop.date = leg.date
+            inbound.date = src.departure_date
+        _stamp_hop_dates(inbound)
 
 
 # ── Live routing ─────────────────────────────────────────────────────────────────
 
 async def _shaped_journey(from_city: str, to_city: str, date: str | None,
-                          travelers: int, budget: str, user_id: str) -> dict | None:
+                          travelers: int, budget: str, user_id: str,
+                          stay_nights: int = 1, include_hotels: bool = False) -> dict | None:
     """Run the production journey pipeline for one hop and return the shaped block
-    (buses/trains/flights buckets), or None on failure/empty."""
+    (buses/trains/flights buckets), or None on failure/empty. The pipeline always
+    fetches destination hotels — `include_hotels` keeps them on the block so the
+    caller can attach them to the stop instead of throwing them away."""
     from app.api.v1.plan_trip.journey import run_plan_journey
     from app.api.v1.plan_trip.models import PlanJourneyRequest
     from app.api.v1.plan_trip.plan import _shape_journey
@@ -145,14 +233,146 @@ async def _shaped_journey(from_city: str, to_city: str, date: str | None,
     try:
         req = PlanJourneyRequest(
             origin=from_city, destination=to_city, travelers=travelers,
-            budget=budget, departure_date=date, stay_nights=1,
+            budget=budget, departure_date=date, stay_nights=max(int(stay_nights or 1), 1),
         )
         result = await run_plan_journey(req, user_id, profile={})
-        block = _shape_journey(result, include_hotels=False)
+        block = _shape_journey(result, include_hotels=include_hotels)
         return block
     except Exception as exc:  # noqa: BLE001 — a routing miss is not fatal
         logger.warning("[builder] journey %s→%s failed: %s", from_city, to_city, exc)
         return None
+
+
+def _attach_stay(node: G.TripStop, hotels: list[dict], nights: int) -> bool:
+    """Attach hotel candidates to a stop that has none (or whose list was fetched
+    for a different stay length). Returns True when the stay list changed."""
+    if not hotels:
+        return False
+    fetched_for = getattr(node.stay, "fetched_nights", None)
+    if node.stay.search_results and fetched_for == nights:
+        return False
+    keep_selected = node.stay.selected_id if node.stay.search_results else None
+    # Cap per stop — 60+ raw hotel payloads per city bloats the snapshot row.
+    node.stay = G.Stay(search_results=list(hotels)[:24], selected_id=keep_selected)
+    node.stay.fetched_nights = nights  # extra="allow"
+    return True
+
+
+async def _fetch_stop_hotels(node: G.TripStop, travelers: int, budget: str) -> list[dict]:
+    """Live hotel search for one stop, dated by the stop's actual arrival and
+    stay length. Best-effort — an empty list on failure."""
+    from app.api.v1.plan_trip.helpers import rank_hotels
+    from app.services.hotels import HotelService
+
+    nights = max(int(node.nights or 1), 1)
+    checkin = node.arrival_date
+    if not checkin:
+        checkin = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    checkout = _plus_days(checkin, nights) or checkin
+    try:
+        result = await HotelService().search(
+            node.city, checkin, checkout,
+            adults=max(travelers, 1), budget=budget,
+        )
+        return rank_hotels(result.get("hotels") or [], budget)
+    except Exception as exc:  # noqa: BLE001 — stays are additive, never fatal
+        logger.warning("[builder] hotel search for %s failed: %s", node.city, exc)
+        return []
+
+
+def _seed_searched_dates(graph: G.TripGraph) -> None:
+    """Legs from before `searched_date` existed (persisted or legacy-derived)
+    record their current date as the one their options were searched for — the
+    baseline that lets the refresh detect a later shift. Call right after
+    loading the graph, BEFORE any resequencing overwrites leg dates."""
+    for leg in graph.edges:
+        if getattr(leg, "searched_date", None) is None and leg.date:
+            leg.searched_date = leg.date  # extra="allow"
+
+
+def _repoint_return_leg(graph: G.TripGraph) -> str | None:
+    """After the chain grows, the return must leave from the trip's REAL
+    terminal — adding Chandigarh after Manali moves it to Chandigarh→origin.
+    Pure re-point; the stale-leg refresh re-searches its options."""
+    ordered, outbound, inbound = G.ordered_path(graph)
+    if not inbound or not outbound or len(ordered) < 2:
+        return None
+    terminal = graph.node(outbound[-1].to_node_id)
+    if terminal is None or terminal.role == "origin" or inbound.from_node_id == terminal.id:
+        return None
+    old_city = inbound.from_city
+    inbound.from_node_id = terminal.id
+    inbound.from_city = terminal.city
+    inbound.date = terminal.departure_date
+    inbound.routes = []          # options were for the old city pair
+    inbound.selection = None
+    return f"moved the return to start from {terminal.city} (it used to leave from {old_city})"
+
+
+async def _refresh_stale_legs(state: dict, graph: G.TripGraph, user_id: str) -> list[str]:
+    """Re-search every leg whose live options no longer match the trip: the date
+    shifted since they were fetched (seats found for the 19th say nothing about
+    the 21st), or the leg was re-pointed and has no routes at all. Runs after
+    `_resequence_dates`; searches run in parallel. Returns human notes about
+    what changed."""
+    stale = [
+        leg for leg in graph.edges
+        if leg.date and (
+            (not leg.routes and leg.status != "no_route")
+            or (leg.routes and getattr(leg, "searched_date", None) != leg.date)
+        )
+    ]
+    if not stale:
+        return []
+
+    req = state.get("request") or {}
+    travelers = max(int(req.get("travelers") or 1), 1)
+    budget = req.get("budget_tier") or "mid"
+
+    blocks = await asyncio.gather(*(
+        _shaped_journey(leg.from_city, leg.to_city, leg.date, travelers, budget, user_id)
+        for leg in stale
+    ))
+
+    notes: list[str] = []
+    for leg, block in zip(stale, blocks):
+        if not _block_has_options(block):
+            if not leg.routes:
+                leg.status = "no_route"
+            leg.searched_date = leg.date  # don't hammer the same failing search
+            notes.append(
+                f"couldn't find live {leg.from_city} → {leg.to_city} options for "
+                f"{leg.date} — that leg needs attention"
+            )
+            continue
+        leg.routes = [_direct_route(leg.id, block, leg.from_city, leg.to_city, leg.date)]
+        leg.selection = None
+        leg.status = "routed"
+        leg.searched_date = leg.date  # extra="allow"
+        _stamp_hop_dates(leg)
+        notes.append(f"re-searched {leg.from_city} → {leg.to_city} for {leg.date} (dates shifted)")
+    return notes
+
+
+async def _sync_legs_after_change(state: dict, graph: G.TripGraph, user_id: str) -> list[str]:
+    """The one call every structural edit makes after mutating the graph:
+    resequence dates (travel-time aware), point the return at the real terminal,
+    and re-search any leg whose options went stale. Two rounds because fresh
+    options can change a leg's travel days and shift dates downstream once more.
+    Returns notes for the reply."""
+    req = state.get("request") or {}
+    notes: list[str] = []
+    for _ in range(2):
+        _resequence_dates(graph, req.get("departure_date"))
+        note = _repoint_return_leg(graph)
+        if note:
+            notes.append(note)
+        round_notes = await _refresh_stale_legs(state, graph, user_id)
+        if not round_notes:
+            break
+        notes += round_notes
+    _resequence_dates(graph, req.get("departure_date"))
+    return notes
 
 
 def _block_has_options(block: dict | None) -> bool:
@@ -190,6 +410,31 @@ def _gateway_route(leg_id: str, gateway: str, hop1_block: dict, hop2_search: dic
 
 # ── Patch emission ───────────────────────────────────────────────────────────────
 
+def _sync_request_dates(state: dict, graph: G.TripGraph) -> list[PatchOp]:
+    """Mirror the graph's resequenced dates onto `request` — when 2 nights in
+    Chandigarh push the return from the 19th to the 21st, return_date/end_date
+    (what the header and any re-plan read) must follow."""
+    req = state.get("request") or {}
+    ordered, outbound, inbound = G.ordered_path(graph)
+    if not outbound:
+        return []
+    terminal = graph.node(outbound[-1].to_node_id)
+    new_return = (inbound.date if inbound else None) or (terminal.departure_date if terminal else None)
+    if not new_return:
+        return []
+
+    changed: dict = {}
+    if (inbound or req.get("return_date")) and req.get("return_date") != new_return:
+        changed["return_date"] = new_return
+    if req.get("end_date") and req.get("end_date") != new_return:
+        changed["end_date"] = new_return
+    if not changed:
+        return []
+    new_req = {**req, **changed}
+    state["request"] = new_req
+    return [PatchOp(op="set", path="/request", value=new_req)]
+
+
 def _graph_patches(state: dict, graph: G.TripGraph) -> list[PatchOp]:
     """Persist the graph and its regenerated projections. Emits `/graph` plus the
     merged legacy projections so both graph-aware and current clients converge."""
@@ -197,6 +442,7 @@ def _graph_patches(state: dict, graph: G.TripGraph) -> list[PatchOp]:
     state["graph"] = graph_dump
     proj = G.project(state, graph)
     patches = [PatchOp(op="set", path="/graph", value=graph_dump)]
+    patches += _sync_request_dates(state, graph)
 
     if "/transport" in proj:
         merged = {**(state.get("transport") or {}), **proj["/transport"]}
@@ -212,6 +458,31 @@ def _graph_patches(state: dict, graph: G.TripGraph) -> list[PatchOp]:
 
 
 # ── Handlers ─────────────────────────────────────────────────────────────────────
+
+def _shift_chain_for_date(state: dict, graph: G.TripGraph,
+                          src: G.TripStop, new_date: str) -> str | None:
+    """Make `src`'s departure land on `new_date` — the lever behind "no seats on
+    the 19th, shift to the 21st?". Origin: move the whole trip's start. Any other
+    stop: adjust its nights, so the resequence carries the shift to every later
+    date (onward legs, the return)."""
+    current = src.departure_date
+    if src.role == "origin":
+        req = dict(state.get("request") or {})
+        current = current or req.get("departure_date")
+        if current == new_date:
+            return None
+        req["departure_date"] = new_date
+        state["request"] = req
+        return f"moved the trip start to {new_date}"
+    delta = _days_between(current, new_date)
+    if not delta:
+        return None
+    src.nights = max(int(src.nights or 0) + delta, 0)
+    return (
+        f"shifted your {src.city} departure to {new_date} "
+        f"({src.nights} night{'s' if src.nights != 1 else ''} there now)"
+    )
+
 
 async def handle_add_leg(
     state: dict, user_id: str, from_city: str, to_city: str,
@@ -231,13 +502,27 @@ async def handle_add_leg(
     start_date = req.get("departure_date")
 
     graph = G.ensure_graph(state)
+    _seed_searched_dates(graph)
+    _anchor_origin(graph, req)
 
     # Idempotency: a leg we already have is not re-added. This is the backstop
     # that stops the agent's re-plan from stacking duplicate legs and looping
     # (the "Added the Goa → Jaipur leg" ×4 symptom). An explicit `via` is a
-    # reroute request, so it replaces the existing leg rather than no-opping.
+    # reroute request, and an explicit different `date` is a reschedule — both
+    # act on the existing leg rather than no-opping.
     existing = _find_leg(graph, None, from_city, to_city)
     if existing and not via:
+        if date and existing.date and date != existing.date:
+            _resequence_dates(graph, start_date)   # stamp node dates before shifting
+            src = graph.node(existing.from_node_id)
+            shift_note = _shift_chain_for_date(state, graph, src, date) if src else None
+            if shift_note:
+                notes = await _sync_legs_after_change(state, graph, user_id)
+                await _geocode_nodes(graph)
+                patches = _graph_patches(state, graph)
+                patches.append(PatchOp(op="set", path="/request", value=state["request"]))
+                detail = f" {'; '.join(notes)}." if notes else ""
+                return patches, f"Done — {shift_note}, and re-checked every affected leg.{detail}", []
         fare = round(G.leg_fare_per_person(existing, prefer=mode, budget=budget))
         price = f" (₹{fare}/person)" if fare else ""
         return [], (
@@ -245,22 +530,29 @@ async def handle_add_leg(
             "say “via <city>” to reroute it, or pick a specific ride to change it."
         ), []
 
-    from_node = _ensure_node(graph, from_city, role_hint="stop")
-    # A leg whose target is the origin city is the return — _ensure_node resolves
-    # it to the existing origin node, which the projection treats as inbound.
-    to_node = _ensure_node(graph, to_city, role_hint="stop")
+    from_node = _resolve_from_node(graph, from_city)
+    # A leg whose target is the origin city is the return; a leg back to a city
+    # already on the path becomes a fresh visit node (never a cycle).
+    to_node = _resolve_to_node(graph, from_node, to_city)
     if existing and via:
         graph.edges = [e for e in graph.edges if e.id != existing.id]  # replace on reroute
     _resequence_dates(graph, start_date)
+    if date and from_node.departure_date and date != from_node.departure_date:
+        # The user named a departure day for this leg — bend the chain to it.
+        _shift_chain_for_date(state, graph, from_node, date)
+        _resequence_dates(graph, state.get("request", {}).get("departure_date") or start_date)
     leg_id = _next_leg_id(graph)
-    leg_date = from_node.departure_date or start_date
+    leg_date = from_node.departure_date or date or start_date
+
+    is_return = to_node.role == "origin"
 
     # ── Explicit gateway: build the two-hop route directly. ──
     if via:
         via = via.strip()
         hop1, hop2 = await asyncio.gather(
             _shaped_journey(from_city, via, leg_date, travelers, budget, user_id),
-            _shaped_journey(via, to_city, _plus_days(leg_date, 0), travelers, budget, user_id),
+            _shaped_journey(via, to_city, _plus_days(leg_date, 0), travelers, budget, user_id,
+                            stay_nights=to_node.nights or 1, include_hotels=not is_return),
         )
         if not _block_has_options(hop1) or not _block_has_options(hop2):
             return [], (
@@ -279,22 +571,35 @@ async def handle_add_leg(
             from_city=from_city, to_city=to_city, date=leg_date,
             routes=[route], status="routed",
         )
+        leg.searched_date = leg_date  # extra="allow"
         graph.edges.append(leg)
         _prune_displaced(graph, from_node.id, to_node.id)
-        _resequence_dates(graph, start_date)
+        if is_return:
+            # ONE return: a new leg home replaces any earlier inbound edge.
+            graph.edges = [e for e in graph.edges
+                           if e.id == leg.id or e.to_node_id != to_node.id]
+        stay_note = ""
+        if not is_return and (to_node.nights or 0) > 0:
+            hop2_hotels = ((hop2.get("hotels") or {}).get("items")) or []
+            if _attach_stay(to_node, hop2_hotels, to_node.nights or 1):
+                stay_note = f" Pulled {len(to_node.stay.search_results)} live stays for {to_city} too."
+        notes = await _sync_legs_after_change(state, graph, user_id)
         await _geocode_nodes(graph)
         patches = _graph_patches(state, graph)
         fare = round(G.leg_fare_per_person(leg, budget=budget))
+        detail = f" Also: {'; '.join(notes)}." if notes else ""
         return patches, (
             f"Routed {from_city} → {to_city} via {via} — {from_city}→{via} then "
-            f"{via}→{to_city}, ₹{fare}/person. Added it as the {from_city}→{to_city} leg."
+            f"{via}→{to_city}, ₹{fare}/person. Added it as the {from_city}→{to_city} "
+            f"leg.{stay_note}{detail}"
         ), []
 
     # ── Direct routing + gateway discovery, in parallel. ──
     from app.services.geo_nearby import find_gateways
 
     direct_block, gateways = await asyncio.gather(
-        _shaped_journey(from_city, to_city, leg_date, travelers, budget, user_id),
+        _shaped_journey(from_city, to_city, leg_date, travelers, budget, user_id,
+                        stay_nights=to_node.nights or 1, include_hotels=not is_return),
         find_gateways(from_city, to_city, leg_date or "", travelers=travelers),
     )
 
@@ -305,16 +610,39 @@ async def handle_add_leg(
             from_city=from_city, to_city=to_city, date=leg_date,
             routes=[route], status="routed",
         )
+        leg.searched_date = leg_date  # extra="allow"
         graph.edges.append(leg)
         _prune_displaced(graph, from_node.id, to_node.id)
-        _resequence_dates(graph, start_date)
+        if is_return:
+            # ONE return: a new leg home replaces any earlier inbound edge.
+            graph.edges = [e for e in graph.edges
+                           if e.id == leg.id or e.to_node_id != to_node.id]
+        stay_note = ""
+        # Stays attach only to stops the traveller SLEEPS in (nights known) —
+        # a transit city ("Delhi without stay") must not fill the Stays tab.
+        if not is_return and (to_node.nights or 0) > 0:
+            hotel_items = ((direct_block.get("hotels") or {}).get("items")) or []
+            if _attach_stay(to_node, hotel_items, to_node.nights or 1):
+                stay_note = f" Pulled {len(to_node.stay.search_results)} live stays for {to_city} too."
+        notes = await _sync_legs_after_change(state, graph, user_id)
         await _geocode_nodes(graph)
         patches = _graph_patches(state, graph)
 
         best = G.recommended_option(route.hops[0], prefer=mode, budget=budget)
         fare = round(G.leg_fare_per_person(leg, prefer=mode, budget=budget))
         picked = f"{best.operator} ({best.mode})" if best else "the best option"
-        reply = f"Added the {from_city} → {to_city} leg — {picked}, ₹{fare}/person."
+        reply = f"Added the {from_city} → {to_city} leg — {picked}, ₹{fare}/person.{stay_note}"
+        if mode and not any(
+            o.mode == mode and G.option_is_available(o.mode, o.raw or {})
+            for h in route.hops for o in h.options
+        ):
+            reply += (
+                f" One thing: no bookable {mode} seats came back for {leg_date} — "
+                f"I've used the best alternative. Say “shift to <date>” if you'd "
+                f"rather take a {mode} on another day."
+            )
+        if notes:
+            reply += f" Also: {'; '.join(notes)}."
         # Proactively surface a cheaper gateway route if one clearly beats direct.
         if gateways and fare:
             cheap = min((g for g in gateways if g.get("fare_per_person")),
@@ -341,6 +669,22 @@ async def handle_add_leg(
             f"through a nearby hub:\n{body}\n\nWhich gateway should I route through?"
         ), chips
 
+    # ── Nothing on this date, anywhere: probe the next two days before giving
+    #    up — sold out today often just means "go tomorrow". ──
+    if leg_date:
+        alt_dates = [d for d in (_plus_days(leg_date, 1), _plus_days(leg_date, 2)) if d]
+        alt_blocks = await asyncio.gather(*(
+            _shaped_journey(from_city, to_city, d, travelers, budget, user_id)
+            for d in alt_dates
+        ))
+        for alt, blk in zip(alt_dates, alt_blocks):
+            if _block_has_options(blk):
+                return [], (
+                    f"Nothing bookable {from_city} → {to_city} on {leg_date} — but "
+                    f"there ARE seats on {alt}. Want me to shift that leg to {alt}? "
+                    "Every later date (stays, onward legs, the return) adjusts with it."
+                ), [f"Shift to {alt}", "Keep the date, I'll decide later"]
+
     return [], (
         f"I couldn't find any {from_city} → {to_city} route, direct or via a nearby "
         "hub, on those dates. Try different dates or a nearby bigger city."
@@ -364,6 +708,8 @@ async def handle_add_stop_itinerary(
     n_days = max(1, min(int(days or 2), 7))
 
     graph = G.ensure_graph(state)
+    _seed_searched_dates(graph)
+    _anchor_origin(graph, req)
     node = _ensure_node(graph, city, role_hint="stop")
 
     # Idempotency: don't rebuild an itinerary that's already there at the asked
@@ -398,17 +744,34 @@ async def handle_add_stop_itinerary(
     # Attach hotel candidates for the stay, if the trip pipeline returned any.
     hotels = (trip or {}).get("hotels") or (trip or {}).get("stay", {}).get("hotels") or []
     if hotels:
-        node.stay = G.Stay(search_results=list(hotels))
+        _attach_stay(node, list(hotels), n_days)
 
-    _resequence_dates(graph, req.get("departure_date"))
+    # New nights shift every later date — resequence, re-point/re-search the
+    # return, and refresh any leg whose options went stale, BEFORE fetching
+    # stays so the hotel search uses the stop's real check-in.
+    notes = await _sync_legs_after_change(state, graph, user_id)
+
+    stay_note = ""
+    if not (node.stay.search_results and getattr(node.stay, "fetched_nights", None) == n_days):
+        stop_hotels = await _fetch_stop_hotels(node, travelers, budget)
+        if _attach_stay(node, stop_hotels, n_days):
+            checkin = node.arrival_date or "your arrival"
+            stay_note = (
+                f" Found {len(node.stay.search_results)} live stays in {city} for "
+                f"{n_days} night{'s' if n_days > 1 else ''} from {checkin} — "
+                "they're on the stop, tell me which to lock in."
+            )
+
     await _geocode_nodes(graph)
     patches = _graph_patches(state, graph)
 
     spots = [a.get("title") for d in day_list for a in (d.get("activities") or [])][:3]
     tail = f" — {', '.join(s for s in spots if s)}" if any(spots) else ""
+    detail = f" Also: {'; '.join(notes)}." if notes else ""
+    when = f" ({node.arrival_date} → {node.departure_date})" if node.arrival_date else ""
     return patches, (
-        f"Added a {n_days}-day itinerary for {city}{tail}. It's slotted into your "
-        "trip in order."
+        f"Added a {n_days}-day itinerary for {city}{when}{tail}. It's slotted into "
+        f"your trip in order.{stay_note}{detail}"
     )
 
 

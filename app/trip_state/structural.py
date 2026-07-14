@@ -235,19 +235,35 @@ async def handle_add_waypoint(
         start_date=dep, end_date=onward_dep, skip_user_trips=True,
     )
 
-    # All three run against the same live pipelines the initial plan uses.
-    # profile={} skips the per-user profile DB read; each guards its own errors.
-    seg1, seg2, wp_trip = await asyncio.gather(
+    # The waypoint's extra days push the whole tail of the trip: the return now
+    # leaves wp_days later, and its old live options were searched for the old
+    # date — re-plan it alongside the two outbound segments.
+    old_return = req.get("return_date")
+    new_return = _plus_days(old_return, wp_days)
+    replan_return = bool(new_return and (state.get("transport") or {}).get("return_journey"))
+    tasks = [
         run_plan_journey(seg1_req, user_id, profile={}),
         run_plan_journey(seg2_req, user_id, profile={}),
         run_plan_trip(wp_trip_req, user_id, profile={}),
-        return_exceptions=True,
-    )
+    ]
+    if replan_return:
+        tasks.append(run_plan_journey(
+            PlanJourneyRequest(
+                origin=destination, destination=origin, travelers=travelers,
+                budget=budget, departure_date=new_return, stay_nights=1,
+            ),
+            user_id, profile={},
+        ))
+
+    # All run against the same live pipelines the initial plan uses.
+    # profile={} skips the per-user profile DB read; each guards its own errors.
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     def _ok(x) -> dict | None:
         return x if isinstance(x, dict) else None
 
-    seg1, seg2, wp_trip = _ok(seg1), _ok(seg2), _ok(wp_trip)
+    seg1, seg2, wp_trip = _ok(results[0]), _ok(results[1]), _ok(results[2])
+    ret_seg = _ok(results[3]) if replan_return else None
 
     patches: list[PatchOp] = []
 
@@ -276,6 +292,11 @@ async def handle_add_waypoint(
         state.setdefault("transport", {})["onward_segments"] = [onward]
         patches.append(PatchOp(op="set", path="/transport/onward_segments", value=[onward]))
         routed = True
+    if ret_seg:
+        ret_block = _shape_journey(ret_seg, include_hotels=False)
+        ret_block["date"] = new_return
+        state.setdefault("transport", {})["return_journey"] = ret_block
+        patches.append(PatchOp(op="set", path="/transport/return_journey", value=ret_block))
 
     # ── Request: record the stopover and grow the trip length ────────────────────
     new_req = dict(req)
@@ -283,6 +304,10 @@ async def handle_add_waypoint(
     new_req["waypoints"] = waypoints
     new_req["days"] = int(req.get("days") or len(existing_days) or 1) + len(wp_days_list)
     new_req["stay_nights"] = int(req.get("stay_nights") or 1) + wp_days
+    if new_return:
+        new_req["return_date"] = new_return
+        if new_req.get("end_date"):
+            new_req["end_date"] = new_return
     state["request"] = new_req
     patches.append(PatchOp(op="set", path="/request", value=new_req))
 
@@ -323,6 +348,13 @@ async def handle_add_waypoint(
             f"re-routed your trip as {full_route} — the {city} → {destination} leg is "
             "still there as an onward hop, and both halves are live-priced"
         )
+    if ret_seg:
+        bits.append(
+            f"moved your return to {new_return} (the {city} days push it out) "
+            "and re-searched it live for that date"
+        )
+    elif new_return:
+        bits.append(f"your return date shifts to {new_return}")
     if not bits:
         return [], (
             f"I couldn't pull live routes or spots for {city} right now — "

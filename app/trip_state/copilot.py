@@ -620,21 +620,24 @@ async def _persist_chat(
 ) -> None:
     """Record the turn in the durable chat log so it survives a refresh. Both
     the user message (when present — structured UI actions carry none) and the
-    assistant reply are stored. Best-effort: a chat-log write must never fail an
-    edit, so transport failures are swallowed (the state edit already succeeded
-    and was broadcast)."""
-    from app.db.client import run_db
+    assistant reply are stored. Runs in the background (spawned by apply_edit)
+    and retries through TLS storms — a lost chat write is what made the thread
+    vanish on refresh. Each message retries independently so a partial success
+    isn't re-sent as a duplicate."""
+    from app.db.client import run_db_resilient
 
-    def _write() -> None:
-        if message:
-            store.append_chat(trip_id, "user", message)
-        if reply:
-            store.append_chat(trip_id, "assistant", reply, intent=kind, meta=meta)
-
-    try:
-        await run_db(_write)
-    except Exception as exc:  # noqa: BLE001 — a chat-log write must never block the edit
-        logger.warning("[trip-state] chat-log write failed for %s: %s", trip_id, exc)
+    for role, content in (("user", message), ("assistant", reply)):
+        if not content:
+            continue
+        intent = kind if role == "assistant" else None
+        msg_meta = meta if role == "assistant" else None
+        try:
+            await run_db_resilient(
+                lambda r=role, c=content: store.append_chat(trip_id, r, c, intent=intent, meta=msg_meta),
+                label="trip_state.chat", max_seconds=600,
+            )
+        except Exception as exc:  # noqa: BLE001 — a chat-log write must never block the edit
+            logger.warning("[trip-state] chat-log write failed for %s: %s", trip_id, exc)
 
 
 def _persist_and_broadcast(trip_id: str, patches: list[PatchOp], reply: str, message: str) -> None:
@@ -796,14 +799,27 @@ async def apply_edit(
                 flush.enqueue(trip_id, "user", patches, phase="copilot_edit", reasoning=message)
                 _broadcast_only()
 
+    if patches and user_id:
+        # Keep the My Trips mirror row current (title/dates/cost/days preview).
+        from .my_trips import upsert_my_trip
+
+        await upsert_my_trip(trip_id, user_id, state)
+
     # Record the turn in the durable chat transcript (every turn, incl. pure
     # Q&A / clarify that produced no patches) so the thread survives a refresh.
+    # Spawned: the write retries through TLS storms for minutes and must not
+    # hold the reply back.
     meta: dict = {}
     if clarify_options:
         meta["clarify_options"] = clarify_options
     if steps:
         meta["steps"] = steps
-    await _persist_chat(trip_id, message, reply, kind, meta=meta or None)
+    from app.core.background import spawn_background
+
+    spawn_background(
+        _persist_chat(trip_id, message, reply, kind, meta=meta or None),
+        name=f"chat:{trip_id}",
+    )
 
     # A multi-tool run surfaces hotel cards if ANY step touched stays.
     card_kind = kind if kind in ("search_hotels", "select_hotel") else next(

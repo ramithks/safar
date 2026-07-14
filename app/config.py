@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     vertex_model_brain: str = "gemini-2.5-flash"
     vertex_model_muscle: str = "gemini-2.5-flash-lite"
 
+    # Embeddings for the recommendation engine (docs/recommendation_engine.md).
+    # 384-dim is deliberate: ~4k hotels, not 100M docs — half the RAM/index, no
+    # measurable recall loss at this scale.
+    vertex_model_embedding: str = "text-embedding-005"
+    embedding_dim: int = 384
+
     # Vertex fallback account — tried only when the primary project returns 429
     # (RESOURCE_EXHAUSTED). Lets a rate-limited Gemini call retry instantly against
     # a second project's independent quota. Both optional; omit to disable fallback.

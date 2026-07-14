@@ -31,6 +31,8 @@ from typing import Any, Callable
 
 from app.services.vertex import generate_json
 
+from . import graph as G
+
 logger = logging.getLogger(__name__)
 
 # Budgets: enough for a 4-city build (legs + itineraries + a hotel search or
@@ -124,7 +126,11 @@ def _graph_lines(state: dict, per_mode: int = 4) -> list[str]:
         days = len(n.get("days") or [])
         bits = [n.get("role") or "stop"]
         if n.get("arrival_date"):
-            bits.append(f"arrive {n['arrival_date']}")
+            dep = n.get("departure_date")
+            bits.append(
+                f"there {n['arrival_date']} → {dep}" if dep and dep != n["arrival_date"]
+                else f"arrive {n['arrival_date']}"
+            )
         bits.append(f"{days} itinerary day{'s' if days != 1 else ''} planned" if days else "no itinerary yet")
         out.append(f"  • {n.get('city')} (id {n.get('id')}: {', '.join(bits)})")
         stay = n.get("stay") or {}
@@ -170,6 +176,7 @@ def _graph_lines(state: dict, per_mode: int = 4) -> list[str]:
                 line = ", ".join(
                     f"[{i}] {o.get('operator') or mode} {_clock(o.get('departure'))}→"
                     f"{_clock(o.get('arrival'))} ₹{round(o.get('fare_per_person') or 0)}"
+                    + ("" if G.option_is_available(mode, o.get("raw") or {}) else " SOLD OUT")
                     + (" ←picked" if picked_id and o.get("id") == picked_id else "")
                     for i, o in enumerate(shown)
                 )
@@ -204,7 +211,17 @@ def _prompt(message: str, state: dict, history: str, memory: str,
         "'back home' / 'return' means the trip's origin; when no transport mode "
         "is named, leave `mode` null and the ranking picks the best; when the "
         "user says 'stay 2 days in X', that stop needs BOTH the leg to reach it "
-        "AND a 2-day itinerary. Don't ask about things you can decide well.\n"
+        "AND a 2-day itinerary. A city named 'without stay' / 'just passing "
+        "through' is a transit stop: add ONLY the leg — no itinerary, no stays. "
+        "Don't ask about things you can decide well.\n"
+        "2b. THE TRIP IS ONE LINEAR CHAIN (origin → stops → back to origin). "
+        "When the user's requested order puts a NEW city before an existing "
+        "stop (e.g. trip is A→C and they say 'Jaipur first, then C'), rebuild "
+        "from the divergence point: add_leg from the earlier city to the new "
+        "one — inserting a leg from X automatically displaces X's old onward "
+        "leg — then re-chain onward to the existing stop. Only route BACK "
+        "through a city already visited when the user genuinely wants to be "
+        "there twice.\n"
         "3. ASK ONLY WHEN IT MATTERS. If a genuinely-needed detail is missing "
         "and guessing could waste the user's money or time (e.g. which of two "
         "possible legs to change), stop: return NO actions, put one short "
@@ -217,18 +234,32 @@ def _prompt(message: str, state: dict, history: str, memory: str,
         "action that already succeeded.\n"
         "5. STAY GROUNDED. Every number, operator and city in your reply must "
         "come from the trip summary or the observations — never invent fares.\n"
-        "6. WHEN THE JOB IS DONE, return NO actions and write `reply`: a warm, "
+        "6. DATES CASCADE AUTOMATICALLY. Adding a stop, nights or a leg reshifts "
+        "every later date — multi-day journeys arrive days later, the return leg "
+        "is re-pointed to the trip's real last city and re-searched live for the "
+        "new date, and request.return_date follows. When an observation says the "
+        "return moved, tell the user the new date plainly.\n"
+        "7. NEVER RECOMMEND A SOLD-OUT RIDE. Options marked SOLD OUT have no "
+        "bookable seats. If an observation says a date has nothing bookable but "
+        "a nearby date does, put that shift to the user as clarify_options "
+        "(unless they already agreed — then re-run add_leg with leg_date set to "
+        "the new date, which shifts the chain and re-searches).\n"
+        "8. WHEN THE JOB IS DONE, return NO actions and write `reply`: a warm, "
         "concrete summary of everything you did (route chain, days per stop, "
-        "real fares/totals) plus anything the user should decide next.\n\n"
+        "real fares/totals, changed dates) plus anything the user should decide "
+        "next.\n\n"
         "TOOLS (set only the args each needs):\n"
-        "- add_leg(leg_from, leg_to, mode?, leg_via?): add one transport hop of "
-        "a multi-city trip. Live-searches flights/trains/buses (and nearby "
-        "gateway hubs in parallel). If there's no direct route the observation "
-        "lists gateway cities — route through one with leg_via, or ask the user. "
-        "A leg back to the origin city is the return leg.\n"
+        "- add_leg(leg_from, leg_to, mode?, leg_via?, leg_date?): add one "
+        "transport hop of a multi-city trip. Live-searches flights/trains/buses "
+        "(and nearby gateway hubs in parallel). If there's no direct route the "
+        "observation lists gateway cities — route through one with leg_via, or "
+        "ask the user. A leg back to the origin city is the return leg. "
+        "leg_date on an EXISTING leg reschedules it: the chain bends so that "
+        "departure lands on that date and every affected leg is re-searched.\n"
         "- add_stop_itinerary(stop_city, stop_days): build a real N-day "
         "itinerary for a city on the trip and slot it in order. Use for every "
-        "'N days in X'.\n"
+        "'N days in X'. Also pulls live stays for that city's actual dates and "
+        "reshifts every later date (including the return) automatically.\n"
         "- select_leg_option(leg_id, mode, option_index, hop_index?): pick a "
         "specific ride on ANY leg of a multi-city trip — the TRIP GRAPH block "
         "lists each leg's id and its numbered options per hop ('the cheaper "
@@ -541,8 +572,17 @@ async def run_agent(
 
     # A loop we broke: the last real step IS the answer (e.g. the hotel results
     # the model kept re-fetching) — surface it plainly, not as "how far I got".
+    # Never verbatim-repeat the last step: the UI already showed it as a ✓ step,
+    # so an identical reply renders as a duplicated message.
     if looped and steps:
-        return _result(steps[-1], all_patches, steps, tools_used, pending_chips[:3])
+        if len(steps) == 1:
+            reply = f"Done — {steps[-1]}"
+        else:
+            reply = (
+                f"That's everything from your message — {len(steps)} changes "
+                f"applied (see the steps above). Most recent: {steps[-1]}"
+            )
+        return _result(reply, all_patches, steps, tools_used, pending_chips[:3])
     # Ran out of turns/budget or the planner errored: report what really happened.
     if steps:
         done = " ".join(steps[-3:])

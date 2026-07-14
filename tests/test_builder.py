@@ -27,6 +27,16 @@ def _offline_geocode(monkeypatch):
     monkeypatch.setattr("app.services.geo_nearby.geocode_city", _none)
 
 
+@pytest.fixture(autouse=True)
+def _offline_stop_hotels(monkeypatch):
+    """Stop the per-stop stay fetch hitting live hotel scrapers. Tests that care
+    about stays override this with their own fake."""
+    async def _none(node, travelers, budget):
+        return []
+
+    monkeypatch.setattr(builder, "_fetch_stop_hotels", _none)
+
+
 def _train_block(fare=800, dur=180, name="Shatabdi"):
     return {"trains": {"items": [
         {"train_name": name, "cheapest_fare": fare, "duration_min": dur,
@@ -575,6 +585,242 @@ def test_add_stop_itinerary_duplicate_is_noop(monkeypatch):
     # Same city + same day count → no rebuild (the pipeline is not hit again).
     assert dup_patches == [] and "already have a 2-day itinerary" in dup_reply
     assert calls["n"] == 1
+
+
+# ── Date cascade + return sync: the "add Chandigarh for 2 days" scenario ────────
+#
+# A generated A→B trip returning on the 19th; the user threads in city C for 2
+# days. The return must (1) leave from C, not B, (2) move out by the 2 extra
+# days, (3) be re-searched live for the new date, and (4) request.return_date
+# must follow. C also gets stays fetched for its REAL dates.
+
+def _pune_manali_state():
+    return {
+        "request": {"origin": "Pune", "destination": "Manali",
+                    "departure_date": "2026-07-16", "return_date": "2026-07-19",
+                    "travelers": 2, "budget_tier": "low", "stay_nights": 3},
+        "transport": {
+            "outbound_chain": ["Pune", "Manali"],
+            "going": _train_block(),
+            "return_journey": _train_block(fare=900, name="Return Exp"),
+        },
+        "stay": {"hotels": [{"name": "Old Manali Inn", "price_per_night": 1500}]},
+        "itinerary": {"days": [{"day": 1, "activities": []}]},
+        "costs": {"breakdown": {}},
+    }
+
+
+def test_add_stop_shifts_return_date_and_repoints_return(monkeypatch):
+    state = _pune_manali_state()
+    searches: list[tuple] = []
+
+    async def fake_journey(f, t, d, *a, **k):
+        searches.append((f, t, d))
+        return _train_block()
+
+    async def no_gateways(*a, **k):
+        return []
+
+    async def fake_trip(req, *a, **k):
+        return {"days": [{"day": i + 1, "activities": [{"title": f"CH {i+1}"}]}
+                         for i in range(req.days)]}
+
+    async def fake_stop_hotels(node, travelers, budget):
+        return [{"name": "Chandigarh Grand", "price_per_night": 1800}]
+
+    monkeypatch.setattr(builder, "_shaped_journey", fake_journey)
+    monkeypatch.setattr(builder, "_fetch_stop_hotels", fake_stop_hotels)
+    monkeypatch.setattr("app.services.geo_nearby.find_gateways", no_gateways)
+    monkeypatch.setattr("app.api.v1.plan_trip.orchestrator.run_plan_trip", fake_trip)
+
+    # "Add Chandigarh after Manali, we'll stay 2 days."
+    _run(builder.handle_add_leg(state, "u", "Manali", "Chandigarh"))
+    patches, reply = _run(builder.handle_add_stop_itinerary(state, "u", "Chandigarh", 2))
+
+    g = G.TripGraph.model_validate(state["graph"])
+    _, outbound, inbound = G.ordered_path(g)
+
+    # Return re-pointed to the real terminal and re-dated +2 nights.
+    assert inbound.from_city == "Chandigarh" and inbound.to_city == "Pune"
+    ch = g.node_by_city("Chandigarh")
+    assert ch.nights == 2
+    assert inbound.date == ch.departure_date
+    assert builder._days_between(ch.arrival_date, ch.departure_date) == 2
+    # …and it was re-SEARCHED for that date, not left with stale options.
+    assert (inbound.from_city, inbound.to_city, inbound.date) in [
+        (f, t, d) for f, t, d in searches
+    ]
+    assert inbound.routes and getattr(inbound, "searched_date", None) == inbound.date
+
+    # request.return_date follows the graph.
+    assert state["request"]["return_date"] == inbound.date
+
+    # City C got stays for its real 2-night window.
+    assert ch.stay.search_results[0]["name"] == "Chandigarh Grand"
+    assert getattr(ch.stay, "fetched_nights", None) == 2
+    assert "Chandigarh Grand" in reply or "live stays" in reply
+
+
+def test_resequence_uses_travel_days_for_multiday_journeys(monkeypatch):
+    """A 2-day train (dep 08:00, 43h) must land its destination's arrival 2 days
+    after departure — and push the stay + return accordingly."""
+    state = _base_state()
+
+    async def slow_train(f, t, *a, **k):
+        return {"trains": {"items": [
+            {"train_name": "Himalayan Queen", "cheapest_fare": 900,
+             "duration_min": 2600, "departure_time": "08:00"},
+        ]}}
+
+    async def no_gateways(*a, **k):
+        return []
+
+    monkeypatch.setattr(builder, "_shaped_journey", slow_train)
+    monkeypatch.setattr("app.services.geo_nearby.find_gateways", no_gateways)
+
+    _run(builder.handle_add_leg(state, "u", "Delhi", "Manali"))
+
+    g = G.TripGraph.model_validate(state["graph"])
+    manali = g.node_by_city("Manali")
+    # Departs 2026-08-01 08:00 + 2600 min → arrives on the 3rd.
+    assert manali.arrival_date == "2026-08-03"
+
+
+def test_add_leg_with_date_reschedules_existing_leg(monkeypatch):
+    """'Shift to <date>' on an existing leg bends the chain: the from-stop's
+    nights grow so its departure lands on the asked date, and stale legs are
+    re-searched."""
+    state = _pune_manali_state()
+
+    async def fake_journey(f, t, d, *a, **k):
+        return _train_block()
+
+    async def no_gateways(*a, **k):
+        return []
+
+    monkeypatch.setattr(builder, "_shaped_journey", fake_journey)
+    monkeypatch.setattr("app.services.geo_nearby.find_gateways", no_gateways)
+
+    # The derived return leaves Manali on the 19th; user shifts it to the 21st.
+    patches, reply, chips = _run(builder.handle_add_leg(
+        state, "u", "Manali", "Pune", date="2026-07-21",
+    ))
+
+    assert patches and not chips
+    g = G.TripGraph.model_validate(state["graph"])
+    _, _, inbound = G.ordered_path(g)
+    assert inbound.date == "2026-07-21"
+    assert state["request"]["return_date"] == "2026-07-21"
+    assert g.node_by_city("Manali").nights == 5   # 3 + 2 shifted days
+
+
+def test_sold_out_options_never_recommended():
+    hop = G.RouteHop(from_city="A", to_city="B", options=[
+        G.TransportOption(id="train-0", mode="train", fare_per_person=500, duration_min=300,
+                          raw={"available_classes": [{"availability": "WL 42"}]}),
+        G.TransportOption(id="train-1", mode="train", fare_per_person=900, duration_min=300,
+                          raw={"available_classes": [{"availability": "AVL 12"}]}),
+    ])
+    rec = G.recommended_option(hop, budget="low")
+    assert rec.id == "train-1"   # cheaper train is waitlist-only → skipped
+
+
+def test_projection_emits_segments_for_multimode_chain():
+    state = _real_planner_state()
+    g = G.derive_graph_from_legacy(state)
+    proj = G.project(state, g)
+    going = proj["/transport"]["going"]
+    segs = going["segments"]
+    assert [(s["from"], s["to"], s["mode"]) for s in segs] == [
+        ("Bengaluru City Railway Station", "Ahmedabad Junction", "train"),
+        ("Ahmedabad Junction", "Udaipur City Railway Station", "train"),
+    ]
+    assert "route_label" in going
+
+
+# ── The bhiwani→Udaipur disaster scenario (2026-07-14) ──────────────────────────
+#
+# Real failure: with the snapshot degraded (transport never persisted through a
+# TLS storm), the first edit's city became the ORIGIN, the return attached to
+# the wrong node, and adding Udaipur→Delhi pruned the Udaipur→Jaipur leg (a
+# revisited city formed an unwalkable cycle). These tests pin the fixes:
+# origin anchoring, revisit-as-new-node, and the single-return invariant.
+
+def test_empty_graph_anchors_origin_from_request(monkeypatch):
+    state = {
+        "request": {"origin": "bhiwani", "destination": "Udaipur",
+                    "departure_date": "2026-07-16", "travelers": 2,
+                    "budget_tier": "low", "stay_nights": 2},
+        "transport": {}, "itinerary": {}, "stay": {}, "costs": {},
+    }
+
+    async def fake_journey(f, t, *a, **k):
+        return _train_block()
+
+    async def no_gateways(*a, **k):
+        return []
+
+    monkeypatch.setattr(builder, "_shaped_journey", fake_journey)
+    monkeypatch.setattr("app.services.geo_nearby.find_gateways", no_gateways)
+
+    _run(builder.handle_add_leg(state, "u", "Udaipur", "Jaipur"))
+
+    g = G.TripGraph.model_validate(state["graph"])
+    origin = next(n for n in g.nodes if n.role == "origin")
+    assert origin.city == "bhiwani"          # NOT Udaipur
+    # A later leg home is recognised as the return (no stays pulled for home).
+    _, reply, _ = _run(builder.handle_add_leg(state, "u", "Jaipur", "Bhiwani"))
+    assert "live stays for Bhiwani" not in reply
+    g = G.TripGraph.model_validate(state["graph"])
+    ret = next(e for e in g.edges if e.to_node_id == origin.id)
+    assert ret.from_city == "Jaipur"
+
+
+def test_revisited_city_becomes_new_visit_not_cycle(monkeypatch):
+    """bhiwani→Udaipur trip; user adds Udaipur→Jaipur(2d)→Udaipur→Delhi(transit)
+    →bhiwani. Every leg must survive (no cycle pruning), Delhi gets no stays,
+    and exactly ONE return leg remains."""
+    state = _pune_manali_state()
+    state["request"].update({"origin": "bhiwani", "destination": "Udaipur"})
+    state["transport"]["outbound_chain"] = ["bhiwani", "Udaipur"]
+
+    async def fake_journey(f, t, *a, **k):
+        return _train_block()
+
+    async def no_gateways(*a, **k):
+        return []
+
+    async def fake_trip(req, *a, **k):
+        return {"days": [{"day": i + 1, "activities": [{"title": f"{req.destination} {i+1}"}]}
+                         for i in range(req.days)]}
+
+    monkeypatch.setattr(builder, "_shaped_journey", fake_journey)
+    monkeypatch.setattr("app.services.geo_nearby.find_gateways", no_gateways)
+    monkeypatch.setattr("app.api.v1.plan_trip.orchestrator.run_plan_trip", fake_trip)
+
+    _run(builder.handle_add_leg(state, "u", "Udaipur", "Jaipur"))
+    _run(builder.handle_add_stop_itinerary(state, "u", "Jaipur", 2))
+    _run(builder.handle_add_leg(state, "u", "Jaipur", "Udaipur"))
+    _, delhi_reply, _ = _run(builder.handle_add_leg(state, "u", "Udaipur", "Delhi"))
+    _run(builder.handle_add_leg(state, "u", "Delhi", "bhiwani"))
+
+    g = G.TripGraph.model_validate(state["graph"])
+    ordered, outbound, inbound = G.ordered_path(g)
+
+    # The whole chain walks: bhiwani → Udaipur → Jaipur → Udaipur(2nd) → Delhi.
+    assert [n.city for n in ordered[:5]] == ["bhiwani", "Udaipur", "Jaipur", "Udaipur", "Delhi"]
+    # The Udaipur→Jaipur leg SURVIVED adding Udaipur→Delhi later (the old bug
+    # pruned it because both legs resolved to the same Udaipur node).
+    assert any(e.from_city == "Udaipur" and e.to_city == "Jaipur" for e in outbound)
+    assert any(e.from_city == "Udaipur" and e.to_city == "Delhi" for e in outbound)
+    # Exactly one return leg, from Delhi.
+    origin = ordered[0]
+    returns = [e for e in g.edges if e.to_node_id == origin.id]
+    assert len(returns) == 1 and inbound.from_city == "Delhi"
+    # Transit Delhi: no stays attached.
+    delhi = next(n for n in ordered if n.city == "Delhi")
+    assert not delhi.stay.search_results
+    assert "live stays for Delhi" not in delhi_reply
 
 
 if __name__ == "__main__":
