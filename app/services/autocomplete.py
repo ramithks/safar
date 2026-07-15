@@ -16,7 +16,7 @@ import asyncio
 import logging
 import re as _re
 
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from app.services.curl_pool import get_curl_session
 
 from app.services import geo
 from app.services.scraper_proxy import with_proxy_fallback
@@ -72,7 +72,7 @@ async def _live_airports(q: str) -> list[dict]:
     returns. City field looks like "New Delhi(DEL)". Never raises.
     """
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _EMT_AUTOSUGGEST,
                 headers={

@@ -11,10 +11,10 @@ import asyncio
 import logging
 import re as _re
 import httpx
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from app.services.curl_pool import get_curl_session
 
 from app.config import settings
-from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
+from app.services.scraper_proxy import with_proxy_fallback
 from app.services.geo import iata_of as geo_iata, country_of, country_of_iata
 
 logger = logging.getLogger(__name__)
@@ -80,7 +80,7 @@ async def resolve_iata(city: str) -> str | None:
 
     # ── Fallback source 1: EaseMyTrip autosuggest (validated) ────────────────
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _EMT_AUTOSUGGEST,
                 headers={
@@ -150,7 +150,7 @@ async def search_flights(
     async def _do(proxy):
         # Tighter per-request timeout (12s) so several fresh-IP proxy retries fit
         # inside this scraper's own budget instead of hanging on one slow attempt.
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.get(
                 _BASE,
                 headers=_build_headers(),
@@ -171,17 +171,31 @@ async def search_flights(
             )
         r.raise_for_status()
         j = r.json()
-        # A genuine "no flights" response still carries the flightOffers key (empty
-        # list). Its absence means a WAF/error body, not real emptiness — treat as
-        # a block so the proxy retry fires and it isn't reported as "0 results".
-        if "flightOffers" not in j:
-            raise ScraperBlocked("flightOffers key missing")
+        # Classify the payload so we retry ONLY when a fresh IP could actually
+        # change the answer:
+        #   • HTML/WAF block → r.json() already raised → retried upstream.
+        #   • non-200        → raise_for_status already raised → retried upstream.
+        #   • 200 + valid JSON object WITHOUT flightOffers → this OD simply isn't
+        #     served (e.g. BAO→KUU). The body is deterministic; retrying 4× with
+        #     fresh IPs returns the identical payload and only churns TLS sockets
+        #     (a documented trigger of the Supabase bad_record_mac storm). Treat
+        #     it as a real empty result — no retry — and log the shape once so a
+        #     future Booking schema change is visible instead of silently empty.
+        if not isinstance(j, dict) or "flightOffers" not in j:
+            logger.warning(
+                "[flights_booking] %s→%s %s: 200 but no flightOffers key — treating as no-service (keys=%s) %.180s",
+                from_airport, to_airport, depart_date,
+                list(j.keys()) if isinstance(j, dict) else type(j).__name__,
+                str(j),
+            )
+            return {"flightOffers": []}
         return j
 
     try:
-        # 4 fresh-IP attempts for the brittle WAF, but cap the whole retry loop at
-        # 25s (< the 30s FlightService merge budget) so Booking's retries can never
-        # time out the shared gather and zero EMT/Gotogate too.
+        # Cap the whole retry loop at 25s (< the 30s FlightService merge budget) so
+        # Booking's retries can never time out the shared gather and zero
+        # EMT/Gotogate too. Structurally-empty payloads no longer retry at all
+        # (see _do), so the 4 attempts now only cover genuine transport/WAF errors.
         raw = await asyncio.wait_for(
             with_proxy_fallback("flights_booking", _do, proxy_attempts=4),
             timeout=25.0,
@@ -208,6 +222,14 @@ def _normalise_offer(offer: dict, depart_date: str = "", adults: int = 1) -> dic
 
     total_sec = seg.get("totalTime") or 0
     stops = len(legs) - 1
+
+    # Connection airports for multi-leg flights (where you change planes).
+    layover_airports = [
+        (lg.get("arrivalAirport") or {}).get("code")
+        for lg in legs[:-1] if (lg.get("arrivalAirport") or {}).get("code")
+    ]
+    checked_kg, cabin_kg = _offer_baggage(offer)
+    branded = offer.get("brandedFareInfo") or {}
 
     from_ap = (seg.get("departureAirport") or {}).get("code") or ""
     to_ap   = (seg.get("arrivalAirport")   or {}).get("code") or ""
@@ -242,4 +264,34 @@ def _normalise_offer(offer: dict, depart_date: str = "", adults: int = 1) -> dic
         "currency": (price_bd.get("total") or {}).get("currencyCode", "INR"),
         "booking_token": token,
         "booking_url": booking_url,
+        "source": "booking",
+        # ── Enriched signals ──
+        "baggage_kg": checked_kg,
+        "cabin_baggage_kg": cabin_kg,
+        "fare_type": branded.get("fareName") or None,       # e.g. "SpiceSaver"
+        "layover_airports": layover_airports or None,
     }
+
+
+def _offer_baggage(offer: dict) -> tuple[int | None, int | None]:
+    """(checked_kg, cabin_kg) from includedProducts, falling back to the branded
+    fare's baggage features. Both providers surface the same allowance two ways."""
+    checked = cabin = None
+    segs = (offer.get("includedProducts") or {}).get("segments") or []
+    for lug in (segs[0] if segs else []):
+        t, w = lug.get("luggageType"), lug.get("maxWeightPerPiece")
+        if t == "CHECKED_IN" and isinstance(w, (int, float)):
+            checked = int(w)
+        elif t == "HAND" and isinstance(w, (int, float)):
+            cabin = int(w)
+    if checked is None or cabin is None:
+        for feat in ((offer.get("brandedFareInfo") or {}).get("features") or []):
+            if feat.get("availability") != "INCLUDED":
+                continue
+            w = (feat.get("baggageInfo") or {}).get("weight")
+            fn = feat.get("featureName")
+            if fn == "CHECK_BAGGAGE" and checked is None and isinstance(w, (int, float)):
+                checked = int(w)
+            elif fn == "CABIN_BAGGAGE" and cabin is None and isinstance(w, (int, float)):
+                cabin = int(w)
+    return checked, cabin

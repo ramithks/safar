@@ -33,7 +33,7 @@ from pydantic import BaseModel
 
 from app.deps.auth import require_user
 from app.db.client import get_db
-from app.services.vertex import vertex_generate
+from app.services.vertex import muscle as vertex_muscle
 from app.services.places import search_places, photo_proxy_path
 
 logger = logging.getLogger(__name__)
@@ -113,7 +113,7 @@ async def _generate_with_retry(prompt: str, *, attempts: int = 2, per_attempt_ti
     for attempt in range(attempts):
         try:
             return await asyncio.wait_for(
-                vertex_generate(
+                vertex_muscle(
                     prompt,
                     response_mime_type="application/json",
                     temperature=0.7,

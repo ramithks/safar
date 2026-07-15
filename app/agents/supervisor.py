@@ -27,16 +27,18 @@ and adjusts cost figures rather than silently returning an unaffordable plan.
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from uuid import uuid4
 
 from .budget_agent import budget_agent_check
 from app.api.v1.plan_trip.constraints import validate_trip
 from app.api.v1.plan_trip.models import PlanRequest, PlanJourneyRequest, PlanTripRequest
-from app.api.v1.plan_trip.journey import run_plan_journey
+from app.api.v1.plan_trip.journey import run_plan_journey, reverse_route_plan
 from app.api.v1.plan_trip.orchestrator import run_plan_trip
 from app.api.v1.plan_trip.budget import compute_detailed_budget
 from app.api.v1.plan_trip.helpers import CURRENCY_CONFIG, fetch_user_profile
 from app.core.timing import RequestTrace
-from app.db.client import get_db
+from app.core.background import spawn_background
+from app.db.client import get_db, run_db, run_db_resilient
 
 logger = logging.getLogger(__name__)
 
@@ -246,12 +248,49 @@ def _assemble_costs(merged: dict) -> dict:
 
 # ── Main supervisor entry point ────────────────────────────────────────────────
 
-async def supervisor_run(body: PlanRequest, user_id: str) -> dict:
+async def _phase_wrap(tag: str, coro, on_phase):
+    """
+    Await an agent coroutine and fire the on_phase callback the moment it
+    finishes — this is what lets the streaming pipeline emit transport/itinerary
+    patches while the other agents are still running. Exceptions are returned
+    (not raised) to mirror gather(return_exceptions=True).
+    """
+    try:
+        res = await coro
+    except Exception as e:  # noqa: BLE001 — mirrored into results like gather does
+        if on_phase:
+            try:
+                await on_phase(tag, None, e)
+            except Exception as cb_err:  # noqa: BLE001 — callback must never kill the plan
+                logger.warning("[supervisor] on_phase(%s) failed: %s", tag, cb_err)
+        return e
+    if on_phase:
+        try:
+            await on_phase(tag, res, None)
+        except Exception as cb_err:  # noqa: BLE001
+            logger.warning("[supervisor] on_phase(%s) failed: %s", tag, cb_err)
+    return res
+
+
+async def supervisor_run(
+    body: PlanRequest, user_id: str, on_phase=None, save_legacy_tables: bool = True
+) -> dict:
     """
     Full plan orchestration with budget supervision.
 
     Drop-in replacement for run_plan() in plan.py.
     Adds a budget-intervention layer between merge and return.
+
+    on_phase: optional async callback (tag, result, error) fired as each agent
+    completes — tags: "journey", "itinerary", "return_journey". Used by the
+    Trip State streaming pipeline; blocking callers just omit it.
+
+    save_legacy_tables: when True (classic /api/v1/plan) the supervisor persists
+    the plan into the legacy `trips` + `trip_journey` tables (read by
+    users/endpoint.get_trip_journey). The v2 Trip State pipeline passes False:
+    it owns persistence (trip_states / trip_state_events + upsert_my_trip keyed
+    to the trip_state id), so these writes would be orphan rows with no reader —
+    and their resilient retries needlessly amplify the TLS-corruption storm.
     """
     stay_nights = max(1, body.days - 1)   # e.g. 4-day trip → 3 hotel nights
 
@@ -295,16 +334,22 @@ async def supervisor_run(body: PlanRequest, user_id: str) -> dict:
 
     # ── Phase 1: Fetch shared profile once, then run all agents in parallel ──────
     trace = RequestTrace(f"supervisor_{user_id[:8]}")
-    _db = get_db()
-    loop = asyncio.get_event_loop()
-    shared_profile = await loop.run_in_executor(None, fetch_user_profile, _db, user_id)
+    # get_db() inside the DB executor thread — clients must not cross threads.
+    shared_profile = await run_db(lambda: fetch_user_profile(get_db(), user_id))
 
     coros = [
-        run_plan_journey(journey_req, user_id, profile=shared_profile),
-        run_plan_trip(trip_req, user_id, trace=trace, profile=shared_profile),
+        _phase_wrap("journey", run_plan_journey(journey_req, user_id, profile=shared_profile), on_phase),
+        _phase_wrap("itinerary", run_plan_trip(trip_req, user_id, trace=trace, profile=shared_profile), on_phase),
     ]
     if return_journey_req:
-        coros.append(run_plan_journey(return_journey_req, user_id, profile=shared_profile))
+        # Compute the return in parallel, but DON'T narrate it yet (on_phase=None):
+        # if the outbound turns out to be a multi-hop route we re-plan the return
+        # to mirror it, then fire the phase once with the final version.
+        coros.append(_phase_wrap(
+            "return_journey",
+            run_plan_journey(return_journey_req, user_id, profile=shared_profile),
+            None,
+        ))
 
     logger.info(
         "[supervisor] %s → %s (%dd, %s budget, %d travelers) — launching agents",
@@ -323,6 +368,34 @@ async def supervisor_run(body: PlanRequest, user_id: str) -> dict:
     journey_result       = results[0]
     trip_result          = results[1]
     return_journey_result = results[2] if return_journey_req else None
+
+    # ── Phase 1b: mirror the return to the outbound's hubs on multi-hop routes ──
+    # The way back should retrace A→B→C→D as D→C→B→A rather than being planned
+    # independently (which can pick different hubs). Only fires for genuine
+    # multi-hop outbounds; single-hop trips keep the parallel result untouched.
+    if return_journey_req:
+        mirror = (
+            reverse_route_plan(journey_result)
+            if journey_result and not isinstance(journey_result, Exception)
+            else None
+        )
+        if mirror:
+            try:
+                mirrored = await run_plan_journey(
+                    return_journey_req, user_id, profile=shared_profile, forced_route=mirror,
+                )
+                if mirrored and not isinstance(mirrored, Exception):
+                    return_journey_result = mirrored
+                    logger.info("[supervisor] return journey mirrored to outbound hubs")
+            except Exception as e:  # noqa: BLE001 — keep the independent return on failure
+                logger.warning("[supervisor] return mirror failed: %s", str(e)[:120])
+        # Narrate the return once, now that it's settled.
+        if on_phase:
+            exc = return_journey_result if isinstance(return_journey_result, Exception) else None
+            try:
+                await on_phase("return_journey", None if exc else return_journey_result, exc)
+            except Exception as cb_err:  # noqa: BLE001 — callback must never kill the plan
+                logger.warning("[supervisor] on_phase(return_journey) failed: %s", cb_err)
 
     # ── Phase 2: Merge ────────────────────────────────────────────────────────
     merged: dict = {}
@@ -421,50 +494,51 @@ async def supervisor_run(body: PlanRequest, user_id: str) -> dict:
     )
 
     # ── Phase 5: DB writes — save trip synchronously to get trip_id ─────────────
-    try:
-        db = get_db()
-        loop = asyncio.get_event_loop()
+    # Only the legacy /api/v1/plan path persists here; the v2 Trip State pipeline
+    # owns persistence and would otherwise write orphan `trips`/`trip_journey`
+    # rows (see save_legacy_tables docstring).
+    if save_legacy_tables:
+        try:
+            itinerary_data = {
+                k: merged[k]
+                for k in ("trip_name", "destination", "destination_description",
+                          "cover_photo_ref", "days",
+                          "trip_intelligence", "currency")
+                if k in merged
+            }
 
-        itinerary_data = {
-            k: merged[k]
-            for k in ("trip_name", "destination", "destination_description",
-                      "cover_photo_ref", "days",
-                      "trip_intelligence", "currency")
-            if k in merged
-        }
+            # Client-generated id → idempotent upsert, so the resilient retry can
+            # re-send through a TLS-corruption storm without duplicating the trip.
+            trip_id = str(uuid4())
+            await run_db_resilient(lambda: (
+                get_db().table("trips").upsert({
+                    "id": trip_id,
+                    "user_id": user_id,
+                    "title": merged.get("trip_name") or body.destination,
+                    "destination": body.destination,
+                    "start_date": body.departure_date or None,
+                    "end_date": end_date or None,
+                    "budget": None,
+                    "currency": merged.get("currency") or "INR",
+                    "itinerary_data": itinerary_data,
+                    "is_public": False,
+                }, on_conflict="id").execute()
+            ), label="supervisor.trips")
 
-        trip_row = await loop.run_in_executor(None, lambda: (
-            db.table("trips").insert({
-                "user_id": user_id,
-                "title": merged.get("trip_name") or body.destination,
-                "destination": body.destination,
-                "start_date": body.departure_date or None,
-                "end_date": end_date or None,
-                "budget": None,
-                "currency": merged.get("currency") or "INR",
-                "itinerary_data": itinerary_data,
-                "is_public": False,
-            }).execute()
-        ))
-
-        trip_id = (trip_row.data or [{}])[0].get("id")
-        if trip_id:
             merged["trip_id"] = trip_id
-            asyncio.create_task(_save_trip_journey(user_id, body, merged, end_date, trip_id))
-        else:
-            logger.warning("[supervisor] Auto-save: trips insert returned no id")
+            spawn_background(
+                _save_trip_journey(user_id, body, merged, end_date, trip_id),
+                name=f"save_trip_journey:{trip_id}",
+            )
 
-    except Exception as e:
-        logger.warning("[supervisor] Failed to auto-save trip: %s", e)
+        except Exception as e:
+            logger.warning("[supervisor] Failed to auto-save trip: %s", e)
 
     return merged
 
 
 async def _save_trip_journey(user_id: str, body: PlanRequest, merged: dict, end_date: str | None, trip_id: str) -> None:
     try:
-        db = get_db()
-        loop = asyncio.get_event_loop()
-
         def _to_numeric(v):
             try:
                 return float(v) if v is not None else None
@@ -487,8 +561,10 @@ async def _save_trip_journey(user_id: str, body: PlanRequest, merged: dict, end_
             "intervention": costs.get("intervention"),
         }
 
-        await loop.run_in_executor(None, lambda: (
-            db.table("trip_journey").insert({
+        journey_id = str(uuid4())
+        await run_db_resilient(lambda: (
+            get_db().table("trip_journey").upsert({
+                "id": journey_id,
                 "trip_id": trip_id,
                 "user_id": user_id,
                 "origin": body.origin,
@@ -520,8 +596,8 @@ async def _save_trip_journey(user_id: str, body: PlanRequest, merged: dict, end_
                 "supervisor_action": costs.get("intervention"),
                 "budget_status": budget_status,
                 "trip_validation": merged.get("trip_validation"),
-            }).execute()
-        ))
+            }, on_conflict="id").execute()
+        ), label="supervisor.trip_journey")
 
     except Exception as e:
         logger.warning("[supervisor] Failed to auto-save trip: %s", e)

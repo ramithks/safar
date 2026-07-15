@@ -16,11 +16,23 @@ import math
 import re
 from difflib import SequenceMatcher
 
-_MAX_SAME_CATEGORY = 2
+# Per-Gemini-category cap is now RELATIVE to trip length (see
+# _category_cap) — a 6-day trip can legitimately hit more temples/cafes than a
+# 2-day one without feeling repetitive. This floor applies to very short trips.
+_MIN_CATEGORY_CAP = 3
 
-# Hard ceiling on activities per day — 4+ places in one day isn't realistically
-# doable, and users flagged overpacked days. Prompt asks for 2-3; this enforces it.
-_MAX_ACTIVITIES_PER_DAY = 3
+# Soft ceiling on activities per day. Days are no longer squeezed down to 2-3 —
+# a full, travel-agent-grade day can hold more. We only trim genuinely
+# unrealistic days (see _MAX_ACTIVITIES_PER_DAY) and let the copilot add more
+# spots on demand. Prompt asks for 3-5; this is the hard upper bound.
+_MAX_ACTIVITIES_PER_DAY = 6
+
+
+def _category_cap(days: list[dict]) -> int:
+    """How many activities may share one Gemini category across the whole trip.
+    Scales with trip length so longer trips aren't force-diversified into thin,
+    repetitive days."""
+    return max(_MIN_CATEGORY_CAP, len(days))
 
 # Suffixes that indicate a "revisit" — normalized away before dup comparison
 _REVISIT_TOKENS = frozenset({
@@ -204,11 +216,12 @@ def trip_health_check(days: list[dict]) -> dict:
 
 def enforce_category_diversity(days: list[dict]) -> int:
     """
-    Allow max _MAX_SAME_CATEGORY activities per Gemini category across the whole trip.
-    Removes the weakest (lowest confidence_score) excess activities per category.
-    Guarantees each day retains at least 2 activities — restores the best cut activity if needed.
-    Returns count removed.
+    Allow up to _category_cap() activities per Gemini category across the whole
+    trip (scales with trip length). Removes the weakest (lowest confidence_score)
+    excess activities per category. Guarantees each day retains at least 2
+    activities — restores the best cut activity if needed. Returns count removed.
     """
+    cap = _category_cap(days)
     by_cat: dict[str, list[tuple[int, dict]]] = {}
     for d_idx, day in enumerate(days):
         for act in (day.get("activities") or []):
@@ -216,11 +229,11 @@ def enforce_category_diversity(days: list[dict]) -> int:
             by_cat.setdefault(cat, []).append((d_idx, act))
 
     for cat, pairs in by_cat.items():
-        if len(pairs) <= _MAX_SAME_CATEGORY:
+        if len(pairs) <= cap:
             continue
         # Weakest first — those are candidates for removal
         pairs.sort(key=lambda x: x[1].get("confidence_score", 0.5))
-        for _d_idx, act in pairs[: len(pairs) - _MAX_SAME_CATEGORY]:
+        for _d_idx, act in pairs[: len(pairs) - cap]:
             act["_diversity_cut"] = True
 
     removed = 0

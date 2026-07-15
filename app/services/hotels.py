@@ -24,7 +24,8 @@ from app.core.metrics import METRICS
 from app.services.scoring import score_hotels
 from app.services.hotels_filters import (
     budget_to_hotel_sort, derive_travel_type, preferred_types,
-    filter_and_rank_by_persona,
+    filter_and_rank_by_persona, sanitize_hotel_filters, apply_hotel_filters,
+    sort_hotels,
 )
 from app.services.hotels_destination import normalize_destination, distance_km_for
 
@@ -64,6 +65,7 @@ class HotelService:
         sort: str | None = None,
         max_distance_km: float | None = None,
         currency_code: str = "inr",
+        filters: dict | None = None,
     ) -> dict:
         from datetime import datetime
         try:
@@ -76,10 +78,19 @@ class HotelService:
         dest  = normalize_destination(destination)
         city  = dest.query
 
+        # Explicit user filters (canonical vocabulary, see hotels_filters) are
+        # HARD and override the persona/budget soft heuristics they overlap:
+        # explicit property types replace the persona matrix, an explicit price
+        # range disables the budget tier's price band, an explicit sort beats
+        # the budget→sort mapping.
+        filters        = sanitize_hotel_filters(filters)
+        explicit_types = filters.get("property_types")
+        explicit_price = "price_min" in filters or "price_max" in filters
+
         # Persona + budget drive property type; budget drives sort (budget wins).
         persona      = derive_travel_type(adults, travel_type)
-        ptypes       = preferred_types(persona, budget)
-        canonical_sort = budget_to_hotel_sort(budget) or sort or "recommended"
+        ptypes       = explicit_types or preferred_types(persona, budget)
+        canonical_sort = filters.get("sort") or budget_to_hotel_sort(budget) or sort or "recommended"
 
         emt_r, booking_r, agoda_r, ixigo_r = await asyncio.gather(
             breaker_emt.call(
@@ -120,7 +131,11 @@ class HotelService:
             raw = len(result)
             # Per-provider contribution to this search (drives avg_result_count).
             METRICS.record_search(name, raw_count=raw, deduped_count=raw)
-            budget_filtered = _filter_by_budget(result, budget, currency_code)
+            # With explicit filters the budget band moves AFTER the hard filters
+            # (see below) — pre-dropping here would starve them: a mid-tier band
+            # would remove the only ₹16k sea-view resort before the facility
+            # filter ever saw it.
+            budget_filtered = result if filters else _filter_by_budget(result, budget, currency_code)
             all_hotels.extend(budget_filtered)
             sources.append(name)
             return f"✓ {len(budget_filtered)}/{raw}"
@@ -142,6 +157,7 @@ class HotelService:
         if not all_hotels:
             return {"hotels": [], "source": "none", "nights": nights,
                     "travel_type": persona, "property_types": ptypes,
+                    "filters_applied": filters or None, "filters_relaxed": False,
                     "destination": dest.display_name, "dest_class": dest.dest_class}
 
         total_raw = len(all_hotels)
@@ -154,20 +170,58 @@ class HotelService:
         # composite (price+rating+reviews+distance+provider+images+amenities+
         # freshness) — replaces the old richness-only ordering.
         scored = score_hotels(nearby)
+        # Hard user filters FIRST — the soft persona/budget shaping below must
+        # never starve an explicit request (e.g. couple/mid prefers hotels, but
+        # "free cancellation" may only match a hostel). If nothing survives,
+        # fall back to the unfiltered pool with filters_relaxed=True so callers
+        # can say so instead of showing an empty screen.
+        filtered = apply_hotel_filters(scored, filters)
+        relaxed = bool(filters) and not filtered
+        if relaxed:
+            filtered = scored
         # Soft persona filter: keep the persona's preferred property types (never
         # empties); a STABLE sort by persona tier preserves rank_score order within
         # each tier, so preferred types lead and the best-scored lead within them.
-        persona_filtered = filter_and_rank_by_persona(scored, persona, budget)
-        hotels_with_map = [_add_map_url(h) for h in persona_filtered]
+        # Explicit property types skip it — the hard filter above was the request.
+        if not explicit_types:
+            filtered = filter_and_rank_by_persona(filtered, persona, budget)
+        if filters and not explicit_price and not relaxed:
+            # Budget band was skipped per-source when filters exist; re-apply it
+            # softly (never empties) so the tier still shapes prices unless the
+            # user set an explicit price range.
+            filtered = _filter_by_budget(filtered, budget, currency_code)
+        if filters.get("sort"):
+            filtered = sort_hotels(filtered, filters["sort"])
+        hotels_with_map = [_add_map_url(h) for h in filtered]
+
+        # Grow the hotels master table with whatever came back — async, best-effort,
+        # so EVERY hotel fetch persists (workspace copilot search included), not just
+        # the /plan path. Idempotent upsert on (source, source_hotel_id).
+        self._persist_master(hotels_with_map, dest.display_name)
+
         return {
             "hotels": hotels_with_map,
             "source": "+".join(sources),
             "nights": nights,
             "travel_type": persona,
             "property_types": ptypes,
+            "filters_applied": filters or None,
+            "filters_relaxed": relaxed,
             "destination": dest.display_name,
             "dest_class": dest.dest_class,
         }
+
+
+    @staticmethod
+    def _persist_master(hotels: list[dict], destination: str) -> None:
+        try:
+            import asyncio
+            from app.services.hotel_store import save_hotels_master
+            asyncio.create_task(save_hotels_master(hotels, destination))
+        except RuntimeError:
+            pass  # no running loop (e.g. sync context) — skip, non-critical
+        except Exception:  # noqa: BLE001 — persistence must never break search
+            pass
 
 
 def _add_map_url(hotel: dict) -> dict:
@@ -226,75 +280,113 @@ def _filter_by_budget(hotels: list[dict], budget: str, currency_code: str = "inr
     return filtered if filtered else hotels
 
 
+# Metadata carried across duplicate providers onto the representative row when it's
+# missing the field. Includes the enriched signals the parsers now emit (subscores,
+# pricing story, scarcity, social proof, landmarks) — a hotel that's bare on the
+# cheapest provider still shows the richest provider's metadata. Price + booking_url
+# are NEVER borrowed (they must stay from the same provider), so what we display
+# always matches the link we send the user to.
+_MERGE_FIELDS = (
+    # original set
+    "amenities", "review_label", "free_cancellation", "free_cancellation_until",
+    "meal_plan", "highlights", "couple_friendly", "distance_km",
+    "no_prepayment", "is_breakfast_included", "checkin_time", "checkout_time",
+    # rating/identity (fill if the cheap provider didn't carry them)
+    "review_score", "review_count", "star_rating", "property_type", "description",
+    "address", "lat", "lon",
+    # enriched signals (Agoda/Booking parser enrichment)
+    "subscores", "recommendation_score", "review_snippet", "landmarks",
+    "nearest_transport", "room_facilities", "has_private_pool", "room_size_sqm",
+    "free_wifi", "social_proof", "people_looking", "badges", "top_selling_point",
+    "is_popular", "family_friendly", "has_airport_transfer",
+    "price_original", "savings", "discount_pct", "discount_label", "available_rooms",
+)
+
+
+def _hotel_price(h: dict) -> float | None:
+    try:
+        v = h.get("price_per_night") or h.get("estimated_price_per_night")
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _deduplicate_by_name(hotels: list[dict]) -> list[dict]:
     """
-    Remove near-duplicate entries (same hotel listed by multiple sources).
-    When duplicates exist, keep the entry with the most data:
-    booking_url + price_per_night + photos score highest.
-    Enrichment fields (amenities, review_label, free_cancellation, etc.) are
-    merged from the loser into the winner so no data is discarded.
+    Collapse the same hotel listed by multiple sources into one row.
+
+    Representative = the CHEAPEST *bookable* listing (booking_url + a live price), so
+    a budget traveller isn't shown a pricier duplicate just because it had richer
+    metadata — and the price we display always matches the link we send them to.
+    Ties, and groups with no bookable listing, fall back to the RICHEST listing.
+    Every other listing's metadata is then unioned onto the representative
+    (``_MERGE_FIELDS`` + photos up to 6), so no scraped signal is discarded.
     """
     def _richness(h: dict) -> int:
         return (
             bool(h.get("booking_url")) * 10
-            + bool(h.get("price_per_night") or h.get("estimated_price_per_night")) * 5
+            + bool(_hotel_price(h)) * 5
             + min(len(h.get("photos") or []), 5)
             + bool(h.get("address")) * 2
             + bool(h.get("review_score") or h.get("star_rating") or h.get("google_rating"))
         )
 
+    def _bookable(h: dict) -> bool:
+        return bool(h.get("booking_url")) and (_hotel_price(h) or 0) > 0
+
     def _norm(name: str) -> str:
         """Normalize hotel name for dedup — strip spaces/punctuation, first 24 chars."""
         return "".join(c for c in (name or "").lower() if c.isalnum())[:24]
 
-    # Fields to carry over from the loser if the winner is missing them
-    _MERGE_FIELDS = (
-        "amenities", "review_label", "free_cancellation", "free_cancellation_until",
-        "meal_plan", "highlights", "couple_friendly", "distance_km",
-        "no_prepayment", "is_breakfast_included", "checkin_time", "checkout_time",
-    )
+    def _better(cand: dict, cur: dict) -> bool:
+        """Is `cand` a better representative of the same hotel than `cur`?
+        Cheapest bookable wins (consistent price↔link); else richest."""
+        cb, rb = _bookable(cand), _bookable(cur)
+        if cb != rb:
+            return cb                      # a bookable listing beats a non-bookable one
+        if cb and rb:
+            pc, pr = _hotel_price(cand), _hotel_price(cur)
+            if pc is not None and pr is not None and pc != pr:
+                return pc < pr             # both bookable → the cheaper one represents
+        return _richness(cand) > _richness(cur)
 
-    seen: dict[str, dict] = {}
+    def _absorb(winner: dict, other: dict) -> None:
+        for field in _MERGE_FIELDS:
+            if not winner.get(field) and other.get(field) not in (None, "", [], {}):
+                winner[field] = other[field]
+        w_photos = winner.get("photos") or []
+        if len(w_photos) < 6:
+            for p in (other.get("photos") or []):
+                if p not in w_photos:
+                    w_photos.append(p)
+                if len(w_photos) >= 6:
+                    break
+            winner["photos"] = w_photos
+
+    # Group by normalized name, preserving first-seen order.
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
     for h in hotels:
         key = _norm(h.get("name", ""))
         if not key:
             continue
-        if key not in seen or _richness(h) > _richness(seen[key]):
-            if key in seen:
-                # Merge enrichment fields from the old winner into the new winner
-                old = seen[key]
-                for field in _MERGE_FIELDS:
-                    if not h.get(field) and old.get(field):
-                        h[field] = old[field]
-                # Merge photos if the new winner has fewer than 6 photos
-                h_photos = h.get("photos") or []
-                old_photos = old.get("photos") or []
-                if len(h_photos) < 6 and old_photos:
-                    for p in old_photos:
-                        if p not in h_photos:
-                            h_photos.append(p)
-                        if len(h_photos) >= 6:
-                            break
-                    h["photos"] = h_photos
-            seen[key] = h
-        else:
-            # Current entry lost — merge its enrichment into the existing winner
-            winner = seen[key]
-            for field in _MERGE_FIELDS:
-                if not winner.get(field) and h.get(field):
-                    winner[field] = h[field]
-            # Merge photos if the winner has fewer than 6 photos
-            winner_photos = winner.get("photos") or []
-            h_photos = h.get("photos") or []
-            if len(winner_photos) < 6 and h_photos:
-                for p in h_photos:
-                    if p not in winner_photos:
-                        winner_photos.append(p)
-                    if len(winner_photos) >= 6:
-                        break
-                winner["photos"] = winner_photos
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(h)
 
-    # Sort: richest entries first (booking_url > price > photos)
-    result = list(seen.values())
+    result: list[dict] = []
+    for key in order:
+        members = groups[key]
+        winner = members[0]
+        for m in members[1:]:
+            if _better(m, winner):
+                winner = m
+        for m in members:
+            if m is not winner:
+                _absorb(winner, m)
+        result.append(winner)
+
+    # Richest first (a stable starting order; score_hotels re-sorts by rank_score next).
     result.sort(key=_richness, reverse=True)
     return result

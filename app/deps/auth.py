@@ -14,6 +14,7 @@ Usage:
 """
 import asyncio
 import logging
+import time
 from types import SimpleNamespace
 
 import jwt
@@ -27,6 +28,16 @@ logger = logging.getLogger(__name__)
 
 _supabase_client: Client | None = None
 _jwks_client: jwt.PyJWKClient | None = None
+
+# Verified-token cache: token → (user, expires_at). A burst of parallel requests
+# (the workspace fires several GETs at once) must not each pay a network
+# verification — and must not each be able to fail one.
+_token_cache: dict[str, tuple[SimpleNamespace, float]] = {}
+_TOKEN_CACHE_TTL = 300.0
+_TOKEN_CACHE_MAX = 1024
+
+_REMOTE_RETRIES = 3
+_hinted_missing_secret = False
 
 
 def _get_auth_client() -> Client:
@@ -57,6 +68,14 @@ def _verify_local(token: str):
 
     if alg == "HS256":
         if not settings.supabase_jwt_secret:
+            global _hinted_missing_secret
+            if not _hinted_missing_secret:
+                _hinted_missing_secret = True
+                logger.warning(
+                    "HS256 token but SUPABASE_JWT_SECRET is not set — every request "
+                    "falls back to a network verification round-trip. Set "
+                    "SUPABASE_JWT_SECRET to verify locally."
+                )
             return None
         payload = jwt.decode(
             token,
@@ -73,13 +92,62 @@ def _verify_local(token: str):
     return SimpleNamespace(id=payload["sub"], email=payload.get("email"))
 
 
+def _is_transient(exc: Exception) -> bool:
+    """A network hiccup (EAGAIN, timeouts, supabase AuthRetryableError), not a
+    verdict on the token. Must never be reported to the client as a 401 — the
+    frontend treats 401 as 'logged out'."""
+    if isinstance(exc, (OSError, ConnectionError, TimeoutError)):
+        return True
+    return "retryable" in type(exc).__name__.lower()
+
+
 def _verify_remote(token: str):
-    """Network fallback: ask Supabase Auth to validate the token."""
+    """Network fallback: ask Supabase Auth to validate the token. Retries
+    transient failures with a short backoff; re-raises the last transient error
+    so the caller can answer 503 instead of 401."""
     client = _get_auth_client()
-    result = client.auth.get_user(token)
-    if not result or not result.user:
+    last_exc: Exception | None = None
+    for attempt in range(_REMOTE_RETRIES):
+        try:
+            result = client.auth.get_user(token)
+            if not result or not result.user:
+                return None
+            return result.user
+        except Exception as exc:  # noqa: BLE001 — classify below
+            if not _is_transient(exc):
+                raise
+            last_exc = exc
+            if attempt < _REMOTE_RETRIES - 1:
+                time.sleep(0.2 * (attempt + 1))
+    raise last_exc  # type: ignore[misc]
+
+
+def _cache_get(token: str):
+    hit = _token_cache.get(token)
+    if not hit:
         return None
-    return result.user
+    user, expires_at = hit
+    if time.monotonic() >= expires_at:
+        _token_cache.pop(token, None)
+        return None
+    return user
+
+
+def _cache_put(token: str, user) -> None:
+    if len(_token_cache) >= _TOKEN_CACHE_MAX:
+        _token_cache.clear()
+    ttl = _TOKEN_CACHE_TTL
+    try:  # never cache past the token's own expiry
+        exp = jwt.decode(token, options={"verify_signature": False}).get("exp")
+        if exp:
+            ttl = min(ttl, max(exp - time.time(), 0))
+    except Exception:  # noqa: BLE001
+        pass
+    if ttl > 0:
+        _token_cache[token] = (
+            SimpleNamespace(id=user.id, email=getattr(user, "email", None)),
+            time.monotonic() + ttl,
+        )
 
 
 async def require_user(authorization: str = Header(...)):
@@ -95,6 +163,11 @@ async def require_user(authorization: str = Header(...)):
     if not settings.supabase_url or not settings.supabase_anon_key:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Auth not configured")
 
+    cached = _cache_get(token)
+    if cached is not None:
+        sentry_sdk.set_user({"id": str(cached.id), "email": cached.email})
+        return cached
+
     try:
         # to_thread: JWKS fetch (first call) and the supabase fallback are
         # blocking I/O — keep them off the event loop.
@@ -103,6 +176,7 @@ async def require_user(authorization: str = Header(...)):
             user = await asyncio.to_thread(_verify_remote, token)
         if user is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+        _cache_put(token, user)
         # Tag Sentry events with the Supabase user so issues are traceable back
         # to a specific user/row in Supabase.
         sentry_sdk.set_user({"id": str(user.id), "email": getattr(user, "email", None)})
@@ -113,5 +187,13 @@ async def require_user(authorization: str = Header(...)):
         logger.info(f"JWT rejected: {type(e).__name__}: {e}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
     except Exception as e:
+        if _is_transient(e):
+            # The token was never judged invalid — we just couldn't reach the
+            # verifier. 503 tells the client to retry, not to log the user out.
+            logger.warning(f"Token verification unreachable: {type(e).__name__}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Auth service temporarily unreachable — retry",
+            )
         logger.warning(f"Token verification failed: {type(e).__name__}: {e}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token verification failed")

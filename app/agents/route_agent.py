@@ -15,7 +15,7 @@ Solution:
 Integration: called at the end of run_plan_journey() after live data is in.
 """
 import logging
-from app.services.vertex import vertex_generate, extract_json
+from app.services.vertex import brain as vertex_brain, extract_json
 from app.api.v1.plan_trip.helpers import CURRENCY_CONFIG, with_retry
 
 logger = logging.getLogger(__name__)
@@ -169,7 +169,7 @@ async def route_agent_decide(
 
     try:
         raw = await with_retry(
-            vertex_generate, prompt,
+            vertex_brain, prompt,
             response_mime_type="application/json",
             timeout=30.0,
             fallback=None,

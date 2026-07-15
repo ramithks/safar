@@ -14,7 +14,7 @@ import logging
 import re
 import time
 import urllib.parse
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from app.services.curl_pool import get_curl_session, CurlAsyncSession
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.padding import PKCS7
 
@@ -138,7 +138,7 @@ async def _resolve_iata_city(iata: str) -> tuple[str, str]:
         return _CITY_CACHE[key]
 
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _AUTOSUGGEST_URL, headers=_AUTOSUGGEST_HEADERS,
                 json={"Prefix": iata}, timeout=8,
@@ -265,7 +265,7 @@ async def search_flights(
         # path) before with_proxy_fallback escalates to the slow proxy retries.
         # Jumping straight to proxy would re-run the UMS+PSP handshake over the
         # proxy and burn the whole 25s budget before the fresh-token search lands.
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             for token_attempt in range(2):
                 payload["TKN"] = await _get_search_token(s)
                 r = await s.post(
@@ -385,10 +385,14 @@ def _parse_new_format(
         stp_raw = bundle.get("stp")
         stops = int(stp_raw) if stp_raw is not None else (len(fl_indices) - 1)
 
+        legs      = [dct.get(str(i)) or {} for i in fl_indices]
         first_leg = dct.get(str(fl_indices[0]))
         last_leg  = dct.get(str(fl_indices[-1]))
         if not first_leg:
             continue
+
+        # Connection airports for multi-leg flights (where you change planes).
+        layover_airports = [_resolve(lg.get("DT", "")) for lg in legs[:-1] if lg.get("DT")]
 
         ac  = first_leg.get("AC", "")
         fn  = first_leg.get("FN", "")
@@ -440,9 +444,31 @@ def _parse_new_format(
             "currency": "INR",
             "booking_url": emt_search_url,
             "source": "easemytrip",
+            # ── Enriched signals (fields absent from EMT's listing response —
+            # aircraft/co2/refundability — are detail-call only, so omitted) ──
+            "cabin_baggage_kg": _safe_int(first_leg.get("HBW")),
+            "fare_type": seg.get("FareTypeUI") or None,          # Regular / Corporate / Student
+            "savings": _safe_int(seg.get("Saving")) or None,
+            "departure_terminal": first_leg.get("DTER") or None,
+            "arrival_terminal": (last_leg or first_leg).get("ATER") or None,
+            "self_transfer": _truthy(first_leg.get("IsSelfT")),
+            "layover_airports": layover_airports or None,
         })
 
     return results
+
+
+def _truthy(v) -> bool | None:
+    """EMT flags come as bool / 0-1 / 'true'-'R'-'Y'. Normalise to bool, None if absent."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "y", "yes", "r", "refundable")
+    return None
 
 
 def _parse_emt_datetime(date_str: str, time_str: str) -> str | None:

@@ -25,6 +25,20 @@ class Settings(BaseSettings):
     # Path to a service account JSON key; leave unset to use ADC
     google_application_credentials: Optional[str] = None
 
+    # LLM gateway tiers — model IDs live in config ONLY (never hardcode at call
+    # sites). "brain" handles reasoning-heavy calls (itinerary, journey tradeoffs,
+    # re-ranking); "muscle" handles high-volume schema-bound transforms
+    # (extraction, tagging, onboarding). Swap to gemini-3.5-flash /
+    # gemini-3.1-flash-lite via env once regional availability is confirmed.
+    vertex_model_brain: str = "gemini-2.5-flash"
+    vertex_model_muscle: str = "gemini-2.5-flash-lite"
+
+    # Embeddings for the recommendation engine (docs/recommendation_engine.md).
+    # 384-dim is deliberate: ~4k hotels, not 100M docs — half the RAM/index, no
+    # measurable recall loss at this scale.
+    vertex_model_embedding: str = "text-embedding-005"
+    embedding_dim: int = 384
+
     # Vertex fallback account — tried only when the primary project returns 429
     # (RESOURCE_EXHAUSTED). Lets a rate-limited Gemini call retry instantly against
     # a second project's independent quota. Both optional; omit to disable fallback.
@@ -103,6 +117,37 @@ class Settings(BaseSettings):
 
     # CORS — comma-separated list of allowed origins, or "*" for all
     allowed_origins: str = "*"
+
+    # Threads (and thus thread-local Supabase clients) for the dedicated DB
+    # executor. Caps concurrent DB ops per process; raise to relieve /plan
+    # contention, but each thread holds its own connection pool.
+    db_executor_workers: int = 4
+
+    # Hard ceiling (seconds) on any single request before the server returns 504.
+    # Backstops per-endpoint timeouts so a wedged scraper/upstream can't pin a
+    # worker connection open forever. 0 disables the middleware.
+    request_timeout_seconds: float = 210.0
+
+    # ── Resilience / load-shedding ───────────────────────────────────────────
+    # Max trip generations running at once PER WORKER PROCESS. Beyond this, new
+    # generations queue (they don't fail) — the trip row exists and the frontend
+    # sees a "queued" event until a slot frees. Stops a burst of users from
+    # saturating Vertex quota + the proxy + the TLS stack all at once. With
+    # uvicorn --workers 4 the box-wide ceiling is 4× this.
+    max_concurrent_generations: int = 6
+
+    # Default hard timeout (seconds) for a single provider operation wrapped by a
+    # circuit breaker — nothing waits forever. Per-provider overrides live on the
+    # breaker singletons (circuit_breaker.py).
+    provider_timeout_seconds: float = 25.0
+
+    # Default max concurrent in-flight calls to any one provider, across all
+    # trips. Per-provider overrides live on the breaker singletons.
+    provider_max_concurrency: int = 8
+
+    # Max concurrent Vertex (Gemini) generateContent calls per process — the
+    # tightest external quota, so it gets its own gate.
+    vertex_max_concurrency: int = 6
 
 
 settings = Settings()

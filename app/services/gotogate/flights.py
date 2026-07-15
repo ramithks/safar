@@ -21,7 +21,7 @@ import re
 import uuid
 from datetime import datetime
 
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from app.services.curl_pool import get_curl_session
 
 from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
 
@@ -108,7 +108,7 @@ async def resolve_iata(city: str) -> str | None:
         return _IATA_CACHE[key]
 
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _SEARCH_LOCATIONS_URL,
                 headers=_loc_headers(),
@@ -203,7 +203,7 @@ async def search_flights(
         variables["sortTypeCode"] = sort_code
 
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(
                 _SEARCH_URL,
                 headers=_search_headers(),
@@ -211,17 +211,29 @@ async def search_flights(
                 timeout=30,
             )
         if r.status_code != 200:
+            # A non-200 is a real block/rate-limit — a fresh IP may fix it, retry.
             raise ScraperBlocked(f"HTTP {r.status_code}")
         j = r.json()
-        # A real "no flights" response still carries data.search. Its absence
-        # (GraphQL errors / WAF body) is a block, not genuine emptiness.
+        # A 200 with valid JSON but no data.search node means the gateway resolved
+        # the query and this route simply has no result set (e.g. BAO→KUU) OR
+        # returned GraphQL errors — both deterministic. Retrying 3× with fresh IPs
+        # returns the identical body and only churns TLS sockets (a documented
+        # trigger of the Supabase bad_record_mac storm), so fast-fail as empty and
+        # log the shape once to keep a future schema/allowlist change visible.
         if not (isinstance(j, dict) and (j.get("data") or {}).get("search")):
-            raise ScraperBlocked("search node missing")
+            logger.warning(
+                "[gotogate] %s→%s %s: 200 but no data.search node — treating as no-service (keys=%s errors=%s)",
+                from_airport, to_airport, depart_date,
+                list(j.keys()) if isinstance(j, dict) else type(j).__name__,
+                (j.get("errors") if isinstance(j, dict) else None),
+            )
+            return {"data": {"search": {"flights": []}}}
         return j
 
     try:
         # Cap the retry loop at 25s (< FlightService's 30s merge budget) so this
         # provider's proxy retries can never time out the shared gather.
+        # Structurally-empty payloads no longer retry (see _do).
         data = await asyncio.wait_for(with_proxy_fallback("gotogate", _do), timeout=25.0)
         trips = ((data.get("data") or {}).get("search") or {}).get("flights") or []
         flights = [_normalise(t, from_airport, to_airport, adults) for t in trips]
@@ -254,6 +266,18 @@ def _normalise(trip: dict, from_iata: str, to_iata: str, adults: int) -> dict | 
     dest = last.get("destination") or {}
     carrier = first.get("marketingCarrier") or {}
     logo = carrier.get("logo") or {}
+
+    # Connection detail: change airports + total wait between segments.
+    layover_airports: list[str] = []
+    layover_minutes = 0
+    for i in range(len(segments) - 1):
+        stop = (segments[i].get("destination") or {})
+        code = stop.get("airportCode") or stop.get("code")
+        if code:
+            layover_airports.append(code)
+        gap = _duration(segments[i].get("arrivedAt"), segments[i + 1].get("departuredAt"))
+        if gap:
+            layover_minutes += gap
 
     dep_at = first.get("departuredAt")
     arr_at = last.get("arrivedAt")
@@ -298,11 +322,46 @@ def _normalise(trip: dict, from_iata: str, to_iata: str, adults: int) -> dict | 
         "duration_min": duration_min,
         "stops": len(segments) - 1,
         "cabin_class": first.get("cabinClassName") or "ECONOMY",
+        "baggage_kg": _checked_baggage_kg(trip),
         "price_total": price_total,
         "currency": currency,
         "booking_url": trip.get("shareableUrl"),
         "source": "gotogate",
+        # ── Enriched signals ──
+        "cabin_baggage_kg": _cabin_baggage_kg(trip),
+        "fare_tags": trip.get("tripTags") or None,      # ["PRICE","WEIGHTED"] → cheapest / best value
+        "layover_airports": layover_airports or None,
+        "layover_minutes": layover_minutes or None,
     }
+
+
+def _checked_baggage_kg(trip: dict) -> int | None:
+    """Included checked-baggage allowance in kg (trip level, else first bound)."""
+    candidates = [trip.get("includedCheckedBaggage")]
+    for bound in (trip.get("bounds") or []):
+        candidates.append(bound.get("includedCheckedBaggage"))
+    for bag in candidates:
+        if not isinstance(bag, dict):
+            continue
+        weight = bag.get("weight")
+        unit = (bag.get("weightUnit") or "").upper()
+        if isinstance(weight, (int, float)) and weight > 0 and unit in ("", "KG", "KILOGRAM", "KILOGRAMS"):
+            return int(weight)
+    return None
+
+
+def _cabin_baggage_kg(trip: dict) -> int | None:
+    """Included cabin/carry-on allowance in kg (trip level, else first bound)."""
+    candidates = [trip.get("includedCabinBaggage")]
+    for bound in (trip.get("bounds") or []):
+        candidates.append(bound.get("includedCabinBaggage"))
+    for bag in candidates:
+        if not isinstance(bag, dict):
+            continue
+        weight = bag.get("weight")
+        if isinstance(weight, (int, float)) and weight > 0:
+            return int(weight)
+    return None
 
 
 def _duration(dep: str | None, arr: str | None) -> int | None:

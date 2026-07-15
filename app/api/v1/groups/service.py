@@ -5,7 +5,7 @@ import asyncio
 import logging
 import secrets
 from app.db.client import get_db
-from app.services.vertex import vertex_generate
+from app.services.vertex import muscle as vertex_muscle
 
 logger = logging.getLogger(__name__)
 
@@ -381,7 +381,7 @@ Instructions:
 """
 
     try:
-        raw = await vertex_generate(prompt, timeout=30.0)
+        raw = await vertex_muscle(prompt, timeout=30.0)
         return (raw or "I'm here to help! Ask me anything about your trip.").strip()
     except Exception as e:
         logger.error(f"AI assist failed for group {group_id}: {type(e).__name__}: {e}", exc_info=True)

@@ -7,15 +7,17 @@ Caller: endpoint.py (POST /plan-trip).
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
 from fastapi import HTTPException
 
-from app.db.client import get_db
-from app.services.vertex import vertex_generate, extract_json
+from app.db.client import get_db, run_db, run_db_resilient
+from app.services.vertex import brain as vertex_brain, extract_json
 from app.services.places import discover_places
 from app.core.timing import RequestTrace
+from app.core.background import spawn_background
 
 from .models import PlanTripRequest
 from .helpers import (
@@ -56,9 +58,11 @@ TASK: Create a rich {days}-day itinerary for {destination}.
 
 RULES:
 - Each day covers ONE geographic area/neighborhood — ALL activities on a single day must be within 5 km of each other. No cross-city or cross-region days.
-- Each day: EXACTLY 2 or 3 activities — NEVER more than 3. A real traveler cannot properly
-  experience 4+ places in one day. Prefer 3 (1 food + 1 attraction + 1 other); use 2 for
-  days with a long trek/experience that fills most of the day.
+- Each day: 3 to 5 activities that flow geographically through the day (a full,
+  well-paced day — morning attraction, lunch spot, afternoon sight, evening
+  experience). Use 5 for dense areas, drop to 3 (or 2) only when a long
+  trek/experience genuinely fills most of the day. Do NOT pad with filler — every
+  spot must be worth a real traveler's time.
 - Do NOT include hotel check-in/check-out as an activity.
 - For candidates, use exact place_id and set source: "google_places".
 - Up to 1 ai_suggested place per day if it adds real value (place_id: null, source: "ai_suggested").
@@ -69,7 +73,7 @@ RULES:
 - best_time must be precise — the system uses it to assign visit times:
   "Morning" = before noon | "Afternoon" = noon–5 PM | "Evening" = after 5 PM | "Anytime" = flexible.
   Sunset viewpoints MUST be "Evening". Dawn/sunrise viewpoints MUST be "Morning". Treks MUST be "Morning".
-- Category diversity: spread across Nature (Viewpoint/Trek/Waterfall/Beach/Park), Culture (Museum/Temple/Landmark/Gallery), Food (Cafe/Restaurant/Street Food), Nightlife (Bar/Rooftop). NEVER use the same category more than twice across the whole trip.
+- Category diversity: spread across Nature (Viewpoint/Trek/Waterfall/Beach/Park), Culture (Museum/Temple/Landmark/Gallery), Food (Cafe/Restaurant/Street Food), Nightlife (Bar/Rooftop). Keep each day varied; avoid leaning on any single category across the whole trip.
 - No revisit days. Every day must have genuinely different experiences. Day {days} should feel as fresh as Day 1.
 - If it is a hill/village destination, do NOT suggest clubs, nightclubs, or urban nightlife. Use local cafes and stargazing instead.
 
@@ -103,26 +107,23 @@ Return ONLY valid JSON (no markdown):
 
 
 async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace | None = None, profile: dict | None = None) -> dict:
-    db = get_db()
     safe_budget = body.budget if body.budget in ("low", "mid", "high") else "mid"
     date_ctx = build_date_context(body.start_date, body.end_date, body.destination)
 
     # ── Phase 1: profile + places + memory (parallel) ─────────────────────────
     async with (trace.track("phase1_parallel") if trace else _noop()):
         if profile is None:
-            (profile,), (candidates, memory_ctx) = await asyncio.gather(
-                asyncio.gather(
-                    asyncio.get_event_loop().run_in_executor(None, fetch_user_profile, db, user_id),
-                ),
-                asyncio.gather(
-                    with_retry(discover_places, body.destination, fallback={}),
-                    asyncio.get_event_loop().run_in_executor(None, fetch_memory_context, db, user_id, body.destination),
-                ),
+            # get_db() runs INSIDE the DB executor thread — clients are
+            # per-thread and must never cross the loop→executor boundary.
+            profile, candidates, memory_ctx = await asyncio.gather(
+                run_db(lambda: fetch_user_profile(get_db(), user_id)),
+                with_retry(discover_places, body.destination, fallback={}),
+                run_db(lambda: fetch_memory_context(get_db(), user_id, body.destination)),
             )
         else:
             candidates, memory_ctx = await asyncio.gather(
                 with_retry(discover_places, body.destination, fallback={}),
-                asyncio.get_event_loop().run_in_executor(None, fetch_memory_context, db, user_id, body.destination),
+                run_db(lambda: fetch_memory_context(get_db(), user_id, body.destination)),
             )
 
     # Default to INR (not USD) so the itinerary's currency matches the journey
@@ -171,7 +172,7 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
             "days": [],
             "include_itinerary": False,
         }
-        asyncio.create_task(_db_writes(db, user_id, body, result))
+        spawn_background(_db_writes(user_id, body, result), name=f"db_writes:{user_id}")
         return result
 
     # ── Phase 3: Gemini itinerary ─────────────────────────────────────────────
@@ -198,7 +199,7 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
     )
     async with (trace.track("gemini") if trace else _noop()):
         raw = await with_retry(
-            vertex_generate, prompt,
+            vertex_brain, prompt,
             response_mime_type="application/json",
             temperature=0.0, seed=itinerary_seed,
             timeout=180.0,
@@ -255,24 +256,26 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
         logger.debug(trace.summary())
 
     # ── Phase 6: DB writes (fire-and-forget) ──────────────────────────────────
-    asyncio.create_task(_db_writes(db, user_id, body, ai_json))
+    spawn_background(_db_writes(user_id, body, ai_json), name=f"db_writes:{user_id}")
 
     return ai_json
 
 
-async def _db_writes(db, user_id: str, body: PlanTripRequest, itinerary: dict) -> None:
+async def _db_writes(user_id: str, body: PlanTripRequest, itinerary: dict) -> None:
     try:
         trip_start = datetime.fromisoformat(body.start_date) if body.start_date else datetime.now()
         trip_end = datetime.fromisoformat(body.end_date) if body.end_date else trip_start + timedelta(days=body.days)
         if not body.skip_user_trips:
-            await asyncio.get_event_loop().run_in_executor(None, lambda: (
-                db.table("internal_trip_logs").insert({
+            log_id = str(uuid4())
+            await run_db_resilient(lambda: (
+                get_db().table("internal_trip_logs").upsert({
+                    "id": log_id,
                     "user_id": user_id,
                     "destination": body.destination,
                     "days": body.days,
                     "itinerary_data": itinerary,
-                }).execute()
-            ))
+                }, on_conflict="id").execute()
+            ), label="plan_trip.internal_trip_logs")
     except Exception as e:
         logger.warning("[plan_trip] DB write error (non-fatal): %s", e)
 

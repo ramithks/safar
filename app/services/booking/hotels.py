@@ -32,7 +32,8 @@ from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
 logger = logging.getLogger(__name__)
 
 try:
-    from curl_cffi.requests import AsyncSession as CurlAsyncSession
+    from curl_cffi.requests import AsyncSession as CurlAsyncSession  # noqa: F401 — _CURL_AVAILABLE probe
+    from app.services.curl_pool import get_curl_session
     _CURL_AVAILABLE = True
 except ImportError:
     _CURL_AVAILABLE = False
@@ -204,7 +205,7 @@ async def resolve_dest_id(city_name: str) -> tuple[int | None, str, str]:
             "query": _AUTOCOMPLETE_GQL_QUERY,
         }
         async def _do(proxy):
-            async with CurlAsyncSession(proxy=proxy) as s:
+            async with get_curl_session(proxy=proxy) as s:
                 r = await s.post(
                     f"{_GRAPHQL_URL}?lang=en-us",
                     headers={**_AUTOCOMPLETE_GQL_HEADERS, "x-booking-pageview-id": pageview_id},
@@ -363,7 +364,7 @@ async def _run_fullsearch(
     }
 
     async def _do(proxy):
-        async with CurlAsyncSession(proxy=proxy) as s:
+        async with get_curl_session(proxy=proxy) as s:
             resp = await s.post(
                 gql_url,
                 headers=gql_headers,
@@ -557,6 +558,18 @@ def _normalise(r: dict, checkin: str, checkout: str, nights: int) -> dict:
     sold_out   = (r.get("soldOutInfo") or {}).get("isSoldOut", False)
     meal       = (r.get("mealPlanIncluded") or {}).get("text")
 
+    # Pricing story (original → final) so the UI can show "Save ₹X / -Y%".
+    savings = discount_pct = None
+    if original and per_stay and original > per_stay:
+        savings = original - per_stay
+        discount_pct = round((original - per_stay) / original * 100)
+
+    # Unified distance_km so scoring compares like-for-like with agoda/ixigo.
+    # geoDistanceMeters is usually null in search; fall back to parsing the human
+    # "6.4 km from downtown" / "450 m from centre" string Booking always returns.
+    geo_m = _safe_float(dist.get("geoDistanceMeters"))
+    distance_km = round(geo_m / 1000, 1) if geo_m else _parse_km(dist.get("mainDistance"))
+
     return {
         "hotel_id": str(hotel_id) if hotel_id else None,
         "name": name,
@@ -586,7 +599,25 @@ def _normalise(r: dict, checkin: str, checkout: str, nights: int) -> dict:
         "is_sold_out": sold_out,
         "property_type": classify_property_type({"name": name}),
         "source": "booking",
+        # ── Enriched signals ──
+        "distance_km": distance_km,
+        "savings": savings,
+        "discount_pct": discount_pct,
     }
+
+
+def _parse_km(s) -> float | None:
+    """'6.4 km from downtown' → 6.4 ; '450 m from centre' → 0.45."""
+    if not isinstance(s, str):
+        return None
+    m = re.search(r"([\d.]+)\s*(km|m)\b", s, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        val = float(m.group(1))
+    except ValueError:
+        return None
+    return round(val / 1000, 2) if m.group(2).lower() == "m" else val
 
 
 def _safe_float(v) -> float | None:

@@ -9,14 +9,24 @@ Optimisations:
 import httpx
 import logging
 from app.config import settings
+from app.core.async_http import loop_client
 
 logger = logging.getLogger(__name__)
 
 # ── Shared HTTP client ────────────────────────────────────────────────────────
-_http_client = httpx.AsyncClient(
-    timeout=10.0,
-    limits=httpx.Limits(max_connections=30, max_keepalive_connections=15),
-)
+# Bound to the running loop (see app.core.async_http) — this module runs inside
+# the Celery pipeline, where each task uses a fresh, short-lived event loop.
+_clients_by_loop: dict[int, httpx.AsyncClient] = {}
+
+
+def _http_client() -> httpx.AsyncClient:
+    return loop_client(
+        _clients_by_loop,
+        lambda: httpx.AsyncClient(
+            timeout=10.0,
+            limits=httpx.Limits(max_connections=30, max_keepalive_connections=15),
+        ),
+    )
 
 
 def _mask(s: str) -> str:
@@ -37,7 +47,7 @@ async def search_places(query: str, type_filter: str | None = None) -> list[dict
     key = _maps_key()
     final_query = f"{query} {type_filter}" if type_filter else query
     try:
-        r = await _http_client.get(
+        r = await _http_client().get(
             "https://maps.googleapis.com/maps/api/place/textsearch/json",
             params={"query": final_query, "key": key},
         )
@@ -67,7 +77,7 @@ async def get_place_details(place_id: str) -> dict | None:
     key = _maps_key()
     fields = "name,formatted_address,photos,opening_hours,geometry,rating,user_ratings_total,types,website,formatted_phone_number"
     try:
-        r = await _http_client.get(
+        r = await _http_client().get(
             "https://maps.googleapis.com/maps/api/place/details/json",
             params={"place_id": place_id, "fields": fields, "key": key},
         )

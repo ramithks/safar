@@ -14,7 +14,7 @@ deterministic (cheapest/best-by-sort) recommendation.
 import json
 import logging
 
-from app.services.vertex import vertex_generate, extract_json
+from app.services.vertex import brain as vertex_brain, extract_json
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,7 @@ def _compact_flight(f: dict) -> dict:
         "refundable": f.get("is_refundable"),
         "from_city": f.get("from_city"),
         "to_city": f.get("to_city"),
+        "why_tags": f.get("why_tags"),                # precomputed "why" chips
     }
 
 
@@ -62,6 +63,7 @@ def _compact_hotel(h: dict) -> dict:
         "amenities": (h.get("amenities") or [])[:8],
         "discount": h.get("discount"),
         "area": h.get("address") or h.get("city"),
+        "why_tags": h.get("why_tags"),              # precomputed "why" chips
     }
 
 
@@ -89,10 +91,33 @@ async def _recommend(
         return None
 
     numbered = [{"index": i, **c} for i, c in enumerate(candidates)]
+    traveller = (context or {}).get("traveller_memory")
+    budget = (context or {}).get("budget")
+    budget_rule = ""
+    if budget == "low":
+        budget_rule = (
+            "This traveller explicitly chose a LOW budget — the options are sorted "
+            "cheapest-first. DEFAULT to the cheapest one; only move up if a small "
+            "premium clearly buys much better location or quality, and then name the "
+            "extra rupees. NEVER call a pick 'budget-friendly', 'cheapest', 'most "
+            "affordable' or similar unless it is genuinely the lowest-priced option "
+            "in the list.\n\n"
+        )
+    elif budget == "high":
+        budget_rule = (
+            "This traveller chose a HIGH budget — lead with quality, comfort and "
+            "location; price is a minor factor. Still flag if a pick is unusually "
+            "pricey versus the rest.\n\n"
+        )
     prompt = (
         f"You are TravBuddy's travel booking assistant. {intro}\n\n"
         f"Trip context: {json.dumps(context, ensure_ascii=False)}\n\n"
-        f"Available {kind} options (0-indexed, already roughly sorted by value):\n"
+        + (f"What we know about this traveller (personalise the pick + the reason, "
+           f"but never override the trip's explicit constraints): {traveller}\n\n"
+           if traveller else "")
+        + budget_rule
+        + f"Available {kind} options (0-indexed, already roughly sorted by value; "
+        f"each carries `why_tags` — precomputed strengths you can lean on):\n"
         f"{json.dumps(numbered, ensure_ascii=False)}\n\n"
         "Pick the SINGLE best option for this specific traveller, balancing price, "
         "convenience, timing, and quality — not just the cheapest. Weigh the richer "
@@ -100,12 +125,15 @@ async def _recommend(
         "with strong review_score/review_count, free_cancellation, breakfast, and "
         "matching highlights/amenities; for flights weigh stops, baggage_kg, seats_left "
         "(scarcity), and refundable. Be concrete and reference real numbers from the "
-        "option (price, duration, stops, rating, distance, baggage).\n\n"
+        "option (price, duration, stops, rating, distance, baggage). CRUCIALLY, when "
+        "your pick is NOT the cheapest, justify the premium explicitly by comparing to "
+        "the cheapest option (e.g. '₹800 more than the cheapest, but 1.2 km closer and "
+        "free cancellation') so the traveller sees the trade-off.\n\n"
         f"{_SCHEMA_HINT}"
     )
 
     try:
-        raw = await vertex_generate(
+        raw = await vertex_brain(
             prompt,
             response_mime_type="application/json",
             temperature=0.3,

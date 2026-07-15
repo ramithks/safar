@@ -12,7 +12,7 @@ Key facts confirmed from live testing:
 import logging
 import uuid
 from datetime import date, datetime
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from app.services.curl_pool import get_curl_session
 
 from app.services.scraper_proxy import with_proxy_fallback
 
@@ -150,7 +150,7 @@ async def search_hotels(
     }
 
     async def _do(proxy):
-        async with CurlAsyncSession(impersonate="chrome", proxy=proxy) as s:
+        async with get_curl_session(impersonate="chrome", proxy=proxy) as s:
             r = await s.post(_BASE, headers=_HEADERS, json=payload, timeout=20)
         r.raise_for_status()
         return r.json()

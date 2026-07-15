@@ -14,11 +14,12 @@ from datetime import datetime, timedelta
 
 from fastapi import HTTPException
 
-from app.db.client import get_db
-from app.services.vertex import vertex_generate, extract_json
+from app.db.client import get_db, run_db
+from app.services.vertex import brain as vertex_brain, extract_json
 from app.services.transport import TransportService
 from app.services.hotels import HotelService
 from app.services.flights import FlightService, budget_to_sort, sort_flights
+from app.services.scoring import score_flights
 from app.services.journey_reasoning import build_journey_reasoning
 from app.services.railway import RailwayService, city_to_station_code, resolve_station_async
 from app.agents.recommendation_agent import recommend_flights, recommend_hotels
@@ -138,7 +139,7 @@ Return ONLY valid JSON (no markdown):
         body.origin, body.destination, budget, body.travelers,
         ",".join(sorted(body.transport_modes or [])), body.departure_date or "",
     )
-    raw = await with_retry(vertex_generate, prompt, response_mime_type="application/json",
+    raw = await with_retry(vertex_brain, prompt, response_mime_type="application/json",
                            temperature=0.0, seed=route_seed,
                            timeout=120.0, max_retries=2)
     if not raw:
@@ -148,6 +149,56 @@ Return ONLY valid JSON (no markdown):
     except Exception as e:
         logger.debug(f"[journey] Gemini route parse error: {e}")
         return {}
+
+
+def _is_multihop_route(route: dict) -> bool:
+    """True when a route has 2+ live intercity legs — the case where the return
+    should retrace the same hubs instead of being planned from scratch."""
+    legs = route.get("legs") or []
+    intercity = [
+        leg for leg in legs
+        if leg.get("needs_live_search")
+        and str(leg.get("mode", "")).lower() in ("bus", "train", "railway", "flight")
+    ]
+    return len(intercity) >= 2
+
+
+def reverse_route_plan(outbound_route: dict) -> dict | None:
+    """Mirror the outbound route for the way back: reverse the leg order and
+    swap each leg's from/to (and its search_params) so A→B→C→D becomes D→C→B→A.
+
+    The route planner is deterministic PER DIRECTION (seeded on origin→dest), so
+    planning the return independently can pick a different decomposition than the
+    outbound. Reversing the outbound instead makes the return retrace the same
+    hubs. Returns None when the outbound isn't a genuine multi-hop route or a leg
+    is missing its endpoints — the caller then falls back to independent planning.
+    """
+    if not _is_multihop_route(outbound_route):
+        return None
+    legs = outbound_route.get("legs") or []
+    mirrored: list[dict] = []
+    for i, leg in enumerate(reversed(legs)):
+        frm, to = leg.get("to"), leg.get("from")
+        if not frm or not to:
+            return None
+        sp = leg.get("search_params") or {}
+        mirrored.append({
+            "leg": i + 1,
+            "from": frm,
+            "to": to,
+            "mode": leg.get("mode"),
+            "duration_approx": leg.get("duration_approx"),
+            "distance_km": leg.get("distance_km"),
+            "tips": leg.get("tips"),
+            "needs_live_search": leg.get("needs_live_search", True),
+            "search_params": {
+                "origin": sp.get("destination") or frm,
+                "destination": sp.get("origin") or to,
+                "mode_type": sp.get("mode_type") or leg.get("mode"),
+            },
+        })
+    return {"legs": mirrored, "is_international": outbound_route.get("is_international", False),
+            "mirrored_from_outbound": True}
 
 
 # ── Booking URL builder ────────────────────────────────────────────────────────
@@ -533,18 +584,23 @@ async def _explain_picks(
 
 # ── Main handler ──────────────────────────────────────────────────────────────
 
-async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict | None = None) -> dict:
-    db = get_db()
+async def run_plan_journey(
+    body: PlanJourneyRequest, user_id: str, profile: dict | None = None,
+    forced_route: dict | None = None,
+) -> dict:
     safe_budget = body.budget if body.budget in ("low", "mid", "high") else "mid"
 
     if profile is None:
-        profile = await asyncio.get_event_loop().run_in_executor(None, fetch_user_profile, db, user_id)
+        # get_db() inside the DB executor thread — clients must not cross threads.
+        profile = await run_db(lambda: fetch_user_profile(get_db(), user_id))
     currency_code = (profile.get("currency") or "inr").lower()
     ci = CURRENCY_CONFIG.get(currency_code) or CURRENCY_CONFIG["inr"]
     symbol = ci["symbol"]
 
-    # Phase 1 — Gemini plans route with intermediate hubs
-    route_plan = await _gemini_plan_route(body, safe_budget, symbol, currency_code)
+    # Phase 1 — plan the route. Normally Gemini decomposes it into hubs; a caller
+    # can force a route instead (the return journey passes the outbound reversed
+    # so the way back retraces the same hubs).
+    route_plan = forced_route or await _gemini_plan_route(body, safe_budget, symbol, currency_code)
     if not route_plan:
         raise HTTPException(502, "Route planning failed — AI could not plan this journey")
 
@@ -606,6 +662,14 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
     if _train_leg_count:
         _enqueue("train", _trip_o, resolve_station_async, _trip_o)
         _enqueue("train", _trip_d, resolve_station_async, _trip_d)
+
+    # Always offer a DIRECT flight alternative when the planner chose a ground
+    # route: many flyable city pairs (e.g. Hyderabad→Udaipur) otherwise show no
+    # flight at all. Resolve trip-level IATA here so the search can fire in 2c.
+    _has_flight_leg = any((l.get("mode") or "").lower() == "flight" for l in legs)
+    if not _has_flight_leg and departure_date:
+        _enqueue("flight", _trip_o, _flights.resolve_iata, _trip_o)
+        _enqueue("flight", _trip_d, _flights.resolve_iata, _trip_d)
 
     if _resolve_coros:
         _resolve_results = await asyncio.gather(*_resolve_coros, return_exceptions=True)
@@ -762,13 +826,36 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
         except Exception:
             hotel_coro = None
 
-    extra_coros = train_alt_coros + ([hotel_coro] if hotel_coro else [])
+    # Direct origin→destination flight — an always-on alternative when the
+    # planned route has no flight leg (see the 2a resolution above).
+    flight_direct_coro = None
+    if not _has_flight_leg and departure_date:
+        _f_from = resolved.get(f"flight|{_trip_o.lower()}")
+        _f_to = resolved.get(f"flight|{_trip_d.lower()}")
+        if _f_from and _f_to and _f_from != _f_to:
+            flight_direct_coro = with_retry(
+                _flights.search, _trip_o, _trip_d, departure_date,
+                adults=body.travelers, from_iata=_f_from, to_iata=_f_to,
+                sort=budget_to_sort(safe_budget),
+                fallback={"flights": [], "resolved": False},
+            )
+
+    extra_coros = (
+        train_alt_coros
+        + ([hotel_coro] if hotel_coro else [])
+        + ([flight_direct_coro] if flight_direct_coro else [])
+    )
     all_results = await asyncio.gather(*(live_coros + extra_coros), return_exceptions=True) if (live_coros + extra_coros) else []
 
     transport_results = all_results[: len(live_coros)]
     train_alt_results = all_results[len(live_coros): len(live_coros) + len(train_alt_coros)]
     hotel_idx = len(live_coros) + len(train_alt_coros)
     hotel_result = all_results[hotel_idx] if hotel_coro and len(all_results) > hotel_idx else None
+    flight_direct_idx = hotel_idx + (1 if hotel_coro else 0)
+    flight_direct_result = (
+        all_results[flight_direct_idx]
+        if flight_direct_coro and len(all_results) > flight_direct_idx else None
+    )
 
     # Stash train-alternative results on their legs (tagged for departure status)
     for task_idx, leg_idx in enumerate(train_alt_meta):
@@ -860,7 +947,7 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
     _rec_hotel: dict | None = None
     _hotel_pool: list[dict] = []
     if hotel_result and not isinstance(hotel_result, Exception):
-        _hotel_pool = rank_hotels(hotel_result.get("hotels") or [])
+        _hotel_pool = rank_hotels(hotel_result.get("hotels") or [], safe_budget)
         _rec_hotel = _pick_recommended_hotel(_hotel_pool, safe_budget)
         if _rec_hotel:
             for h in _hotel_pool:
@@ -869,6 +956,9 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
     # ── AI reasoning: pick the best flight + hotel and explain *why* ──────────
     # Concurrent, advisory layer over the deterministic picks. Re-points each
     # recommendation to the agent's choice and stamps ai_reason/ai_pros/ai_best_for.
+    # The traveller's learned memory personalises the pick + the reason (best-effort).
+    from app.services.user_memory import get_memory, memory_grounding
+    _traveller_mem = memory_grounding(await get_memory(user_id)) if user_id else ""
     _rec_flight, _rec_hotel = await _explain_picks(
         _rec_flight, _rec_flight_pool,
         {
@@ -876,6 +966,7 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
             "date": departure_date,
             "passengers": body.travelers,
             "budget": safe_budget,
+            "traveller_memory": _traveller_mem or None,
         },
         _rec_hotel, _hotel_pool,
         {
@@ -885,6 +976,7 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
             "adults": body.travelers,
             "nights": body.stay_nights,
             "budget": safe_budget,
+            "traveller_memory": _traveller_mem or None,
         },
     )
 
@@ -931,6 +1023,19 @@ async def run_plan_journey(body: PlanJourneyRequest, user_id: str, profile: dict
     train_journey = _build_train_journey_bundle(legs, body.travelers)
     if train_journey:
         route_plan["train_journey"] = train_journey
+
+    # ── Direct flight alternative (when the planned route was ground-only) ────
+    flight_journey = _build_flight_journey_bundle(
+        flight_direct_result, body.travelers, body.origin, body.destination, safe_budget,
+    )
+    if flight_journey:
+        route_plan["flight_journey"] = flight_journey
+        logger.info(
+            "[journey] %s→%s | direct flight alternative: %d options from ₹%s/person",
+            body.origin, body.destination,
+            len(flight_journey.get("items") or []),
+            flight_journey.get("total_fare_per_person"),
+        )
 
     # Summary log
     _h  = route_plan.get("destination_hotels")
@@ -1017,6 +1122,47 @@ def _build_train_journey_bundle(legs: list[dict], travelers: int) -> dict | None
             if feasible else
             "Some segments have no train connectivity — shown for comparison only."
         ),
+    }
+
+
+def _build_flight_journey_bundle(
+    flight_result, travelers: int, origin: str, destination: str, budget: str,
+) -> dict | None:
+    """
+    A direct origin→destination flight offered as a whole-route alternative when
+    the planner chose a ground route (so flyable pairs always show a flight).
+
+    Mirrors `_build_train_journey_bundle`: returns None when no live flights were
+    found; otherwise a scored, budget-sorted bundle with a starred recommendation.
+    """
+    if not flight_result or isinstance(flight_result, Exception):
+        return None
+    flights = (flight_result.get("flights") or []) if isinstance(flight_result, dict) else []
+    if not flights:
+        return None
+
+    flights = sort_flights(score_flights(flights), budget_to_sort(budget) or "CHEAPEST")
+    rec = _pick_recommended_flight(flights, budget)
+    if rec:
+        for f in flights:
+            f["is_recommended"] = (
+                f.get("flight_number") == rec.get("flight_number")
+                and f.get("departure_time") == rec.get("departure_time")
+            )
+
+    fare = (rec or flights[0]).get("price_total") or 0
+    dur = (rec or flights[0]).get("duration_min") or 0
+    return {
+        "feasible": True,
+        "from": origin,
+        "to": destination,
+        "items": flights,
+        "recommended": rec or flights[0],
+        "total_fare_per_person": fare,
+        "total_cost": fare * max(travelers, 1),
+        "total_duration_min": dur,
+        "total_duration_display": _fmt_duration(dur) if dur else None,
+        "note": "Direct flight — a faster alternative to the recommended ground route.",
     }
 
 

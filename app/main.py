@@ -15,8 +15,10 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from app.api.v1.router import router
+from app.api.v2.router import router as router_v2
 from app.config import settings
 from app.core.limiter import limiter
+from app.core.timeout import TimeoutMiddleware
 from app.observability import init_sentry
 
 # ── Sentry — must init before FastAPI() to capture startup errors ───────────────
@@ -73,14 +75,23 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Backstop timeout so a handler that wedges pre-response can't pin a connection
+# open forever. Added first → runs outermost (wraps every other middleware).
+if settings.request_timeout_seconds and settings.request_timeout_seconds > 0:
+    app.add_middleware(TimeoutMiddleware, timeout_seconds=settings.request_timeout_seconds)
+
+# CORS — driven by ALLOWED_ORIGINS (comma-separated, or "*"). Mobile clients
+# don't enforce CORS, but a tightened list protects the browser docs/dashboards.
+_origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.include_router(router)
+app.include_router(router_v2)
 
 
 # ── Exception handlers ───────────────────────────────────────────────────────────

@@ -424,3 +424,99 @@ CREATE POLICY "folder_items_own" ON public.folder_items FOR ALL USING (EXISTS (S
 -- user_home_feed
 CREATE POLICY "feed_user_read"  ON public.user_home_feed FOR SELECT USING (auth.uid() = user_id);
 CREATE POLICY "feed_service_all" ON public.user_home_feed FOR ALL USING (auth.role() = 'service_role');
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- Trip State V2 — persistent TripState object + append-only patch log
+-- (Travel-OS architecture: workspace state, undo, version history, collab)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS public.trip_states (
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id        uuid REFERENCES auth.users(id) ON DELETE CASCADE,
+  title          text,
+  origin         text,
+  destination    text,
+  status         text NOT NULL DEFAULT 'planning',   -- planning | ready | error
+  visibility     text NOT NULL DEFAULT 'private',    -- private | link | public
+  schema_version integer NOT NULL DEFAULT 1,
+  state          jsonb NOT NULL DEFAULT '{}',        -- current TripState snapshot
+  last_seq       integer NOT NULL DEFAULT 0,         -- seq of last applied event
+  created_at     timestamptz NOT NULL DEFAULT timezone('utc', now()),
+  updated_at     timestamptz NOT NULL DEFAULT timezone('utc', now())
+);
+
+CREATE TABLE IF NOT EXISTS public.trip_state_events (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  trip_id    uuid NOT NULL REFERENCES public.trip_states(id) ON DELETE CASCADE,
+  seq        integer NOT NULL,                       -- per-trip ordering
+  actor      text NOT NULL,                          -- user | agent:<name> | supervisor
+  phase      text,                                   -- generation phase / edit label
+  patches    jsonb NOT NULL DEFAULT '[]',            -- [PatchOp, ...]
+  reasoning  text,                                   -- agent explanation (optional)
+  created_at timestamptz NOT NULL DEFAULT timezone('utc', now()),
+  UNIQUE (trip_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trip_states_user     ON public.trip_states(user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trip_state_events_trip ON public.trip_state_events(trip_id, seq);
+
+ALTER TABLE public.trip_states       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.trip_state_events ENABLE ROW LEVEL SECURITY;
+
+-- Owner CRUD; public/link trips readable by anyone (share/clone flows)
+CREATE POLICY "trip_states_own"    ON public.trip_states FOR ALL
+  USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "trip_states_shared" ON public.trip_states FOR SELECT
+  USING (visibility IN ('link', 'public'));
+
+CREATE POLICY "trip_state_events_own" ON public.trip_state_events FOR SELECT
+  USING (EXISTS (SELECT 1 FROM public.trip_states t
+                 WHERE t.id = trip_state_events.trip_id
+                   AND (t.user_id = auth.uid() OR t.visibility IN ('link', 'public'))));
+-- Writes go through the service role only (backend orchestrator)
+
+
+-- ── Copilot chat transcript ──────────────────────────────────────────────────
+-- Durable, linear per-trip conversation log. Decoupled from trip_state_events
+-- (which carries state PATCHES + CAS/snapshot semantics): chat is an append-only
+-- transcript that must survive a page refresh and a Redis flush. Every copilot
+-- turn — user message AND assistant reply, including pure Q&A that changes no
+-- state — is recorded here so the thread rehydrates on load.
+CREATE TABLE IF NOT EXISTS public.copilot_messages (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  trip_id    uuid NOT NULL REFERENCES public.trip_states(id) ON DELETE CASCADE,
+  role       text NOT NULL,                          -- user | assistant
+  content    text NOT NULL,
+  intent     text,                                   -- classified intent (assistant turns)
+  meta       jsonb NOT NULL DEFAULT '{}',            -- clarify options, applied patch count, …
+  created_at timestamptz NOT NULL DEFAULT timezone('utc', now())
+);
+
+CREATE INDEX IF NOT EXISTS idx_copilot_messages_trip ON public.copilot_messages(trip_id, id);
+
+ALTER TABLE public.copilot_messages ENABLE ROW LEVEL SECURITY;
+
+-- Readable by the trip owner + anyone the trip is shared with (mirrors events)
+CREATE POLICY "copilot_messages_own" ON public.copilot_messages FOR SELECT
+  USING (EXISTS (SELECT 1 FROM public.trip_states t
+                 WHERE t.id = copilot_messages.trip_id
+                   AND (t.user_id = auth.uid() OR t.visibility IN ('link', 'public'))));
+-- Writes go through the service role only (backend copilot)
+
+
+-- ── Per-user travel preference memory ────────────────────────────────────────
+-- Lightweight, learned profile the agents read to warm-start planning +
+-- recommendations + copilot. Distilled from a user's completed trips and their
+-- copilot edits (budget sensitivity, preferred stay types, pace, transport,
+-- dietary, interests). One row per user; the backend merges into `memory`.
+CREATE TABLE IF NOT EXISTS public.user_travel_memory (
+  user_id    uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  memory     jsonb NOT NULL DEFAULT '{}',
+  updated_at timestamptz NOT NULL DEFAULT timezone('utc', now())
+);
+
+ALTER TABLE public.user_travel_memory ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "user_travel_memory_own" ON public.user_travel_memory FOR SELECT
+  USING (auth.uid() = user_id);
+-- Writes go through the service role only (backend distiller)

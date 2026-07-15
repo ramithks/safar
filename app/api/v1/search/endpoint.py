@@ -15,7 +15,9 @@ from app.deps.auth import require_user
 from app.agents.recommendation_agent import recommend_flights, recommend_hotels
 from app.services.flights import FlightService, budget_to_sort, sort_flights
 from app.services.hotels import HotelService
-from app.services.hotels_filters import budget_to_hotel_sort
+from app.services.hotels_filters import (
+    budget_to_hotel_sort, hotel_filters_catalog, sort_hotels as _sort_hotels,
+)
 from app.services.transport import TransportService
 
 from .models import (
@@ -34,20 +36,9 @@ _transport = TransportService()
 
 
 # ── Sort helpers ──────────────────────────────────────────────────────────────
-# Flight sorting lives in app.services.flights (sort_flights / budget_to_sort) so
-# the standalone search and the trip planner stay in lock-step.
-
-def _sort_hotels(hotels: list[dict], sort: str) -> list[dict]:
-    if sort == "price_asc":
-        return sorted(hotels, key=lambda h: (h.get("price_per_night") or h.get("estimated_price_per_night") or 999999))
-    if sort == "price_desc":
-        return sorted(hotels, key=lambda h: -(h.get("price_per_night") or h.get("estimated_price_per_night") or 0))
-    if sort == "rating":
-        return sorted(hotels, key=lambda h: -(
-            float(h.get("review_score") or h.get("star_rating") or h.get("google_rating") or 0)
-        ))
-    return hotels  # recommended — already ordered by HotelService richness score
-
+# Flight sorting lives in app.services.flights (sort_flights / budget_to_sort),
+# hotel sorting in app.services.hotels_filters (sort_hotels) so the standalone
+# search and the trip planner stay in lock-step.
 
 def _sort_buses(buses: list[dict], sort: str) -> list[dict]:
     if sort == "earliest":
@@ -128,13 +119,28 @@ async def search_flights(body: FlightSearchRequest, _user=Depends(require_user))
     }
 
 
+@router.get("/hotels/filters")
+async def hotel_filters(_user=Depends(require_user)):
+    """
+    The canonical hotel filter vocabulary — property types, facility keys, meal
+    plans, ranges, and sorts accepted in POST /search/hotels `filters`. Serve
+    this to the frontend/copilot so filter chips and LLM extraction stay in
+    sync with the backend.
+    """
+    return hotel_filters_catalog()
+
+
 @router.post("/hotels")
 async def search_hotels(body: HotelSearchRequest, _user=Depends(require_user)):
     """
-    Search hotel availability. Results from EaseMyTrip + Booking.com (parallel).
-    sort: recommended | price_asc | price_desc | rating
-    Returns all deduplicated results; first item flagged is_recommended=true.
+    Search hotel availability. Results from EaseMyTrip + Booking.com + Agoda +
+    Ixigo (parallel). sort: recommended | price_asc | price_desc | rating.
+    `filters` hard-filters the merged list (vocabulary: GET /search/hotels/filters);
+    when nothing matches every filter the unfiltered list is returned with
+    filters_relaxed=true. Returns deduplicated results; first item flagged
+    is_recommended=true.
     """
+    filters = body.filters.model_dump(exclude_none=True) if body.filters else None
     result = await _hotels.search(
         destination=body.destination,
         checkin=body.checkin,
@@ -144,9 +150,15 @@ async def search_hotels(body: HotelSearchRequest, _user=Depends(require_user)):
         children=body.children,
         budget=body.budget,
         travel_type=body.travel_type,
+        filters=filters,
     )
-    # Budget always wins: a budget tier dictates sort, overriding any explicit sort.
-    effective_sort = budget_to_hotel_sort(body.budget) or body.sort
+    # Sort precedence: explicit filter sort > budget tier mapping > body.sort.
+    # Read the filter sort back from the service's SANITIZED filters_applied —
+    # a junk sort in the raw body must not shadow the budget mapping.
+    effective_sort = (
+        (result.get("filters_applied") or {}).get("sort")
+        or budget_to_hotel_sort(body.budget) or body.sort
+    )
     hotels = _tag_recommended(_sort_hotels(result.get("hotels") or [], effective_sort))
     cheapest = min(
         (
