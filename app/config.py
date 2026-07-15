@@ -128,5 +128,26 @@ class Settings(BaseSettings):
     # worker connection open forever. 0 disables the middleware.
     request_timeout_seconds: float = 210.0
 
+    # ── Resilience / load-shedding ───────────────────────────────────────────
+    # Max trip generations running at once PER WORKER PROCESS. Beyond this, new
+    # generations queue (they don't fail) — the trip row exists and the frontend
+    # sees a "queued" event until a slot frees. Stops a burst of users from
+    # saturating Vertex quota + the proxy + the TLS stack all at once. With
+    # uvicorn --workers 4 the box-wide ceiling is 4× this.
+    max_concurrent_generations: int = 6
+
+    # Default hard timeout (seconds) for a single provider operation wrapped by a
+    # circuit breaker — nothing waits forever. Per-provider overrides live on the
+    # breaker singletons (circuit_breaker.py).
+    provider_timeout_seconds: float = 25.0
+
+    # Default max concurrent in-flight calls to any one provider, across all
+    # trips. Per-provider overrides live on the breaker singletons.
+    provider_max_concurrency: int = 8
+
+    # Max concurrent Vertex (Gemini) generateContent calls per process — the
+    # tightest external quota, so it gets its own gate.
+    vertex_max_concurrency: int = 6
+
 
 settings = Settings()

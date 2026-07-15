@@ -164,37 +164,53 @@ async def vertex_generate(
     base_delay = 5.0
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    for attempt in range(max_attempts):
-        location = regions[attempt % n_regions]
-        url = (
-            f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}"
-            f"/locations/{location}/publishers/google/models/{model}:generateContent"
-        )
-        r = await _get_http_client().post(url, headers=headers, json=body, timeout=timeout)
+    # Concurrency gate on the tightest external quota (Gemini). Caps simultaneous
+    # generateContent calls per process so a burst of trips queues instead of
+    # stampeding the quota; also feeds the health dashboard. The breaker keeps its
+    # own region-retry loop below (guard imposes no timeout).
+    from app.core.circuit_breaker import breaker_gemini, CircuitOpenError
 
-        if r.status_code in (429, 503) and attempt < max_attempts - 1:
-            next_location = regions[(attempt + 1) % n_regions]
-            cycle = (attempt + 1) // n_regions   # how many times we've wrapped the region list
-            if cycle == 0 and n_regions > 1:
-                # Fresh region still available — switch over near-instantly.
-                delay = random.uniform(0.2, 0.8)
-            else:
-                # Exhausted the region list (or only one region) — back off.
-                retry_after = r.headers.get("Retry-After")
-                base = float(retry_after) if retry_after else base_delay * (2 ** (cycle - 1))
-                delay = min(base + random.uniform(0, base * 0.3), 60.0)
-            logger.warning(
-                "[vertex] %s in %s — switching to %s (attempt %d/%d) in %.1fs",
-                r.status_code, location, next_location, attempt + 1, max_attempts, delay,
+    async def _run() -> str:
+        for attempt in range(max_attempts):
+            location = regions[attempt % n_regions]
+            url = (
+                f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}"
+                f"/locations/{location}/publishers/google/models/{model}:generateContent"
             )
-            await asyncio.sleep(delay)
-            continue
+            r = await _get_http_client().post(url, headers=headers, json=body, timeout=timeout)
 
-        r.raise_for_status()
-        break
+            if r.status_code in (429, 503) and attempt < max_attempts - 1:
+                next_location = regions[(attempt + 1) % n_regions]
+                cycle = (attempt + 1) // n_regions   # how many times we've wrapped the region list
+                if cycle == 0 and n_regions > 1:
+                    # Fresh region still available — switch over near-instantly.
+                    delay = random.uniform(0.2, 0.8)
+                else:
+                    # Exhausted the region list (or only one region) — back off.
+                    retry_after = r.headers.get("Retry-After")
+                    base = float(retry_after) if retry_after else base_delay * (2 ** (cycle - 1))
+                    delay = min(base + random.uniform(0, base * 0.3), 60.0)
+                logger.warning(
+                    "[vertex] %s in %s — switching to %s (attempt %d/%d) in %.1fs",
+                    r.status_code, location, next_location, attempt + 1, max_attempts, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
 
-    data = r.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+            r.raise_for_status()
+            break
+
+        data = r.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+
+    try:
+        async with breaker_gemini.guard():
+            return await _run()
+    except CircuitOpenError:
+        # Gemini is shedding load (sustained outage). Surface as a normal upstream
+        # failure so the supervisor degrades the affected agent, same as a raise
+        # from _run would.
+        raise RuntimeError("Vertex temporarily unavailable (circuit open)")
 
 
 def extract_json(raw: str) -> dict:

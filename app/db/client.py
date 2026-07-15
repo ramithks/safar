@@ -25,6 +25,50 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# ── Request instrumentation ──────────────────────────────────────────────────
+# Every actual HTTP request the service/user clients send is tallied here (by
+# method, plus a retry counter that only counts re-sends). Callers snapshot the
+# tally before a unit of work and diff it after — see db_stats_snapshot /
+# db_stats_delta — to answer "how many DB requests did this generation cost?".
+# Sends happen on several executor threads, so the counter is lock-guarded.
+_stats_lock = threading.Lock()
+_req_stats: dict[str, int] = {}
+
+
+def _record_request(method: str, *, retry: bool) -> None:
+    with _stats_lock:
+        _req_stats[method] = _req_stats.get(method, 0) + 1
+        _req_stats["total"] = _req_stats.get("total", 0) + 1
+        if retry:
+            _req_stats["retries"] = _req_stats.get("retries", 0) + 1
+
+
+def db_stats_snapshot() -> dict[str, int]:
+    """A copy of the running request tally. Diff two snapshots with db_stats_delta."""
+    with _stats_lock:
+        return dict(_req_stats)
+
+
+def db_stats_delta(before: dict[str, int]) -> dict[str, int]:
+    """Requests recorded since `before`. Accurate per-unit-of-work only when work
+    is single-flight (dev / one generation at a time); overlapping generations
+    share the global counter."""
+    now = db_stats_snapshot()
+    return {k: now.get(k, 0) - before.get(k, 0) for k in set(now) | set(before)}
+
+
+def format_db_delta(delta: dict[str, int]) -> str:
+    """Compact one-line summary, e.g. '9 DB requests (GET 4, POST 3, PATCH 2), 0 retries'."""
+    methods = ", ".join(
+        f"{m} {delta[m]}" for m in ("GET", "POST", "PATCH", "DELETE", "PUT")
+        if delta.get(m)
+    )
+    return (
+        f"{delta.get('total', 0)} DB requests"
+        f"{f' ({methods})' if methods else ''}, {delta.get('retries', 0)} retries"
+    )
+
+
 # Dedicated executor for ALL sync Supabase calls made from async code, isolated
 # from the default executor (busy with video downloads / curl_cffi scrapers whose
 # fd churn corrupted shared TLS). Each thread gets its OWN thread-local client
@@ -114,6 +158,7 @@ def _install_retry(session: httpx.Client, attempts: int = 6) -> None:
         last_exc: Exception | None = None
         for i in range(attempts):
             try:
+                _record_request(request.method, retry=i > 0)
                 return _original_send(request, **kwargs)
             except _RETRYABLE as exc:
                 last_exc = exc

@@ -13,13 +13,14 @@ Event shape (what the frontend receives):
 import asyncio
 import json
 import logging
+import ssl
 from datetime import datetime, timedelta
 
 import httpx
 import redis as redis_lib
 import sentry_sdk
 
-from app.db.client import run_db
+from app.db.client import db_stats_delta, db_stats_snapshot, format_db_delta, run_db
 
 from app.api.v1.plan_trip.models import PlanRequest
 from app.api.v1.plan_trip.plan import _shape_journey
@@ -64,25 +65,33 @@ def read_events(trip_id: str, start: int = 0) -> list[dict]:
 
 
 class _Emitter:
-    """Persists patches to the event log, then publishes to the live stream.
+    """Streams patches to the live Redis stream immediately, and persists them to
+    the durable event log EXACTLY ONCE — at the authoritative `critical` emit that
+    ends generation.
 
-    Persistence failures must not kill the generation: the live stream (Redis)
-    still gets the event, and the unpersisted patches are carried forward and
-    folded into the next successful append, so the stored snapshot converges.
-    A `critical=True` emit (the final authoritative one — there is no "next
-    emit" after it) hands its patches to the background flush queue instead,
-    which retries for minutes.
+    Why one write: the frontend consumes the live Redis stream, and a
+    mid-generation read reconstructs full state by overlaying that stream on the
+    snapshot (endpoint._overlay_stream_events). Per-phase DB writes therefore only
+    duplicated what the final commit re-sets anyway — and each was a read-modify-
+    write whose storm retries multiplied Supabase traffic (the SSL bad_record_mac
+    storm). So intermediate patches are buffered in emit order and folded into the
+    single commit: nothing (weather, agent errors) is lost, later authoritative
+    sections win for overlapping paths, and the durable snapshot still converges
+    to the live trip.
+
+    If the one commit hits a TLS storm it hands the whole buffer to the background
+    flush queue, which retries for minutes — the live stream already delivered
+    everything to connected clients.
     """
 
     def __init__(self, trip_id: str):
         self.trip_id = trip_id
-        # Weather runs in parallel with supervisor phases; append_events is a
-        # read-modify-write on the snapshot, so emits must never interleave.
+        # Weather runs in parallel with supervisor phases; the lock serializes
+        # emits so buffer appends and the final commit never interleave.
         self._lock = asyncio.Lock()
-        # Patches whose persist failed, ordered oldest-first. Folded into the
-        # next append (their per-event actor/phase granularity is lost — the
-        # snapshot result is identical since later sets of a path win).
-        self._pending: list[PatchOp] = []
+        # Every streamed patch not yet persisted, in emit order. Drained by the
+        # single commit at the critical emit.
+        self._buffer: list[PatchOp] = []
 
     async def __call__(
         self,
@@ -107,27 +116,30 @@ class _Emitter:
         actor: str,
         critical: bool,
     ) -> None:
-        to_persist = self._pending + patches
-        if to_persist:
-            try:
-                await run_db(
-                    lambda: store.append_events(
-                        self.trip_id, actor, to_persist, phase=phase, reasoning=reasoning
+        if critical:
+            # The one durable write of the whole generation: everything buffered so
+            # far, then this emit's authoritative sections (last-write-wins for any
+            # overlapping path; buffered-only paths like /weather are preserved).
+            to_persist = self._buffer + patches
+            if to_persist:
+                try:
+                    await run_db(
+                        lambda: store.append_events(
+                            self.trip_id, actor, to_persist, phase=phase, reasoning=reasoning
+                        )
                     )
-                )
-                self._pending = []
-            except httpx.TransportError as exc:
-                if critical:
+                except (httpx.TransportError, ssl.SSLError) as exc:
                     flush.enqueue(
                         self.trip_id, actor, to_persist, phase=phase, reasoning=reasoning
                     )
-                    self._pending = []
-                else:
-                    self._pending = to_persist
                     logger.warning(
-                        "[trip-state] %s persisting %s for %s — deferring %d patches to next emit",
-                        type(exc).__name__, phase, self.trip_id, len(to_persist),
+                        "[trip-state] %s on final commit for %s — handed %d patches to background flush",
+                        type(exc).__name__, self.trip_id, len(to_persist),
                     )
+                self._buffer = []
+        else:
+            # Live-stream only; persistence is deferred to the single commit.
+            self._buffer.extend(patches)
         publish_event(self.trip_id, {
             "phase": phase,
             "label": label,
@@ -224,11 +236,32 @@ async def _fetch_and_emit_weather(trip_id: str, body: PlanRequest, emit: "_Emitt
 
 
 async def run_generation(trip_id: str, body: PlanRequest, user_id: str) -> None:
+    """Entry point: admit through the global generation queue, then generate.
+
+    Beyond `max_concurrent_generations` in-flight (per process), this WAITS for a
+    slot instead of piling on — the top-level load-shedder. The trip row already
+    exists; a "queued" event tells the frontend to show a queue spinner."""
+    from app.core.generation_queue import generation_slot, has_free_slot
+
+    emit = _Emitter(trip_id)
+    if not has_free_slot():
+        try:
+            await emit(
+                "queued", "In queue — your trip starts shortly",
+                [PatchOp(op="set", path="/meta/status", value="queued")], 2,
+            )
+        except Exception:  # noqa: BLE001 — a queued notice must never break generation
+            pass
+    async with generation_slot(trip_id):
+        await _generate(trip_id, body, user_id, emit)
+
+
+async def _generate(trip_id: str, body: PlanRequest, user_id: str, emit: "_Emitter") -> None:
     """Run the full plan pipeline for a trip, streaming patches as agents finish."""
     from app.agents.supervisor import supervisor_run
 
-    emit = _Emitter(trip_id)
     weather_task: asyncio.Task | None = None
+    db_before = db_stats_snapshot()
     try:
         await emit("understanding", "Understanding your trip", [], 5)
         weather_task = asyncio.create_task(_fetch_and_emit_weather(trip_id, body, emit))
@@ -330,14 +363,25 @@ async def run_generation(trip_id: str, body: PlanRequest, user_id: str) -> None:
         except Exception as exc:  # noqa: BLE001 — memory is advisory
             logger.warning("[trip-state] memory distill failed for %s: %s", trip_id, exc)
 
+        logger.info(
+            "[trip-state] generation %s cost — %s",
+            trip_id, format_db_delta(db_stats_delta(db_before)),
+        )
+
     except Exception as exc:  # noqa: BLE001 — stream must terminate cleanly
-        logger.error("[trip-state] generation failed for %s: %s", trip_id, exc, exc_info=True)
+        logger.error(
+            "[trip-state] generation failed for %s (%s) — %s",
+            trip_id, format_db_delta(db_stats_delta(db_before)), exc, exc_info=True,
+        )
         sentry_sdk.capture_exception(exc)
         try:
+            # critical: no further emit follows, so this is the only chance to
+            # commit the failed status (and anything buffered) to the durable snapshot.
             await emit(
                 "error", "Trip planning failed",
                 [PatchOp(op="set", path="/meta/status", value="error")],
                 100,
+                critical=True,
             )
         except Exception:  # noqa: BLE001
             publish_event(trip_id, {
