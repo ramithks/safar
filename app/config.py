@@ -25,6 +25,28 @@ class Settings(BaseSettings):
     # Path to a service account JSON key; leave unset to use ADC
     google_application_credentials: Optional[str] = None
 
+    # EXPERIMENT flag (Experiment #2 — scraper-fd-churn → Supabase bad_record_mac).
+    # When true, every pooled curl_cffi session is swapped for a no-network mock
+    # that returns deterministic empty 200 responses, so ZERO libcurl sockets are
+    # opened. The planner (Gemini), persistence, and all Supabase writes stay real
+    # and unchanged. Toggling this isolates whether scraper TLS-socket churn is
+    # what induces the SSL storm. NEVER enable in production.
+    mock_scrapers: bool = False
+
+    # EXPERIMENT flag (Experiment #1 — Gemini/Vertex as the SSL-storm trigger).
+    # When true, vertex_generate() returns a deterministic canned string and makes
+    # ZERO Vertex HTTP calls, so a generation exercises the full planner +
+    # persistence + Supabase write path with no google TLS activity in-process.
+    # Isolates whether Vertex TLS churn is what induces the storm. NEVER in prod.
+    mock_gemini: bool = False
+
+    # EXPERIMENT flag (Experiment #3 — instrument the trip_state.batches write).
+    # When true, each batch save logs thread id, Supabase client id, payload size,
+    # duration, and correlation ids, and flags any cross-thread client reuse (a
+    # client used off its owning thread — the leading code-level SSL-storm suspect).
+    # Pure additive logging; no behavior change. Safe to leave off in prod.
+    instrument_batches: bool = False
+
     # LLM gateway tiers — model IDs live in config ONLY (never hardcode at call
     # sites). "brain" handles reasoning-heavy calls (itinerary, journey tradeoffs,
     # re-ranking); "muscle" handles high-volume schema-bound transforms

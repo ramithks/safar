@@ -128,6 +128,13 @@ async def vertex_generate(
     response_schema: a Gemini-compatible JSON schema — enables native
     structured output (forces responseMimeType to application/json).
     """
+    # EXPERIMENT #1 (settings.mock_gemini): short-circuit before any Vertex HTTP.
+    # Return an empty-JSON string so JSON-expecting callers (extract_json /
+    # generate_json) parse `{}` and degrade gracefully, while text callers get "".
+    # No google TLS socket is opened — isolates Vertex as an SSL-storm trigger.
+    if settings.mock_gemini:
+        return "{}" if (response_schema or response_mime_type) else ""
+
     token, project_id = _get_access_token()
     regions = _regions()
     model = model or settings.vertex_model_brain

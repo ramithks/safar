@@ -21,9 +21,63 @@ import hashlib
 import json
 import logging
 import re
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
+
+# EXPERIMENT #3 — cross-thread Supabase client detector. Maps a client object id
+# to the FIRST thread that used it; the one-client-per-thread invariant means a
+# given client id must never appear under two thread ids. If it does, a client
+# leaked across threads (the leading code-level bad_record_mac suspect).
+_client_owner: dict[int, int] = {}
+_client_owner_lock = threading.Lock()
+
+
+def _instrumented_insert(trip_id: str, kind: str, batch_id: str, rows: list[dict]) -> str:
+    """insert_results + finalize, wrapped with per-write diagnostics (thread id,
+    client id, payload size, duration) and cross-thread client-reuse detection.
+    Logs full context on SSL/transport failure, then re-raises so the caller's
+    best-effort handler still runs. Only active under settings.instrument_batches."""
+    from app.db.client import get_db
+
+    tid = threading.get_ident()
+    client = get_db()
+    cid = id(client)
+    payload_bytes = len(json.dumps(rows, default=str))
+
+    with _client_owner_lock:
+        owner = _client_owner.setdefault(cid, tid)
+    if owner != tid:
+        logger.error(
+            "[batches-instr] ⚠ CROSS-THREAD CLIENT: client %s owned by thread %s "
+            "but used on thread %s (trip %s batch %s) — invariant violated",
+            cid, owner, tid, trip_id, batch_id,
+        )
+
+    t0 = time.monotonic()
+    try:
+        n = SearchBatchStore.insert_results(rows)
+        SearchBatchStore.finalize(batch_id, n)
+        dt = (time.monotonic() - t0) * 1000
+        logger.info(
+            "[batches-instr] ok trip=%s batch=%s kind=%s rows=%d bytes=%d "
+            "thread=%s client=%s dur_ms=%.0f",
+            trip_id, batch_id, kind, n, payload_bytes, tid, cid, dt,
+        )
+        return batch_id
+    except Exception as exc:  # noqa: BLE001
+        dt = (time.monotonic() - t0) * 1000
+        logger.error(
+            "[batches-instr] FAIL %s trip=%s batch=%s kind=%s rows=%d bytes=%d "
+            "thread=%s client=%s owner_thread=%s dur_ms=%.0f err=%s: %s",
+            type(exc).__name__, trip_id, batch_id, kind, len(rows), payload_bytes,
+            tid, cid, owner, dt, type(exc).__name__, exc,
+        )
+        raise
 
 # Transport block keys in a shaped journey (plural) → canonical item_type (singular).
 _TRANSPORT_MODES = {"flights": "flight", "trains": "train", "buses": "bus"}
@@ -270,6 +324,8 @@ async def _persist(trip_id: str, kind: str, scope_id: str, mode: str | None,
         )
         for r in rows:
             r["batch_id"] = batch_id
+        if settings.instrument_batches:
+            return _instrumented_insert(trip_id, kind, batch_id, rows)
         n = SearchBatchStore.insert_results(rows)
         SearchBatchStore.finalize(batch_id, n)
         return batch_id

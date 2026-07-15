@@ -26,10 +26,62 @@ from contextlib import asynccontextmanager
 
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 
 # key = (id(loop), proxy_or_empty, impersonate_or_empty)
 _pool: dict[tuple, CurlAsyncSession] = {}
+
+
+# ── Experiment #2 mock (settings.mock_scrapers) ───────────────────────────────
+# A no-network stand-in for a curl_cffi AsyncSession. Every verb returns the same
+# deterministic empty 200 response and NO libcurl socket is ever opened, so a
+# generation run under mock_scrapers exercises the full planner + persistence +
+# Supabase write path with zero scraper fd churn. Scrapers parsing an empty body
+# simply yield "0 results" (or raise and get caught by their own try/except) —
+# fine for the experiment, whose only variable is "curl activity present vs not".
+class _MockResponse:
+    def __init__(self, url: str = "") -> None:
+        self.status_code = 200
+        self.url = url
+        self.headers: dict = {}
+        self.cookies: dict = {}
+        self.content = b"{}"
+        self.text = "{}"
+        self.ok = True
+
+    def json(self):
+        return {}
+
+    def raise_for_status(self):
+        return None
+
+
+class _MockSession:
+    async def request(self, method: str = "GET", url: str = "", **kwargs) -> _MockResponse:
+        return _MockResponse(url)
+
+    async def get(self, url: str = "", **kwargs) -> _MockResponse:
+        return _MockResponse(url)
+
+    async def post(self, url: str = "", **kwargs) -> _MockResponse:
+        return _MockResponse(url)
+
+    async def put(self, url: str = "", **kwargs) -> _MockResponse:
+        return _MockResponse(url)
+
+    async def delete(self, url: str = "", **kwargs) -> _MockResponse:
+        return _MockResponse(url)
+
+    async def head(self, url: str = "", **kwargs) -> _MockResponse:
+        return _MockResponse(url)
+
+    async def close(self) -> None:
+        return None
+
+
+_mock_session = _MockSession()
 
 
 def _get(proxy: str | None, impersonate: str | None) -> CurlAsyncSession:
@@ -56,4 +108,7 @@ async def get_curl_session(*, proxy: str | None = None, impersonate: str | None 
     """Drop-in for `async with CurlAsyncSession(...) as s:` that yields a pooled,
     reused session instead of building/closing one per request. Does NOT close
     the session on exit — that's the whole point (keep-alive, no fd churn)."""
+    if settings.mock_scrapers:
+        yield _mock_session
+        return
     yield _get(proxy, impersonate)
