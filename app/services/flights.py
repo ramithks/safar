@@ -12,6 +12,7 @@ Usage:
 """
 import asyncio
 import logging
+import time
 from app.services.booking.flights import (
     search_flights as booking_search_flights,
     resolve_iata,
@@ -28,6 +29,37 @@ logger = logging.getLogger(__name__)
 
 async def _noop(value):
     return value
+
+
+# ── No-service route cache ────────────────────────────────────────────────────
+# Many routes have no air service at all (tiny airports like Kullu/KUU, or two
+# cities with no direct flights). A single trip hammers each such route THREE
+# times — outbound, return, and the multi-hop mirror re-scrape — burning 3
+# providers × 3 passes = 9 dead calls. Once all providers agree a route is empty,
+# remember it briefly and short-circuit: the return leg and mirror pass then cost
+# nothing. Keyed by IATA pair (date-agnostic — a route without service on one day
+# has none on adjacent days); only set when providers actually RESPONDED empty,
+# never on errors/timeouts (those are transient).
+_NO_SERVICE_TTL = 6 * 3600  # seconds
+_no_service: dict[str, float] = {}  # "FROM>TO" → epoch when it expires
+
+
+def _route_key(from_iata: str, to_iata: str) -> str:
+    return f"{from_iata}>{to_iata}"
+
+
+def _is_no_service(from_iata: str, to_iata: str) -> bool:
+    exp = _no_service.get(_route_key(from_iata, to_iata))
+    if exp is None:
+        return False
+    if exp < time.monotonic():
+        _no_service.pop(_route_key(from_iata, to_iata), None)
+        return False
+    return True
+
+
+def _mark_no_service(from_iata: str, to_iata: str) -> None:
+    _no_service[_route_key(from_iata, to_iata)] = time.monotonic() + _NO_SERVICE_TTL
 
 
 # ── Sorting (shared by /search/flights and the /plan journey) ────────────────
@@ -102,12 +134,22 @@ class FlightService:
                 "to_iata": to_iata, "resolved": False,
             }
 
+        # Known dead route (recently confirmed no service by all providers) —
+        # skip the scrape entirely. Saves the return-leg + mirror re-scrapes.
+        if _is_no_service(from_iata, to_iata):
+            logger.info("[flights] %s→%s: skipped (cached no-service)", from_iata, to_iata)
+            return {
+                "flights": [], "from_iata": from_iata, "to_iata": to_iata,
+                "resolved": True, "no_service": True,
+            }
+
         # Push the requested sort UPSTREAM so each provider returns a slice that
         # already favours it — sorting after a biased page can't recover the
         # candidates a provider never returned. Booking + Gotogate sort natively;
         # EMT has no upstream sort but returns near-full inventory, so reranking it
         # locally is safe. A final merge-wide rerank by `sort` happens below.
         eff_sort = (sort or "CHEAPEST").upper()
+        timed_out = False
         try:
             booking_r, emt_r, gotogate_r = await asyncio.wait_for(
                 asyncio.gather(
@@ -135,6 +177,7 @@ class FlightService:
         except asyncio.TimeoutError:
             logger.warning("[flights] search timeout for %s→%s on %s", from_iata, to_iata, date)
             booking_r, emt_r, gotogate_r = [], [], []
+            timed_out = True
 
         def _src_status(result) -> tuple[list, str]:
             if isinstance(result, Exception):
@@ -144,6 +187,24 @@ class FlightService:
         booking_flights,  booking_status  = _src_status(booking_r)
         emt_flights,      emt_status      = _src_status(emt_r)
         gotogate_flights, gotogate_status = _src_status(gotogate_r)
+
+        # If EVERY provider actually responded (no exception/timeout) and all came
+        # back empty, this route has no service — cache it so the return leg and
+        # the multi-hop mirror pass don't re-scrape the same dead route. Only when
+        # all breakers are CLOSED: an open breaker returns the empty fallback too,
+        # and caching a transient outage as "no service" would hide a real route.
+        responses = (booking_r, emt_r, gotogate_r)
+        breakers_healthy = not any(
+            b.is_open for b in (breaker_booking, breaker_emt, breaker_gotogate)
+        )
+        all_responded = (
+            not timed_out
+            and breakers_healthy
+            and all(not isinstance(r, Exception) for r in responses)
+        )
+        all_empty = not (booking_flights or emt_flights or gotogate_flights)
+        if all_responded and all_empty:
+            _mark_no_service(from_iata, to_iata)
 
         # Per-provider result counts for this search (observability).
         for prov, flights_list in (

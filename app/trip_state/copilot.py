@@ -823,13 +823,24 @@ async def apply_edit(
                 flush.enqueue(trip_id, "user", patches, phase="copilot_edit", reasoning=message)
                 _broadcast_only()
 
-    if patches and user_id:
+    # Both the My Trips mirror and the search-store sync only reflect specific
+    # sections. A turn whose patches touch none of them (e.g. a documents/weather
+    # tweak, or a clarify that only edited /agent_meta) doesn't need either — the
+    # frontend fires several edits per session, so skipping the no-op ones avoids
+    # a redundant DB upsert + three search-store selects each time.
+    def _touches(prefixes: tuple[str, ...]) -> bool:
+        return any((p.path or "").startswith(prefixes) for p in patches)
+
+    _MIRROR_PATHS = ("/meta/title", "/request", "/destination", "/itinerary", "/costs", "/transport")
+    _SYNC_PATHS = ("/graph", "/transport", "/stay")
+
+    if patches and user_id and _touches(_MIRROR_PATHS):
         # Keep the My Trips mirror row current (title/dates/cost/days preview).
         from .my_trips import upsert_my_trip
 
         await upsert_my_trip(trip_id, user_id, state)
 
-    if patches:
+    if patches and _touches(_SYNC_PATHS):
         # Mirror the (possibly newly-built) graph into the search store keyed by
         # real leg/node ids so the /options + /recommendations endpoints stay current
         # — idempotent + content-hashed, so an unchanged graph is a no-op. Best-effort,

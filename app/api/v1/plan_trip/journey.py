@@ -531,6 +531,152 @@ def _pick_recommended_flight(flights: list[dict], budget: str) -> dict | None:
     return pick
 
 
+# ── Connection-aware selection (multi-leg timing) ─────────────────────────────
+# A journey's legs are chained: leg N+1 cannot depart before leg N arrives. The
+# per-leg pickers above score each leg in isolation, so on a Manali→Delhi (overnight
+# bus, arrives 08:00) → Delhi→Bhiwani (train) journey they'd happily recommend a
+# 05:00 train that departs three hours before you reach Delhi. This pass walks the
+# legs in order and re-points each leg's recommendation to the best option that
+# departs at least CONNECTION_BUFFER_MIN after the previous leg arrives, rolling the
+# clock (and date) forward across overnight legs. It also stamps each live leg with a
+# concrete departure/arrival date so the UI can show "which day" per leg.
+
+CONNECTION_BUFFER_MIN = 90  # min gap between arriving one leg and departing the next
+
+
+def _parse_hhmm_on(date_: "datetime | None", hhmm: str) -> "datetime | None":
+    """Anchor a bare 'HH:MM' (trains carry no date) onto a running date."""
+    if not (date_ and hhmm):
+        return None
+    hhmm = hhmm.strip()
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            t = datetime.strptime(hhmm, fmt)
+            return date_.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+        except ValueError:
+            continue
+    return None
+
+
+def _option_times(opt: dict, mode: str, anchor: "datetime | None") -> "tuple[datetime, datetime] | None":
+    """(departure, arrival) as datetimes for one transport option, or None if it
+    can't be parsed. `anchor` seeds the date for date-less options (trains)."""
+    try:
+        if mode == "bus":
+            dep = datetime.strptime(opt["departure"], "%Y-%m-%d %H:%M:%S")
+            arr = datetime.strptime(opt["arrival"], "%Y-%m-%d %H:%M:%S")
+            if arr < dep:  # overnight
+                arr += timedelta(days=1)
+            return dep, arr
+        if mode == "flight":
+            dep = datetime.fromisoformat((opt.get("departure_time") or "").replace("Z", ""))
+            dur = opt.get("duration_min") or 0
+            arr = dep + timedelta(minutes=dur) if dur else dep
+            return dep, arr
+        if mode in ("train", "railway"):
+            base = anchor or datetime.now()
+            dep = _parse_hhmm_on(base, opt.get("departure_time") or "")
+            if dep is None:
+                return None
+            arr = _parse_hhmm_on(dep, opt.get("arrival_time") or "")
+            dur = opt.get("duration_min") or 0
+            if arr is not None and arr < dep:  # crosses midnight
+                arr += timedelta(days=1)
+            if arr is None and dur:
+                arr = dep + timedelta(minutes=dur)
+            return dep, (arr or dep)
+    except (ValueError, KeyError, TypeError):
+        return None
+    return None
+
+
+def _leg_options(leg: dict, mode: str) -> list[dict]:
+    live = leg.get("live_data") or {}
+    if mode == "bus":
+        return live.get("buses") or []
+    if mode == "flight":
+        return live.get("flights") or []
+    if mode in ("train", "railway"):
+        return [t for t in (live.get("trains") or []) if not t.get("departed")] or (live.get("trains") or [])
+    return []
+
+
+def _pick_leg_option(mode: str, options: list[dict], budget: str) -> dict | None:
+    """Re-run the mode's scorer over a (possibly connection-filtered) subset.
+    Bus/flight pickers return a COPY, so callers must match it back by identity
+    fields (see _same_option), not by `is`."""
+    if not options:
+        return None
+    if mode == "bus":
+        return _pick_recommended_bus(options, budget)
+    if mode == "flight":
+        return _pick_recommended_flight(options, budget)
+    return options[0]  # trains: earliest valid departure (already the original)
+
+
+def _same_option(a: dict, b: dict, mode: str) -> bool:
+    """Match a scorer's returned copy back to the original option in the leg array."""
+    if mode == "bus":
+        return a.get("departure") == b.get("departure") and a.get("operator") == b.get("operator")
+    if mode == "flight":
+        return (a.get("flight_number") == b.get("flight_number")
+                and a.get("departure_time") == b.get("departure_time"))
+    return a is b
+
+
+def _apply_connection_constraints(legs: list[dict], base_date: str | None, budget: str) -> None:
+    """Re-point per-leg transport recommendations so each leg departs after the
+    previous leg arrives (+ buffer), and stamp per-leg dates. Mutates `legs`."""
+    anchor: datetime | None = None
+    if base_date:
+        try:
+            anchor = datetime.fromisoformat(base_date)
+        except ValueError:
+            anchor = None
+    earliest_dep: datetime | None = None  # previous arrival + buffer
+
+    for leg in legs:
+        mode = (leg.get("mode") or "").lower()
+        if mode not in ("bus", "train", "railway", "flight") or not leg.get("has_live_data"):
+            continue
+        options = _leg_options(leg, mode)
+        timed = [(o, *t) for o in options if (t := _option_times(o, mode, anchor)) is not None]
+        if not timed:
+            continue
+
+        if earliest_dep is not None:
+            valid = [row for row in timed if row[1] >= earliest_dep]
+        else:
+            valid = timed
+        connection_ok = bool(valid) or earliest_dep is None
+        pool = valid if valid else timed  # nothing connects → earliest available, flagged
+
+        pick = _pick_leg_option(mode, [row[0] for row in pool], budget)
+        chosen = next(
+            (row for row in pool if pick and _same_option(row[0], pick, mode)), None
+        )
+        if chosen is None:
+            chosen = min(pool, key=lambda r: r[1])  # earliest departure
+        opt, dep, arr = chosen
+
+        # Re-mark is_recommended on the leg's own option array.
+        for o in options:
+            o["is_recommended"] = (o is opt)
+        leg["recommended_departure"] = dep.strftime("%Y-%m-%d %H:%M")
+        leg["recommended_arrival"] = arr.strftime("%Y-%m-%d %H:%M")
+        leg["date"] = dep.strftime("%Y-%m-%d")
+        if not connection_ok:
+            leg["connection_warning"] = (
+                "No option departs after the previous leg arrives — showing the "
+                "earliest available; you may need an overnight stop."
+            )
+        else:
+            leg.pop("connection_warning", None)
+
+        earliest_dep = arr + timedelta(minutes=CONNECTION_BUFFER_MIN)
+        anchor = arr
+
+
 async def _explain_picks(
     rec_flight: dict | None, flight_pool: list[dict], flight_ctx: dict,
     rec_hotel: dict | None,  hotel_pool: list[dict],  hotel_ctx: dict,
@@ -930,6 +1076,29 @@ async def run_plan_journey(
         )
         legs[leg_idx]["has_live_data"] = has
         legs[leg_idx]["booking_url"] = _leg_booking_url(legs[leg_idx], result, departure_date)
+
+    # ── Chain the legs: each must depart after the previous one arrives ───────
+    # Overrides the per-leg picks above so a connecting leg never departs before
+    # the prior leg lands (+ buffer), and stamps each live leg with its date.
+    _apply_connection_constraints(legs, departure_date, safe_budget)
+    # Re-derive the singular recs from the connection-aware per-leg picks so the
+    # recommendations block + AI explain layer see the same option the leg shows.
+    _rec_bus = _rec_train = _rec_flight = None
+    _rec_flight_pool = []
+    for leg in legs:
+        _m = (leg.get("mode") or "").lower()
+        if not leg.get("has_live_data"):
+            continue
+        _rec = next((o for o in _leg_options(leg, _m) if o.get("is_recommended")), None)
+        if not _rec:
+            continue
+        if _m == "bus" and _rec_bus is None:
+            _rec_bus = _rec
+        elif _m == "flight" and _rec_flight is None:
+            _rec_flight = _rec
+            _rec_flight_pool = (leg.get("live_data") or {}).get("flights") or []
+        elif _m in ("train", "railway") and _rec_train is None:
+            _rec_train = _rec
 
     # ── Recompute cost + duration from live data ──────────────────────────────
     live_costs = _compute_live_costs(legs, hotel_result, body.stay_nights, body.travelers)
