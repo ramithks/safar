@@ -88,12 +88,24 @@ _RETRYABLE = (
     httpx.ReadError,
     httpx.WriteError,
     httpx.PoolTimeout,
+    # Raw bad_record_mac from the scraper fd-churn isn't always normalised into
+    # an httpx.TransportError — catch it here too (mirrors _WRITE_RETRYABLE).
+    ssl.SSLError,
 )
 _IDEMPOTENT = {"GET", "HEAD", "OPTIONS", "DELETE"}
 
 
-def _install_retry(session: httpx.Client, attempts: int = 3) -> None:
-    """Wrap an httpx.Client.send so stale-connection drops auto-retry."""
+def _install_retry(session: httpx.Client, attempts: int = 6) -> None:
+    """Wrap an httpx.Client.send so stale-connection drops auto-retry.
+
+    Retries are spaced with jittered exponential backoff (~0.3s → ~4s, ~10s
+    total across the default 6 attempts). The backoff is the whole point: the
+    curl_cffi scraper fd-churn corrupts Supabase's TLS sockets in bursts that
+    last several seconds, and retries fired back-to-back all die inside the same
+    window (the old no-sleep 3× loop is why user-facing GETs 500'd mid-storm).
+    Spacing the retries lets an idempotent read land after the burst passes —
+    the same recovery the trip_state append loop already relied on for writes.
+    """
     if not isinstance(session, httpx.Client) or getattr(session, "_tb_retry", False):
         return
     _original_send = session.send
@@ -113,6 +125,8 @@ def _install_retry(session: httpx.Client, attempts: int = 3) -> None:
                     "[db] transient %s on %s %s — retry %d/%d",
                     type(exc).__name__, request.method, request.url, i + 1, attempts,
                 )
+                if i < attempts - 1:
+                    time.sleep(min(0.3 * (2 ** i), 4.0) + random.uniform(0, 0.3))
         assert last_exc is not None
         raise last_exc
 

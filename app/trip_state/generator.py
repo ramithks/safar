@@ -13,6 +13,7 @@ Event shape (what the frontend receives):
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta
 
 import httpx
 import redis as redis_lib
@@ -142,7 +143,20 @@ def _section_patches(state_dict: dict, sections: list[str]) -> list[PatchOp]:
 
 def _reco_ctx(body: PlanRequest) -> dict:
     """Minimal traveller context for the reco ranker (persona is derived from it)."""
-    return {"budget": body.budget_tier, "intent": {"interests": list(body.interests or [])}}
+    return {"budget": body.budget, "intent": {"interests": list(body.interests or [])}}
+
+
+def _return_date(body: PlanRequest) -> str | None:
+    """The return leg departs on the last day of the trip. PlanRequest carries no
+    return_date field, so derive it the same way the supervisor does
+    (departure_date + days) instead of reading a non-existent attribute."""
+    if not body.departure_date:
+        return None
+    try:
+        dep = datetime.fromisoformat(body.departure_date)
+        return (dep + timedelta(days=body.days)).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
 
 
 async def _save_and_score_transport(trip_id, scope_id, origin, destination,
@@ -175,7 +189,7 @@ def _populate_search_store(trip_id: str, body: PlanRequest, shaped: dict, direct
     going = direction == "going"
     origin = body.origin if going else body.destination
     destination = body.destination if going else body.origin
-    depart_date = body.departure_date if going else body.return_date
+    depart_date = body.departure_date if going else _return_date(body)
     ctx = _reco_ctx(body)
     spawn_background(
         _save_and_score_transport(trip_id, direction, origin, destination,

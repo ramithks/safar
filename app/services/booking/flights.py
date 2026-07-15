@@ -14,7 +14,7 @@ import httpx
 from app.services.curl_pool import get_curl_session
 
 from app.config import settings
-from app.services.scraper_proxy import with_proxy_fallback, ScraperBlocked
+from app.services.scraper_proxy import with_proxy_fallback
 from app.services.geo import iata_of as geo_iata, country_of, country_of_iata
 
 logger = logging.getLogger(__name__)
@@ -171,17 +171,31 @@ async def search_flights(
             )
         r.raise_for_status()
         j = r.json()
-        # A genuine "no flights" response still carries the flightOffers key (empty
-        # list). Its absence means a WAF/error body, not real emptiness — treat as
-        # a block so the proxy retry fires and it isn't reported as "0 results".
-        if "flightOffers" not in j:
-            raise ScraperBlocked("flightOffers key missing")
+        # Classify the payload so we retry ONLY when a fresh IP could actually
+        # change the answer:
+        #   • HTML/WAF block → r.json() already raised → retried upstream.
+        #   • non-200        → raise_for_status already raised → retried upstream.
+        #   • 200 + valid JSON object WITHOUT flightOffers → this OD simply isn't
+        #     served (e.g. BAO→KUU). The body is deterministic; retrying 4× with
+        #     fresh IPs returns the identical payload and only churns TLS sockets
+        #     (a documented trigger of the Supabase bad_record_mac storm). Treat
+        #     it as a real empty result — no retry — and log the shape once so a
+        #     future Booking schema change is visible instead of silently empty.
+        if not isinstance(j, dict) or "flightOffers" not in j:
+            logger.warning(
+                "[flights_booking] %s→%s %s: 200 but no flightOffers key — treating as no-service (keys=%s) %.180s",
+                from_airport, to_airport, depart_date,
+                list(j.keys()) if isinstance(j, dict) else type(j).__name__,
+                str(j),
+            )
+            return {"flightOffers": []}
         return j
 
     try:
-        # 4 fresh-IP attempts for the brittle WAF, but cap the whole retry loop at
-        # 25s (< the 30s FlightService merge budget) so Booking's retries can never
-        # time out the shared gather and zero EMT/Gotogate too.
+        # Cap the whole retry loop at 25s (< the 30s FlightService merge budget) so
+        # Booking's retries can never time out the shared gather and zero
+        # EMT/Gotogate too. Structurally-empty payloads no longer retry at all
+        # (see _do), so the 4 attempts now only cover genuine transport/WAF errors.
         raw = await asyncio.wait_for(
             with_proxy_fallback("flights_booking", _do, proxy_attempts=4),
             timeout=25.0,
