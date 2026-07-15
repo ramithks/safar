@@ -9,7 +9,11 @@ still what the mobile app calls; that contract must not move.
 from fastapi import APIRouter
 
 from app.api.v1.trip_state.endpoint import router as trip_state_router
+from app.api.v2.search import router as search_router
 
 router = APIRouter(prefix="/api/v2")
 
 router.include_router(trip_state_router, prefix="/plan", tags=["plan-v2"])
+# Search-store surface (docs/persistence_architecture.md §11): options / results /
+# view / recommendations / memory / projection.
+router.include_router(search_router, tags=["search-store"])

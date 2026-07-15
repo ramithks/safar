@@ -24,6 +24,7 @@ live in the copilot/builder handlers.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -64,6 +65,11 @@ class TransportOption(BaseModel):
     duration_min: Optional[int] = None
     fare_per_person: float = 0
     currency: str = "INR"
+    # Seat availability, denormalized at build time from the provider item so the
+    # sold-out check no longer needs `raw` — the first step to dropping `raw` from
+    # the stored graph. Older options (pre-denorm) leave it None and _sold_out
+    # falls back to computing it from `raw`.
+    available: Optional[bool] = None
     raw: dict = Field(default_factory=dict)
 
 
@@ -194,6 +200,7 @@ def option_from_item(mode: str, item: dict, oid: str) -> TransportOption:
         arrival=item.get("arrival_time") or item.get("arrival"),
         duration_min=item.get("duration_min"),
         fare_per_person=_fare(mode, item),
+        available=option_is_available(mode, item),
         raw=raw,
     )
 
@@ -241,8 +248,37 @@ def option_is_available(mode: str, item: dict) -> bool:
     return True
 
 
+_HEAVY_HOTEL_KEYS = ("photos", "amenities", "description", "rooms", "reviews",
+                     "raw", "room_options")
+
+
+def thin_graph_dump(dump: dict) -> dict:
+    """A copy of a serialized graph with the heavy provider payloads removed:
+    each transport option's `raw` and each hotel's photo/amenity blobs. Those live
+    in the search store (populated by sync_trip_to_store) and are served by /options
+    + /results, so the persisted snapshot keeps only the thin fields that cost,
+    ranking, and the (skinny) projection need. The in-memory graph stays fat for the
+    duration of an edit so sync can still mirror the raw payloads to the store."""
+    d = deepcopy(dump)
+    for e in d.get("edges") or []:
+        for r in e.get("routes") or []:
+            for hop in r.get("hops") or []:
+                for o in hop.get("options") or []:
+                    if isinstance(o, dict):
+                        o.pop("raw", None)
+    for n in d.get("nodes") or []:
+        for hotel in ((n.get("stay") or {}).get("search_results")) or []:
+            if isinstance(hotel, dict):
+                for k in _HEAVY_HOTEL_KEYS:
+                    hotel.pop(k, None)
+    return d
+
+
 def _sold_out(o: TransportOption) -> int:
-    return 0 if option_is_available(o.mode, o.raw or {}) else 1
+    avail = o.available
+    if avail is None:  # pre-denorm option — fall back to the provider payload
+        avail = option_is_available(o.mode, o.raw or {})
+    return 0 if avail else 1
 
 
 # ── Travel-time arithmetic ───────────────────────────────────────────────────────
@@ -791,35 +827,14 @@ def _project_journey_block(leg: TripLeg, prefer: str | None, budget: str | None)
     if route.kind == "via_gateway":
         block["via_gateway"] = route.gateway_city
 
-    # Single-hop direct routes fill the mode buckets (what today's UI expects);
-    # multi-hop gateway routes expose per-hop buckets under `hops`.
-    def bucketize(hop: RouteHop, hop_index: int) -> dict:
-        out: dict = {}
-        pick = selected_option_for_hop(leg, route, hop_index, prefer, budget)
-        for mode in _MODES:
-            items = []
-            for o in hop.options:
-                if o.mode != mode:
-                    continue
-                it = dict(o.raw, is_recommended=(pick is not None and o.id == pick.id))
-                if _sold_out(o):
-                    it["sold_out"] = True
-                items.append(it)
-            if items:
-                key = {"flight": "flights", "train": "trains", "bus": "buses"}[mode]
-                out[key] = {
-                    "items": items,
-                    "recommended": next((it for it in items if it.get("is_recommended")), None),
-                }
-        return out
-
-    if len(route.hops) == 1:
-        block.update(bucketize(route.hops[0], 0))
-    else:
-        block["hops"] = [
-            {"from": h.from_city, "to": h.to_city, **bucketize(h, i)}
-            for i, h in enumerate(route.hops)
-        ]
+    # Skinny projection: emit the route SKELETON + a flag so the client fetches the
+    # full ranked option lists from /trips/{id}/options?scope={leg_id}. The picked/
+    # recommended ride per hop is carried by `segments` below; the raw provider
+    # payloads live only in the search store (served by /results). We no longer
+    # inline every option's raw payload here — that was the fat frontend blob.
+    block["has_options"] = any(h.options for h in route.hops)
+    if len(route.hops) > 1:
+        block["hops"] = [{"from": h.from_city, "to": h.to_city} for h in route.hops]
 
     # Per-hop breakdown of the ride actually in force, with real cities, mode and
     # calendar dates — so the UI can render "Manali → Delhi (bus, overnight) then
@@ -857,7 +872,7 @@ def _project_journey_block(leg: TripLeg, prefer: str | None, budget: str | None)
 # (flight_journey, ground_route_backup, reasoning, journey_options, hotels,
 # train_journey…) is preserved verbatim when re-emitting.
 _PROJECTED_KEYS = {"leg_id", "date", "legs", "hops", "flights", "trains", "buses",
-                   "via_gateway", "summary", "segments", "route_label"}
+                   "via_gateway", "summary", "segments", "route_label", "has_options"}
 
 
 def _merged_block(original: dict | None, projected: dict) -> dict:

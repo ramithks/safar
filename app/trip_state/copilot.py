@@ -73,6 +73,15 @@ def _journey(state: dict, direction: str) -> dict:
     return transport.get(key) or {}
 
 
+def _has_graph(state: dict) -> bool:
+    """A multi-city trip carries a canonical graph; its transport is edited through
+    the per-leg graph handlers, and its projected `transport` blocks are skinny
+    (option lists live in the search store). The legacy transport handlers below
+    operate on those fat blocks and only apply to classic single-destination trips."""
+    g = state.get("graph") or {}
+    return bool(g.get("nodes") or g.get("edges"))
+
+
 def _fare_per_person(mode: str, option: dict) -> float:
     if mode == "train":
         return option.get("cheapest_fare") or 0
@@ -179,10 +188,17 @@ def _state_summary(state: dict) -> str:
         f"{req.get('days')} days ({req.get('departure_date')} to {req.get('return_date') or '?'}), "
         f"{req.get('travelers')} travelers, budget tier {req.get('budget_tier')}.",
     ]
-    lines += _route_lines(state, "going")
-    lines += _route_lines(state, "return")
-    lines += _option_lines(state, "going")
-    lines += _option_lines(state, "return", per_mode=5)
+    # For graph (multi-city) trips the agent prompt appends the canonical TRIP GRAPH
+    # block (legs + per-hop options + stays) straight from the graph, so re-deriving
+    # transport from the legacy `transport.going`/`return_journey` projection here is
+    # pure duplication — and reading it couples this summary to a projection that is
+    # going skinny. Classic single-destination trips (no graph) still read it.
+    graph = state.get("graph") or {}
+    if not (graph.get("nodes") or graph.get("edges")):
+        lines += _route_lines(state, "going")
+        lines += _route_lines(state, "return")
+        lines += _option_lines(state, "going")
+        lines += _option_lines(state, "return", per_mode=5)
 
     if costs:
         lines.append(
@@ -393,6 +409,9 @@ def handle_select_option(
     state: dict, direction: str, mode: str, index: int,
 ) -> tuple[list[PatchOp], str]:
     """Pick a specific ride on one leg; re-star items and reprice the trip."""
+    if _has_graph(state):
+        return [], ("This is a multi-city trip — tell me which leg to change and "
+                    "I'll pick the ride there.")
     if mode not in _MODE_KEYS:
         return [], "I don't recognise that transport mode."
     direction = "going" if direction != "return" else "return"
@@ -465,6 +484,9 @@ async def handle_select_flight_journey(state: dict) -> tuple[list[PatchOp], str]
     attached (`going.flight_journey`) when present, else LIVE-searches one so this
     works on any trip. Rebuilds `going` as a flight-only journey (existing cost/
     selection logic then just works) and stashes the ground route to switch back."""
+    if _has_graph(state):
+        return [], ("For a multi-city trip, tell me the leg you'd like to fly and "
+                    "I'll add a flight there.")
     going = dict(_journey(state, "going"))
     if going.get("ground_route_backup"):
         return [], "You're already on the direct flight. Say “back to train + bus” to switch back."
@@ -508,6 +530,8 @@ async def handle_select_flight_journey(state: dict) -> tuple[list[PatchOp], str]
 
 def handle_restore_ground_route(state: dict) -> tuple[list[PatchOp], str]:
     """Revert a flight-swap back to the originally-planned train/bus route."""
+    if _has_graph(state):
+        return [], "That applies to single-destination trips — tell me the leg to change."
     going = dict(_journey(state, "going"))
     backup = going.get("ground_route_backup")
     if not backup:
@@ -754,7 +778,7 @@ async def apply_edit(
         history = _recent_history(trip_id)
         memory = memory_grounding(await get_memory(user_id)) if user_id else ""
         agent_result = await run_agent(
-            message, state, user_id,
+            message, state, user_id, trip_id,
             history=history, memory=memory, on_step=on_step,
         )
         kind = agent_result["intent"]
@@ -804,6 +828,24 @@ async def apply_edit(
         from .my_trips import upsert_my_trip
 
         await upsert_my_trip(trip_id, user_id, state)
+
+    if patches:
+        # Mirror the (possibly newly-built) graph into the search store keyed by
+        # real leg/node ids so the /options + /recommendations endpoints stay current
+        # — idempotent + content-hashed, so an unchanged graph is a no-op. Best-effort,
+        # off the reply path.
+        from app.core.background import spawn_background as _spawn
+
+        from .sync_store import sync_trip_to_store
+
+        req = state.get("request") or {}
+        _spawn(
+            sync_trip_to_store(trip_id, state, ctx={
+                "budget": req.get("budget_tier") or "mid",
+                "intent": {"interests": req.get("interests") or []},
+            }),
+            name=f"sync-store:{trip_id}",
+        )
 
     # Record the turn in the durable chat transcript (every turn, incl. pure
     # Q&A / clarify that produced no patches) so the thread survives a refresh.

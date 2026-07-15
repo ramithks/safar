@@ -439,9 +439,14 @@ def _graph_patches(state: dict, graph: G.TripGraph) -> list[PatchOp]:
     """Persist the graph and its regenerated projections. Emits `/graph` plus the
     merged legacy projections so both graph-aware and current clients converge."""
     graph_dump = graph.model_dump(mode="json")
+    # Keep the FULL graph in memory so the post-edit sync_trip_to_store can mirror
+    # every option's raw payload into the search store, but PERSIST a thinned dump
+    # (raw + hotel blobs stripped — they live in the store, served by /options and
+    # /results). This is what keeps the stored snapshot skinny at rest.
     state["graph"] = graph_dump
+    thin_dump = G.thin_graph_dump(graph_dump)
     proj = G.project(state, graph)
-    patches = [PatchOp(op="set", path="/graph", value=graph_dump)]
+    patches = [PatchOp(op="set", path="/graph", value=thin_dump)]
     patches += _sync_request_dates(state, graph)
 
     if "/transport" in proj:

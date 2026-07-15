@@ -53,7 +53,14 @@ _TOOLS = [
     "add_activities",
     "add_waypoint",
     "set_title",
+    "remember",
 ]
+
+# Durable preference keys the `remember` tool may write to trip memory. These map
+# 1:1 onto MemoryService.as_query_rules (app.trip_state.memory) — the rules
+# TripContextService applies to every future search for this trip.
+_MEMORY_KEYS = ["only_refundable", "avoid_early_flights", "rank_axis",
+                "stay_tier", "hide_operators", "max_price"]
 
 
 def _plan_schema() -> dict:
@@ -87,6 +94,8 @@ def _plan_schema() -> dict:
             "waypoint_city": {"type": "STRING", "nullable": True},
             "waypoint_days": {"type": "INTEGER", "nullable": True},
             "title": {"type": "STRING", "nullable": True},
+            "memory_key": {"type": "STRING", "enum": _MEMORY_KEYS, "nullable": True},
+            "memory_value": {"type": "STRING", "nullable": True},
         },
         "required": ["tool"],
     }
@@ -109,6 +118,13 @@ def _clock(v) -> str:
         return "?"
     tail = v.split(" ")[-1].split("T")[-1]
     return tail[:5] if ":" in tail else v
+
+
+def _opt_available(mode: str, o: dict) -> bool:
+    """Prefer the denormalized `available` flag; fall back to the provider payload
+    for options stored before denormalization."""
+    a = o.get("available")
+    return a if isinstance(a, bool) else G.option_is_available(mode, o.get("raw") or {})
 
 
 def _graph_lines(state: dict, per_mode: int = 4) -> list[str]:
@@ -176,7 +192,7 @@ def _graph_lines(state: dict, per_mode: int = 4) -> list[str]:
                 line = ", ".join(
                     f"[{i}] {o.get('operator') or mode} {_clock(o.get('departure'))}→"
                     f"{_clock(o.get('arrival'))} ₹{round(o.get('fare_per_person') or 0)}"
-                    + ("" if G.option_is_available(mode, o.get("raw") or {}) else " SOLD OUT")
+                    + ("" if _opt_available(mode, o) else " SOLD OUT")
                     + (" ←picked" if picked_id and o.get("id") == picked_id else "")
                     for i, o in enumerate(shown)
                 )
@@ -286,7 +302,15 @@ def _prompt(message: str, state: dict, history: str, memory: str,
         "the existing origin→destination route of a classic single-destination "
         "trip. For building a NEW multi-city chain prefer add_leg + "
         "add_stop_itinerary.\n"
-        "- set_title(title): rename the trip.\n\n"
+        "- set_title(title): rename the trip.\n"
+        "- remember(memory_key, memory_value): save a DURABLE preference the user "
+        "states as a standing rule ('only refundable from now on', 'avoid early "
+        "morning flights', 'rank by comfort not price', 'no IndiGo'). This shapes "
+        "EVERY future search — don't just filter this once. Keys: only_refundable "
+        "(true), avoid_early_flights (HH:MM cutoff), rank_axis (price|comfort|time), "
+        "stay_tier (budget|mid|luxury), hide_operators (comma list), max_price. Use "
+        "this for 'from now on'/'always'/'stop showing me' asks; use a one-off "
+        "select_* tool when they just want this specific change.\n\n"
         "Pure questions about the trip (costs, timings, weather, packing) need "
         "NO actions — answer directly in `reply` from the summary, 2-4 concrete "
         "sentences.\n\n"
@@ -317,7 +341,24 @@ def _arg(action: dict, *keys: str) -> Any:
     return None
 
 
-async def _execute(action: dict, state: dict, user_id: str) -> ToolResult:
+def _coerce_memory_value(key: str, raw: Any):
+    """Map the model's string arg onto the typed value MemoryService expects."""
+    if key == "only_refundable":
+        return str(raw).strip().lower() not in ("false", "no", "0", "", "none")
+    if key == "hide_operators":
+        return [p.strip().lower() for p in str(raw or "").split(",") if p.strip()]
+    if key == "max_price":
+        try:
+            return float(str(raw).replace(",", "").strip())
+        except (TypeError, ValueError):
+            return raw
+    if key == "avoid_early_flights":
+        return {"before": str(raw).strip()} if raw else {"before": "09:00"}
+    return str(raw).strip().lower() if raw else raw  # rank_axis, stay_tier
+
+
+async def _execute(action: dict, state: dict, user_id: str,
+                   trip_id: str | None = None) -> ToolResult:
     """Run one tool against the live handlers. Never raises — a failure becomes
     an observation the model can react to on the next turn."""
     from .patch import PatchOp
@@ -441,6 +482,23 @@ async def _execute(action: dict, state: dict, user_id: str) -> ToolResult:
                 f"Renamed your trip to “{title}”.",
             )
 
+        if tool == "remember":
+            if not trip_id:
+                return ToolResult(observation="remember is unavailable for this trip.")
+            key = str(_arg(action, "memory_key") or "").strip()
+            if key not in _MEMORY_KEYS:
+                return ToolResult(observation=f"remember needs a valid memory_key ({_MEMORY_KEYS}).")
+            value = _coerce_memory_value(key, _arg(action, "memory_value"))
+            from app.db.client import run_db
+
+            from .memory import MemoryService
+
+            await run_db(lambda: MemoryService.upsert(
+                trip_id, key, value, confidence=0.85, source="copilot"))
+            return ToolResult(observation=(
+                f"Remembered '{key}={value}' — it will personalise every future "
+                "search for this trip."))
+
         return ToolResult(observation=f"Unknown tool '{tool}' — not executed.")
     except Exception as exc:  # noqa: BLE001 — surface as an observation, keep the run alive
         logger.warning("[agent] tool %s failed: %s", tool, exc, exc_info=True)
@@ -472,6 +530,7 @@ def _signature(action: dict) -> str:
 
 async def run_agent(
     message: str, state: dict, user_id: str,
+    trip_id: str | None = None,
     history: str = "", memory: str = "",
     on_step: Callable[[dict], None] | None = None,
 ) -> dict:
@@ -533,7 +592,7 @@ async def run_agent(
                 )
                 continue
             actions_left -= 1
-            res = await _execute(action, state, user_id)
+            res = await _execute(action, state, user_id, trip_id)
             executed.add(sig)
             progressed = True
             transcript.append(f"{_describe(action)} → {res.observation or 'no result'}")

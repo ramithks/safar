@@ -23,8 +23,9 @@ from app.db.client import run_db
 from app.api.v1.plan_trip.models import PlanRequest
 from app.api.v1.plan_trip.plan import _shape_journey
 from app.config import settings
+from app.core.background import spawn_background
 
-from . import flush, store
+from . import batches, flush, store
 from .models import trip_state_from_merged
 from .patch import PatchOp
 
@@ -139,6 +140,57 @@ def _section_patches(state_dict: dict, sections: list[str]) -> list[PatchOp]:
     return [PatchOp(op="set", path=f"/{s}", value=state_dict[s]) for s in sections]
 
 
+def _reco_ctx(body: PlanRequest) -> dict:
+    """Minimal traveller context for the reco ranker (persona is derived from it)."""
+    return {"budget": body.budget_tier, "intent": {"interests": list(body.interests or [])}}
+
+
+async def _save_and_score_transport(trip_id, scope_id, origin, destination,
+                                    depart_date, shaped, ctx) -> None:
+    from app.reco import index
+    batch_id = await batches.save_transport_batch(
+        trip_id, scope_id=scope_id, origin=origin, destination=destination,
+        depart_date=depart_date, shaped=shaped)
+    if batch_id:
+        await index.score_batch(trip_id, batch_id, scope_id=scope_id,
+                                kind="transport", ctx=ctx)
+
+
+async def _save_and_score_hotels(trip_id, scope_id, destination, depart_date,
+                                 hotels_block, ctx) -> None:
+    from app.reco import index
+    batch_id = await batches.save_hotel_batch(
+        trip_id, scope_id=scope_id, destination=destination,
+        depart_date=depart_date, hotels_block=hotels_block)
+    if batch_id:
+        await index.score_batch(trip_id, batch_id, scope_id=scope_id,
+                                kind="hotel", ctx=ctx)
+
+
+def _populate_search_store(trip_id: str, body: PlanRequest, shaped: dict, direction: str) -> None:
+    """Mirror this journey's scraped transport (+ hotels, going only) into the search
+    store AND populate the reco index for it. This store is what the workspace API's
+    /options + /recommendations endpoints read. Fire-and-forget and best-effort — it
+    must never affect generation."""
+    going = direction == "going"
+    origin = body.origin if going else body.destination
+    destination = body.destination if going else body.origin
+    depart_date = body.departure_date if going else body.return_date
+    ctx = _reco_ctx(body)
+    spawn_background(
+        _save_and_score_transport(trip_id, direction, origin, destination,
+                                  depart_date, shaped, ctx),
+        name=f"search-store:transport:{direction}:{trip_id}",
+    )
+    hotels = shaped.get("hotels") if going else None
+    if isinstance(hotels, dict) and hotels.get("items"):
+        spawn_background(
+            _save_and_score_hotels(trip_id, body.destination or "", body.destination,
+                                   body.departure_date, hotels, ctx),
+            name=f"search-store:hotel:{trip_id}",
+        )
+
+
 async def _fetch_and_emit_weather(trip_id: str, body: PlanRequest, emit: "_Emitter") -> None:
     """Runs alongside the supervisor; weather is optional and never blocks the plan."""
     from app.services.weather import get_trip_weather
@@ -179,6 +231,7 @@ async def run_generation(trip_id: str, body: PlanRequest, user_id: str) -> None:
             if tag == "journey":
                 shaped = _shape_journey(result, include_hotels=True)
                 hotels = shaped.get("hotels") or {}
+                _populate_search_store(trip_id, body, shaped, "going")
                 patches = [
                     PatchOp(op="set", path="/transport/going", value=shaped),
                     PatchOp(op="set", path="/transport/journey_summary",
@@ -207,10 +260,11 @@ async def run_generation(trip_id: str, body: PlanRequest, user_id: str) -> None:
                 await emit("itinerary_ready", "Day-by-day itinerary built", patches, 70)
 
             elif tag == "return_journey":
+                shaped_return = _shape_journey(result, include_hotels=False)
+                _populate_search_store(trip_id, body, shaped_return, "return")
                 await emit(
                     "return_ready", "Return journey planned",
-                    [PatchOp(op="set", path="/transport/return_journey",
-                             value=_shape_journey(result, include_hotels=False))],
+                    [PatchOp(op="set", path="/transport/return_journey", value=shaped_return)],
                     80,
                 )
 

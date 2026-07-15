@@ -288,17 +288,21 @@ def test_same_mode_chain_derives_per_leg_hops_and_projects():
     going = proj["/transport"]["going"]
     # The full original chain (autos included) is re-emitted…
     assert [l.get("mode") for l in going["legs"]] == ["auto", "train", "train", "auto"]
-    # …with per-hop buckets the frontend can render and select from.
+    # …with a SKINNY per-hop skeleton — the full option lists load from the search
+    # store (/options), not inline. Only from/to per hop, no raw buckets.
+    assert going["has_options"] is True
     assert len(going["hops"]) == 2
-    assert going["hops"][0]["trains"]["recommended"]["train_name"] == "GANDHIDHAM EXP"
-    assert going["hops"][1]["trains"]["recommended"]["train_name"] == "ASV UDZ SF EXP"
+    assert set(going["hops"][0].keys()) == {"from", "to"}
+    assert "trains" not in going and "flights" not in going
+    # The picked ride per hop is carried by `segments`.
+    assert [s["operator"] for s in going["segments"]] == ["GANDHIDHAM EXP", "ASV UDZ SF EXP"]
     # Non-projected keys (the direct-flight alternative) survive the merge.
     assert "flight_journey" in going
     assert going["summary"]["duration"] == "38h 0m"
 
     # The return keeps the user's S.R.Travels pick, not the cheaper VRL.
     ret = proj["/transport"]["return_journey"]
-    assert ret["buses"]["recommended"]["operator"] == "S.R.Travels"
+    assert any(s.get("operator") == "S.R.Travels" for s in ret["segments"])
 
     # Costs: (750 + 150 going + 6000 return) × 2 travelers; food carried over.
     assert proj["/costs"]["breakdown"]["transport"] == (750 + 150 + 6000) * 2
@@ -347,8 +351,11 @@ def test_derive_graph_from_legacy_round_trips():
     assert [n.city for n in g.nodes] == ["Delhi", "Manali"]
     assert len(g.edges) == 2          # going + return
     proj = G.project(state, g)
-    assert "trains" in proj["/transport"]["going"]
-    assert "flights" in proj["/transport"]["return_journey"]
+    # Skinny projection: no inline buckets; the picked mode shows in segments and
+    # `has_options` tells the client to fetch the list from /options.
+    assert proj["/transport"]["going"]["has_options"] is True
+    assert any(s.get("mode") == "train" for s in proj["/transport"]["going"]["segments"])
+    assert any(s.get("mode") == "flight" for s in proj["/transport"]["return_journey"]["segments"])
 
 
 # ── select_leg_option: pick a ride on ANY graph leg; selection survives reprojection ──
@@ -376,10 +383,9 @@ def test_select_leg_option_persists_and_projects(monkeypatch):
     g = G.TripGraph.model_validate(state["graph"])
     sel = g.edges[0].selection
     assert sel and sel.per_hop_option_ids[0] == "train-1"
-    # The projection marks the USER'S pick, not the derived cheapest.
-    items = state["transport"]["going"]["trains"]["items"]
-    flags = [it["is_recommended"] for it in items]
-    assert flags == [False, True]
+    # The projection's segment reflects the USER'S pick (Duronto), not the cheapest.
+    seg = state["transport"]["going"]["segments"][0]
+    assert seg["operator"] == "Duronto" and seg["fare_per_person"] == 1200
     # Costs follow the pick: 1200/pp x 2 travelers.
     assert state["costs"]["breakdown"]["transport"] == 2400
     # The projected block carries the leg id so the UI can target this leg.
@@ -539,7 +545,7 @@ def test_insert_stop_into_legacy_trip_rewires_cleanly(monkeypatch):
     assert t["journey_summary"] == "Bengaluru → Goa → Jaipur"
     assert t["going"]["legs"][0]["to"] == "Goa"
     assert t["onward_segments"][0]["to"] == "Jaipur"
-    assert "flights" in t["return_journey"]
+    assert t["return_journey"]["has_options"] is True
 
     # Flat itinerary is in TRAVEL order: Goa's 2 days first, then Jaipur's 2.
     days = state["itinerary"]["days"]
