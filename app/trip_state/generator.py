@@ -282,7 +282,12 @@ async def run_generation(trip_id: str, body: PlanRequest, user_id: str) -> None:
                     80,
                 )
 
-        merged = await supervisor_run(body, user_id, on_phase=on_phase)
+        # v2 owns persistence (trip_states/events + upsert_my_trip); skip the
+        # supervisor's legacy trips/trip_journey writes — they'd be orphan rows
+        # whose resilient retries amplify the TLS-corruption storm.
+        merged = await supervisor_run(
+            body, user_id, on_phase=on_phase, save_legacy_tables=False
+        )
 
         # Weather must land before "complete" — the SSE stream closes on it.
         if weather_task is not None:

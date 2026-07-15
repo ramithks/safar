@@ -272,7 +272,9 @@ async def _phase_wrap(tag: str, coro, on_phase):
     return res
 
 
-async def supervisor_run(body: PlanRequest, user_id: str, on_phase=None) -> dict:
+async def supervisor_run(
+    body: PlanRequest, user_id: str, on_phase=None, save_legacy_tables: bool = True
+) -> dict:
     """
     Full plan orchestration with budget supervision.
 
@@ -282,6 +284,13 @@ async def supervisor_run(body: PlanRequest, user_id: str, on_phase=None) -> dict
     on_phase: optional async callback (tag, result, error) fired as each agent
     completes — tags: "journey", "itinerary", "return_journey". Used by the
     Trip State streaming pipeline; blocking callers just omit it.
+
+    save_legacy_tables: when True (classic /api/v1/plan) the supervisor persists
+    the plan into the legacy `trips` + `trip_journey` tables (read by
+    users/endpoint.get_trip_journey). The v2 Trip State pipeline passes False:
+    it owns persistence (trip_states / trip_state_events + upsert_my_trip keyed
+    to the trip_state id), so these writes would be orphan rows with no reader —
+    and their resilient retries needlessly amplify the TLS-corruption storm.
     """
     stay_nights = max(1, body.days - 1)   # e.g. 4-day trip → 3 hotel nights
 
@@ -485,41 +494,45 @@ async def supervisor_run(body: PlanRequest, user_id: str, on_phase=None) -> dict
     )
 
     # ── Phase 5: DB writes — save trip synchronously to get trip_id ─────────────
-    try:
-        itinerary_data = {
-            k: merged[k]
-            for k in ("trip_name", "destination", "destination_description",
-                      "cover_photo_ref", "days",
-                      "trip_intelligence", "currency")
-            if k in merged
-        }
+    # Only the legacy /api/v1/plan path persists here; the v2 Trip State pipeline
+    # owns persistence and would otherwise write orphan `trips`/`trip_journey`
+    # rows (see save_legacy_tables docstring).
+    if save_legacy_tables:
+        try:
+            itinerary_data = {
+                k: merged[k]
+                for k in ("trip_name", "destination", "destination_description",
+                          "cover_photo_ref", "days",
+                          "trip_intelligence", "currency")
+                if k in merged
+            }
 
-        # Client-generated id → idempotent upsert, so the resilient retry can
-        # re-send through a TLS-corruption storm without duplicating the trip.
-        trip_id = str(uuid4())
-        await run_db_resilient(lambda: (
-            get_db().table("trips").upsert({
-                "id": trip_id,
-                "user_id": user_id,
-                "title": merged.get("trip_name") or body.destination,
-                "destination": body.destination,
-                "start_date": body.departure_date or None,
-                "end_date": end_date or None,
-                "budget": None,
-                "currency": merged.get("currency") or "INR",
-                "itinerary_data": itinerary_data,
-                "is_public": False,
-            }, on_conflict="id").execute()
-        ), label="supervisor.trips")
+            # Client-generated id → idempotent upsert, so the resilient retry can
+            # re-send through a TLS-corruption storm without duplicating the trip.
+            trip_id = str(uuid4())
+            await run_db_resilient(lambda: (
+                get_db().table("trips").upsert({
+                    "id": trip_id,
+                    "user_id": user_id,
+                    "title": merged.get("trip_name") or body.destination,
+                    "destination": body.destination,
+                    "start_date": body.departure_date or None,
+                    "end_date": end_date or None,
+                    "budget": None,
+                    "currency": merged.get("currency") or "INR",
+                    "itinerary_data": itinerary_data,
+                    "is_public": False,
+                }, on_conflict="id").execute()
+            ), label="supervisor.trips")
 
-        merged["trip_id"] = trip_id
-        spawn_background(
-            _save_trip_journey(user_id, body, merged, end_date, trip_id),
-            name=f"save_trip_journey:{trip_id}",
-        )
+            merged["trip_id"] = trip_id
+            spawn_background(
+                _save_trip_journey(user_id, body, merged, end_date, trip_id),
+                name=f"save_trip_journey:{trip_id}",
+            )
 
-    except Exception as e:
-        logger.warning("[supervisor] Failed to auto-save trip: %s", e)
+        except Exception as e:
+            logger.warning("[supervisor] Failed to auto-save trip: %s", e)
 
     return merged
 
