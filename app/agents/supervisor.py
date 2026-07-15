@@ -449,6 +449,7 @@ async def supervisor_run(
     j_ok = journey_result and not isinstance(journey_result, Exception)
     t_ok = trip_result and not isinstance(trip_result, Exception)
 
+    r_ok = return_journey_result and not isinstance(return_journey_result, Exception)
     merged["budget_breakdown"] = compute_detailed_budget(
         journey_result=journey_result if j_ok else None,
         itinerary_result=trip_result if t_ok else None,
@@ -456,6 +457,7 @@ async def supervisor_run(
         travelers=body.travelers,
         stay_nights=stay_nights,
         currency_code=currency_code,
+        return_journey_result=return_journey_result if r_ok else None,
     )
 
     # ── Phase 3: Budget Agent ─────────────────────────────────────────────────

@@ -28,6 +28,18 @@ _ACTIVITY_DAILY: dict[str, dict[str, int]] = {
 _HOTEL_TIER = {"low": "budget", "mid": "mid-range", "high": "luxury"}
 
 
+def _leg_transport_per_person(journey_result: dict | None) -> int:
+    """Per-person transport fare for one journey (outbound or return)."""
+    if not journey_result or isinstance(journey_result, Exception):
+        return 0
+    cb = journey_result.get("cost_breakdown") or {}
+    return (
+        cb.get("transport_per_person")
+        or journey_result.get("cost_per_person")
+        or 0
+    )
+
+
 def compute_detailed_budget(
     journey_result: dict | None,
     itinerary_result: dict | None,
@@ -35,6 +47,7 @@ def compute_detailed_budget(
     travelers: int,
     stay_nights: int,
     currency_code: str,
+    return_journey_result: dict | None = None,
 ) -> dict:
     safe_budget = budget if budget in ("low", "mid", "high") else "mid"
     c = currency_code.lower()
@@ -42,14 +55,12 @@ def compute_detailed_budget(
     symbol = ci["symbol"]
 
     # ── Transport ─────────────────────────────────────────────────────────────
-    transport_per_person = 0
-    if journey_result and not isinstance(journey_result, Exception):
-        cb = journey_result.get("cost_breakdown") or {}
-        transport_per_person = (
-            cb.get("transport_per_person")
-            or journey_result.get("cost_per_person")
-            or 0
-        )
+    # A round trip is outbound + return; the return was historically dropped here,
+    # so the "transport" line under-counted by roughly half on any round trip.
+    transport_per_person = (
+        _leg_transport_per_person(journey_result)
+        + _leg_transport_per_person(return_journey_result)
+    )
     transport_total = transport_per_person * travelers
 
     # ── Stay ─────────────────────────────────────────────────────────────────
