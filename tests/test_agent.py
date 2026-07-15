@@ -156,6 +156,16 @@ def test_question_answers_without_tools(monkeypatch):
     assert "06:00" in result["reply"]
 
 
+def test_prompt_enforces_trip_planning_scope():
+    """The agent must be told to stay in the trip-planning lane and decline
+    off-topic asks (math/coding/trivia) — regression guard on the guardrail."""
+    prompt = agent._prompt("what is 2+2?", _base_state(), "", "", [], agent.MAX_ACTIONS)
+    low = prompt.lower()
+    assert "scope" in low
+    assert "only" in low and "travel planning" in low
+    assert "never answer the off-topic question" in low
+
+
 # ── Gateway offer: tool yields choices → agent re-plans → asks the user ────────
 
 def test_no_route_gateway_offer_reaches_user(monkeypatch):
