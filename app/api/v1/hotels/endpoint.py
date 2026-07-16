@@ -33,13 +33,13 @@ _UUID_RE = re.compile(
 # list/sitemap must not hide the not-yet-profiled 4,400.
 _LIST_COLUMNS = (
     "id,slug,name,city,destination,star_rating,review_score,review_count,"
-    "property_type,photos,"
+    "property_type,photos,price_hint,"
     "hotel_profiles(one_liner,personality_tags,best_for)"
 )
 _DETAIL_COLUMNS = (
     "id,slug,name,address,city,destination,lat,lon,star_rating,review_score,"
     "review_count,review_label,property_type,amenities,photos,booking_url,map_url,"
-    "description,subscores,landmarks,"
+    "description,subscores,landmarks,price_hint,"
     "hotel_profiles(one_liner,seo_summary,personality_tags,highlights,best_for,"
     "not_for,confidence,refreshed_at)"
 )
