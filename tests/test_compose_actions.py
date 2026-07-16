@@ -3,8 +3,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.api.v1.plan_trip.models import PlanRequest
-from app.trip_state import graph as G
-from app.trip_state.compose import allocate_nights, build_skeleton, carry_forward_selections
+from app.trip_state.compose import allocate_nights, build_skeleton
 
 
 class TestSpecModels:
@@ -63,43 +62,7 @@ class TestSkeleton:
         assert build_skeleton(spec).model_dump() == build_skeleton(spec).model_dump()
 
 
-def _new_graph_with_option(operator="JP UDZ EXP", train_no="12991"):
-    g = build_skeleton({"origin": "Jaipur", "destination": "Udaipur", "days": 3, "stops": []})
-    leg = g.edges[0]
-    opt = G.TransportOption(id="train-0", mode="train", operator=operator,
-                            raw={"train_number": train_no, "train_name": operator})
-    leg.routes = [G.RouteCandidate(id="rt-1", hops=[
-        G.RouteHop(from_city="Jaipur", to_city="Udaipur", options=[opt])])]
-    return g, leg
-
-
-class TestCarryForward:
-    def _prior(self, operator="JP UDZ EXP", train_no="12991"):
-        return {"edges": [{
-            "from_city": "Jaipur", "to_city": "Udaipur",
-            "selection": {"route_id": "old-rt", "per_hop_option_ids": ["train-7"]},
-            "routes": [{"id": "old-rt", "hops": [{"options": [
-                {"id": "train-7", "mode": "train", "operator": operator,
-                 "raw": {"train_number": train_no}},
-            ]}]}],
-        }]}
-
-    def test_same_ride_carried(self):
-        g, leg = _new_graph_with_option()
-        dropped = carry_forward_selections(self._prior(), g)
-        assert dropped == []
-        assert leg.selection and leg.selection.per_hop_option_ids == ["train-0"]
-
-    def test_missing_ride_dropped_and_reported(self):
-        g, leg = _new_graph_with_option(operator="OTHER EXPRESS", train_no="99999")
-        dropped = carry_forward_selections(self._prior(), g)
-        assert dropped == ["Jaipur → Udaipur"]
-        assert leg.selection is None
-
-    def test_no_prior_graph_noop(self):
-        g, leg = _new_graph_with_option()
-        assert carry_forward_selections(None, g) == []
-        assert leg.selection is None
+# Selection carry-forward is DOC-level now — tested in tests/test_trip_doc.py.
 
 
 class TestActionSpecMutation:
@@ -109,8 +72,8 @@ class TestActionSpecMutation:
                 "stops": [{"city": "Jaipur", "nights": 1}], "version": 3}
 
     def _mutate(self, spec, **kw):
-        from app.api.v1.trip_state.endpoint import TripActionRequest, _mutate_spec
-        return _mutate_spec(spec, TripActionRequest(**kw))
+        from app.api.v3.trips import ActionBody, _mutate_spec
+        return _mutate_spec(spec, ActionBody(**kw))
 
     def test_add_stop(self):
         spec = self._spec()
@@ -144,7 +107,7 @@ class TestActionSpecMutation:
             self._mutate(self._spec(), type="change_dates", departure_date="2020-01-01")
 
     def test_spec_derived_from_legacy_request(self):
-        from app.api.v1.trip_state.endpoint import _spec_of
+        from app.trips_doc.convert import _spec_of
         spec = _spec_of({"request": {"origin": "Delhi", "destination": "Goa",
                                      "days": 4, "travelers": 2, "budget_tier": "low"}})
         assert spec["origin"] == "Delhi" and spec["stops"] == [] and spec["version"] == 1

@@ -1,6 +1,5 @@
 from fastapi import APIRouter
 from app.api.v1.plan_trip.endpoint import router as plan_trip_router
-from app.api.v1.trip_state.endpoint import router as trip_state_router
 from app.api.v1.groups.endpoint import router as groups_router
 from app.api.v1.trips.endpoint import router as trips_router
 from app.api.v1.search.endpoint import router as search_router
@@ -24,7 +23,6 @@ router = APIRouter(prefix="/api/v1")
 router.include_router(health_router, tags=["health"])
 router.include_router(metrics_router)
 router.include_router(plan_trip_router, tags=["ai"])
-router.include_router(trip_state_router, prefix="/trip-state", tags=["trip-state"])
 router.include_router(groups_router)
 router.include_router(referral_router)
 router.include_router(trips_router)

@@ -80,16 +80,15 @@ def _legacy_stay_onto_terminal(state: dict, graph: G.TripGraph) -> None:
 
 
 async def doc_from_legacy_row(row: dict) -> dict:
-    """Convert one trip_states row (with `state`) into a TripDoc."""
-    from app.trip_state.retrieval import hydrate_graph_option_raws
+    """Convert one trip_states row (with `state`) into a TripDoc.
 
+    Search-store hydration (re-attaching provider raws to thinned graph
+    options) was deleted with app/trip_state/retrieval.py — every live trip
+    was already backfilled WITH hydration (scripts/backfill_trip_docs.py ran
+    before the deletion). A straggler legacy row converts degraded: options
+    keep their denormalized fields but lose deep provider detail."""
     trip_id = str(row["id"])
     state = row.get("state") or {}
-
-    try:
-        await hydrate_graph_option_raws(trip_id, state)
-    except Exception as exc:  # noqa: BLE001 — degraded options beat a failed conversion
-        logger.warning("[trip-doc] hydration failed converting %s: %s", trip_id, exc)
 
     graph = G.ensure_graph(state)
     G.order_nodes_along_path(graph)

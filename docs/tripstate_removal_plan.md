@@ -1,9 +1,18 @@
 # TripState Removal — Migration Plan
 
 *Written 2026-07-16. Supersedes `docs/trip_engine_architecture.md` (v4) and
-`docs/persistence_architecture.md` as the forward direction. Those documents
-describe the machinery this plan deletes; they remain useful as reference for
-what exists today.*
+`docs/persistence_architecture.md` as the forward direction.*
+
+**STATUS 2026-07-16 — EXECUTED through step 6.** Backend: `app/trips_doc/` +
+`/api/v3/trips` built, 44 trips backfilled (twice), the old machinery DELETED
+(−9,718 lines; `app/trip_state/` is now 1,371 lines of generation-time
+build machinery: graph model/ranking, leg-search stabilization, skeleton +
+gateway fallback). Frontend: v3 proxies + `lib/trip-doc.ts` view adapter +
+polling `useTripDoc` hook; SSE/patch/copilot client deleted (−2,504 lines).
+Live-verified: full generation (70s, progressive doc writes), selections,
+change_budget re-rank. REMAINING: deploy both repos (any order — no users),
+soak, then apply `migrations/2026-07-16_drop_tripstate_tables.sql` and delete
+`app/trips_doc/convert.py` + the legacy `state` reads with it.*
 
 **Goal:** every trip becomes one plain JSON document in Supabase. Generate →
 save JSON → return JSON. Selections are a single-column UPDATE. No events, no

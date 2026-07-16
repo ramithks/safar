@@ -6,7 +6,7 @@ single backstop: a handler that wedges *before* producing a response can pin a
 worker connection open indefinitely. This middleware caps time-to-first-byte and
 returns 504 past the ceiling.
 
-Streaming endpoints (SSE trip-state) are unaffected: BaseHTTPMiddleware resolves
+Streaming endpoints (SSE) are unaffected: BaseHTTPMiddleware resolves
 `call_next` as soon as the response starts, so only the setup phase is timed —
 the long-lived body stream runs outside the wait_for.
 """
