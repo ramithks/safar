@@ -491,6 +491,26 @@ def _graph_patches(state: dict, graph: G.TripGraph) -> list[PatchOp]:
     return patches
 
 
+def client_patches(state: dict, graph: G.TripGraph, patches: list[PatchOp]) -> list[PatchOp]:
+    """The CLIENT-facing variant of `patches`: identical list, but the skinny
+    `/transport` projection is swapped for the fat one (include_buckets=True) so
+    a live viewer can render the ride options immediately — without this, a
+    streamed/returned patch would wipe the buckets a hydrated read gave the
+    frontend, and the journey board would go blank until a refresh. The
+    PERSISTED patches stay skinny (buckets live in the search store)."""
+    if not any(p.path == "/transport" for p in patches):
+        return patches
+    proj = G.project(state, graph, include_buckets=True)
+    fat = proj.get("/transport")
+    if not fat:
+        return patches
+    merged = {**(state.get("transport") or {}), **fat}
+    return [
+        PatchOp(op="set", path="/transport", value=merged) if p.path == "/transport" else p
+        for p in patches
+    ]
+
+
 # ── Handlers ─────────────────────────────────────────────────────────────────────
 
 def _shift_chain_for_date(state: dict, graph: G.TripGraph,

@@ -238,8 +238,10 @@ async def generate_from_spec(trip_id: str, spec: dict, user_id: str, emit,
     routed = sum(1 for e in graph.edges if e.routes)
     if routed == 0:
         raise RuntimeError(f"no leg of {route_label} could be routed")
+    transport_patches = B._graph_patches(state, graph)
     await emit("transport_ready", "Transport found for your route",
-               B._graph_patches(state, graph), 45)
+               transport_patches, 45,
+               stream_patches=B.client_patches(state, graph, transport_patches))
 
     # ── itineraries + stays for every city the traveller sleeps in ──────────
     stayed = [n for n in graph.nodes if n.role != "origin" and (n.nights or 0) > 0]
@@ -329,7 +331,8 @@ async def generate_from_spec(trip_id: str, spec: dict, user_id: str, emit,
     if notes:
         patches.append(PatchOp(op="set", path="/agent_meta/notes",
                                value=[{"agent": "composer", "message": n} for n in notes]))
-    await emit("complete", "Trip ready", patches, 100, critical=True)
+    await emit("complete", "Trip ready", patches, 100, critical=True,
+               stream_patches=B.client_patches(state, graph, patches))
     logger.info("[compose] %s built: %s | legs routed %d/%d | %d stayed stops",
                 trip_id, route_label, routed, len(graph.edges), len(stayed))
 

@@ -901,11 +901,31 @@ async def apply_edit(
     card_kind = kind if kind in ("search_hotels", "select_hotel") else next(
         (t for t in tools_used if t in ("search_hotels", "select_hotel")), None,
     )
+
+    # Graph edits (leg selections, waypoints…) produce a SKINNY `/transport`
+    # projection for persistence. The requesting client, however, holds the
+    # hydrated fat state from its last read — applying a skinny patch over it
+    # would wipe every option bucket off the journey board. Return the fat
+    # (include_buckets) variant instead; the persisted snapshot stays skinny.
+    out_patches = patches
+    if any(p.path == "/transport" for p in patches) and state.get("graph"):
+        try:
+            from .builder import client_patches
+            from .graph import ensure_graph
+            from .retrieval import hydrate_graph_option_raws
+
+            # The edit loaded a THIN persisted graph — reattach the store raws
+            # first so the fat buckets carry full ride details, not thin stubs.
+            await hydrate_graph_option_raws(trip_id, state)
+            out_patches = client_patches(state, ensure_graph(state), patches)
+        except Exception as exc:  # noqa: BLE001 — degraded (skinny) beats a failed edit
+            logger.warning("[copilot] fat re-projection failed for %s: %s", trip_id, exc)
+
     return {
         "reply": reply,
         "intent": kind,
         "applied": bool(patches),
-        "patches": [p.model_dump(mode="json") for p in patches],
+        "patches": [p.model_dump(mode="json") for p in out_patches],
         "clarify_options": clarify_options,
         "steps": steps,
         "cards": _build_cards(card_kind, state),

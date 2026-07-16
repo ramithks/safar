@@ -374,6 +374,8 @@ class TripActionRequest(BaseModel):
     type: str                            # add_stop | remove_stop | change_dates | change_budget | regenerate
     city: str | None = None              # add_stop / remove_stop
     nights: int | None = None            # add_stop
+    position: int | None = None          # add_stop: index into spec.stops (0 = right after origin);
+                                         # omitted/None appends (just before the destination)
     departure_date: str | None = None    # change_dates
     budget: str | None = None            # change_budget: low | mid | high
 
@@ -407,9 +409,13 @@ def _mutate_spec(spec: dict, body: TripActionRequest) -> str:
                  *((s.get("city") or "").strip().lower() for s in spec.get("stops") or [])}
         if stop.city.strip().lower() in taken:
             raise HTTPException(status_code=400, detail=f"{stop.city} is already on the route")
-        if len(spec.get("stops") or []) >= 4:
+        stops = spec.setdefault("stops", [])
+        if len(stops) >= 4:
             raise HTTPException(status_code=400, detail="At most 4 stops per trip")
-        spec.setdefault("stops", []).append(stop.model_dump())
+        # `position` = index on the outbound chain (0 = right after the origin);
+        # omitted appends, i.e. the stop lands just before the destination.
+        idx = len(stops) if body.position is None else max(0, min(int(body.position), len(stops)))
+        stops.insert(idx, stop.model_dump())
         return f"added stop {stop.city}"
 
     if body.type == "remove_stop":
