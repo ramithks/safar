@@ -124,9 +124,11 @@ class _Emitter:
         reasoning: str | None = None,
         actor: str = "supervisor",
         critical: bool = False,
+        stream_patches: list[PatchOp] | None = None,
     ) -> None:
         async with self._lock:
-            await self._emit(phase, label, patches, progress, reasoning, actor, critical)
+            await self._emit(phase, label, patches, progress, reasoning, actor, critical,
+                             stream_patches)
 
     async def _emit(
         self,
@@ -137,6 +139,7 @@ class _Emitter:
         reasoning: str | None,
         actor: str,
         critical: bool,
+        stream_patches: list[PatchOp] | None = None,
     ) -> None:
         if critical:
             # The one durable write of the whole generation: everything buffered so
@@ -162,11 +165,15 @@ class _Emitter:
         else:
             # Live-stream only; persistence is deferred to the single commit.
             self._buffer.extend(patches)
+        # `stream_patches` (when given) is the CLIENT-facing variant of `patches` —
+        # e.g. the transport projection with the full option buckets inlined so a
+        # live viewer can render rides mid-generation, while the persisted patches
+        # stay skinny (buckets live in the search store; reads re-inline them).
         publish_event(self.trip_id, {
             "phase": phase,
             "label": label,
             "progress": progress,
-            "patches": [p.model_dump(mode="json") for p in patches],
+            "patches": [p.model_dump(mode="json") for p in (stream_patches or patches)],
             "reasoning": reasoning,
         })
 
