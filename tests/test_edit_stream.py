@@ -29,6 +29,15 @@ def override_auth():
     app.dependency_overrides.pop(require_user, None)
 
 
+@pytest.fixture(autouse=True)
+def copilot_on(monkeypatch):
+    """These tests exercise the free-text streaming machinery, which ships
+    flag-gated OFF (docs/trip_engine_architecture.md M1) — enable it here.
+    The gate itself is covered in tests/test_integrity.py::TestCopilotGate."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "copilot_enabled", True)
+
+
 def _parse_sse(text: str):
     events = []
     for frame in text.split("\n\n"):

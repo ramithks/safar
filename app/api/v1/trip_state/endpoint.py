@@ -27,6 +27,7 @@ from app.db.client import run_db
 from app.deps.auth import require_user
 from app.api.v1.plan_trip.models import PlanRequest
 from app.trip_state import empty_trip_state
+from app.trip_state import integrity
 from app.trip_state import store
 from app.trip_state.copilot import apply_edit
 from app.trip_state.generator import read_events, run_generation
@@ -58,6 +59,18 @@ class EditAction(BaseModel):
 class EditRequest(BaseModel):
     message: str = ""
     action: EditAction | None = None
+
+
+def _require_copilot_or_action(body: EditRequest) -> None:
+    """Free-text messages run the LLM agent — gated by the copilot flag.
+    Structured actions (the user driving the workspace directly) always pass."""
+    from app.config import settings
+
+    if body.action is None and not settings.copilot_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="Chat editing is disabled. Use the trip actions instead.",
+        )
 
 
 def _authorize_read(row: dict, user_id: str) -> None:
@@ -116,6 +129,7 @@ async def create_trip(request: Request, body: PlanRequest, user=Depends(require_
         "travelers": body.travelers,
         "budget_tier": body.budget,
         "interests": body.interests,
+        "stops": [s.model_dump() for s in body.stops],
     })
     trip_id = await run_db(store.create_trip_state, str(user.id), state)
     spawn_background(run_generation(trip_id, body, str(user.id)), name=f"trip_gen:{trip_id}")
@@ -123,32 +137,73 @@ async def create_trip(request: Request, body: PlanRequest, user=Depends(require_
     return {"trip_id": trip_id, "status": "planning"}
 
 
+def _attach_freshness(state: dict, freshness: dict[str, dict]) -> None:
+    """Stamp searched_at/stale onto each projected transport block (matched by
+    its graph leg_id) so the UI can say "prices from 3 days ago"."""
+    if not freshness:
+        return
+    transport = state.get("transport") or {}
+    blocks = [transport.get("going"), transport.get("return_journey"),
+              *(transport.get("onward_segments") or [])]
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        info = freshness.get(str(block.get("leg_id") or ""))
+        if info:
+            block["searched_at"] = info["searched_at"]
+            block["stale"] = info["stale"]
+
+
 @router.get("/{trip_id}")
 async def get_trip(trip_id: str, user=Depends(require_user)):
     from app.trip_state.graph import projected_state
+    from app.trip_state.retrieval import batch_freshness, hydrate_graph_option_raws
 
     row = await _get_row(trip_id)
     _authorize_read(row, str(user.id))
     # Regenerate the compatibility projections (transport/itinerary/costs and the
     # DERIVED recommendation) from the canonical graph on every read — nothing
     # derived is served from a stored snapshot. No-op for graph-less legacy trips.
+    # A thin persisted graph (post-edit) first gets its option raws back from the
+    # search store so the projection can re-emit the full transport buckets.
+    state = row["state"] or {}
+
+    # Integrity check BEFORE any mutation (hydration/projection): compare the
+    # seals stamped at commit time against the stored payload. A mismatch is
+    # surfaced (and alerted), never silently rendered — but the data is still
+    # served: degraded-visible beats a blank screen.
+    integrity_status = integrity.verify(state)
+    if integrity_status == "corrupted":
+        logger.error("[trip-state] integrity check FAILED for %s — serving flagged state", trip_id)
+        sentry_sdk.capture_message(f"trip_state integrity corrupted: {trip_id}", level="error")
+
+    await hydrate_graph_option_raws(trip_id, state)
+    projected = projected_state(state)
+    _attach_freshness(projected, await batch_freshness(trip_id))
     return {
         "trip_id": row["id"],
         "status": row["status"],
         "visibility": row["visibility"],
         "last_seq": row["last_seq"],
-        "state": projected_state(row["state"] or {}),
+        "integrity": integrity_status,
+        "generation": (state.get("meta") or {}).get("generation"),
+        "state": projected,
     }
 
 
 @router.get("/{trip_id}/chat")
 async def get_trip_chat(trip_id: str, user=Depends(require_user), limit: int = 100):
     """Durable copilot chat transcript — the frontend loads this on mount to
-    rehydrate the thread after a refresh."""
+    rehydrate the thread after a refresh. With the copilot flagged off this
+    degrades to an empty transcript (never an error — old clients still mount)."""
+    from app.config import settings
+
     row = await _get_row(trip_id)
     _authorize_read(row, str(user.id))
+    if not settings.copilot_enabled:
+        return {"trip_id": trip_id, "messages": [], "copilot_enabled": False}
     messages = await run_db(store.get_chat, trip_id, min(max(limit, 1), 300))
-    return {"trip_id": trip_id, "messages": messages}
+    return {"trip_id": trip_id, "messages": messages, "copilot_enabled": True}
 
 
 @router.get("/{trip_id}/stream")
@@ -207,6 +262,7 @@ async def edit_trip(request: Request, trip_id: str, body: EditRequest, user=Depe
     """Copilot command → intent router → patches over existing state."""
     row = await _get_row(trip_id)
     _authorize_write(row, str(user.id))
+    _require_copilot_or_action(body)
     message = body.message.strip()[:500]
     if not message and body.action is None:
         raise HTTPException(status_code=400, detail="Say what you'd like to change.")
@@ -237,6 +293,7 @@ async def edit_trip_stream(request: Request, trip_id: str, body: EditRequest, us
     """
     row = await _get_row(trip_id)
     _authorize_write(row, str(user.id))
+    _require_copilot_or_action(body)
     message = body.message.strip()[:500]
     if not message and body.action is None:
         raise HTTPException(status_code=400, detail="Say what you'd like to change.")
@@ -302,3 +359,166 @@ async def edit_trip_stream(request: Request, trip_id: str, body: EditRequest, us
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+# ── Structured trip actions (trip engine v4 M5) ──────────────────────────────
+#
+# First-class, deterministic replacements for chat editing. Structural actions
+# mutate the SPEC (never the graph) and rebuild via the unified generator;
+# change_budget re-ranks at read time (no re-search, no LLM); selections stay
+# on /edit's EditAction path. Every rebuild archives the current state first.
+
+_REGEN_ACTIONS = {"add_stop", "remove_stop", "change_dates", "regenerate"}
+
+
+class TripActionRequest(BaseModel):
+    type: str                            # add_stop | remove_stop | change_dates | change_budget | regenerate
+    city: str | None = None              # add_stop / remove_stop
+    nights: int | None = None            # add_stop
+    departure_date: str | None = None    # change_dates
+    budget: str | None = None            # change_budget: low | mid | high
+
+
+def _spec_of(state: dict) -> dict:
+    """The trip's spec — derived from `request` for trips that predate spec
+    formalization (pure shape lift; no graph reconstruction)."""
+    spec = state.get("spec") or {}
+    if spec.get("origin"):
+        return dict(spec)
+    req = state.get("request") or {}
+    return {
+        "origin": req.get("origin"), "destination": req.get("destination"),
+        "departure_date": req.get("departure_date"), "days": req.get("days") or 3,
+        "travelers": req.get("travelers") or 1,
+        "budget_tier": req.get("budget_tier") or "mid",
+        "interests": req.get("interests") or [], "stops": req.get("stops") or [],
+        "version": 1,
+    }
+
+
+def _mutate_spec(spec: dict, body: TripActionRequest) -> str:
+    """Apply one structural mutation in place. Returns a human note.
+    Raises HTTPException(400) on invalid input."""
+    from app.api.v1.plan_trip.models import StopSpec
+
+    if body.type == "add_stop":
+        stop = StopSpec(city=body.city or "", nights=body.nights)
+        taken = {(spec.get("origin") or "").strip().lower(),
+                 (spec.get("destination") or "").strip().lower(),
+                 *((s.get("city") or "").strip().lower() for s in spec.get("stops") or [])}
+        if stop.city.strip().lower() in taken:
+            raise HTTPException(status_code=400, detail=f"{stop.city} is already on the route")
+        if len(spec.get("stops") or []) >= 4:
+            raise HTTPException(status_code=400, detail="At most 4 stops per trip")
+        spec.setdefault("stops", []).append(stop.model_dump())
+        return f"added stop {stop.city}"
+
+    if body.type == "remove_stop":
+        key = (body.city or "").strip().lower()
+        stops = spec.get("stops") or []
+        kept = [s for s in stops if (s.get("city") or "").strip().lower() != key]
+        if len(kept) == len(stops):
+            raise HTTPException(status_code=400, detail=f"{body.city} is not a stop on this trip")
+        spec["stops"] = kept
+        return f"removed stop {body.city}"
+
+    if body.type == "change_dates":
+        from app.api.v1.plan_trip.models import _validate_not_past_date
+        try:
+            spec["departure_date"] = _validate_not_past_date(body.departure_date)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return f"moved departure to {body.departure_date}"
+
+    if body.type == "change_budget":
+        if body.budget not in ("low", "mid", "high"):
+            raise HTTPException(status_code=400, detail="budget must be low | mid | high")
+        spec["budget_tier"] = body.budget
+        return f"budget set to {body.budget}"
+
+    if body.type == "regenerate":
+        return "regenerating from the current specification"
+
+    raise HTTPException(status_code=400, detail=f"Unknown action '{body.type}'")
+
+
+@router.post("/{trip_id}/actions")
+@limiter.limit("30/hour")
+async def trip_action(request: Request, trip_id: str, body: TripActionRequest,
+                      user=Depends(require_user)):
+    from copy import deepcopy
+
+    from app.api.v1.plan_trip.models import PlanRequest
+    from app.trip_state import integrity as integ
+
+    row = await _get_row(trip_id)
+    _authorize_write(row, str(user.id))
+    state = row["state"] or {}
+
+    # Regeneration mutex: one rebuild at a time per trip, across workers.
+    gen = (state.get("meta") or {}).get("generation") or {}
+    if row["status"] == "planning" or gen.get("status") == "running":
+        raise HTTPException(status_code=409, detail="A generation is already running for this trip")
+
+    spec = _spec_of(state)
+    prev_spec = deepcopy(spec)
+    note = _mutate_spec(spec, body)
+
+    # ── change_budget: re-rank only — projections recompute from budget_tier on
+    # every read, so committing the new spec/request IS the re-rank. ──
+    if body.type == "change_budget":
+        spec["version"] = int(spec.get("version") or 1) + 1
+        history = (state.get("spec_history") or [])[-9:] + [prev_spec]
+        new_request = {**(state.get("request") or {}), "budget_tier": body.budget}
+        await run_db(
+            store.append_events, trip_id, "user",
+            [
+                PatchOp(op="set", path="/spec", value=spec),
+                PatchOp(op="set", path="/spec_history", value=history),
+                PatchOp(op="set", path="/request", value=new_request),
+            ],
+            f"action:{body.type}",
+        )
+        return {"status": "applied", "applied": note, "spec_version": spec["version"],
+                "regenerating": False}
+
+    # ── structural actions: archive → bump spec → rebuild from spec ──
+    if body.type != "regenerate":
+        spec["version"] = int(spec.get("version") or 1) + 1
+    try:
+        plan_body = PlanRequest(
+            origin=spec.get("origin") or "", destination=spec.get("destination") or "",
+            departure_date=spec.get("departure_date"), days=int(spec.get("days") or 3),
+            travelers=int(spec.get("travelers") or 1),
+            budget=spec.get("budget_tier") or "mid",
+            interests=spec.get("interests") or [], stops=spec.get("stops") or [],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Specification invalid: {exc}") from exc
+
+    # Archive BEFORE anything changes — the rollback point (v4 §6). Awaited:
+    # a rebuild must not start until the pre-change state is durable.
+    await run_db(lambda: integ.archive_snapshot(
+        trip_id, state, reason=f"pre-{body.type}",
+        generation_id=gen.get("generation_id"), last_seq=row["last_seq"]))
+
+    history = (state.get("spec_history") or [])[-9:] + [prev_spec]
+    running = integ.build_manifest(spec_version=spec.get("version") or 1)
+    await run_db(
+        store.append_events, trip_id, "user",
+        [
+            PatchOp(op="set", path="/spec", value=spec),
+            PatchOp(op="set", path="/spec_history", value=history),
+            PatchOp(op="set", path="/meta/status", value="planning"),
+            PatchOp(op="set", path="/meta/generation", value=running),
+        ],
+        f"action:{body.type}",
+    )
+    from app.trip_state.generator import reset_stream
+
+    reset_stream(trip_id)   # old run's `complete` must not close the new stream
+    spawn_background(run_generation(trip_id, plan_body, str(user.id)),
+                     name=f"trip_regen:{trip_id}")
+    logger.info("[trip-state] %s on %s → regenerating (spec v%s)",
+                body.type, trip_id, spec.get("version"))
+    return {"status": "regenerating", "applied": note,
+            "spec_version": spec.get("version"), "regenerating": True}

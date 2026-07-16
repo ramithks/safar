@@ -9,7 +9,9 @@ Phase 2c — Run all searches + flight alternatives + hotels in parallel.
 """
 import asyncio
 import logging
+import time
 import urllib.parse
+from copy import deepcopy
 from datetime import datetime, timedelta
 
 from fastapi import HTTPException
@@ -45,7 +47,53 @@ _railway   = RailwayService()
 
 # ── Gemini route planner ──────────────────────────────────────────────────────
 
+# The route planner is fully deterministic (temperature 0 + stable seed on these
+# same inputs), so an identical request always yields the identical plan — cache
+# it and skip the LLM round-trip. This kills the duplicate plans a single edit
+# session fires (the same return leg gets re-planned after every resequence) and
+# shares plans across users on popular routes. Keyed per process; TTL'd so a
+# model/prompt change rolls out within a day of deploy anyway (deploys restart).
+_route_plan_cache: dict[tuple, tuple[float, dict]] = {}
+_ROUTE_PLAN_TTL_S = 24 * 3600
+_ROUTE_PLAN_MAX = 512
+
+
+def _route_plan_key(body: PlanJourneyRequest, budget: str) -> tuple:
+    return (
+        (body.origin or "").strip().lower(),
+        (body.destination or "").strip().lower(),
+        budget,
+        body.travelers,
+        ",".join(sorted(body.transport_modes or [])),
+        body.departure_date or "",
+    )
+
+
+def _route_plan_cached(key: tuple) -> dict | None:
+    hit = _route_plan_cache.get(key)
+    if not hit:
+        return None
+    ts, plan = hit
+    if time.time() - ts > _ROUTE_PLAN_TTL_S:
+        _route_plan_cache.pop(key, None)
+        return None
+    return deepcopy(plan)
+
+
+def _route_plan_store(key: tuple, plan: dict) -> None:
+    if len(_route_plan_cache) >= _ROUTE_PLAN_MAX:
+        oldest = min(_route_plan_cache, key=lambda k: _route_plan_cache[k][0])
+        _route_plan_cache.pop(oldest, None)
+    _route_plan_cache[key] = (time.time(), deepcopy(plan))
+
+
 async def _gemini_plan_route(body: PlanJourneyRequest, budget: str, symbol: str, currency: str) -> dict:
+    cache_key = _route_plan_key(body, budget)
+    cached = _route_plan_cached(cache_key)
+    if cached is not None:
+        logger.info("[journey] route plan cache hit %s → %s", body.origin, body.destination)
+        return cached
+
     modes_hint = (
         f"Preferred transport modes: {', '.join(body.transport_modes)}."
         if body.transport_modes
@@ -145,10 +193,13 @@ Return ONLY valid JSON (no markdown):
     if not raw:
         return {}
     try:
-        return extract_json(raw)
+        plan = extract_json(raw)
     except Exception as e:
         logger.debug(f"[journey] Gemini route parse error: {e}")
         return {}
+    if plan.get("legs"):
+        _route_plan_store(cache_key, plan)
+    return plan
 
 
 def _is_multihop_route(route: dict) -> bool:

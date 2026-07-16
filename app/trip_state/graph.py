@@ -70,6 +70,10 @@ class TransportOption(BaseModel):
     # the stored graph. Older options (pre-denorm) leave it None and _sold_out
     # falls back to computing it from `raw`.
     available: Optional[bool] = None
+    # Permanent search-store reference (search_results.id) — the v4 typed link.
+    # Stamped by the store-first write at generation time; the read path
+    # hydrates `raw` back by this id (exact, no fuzzy matching).
+    result_id: Optional[str] = None
     raw: dict = Field(default_factory=dict)
 
 
@@ -797,12 +801,32 @@ def order_nodes_along_path(graph: TripGraph) -> None:
 
 # ── Graph → legacy projection (compatibility layer) ──────────────────────────────
 
-def _project_journey_block(leg: TripLeg, prefer: str | None, budget: str | None) -> dict:
+def _thin_item(o: TransportOption) -> dict:
+    """Degraded provider-shaped item synthesized from an option's denormalized
+    fields — the fallback when the full `raw` payload was thinned at rest and
+    store hydration found no match. Renders name/fare/times; class, seats and
+    baggage detail need the real raw."""
+    return {k: v for k, v in {
+        "operator": o.operator, "name": o.operator, "airline": o.operator,
+        "departure_time": o.departure, "arrival_time": o.arrival,
+        "duration_min": o.duration_min,
+        "price": o.fare_per_person, "fare": o.fare_per_person,
+        "currency": o.currency,
+    }.items() if v not in (None, "")}
+
+
+def _project_journey_block(leg: TripLeg, prefer: str | None, budget: str | None,
+                           include_buckets: bool = False) -> dict:
     """Render an edge back into the legacy going/return block shape the frontend
     reads: buses/trains/flights buckets with items, and a materialized (derived)
     `recommended` + `is_recommended` flags — computed here, stored nowhere.
     The user's explicit `leg.selection` wins over the derived ranking, and the
-    block carries `leg_id` so the UI can target this leg with select_leg_option."""
+    block carries `leg_id` so the UI can target this leg with select_leg_option.
+
+    `include_buckets` controls the fat/skinny split: READS (GET /plan) pass True
+    so the frontend gets the full option buckets it renders; the builder's
+    persisted patches keep the default False so the snapshot stays skinny at
+    rest (the buckets live in the search store)."""
     route = active_route(leg, prefer, budget)
     block: dict = {
         "leg_id": leg.id,
@@ -827,14 +851,43 @@ def _project_journey_block(leg: TripLeg, prefer: str | None, budget: str | None)
     if route.kind == "via_gateway":
         block["via_gateway"] = route.gateway_city
 
-    # Skinny projection: emit the route SKELETON + a flag so the client fetches the
-    # full ranked option lists from /trips/{id}/options?scope={leg_id}. The picked/
-    # recommended ride per hop is carried by `segments` below; the raw provider
-    # payloads live only in the search store (served by /results). We no longer
-    # inline every option's raw payload here — that was the fat frontend blob.
+    # Skinny projection (persistence path): emit the route SKELETON + a flag; the
+    # picked/recommended ride per hop is carried by `segments` below and the raw
+    # provider payloads live in the search store. Read path (include_buckets):
+    # re-inline the full mode buckets — single-hop routes fill the top-level
+    # buckets, multi-hop routes expose per-hop buckets under `hops` — because
+    # that is the shape the frontend renders (it never fetches /options).
     block["has_options"] = any(h.options for h in route.hops)
+
+    def bucketize(hop: RouteHop, hop_index: int) -> dict:
+        out: dict = {}
+        pick = selected_option_for_hop(leg, route, hop_index, prefer, budget)
+        for mode in _MODES:
+            items = []
+            for o in hop.options:
+                if o.mode != mode:
+                    continue
+                base = o.raw if isinstance(o.raw, dict) and o.raw else _thin_item(o)
+                it = dict(base, is_recommended=(pick is not None and o.id == pick.id))
+                if _sold_out(o):
+                    it["sold_out"] = True
+                items.append(it)
+            if items:
+                key = {"flight": "flights", "train": "trains", "bus": "buses"}[mode]
+                out[key] = {
+                    "items": items,
+                    "recommended": next((it for it in items if it.get("is_recommended")), None),
+                }
+        return out
+
+    if include_buckets and len(route.hops) == 1:
+        block.update(bucketize(route.hops[0], 0))
     if len(route.hops) > 1:
-        block["hops"] = [{"from": h.from_city, "to": h.to_city} for h in route.hops]
+        block["hops"] = [
+            {"from": h.from_city, "to": h.to_city,
+             **(bucketize(h, i) if include_buckets else {})}
+            for i, h in enumerate(route.hops)
+        ]
 
     # Per-hop breakdown of the ride actually in force, with real cities, mode and
     # calendar dates — so the UI can render "Manali → Delhi (bus, overnight) then
@@ -882,7 +935,8 @@ def _merged_block(original: dict | None, projected: dict) -> dict:
     return {**keep, **projected, "summary": summary}
 
 
-def project(state: dict, graph: TripGraph | None = None) -> dict:
+def project(state: dict, graph: TripGraph | None = None,
+            include_buckets: bool = False) -> dict:
     """Regenerate the compatibility projections (transport blocks, flat itinerary,
     journey summary, costs) from the canonical graph. The single place a
     recommendation is materialized. Returns a dict of {path: value} the caller
@@ -913,19 +967,22 @@ def project(state: dict, graph: TripGraph | None = None) -> dict:
     }
     if outbound:
         transport["going"] = _merged_block(
-            orig_t.get("going"), _project_journey_block(outbound[0], None, budget),
+            orig_t.get("going"),
+            _project_journey_block(outbound[0], None, budget, include_buckets),
         )
         if len(outbound) > 1:
             transport["onward_segments"] = [
                 _merged_block(
                     orig_onward[i] if i < len(orig_onward) else None,
-                    {**_project_journey_block(e, None, budget), "from": e.from_city, "to": e.to_city},
+                    {**_project_journey_block(e, None, budget, include_buckets),
+                     "from": e.from_city, "to": e.to_city},
                 )
                 for i, e in enumerate(outbound[1:])
             ]
     if inbound:
         transport["return_journey"] = _merged_block(
-            orig_t.get("return_journey"), _project_journey_block(inbound, None, budget),
+            orig_t.get("return_journey"),
+            _project_journey_block(inbound, None, budget, include_buckets),
         )
     out["/transport"] = transport
 
@@ -946,7 +1003,7 @@ def project(state: dict, graph: TripGraph | None = None) -> dict:
     return out
 
 
-def projected_state(state: dict) -> dict:
+def projected_state(state: dict, include_buckets: bool = True) -> dict:
     """A shallow copy of `state` with the graph's compatibility projections
     applied over the legacy transport/itinerary/costs fields. Used at read time
     so `recommended` (and every other derived value) is recomputed on every read
@@ -956,12 +1013,17 @@ def projected_state(state: dict) -> dict:
     time, not persisted). This is what makes journeys the legacy shape cannot
     express — e.g. two train legs, whose options hide in per-leg live_data with
     an empty top-level bucket — render correctly: the projection re-emits them
-    as per-hop buckets under `hops`."""
+    as per-hop buckets under `hops`.
+
+    include_buckets defaults True: this is the READ path and the frontend
+    renders the inline flights/trains/buses buckets (it does not fetch
+    /options). The persisted snapshot never comes through here — the builder
+    calls project() directly with the skinny default."""
     try:
         graph = ensure_graph(state)
         if not graph.nodes or not graph.edges:
             return state
-        proj = project(state, graph)
+        proj = project(state, graph, include_buckets=include_buckets)
     except Exception as exc:  # noqa: BLE001 — a projection error must never 500 a read
         logger.warning("[graph] projection failed, serving raw state: %s", exc)
         return state

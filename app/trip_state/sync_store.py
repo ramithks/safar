@@ -183,3 +183,69 @@ def _ready_batches(trip_id: str) -> list[dict]:
     return (get_db().table("search_batches").select("id, kind, scope_id")
             .eq("trip_id", trip_id).eq("status", "ready").execute().data or [])
 
+
+# ── store-first write with permanent-id stamping (trip engine v4, M3) ────────────
+
+def mirror_graph_with_ids(trip_id: str, graph) -> dict:
+    """PRIMARY store write for a fresh generation (sync; run via run_db_resilient).
+
+    For every leg / stayed stop of the (fat, in-memory) graph: insert this
+    scope's provider items into search_results and stamp each returned
+    permanent id back onto the option/hotel as `result_id`. The graph then
+    persists as references; the read path hydrates raw by id — exact, no fuzzy
+    matching (docs/trip_engine_architecture.md §5.2).
+
+    Old batches for a scope are NOT deleted (archived snapshots may reference
+    their rows); readers pick the newest batch per scope, superseded ones age
+    out by TTL. Returns {batches, results} stats.
+    """
+    from app.db.client import get_db
+
+    db = get_db()
+    stats = {"batches": 0, "results": 0}
+
+    def _insert_scope(kind: str, scope_id: str, origin, destination, depart_date,
+                      rows: list[dict], targets: list) -> None:
+        """Insert rows for one scope and stamp returned ids onto `targets`
+        (same order — transport_result_row/hotel_result_row preserve input order)."""
+        if not rows:
+            return
+        batch_id = SearchBatchStore.create_batch(
+            trip_id, kind, scope_id=scope_id,
+            origin=origin, destination=destination, depart_date=depart_date)
+        for r in rows:
+            r["batch_id"] = batch_id
+        inserted = db.table("search_results").insert(rows).execute().data or []
+        SearchBatchStore.finalize(batch_id, len(inserted))
+        for target, row in zip(targets, inserted):
+            if isinstance(target, dict):
+                target["result_id"] = row["id"]
+            else:
+                target.result_id = row["id"]
+        stats["batches"] += 1
+        stats["results"] += len(inserted)
+
+    for edge in graph.edges:
+        opts, rows = [], []
+        seen: set[int] = set()
+        for route in edge.routes or []:
+            for hop in route.hops or []:
+                for opt in hop.options or []:
+                    if id(opt) in seen or not opt.raw:
+                        continue
+                    seen.add(id(opt))
+                    opts.append(opt)
+                    rows.append(batches.transport_result_row(
+                        "", trip_id, opt.mode or "flight", edge.date, opt.raw))
+        _insert_scope("transport", str(edge.id), edge.from_city, edge.to_city,
+                      edge.date, rows, opts)
+
+    for node in graph.nodes:
+        hotels = [h for h in (node.stay.search_results or []) if isinstance(h, dict)]
+        rows = [batches.hotel_result_row("", trip_id, h) for h in hotels]
+        _insert_scope("hotel", str(node.id), None, node.city,
+                      node.arrival_date, rows, hotels)
+
+    logger.info("[sync-store] store-first mirror %s: %s", trip_id, stats)
+    return stats
+

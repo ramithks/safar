@@ -67,9 +67,14 @@ def get_group(group_id: UUID, user=Depends(require_user)):
 @router.post("/join/{invite_code}")
 def join_group(invite_code: str, body: JoinGroupRequest, user=Depends(require_user)):
     try:
-        return service.join_group(invite_code, user.id, body.display_name)
+        result = service.join_group(invite_code, user.id, body.display_name)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    # First group join pays this user's referrer (idempotent; best-effort).
+    from app.api.v1.referral.service import award_referrer_on_first_action
+
+    award_referrer_on_first_action(str(user.id), "group trip")
+    return result
 
 
 # ── Messages ──────────────────────────────────────────────────────────────────

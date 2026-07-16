@@ -55,6 +55,8 @@ def _now() -> str:
 
 def create_trip_state(user_id: str | None, state: TripState) -> str:
     """Insert a new trip_states row; returns trip_id."""
+    from . import integrity
+
     db = get_db()
     row = db.table("trip_states").insert({
         "user_id": user_id,
@@ -64,7 +66,7 @@ def create_trip_state(user_id: str | None, state: TripState) -> str:
         "status": state.meta.status,
         "visibility": state.meta.visibility,
         "schema_version": SCHEMA_VERSION,
-        "state": state.model_dump(mode="json"),
+        "state": integrity.stamp(state.model_dump(mode="json")),
     }).execute()
     trip_id = row.data[0]["id"]
     logger.info("[trip-state] created %s (%s → %s)", trip_id,
@@ -209,6 +211,12 @@ def _append_events_once(
                 "[trip-state] %s: event seq=%s already committed — finishing snapshot update",
                 trip_id, seq,
             )
+
+    # Seal the snapshot: checksums land in the SAME write as the data they
+    # cover, so a read that sees the row sees its seals (integrity.verify).
+    from . import integrity
+
+    integrity.stamp(state)
 
     meta = state.get("meta") or {}
     updated = db.table("trip_states").update({

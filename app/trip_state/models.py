@@ -25,6 +25,12 @@ class TripMeta(BaseModel):
     visibility: str = "private"       # private | link | public
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    # Generation Manifest — what the last successful generation used (models,
+    # provider parser versions, spec version, timestamps). Immutable per run.
+    generation: Optional[dict] = None
+    # Integrity seals, restamped by the store on every committed snapshot —
+    # never set by agents. See app.trip_state.integrity.
+    checksums: Optional[dict] = None
 
 
 class TripRequest(BaseModel):
@@ -38,6 +44,9 @@ class TripRequest(BaseModel):
     budget_tier: str = "mid"              # low | mid | high (presets)
     budget_amount: Optional[int] = None   # real ₹ ceiling, overrides tier when set
     interests: list[str] = Field(default_factory=list)
+    # Intermediate cities [{city, nights?}] — the multi-stop request. The spec
+    # copy is authoritative; this mirror keeps the runtime request complete.
+    stops: list[dict] = Field(default_factory=list)
 
 
 class TripDestination(BaseModel):
@@ -95,6 +104,14 @@ class AgentMeta(BaseModel):
 class TripState(BaseModel):
     schema_version: int = SCHEMA_VERSION
     meta: TripMeta = Field(default_factory=TripMeta)
+    # The immutable Trip Specification — what the user ASKED FOR, versioned.
+    # Structured edits append revisions (spec_history) and bump spec.version;
+    # every regeneration reads THIS, never the graph. `request` below remains
+    # the runtime working copy (return_date resync etc.); spec is the record.
+    spec: dict = Field(default_factory=dict)
+    # Previous spec revisions, newest last, bounded (structured actions push
+    # the outgoing spec here before bumping version).
+    spec_history: list[dict] = Field(default_factory=list)
     request: TripRequest = Field(default_factory=TripRequest)
     destination: TripDestination = Field(default_factory=TripDestination)
     transport: TripTransport = Field(default_factory=TripTransport)
@@ -123,6 +140,12 @@ def empty_trip_state(request: dict | None = None) -> TripState:
     state.meta.updated_at = _now()
     if request:
         state.request = TripRequest(**request)
+        state.spec = {
+            **{k: v for k, v in request.items() if v is not None},
+            "stops": request.get("stops") or [],
+            "version": 1,
+            "created_at": state.meta.created_at,
+        }
     return state
 
 

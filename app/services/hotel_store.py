@@ -72,12 +72,25 @@ def _rows(hotels: list[dict], destination: str | None) -> list[dict]:
             "last_seen_at": now,
             "updated_at": now,
         })
+        # Display hint only (SEO pages show "from ₹…"), never a quote — real
+        # prices stay date-specific in the live path. Set ONLY when this search
+        # carried one: upserting None would wipe a previously observed price.
+        price = _num(h.get("price_per_night") or h.get("price"))
+        if price and price > 0:
+            rows[-1]["price_hint"] = price
     return rows
 
 
 def _upsert_sync(rows: list[dict]) -> None:
     from app.db.client import get_db
-    get_db().table("hotels").upsert(rows, on_conflict="source,source_hotel_id").execute()
+    # PostgREST bulk upserts need homogeneous keys per call, and price_hint is
+    # only present on rows whose search carried a price — split accordingly.
+    priced = [r for r in rows if "price_hint" in r]
+    unpriced = [r for r in rows if "price_hint" not in r]
+    db = get_db()
+    for batch in (priced, unpriced):
+        if batch:
+            db.table("hotels").upsert(batch, on_conflict="source,source_hotel_id").execute()
 
 
 async def save_hotels_master(hotels: list[dict], destination: str | None) -> int:

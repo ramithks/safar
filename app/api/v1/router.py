@@ -10,6 +10,7 @@ from app.api.v1.onboarding.endpoint import router as onboarding_router
 from app.api.v1.discover.endpoint import router as discover_router
 from app.api.v1.hostels.endpoint import router as hostels_router
 from app.api.v1.hotels.endpoint import router as hotels_router
+from app.api.v1.referral.endpoint import router as referral_router
 from app.api.v1.users.endpoint import router as users_router
 from app.api.v1.reels.endpoint import router as reels_router
 from app.api.v1.reels.analyze import router as reels_analyze_router
@@ -25,6 +26,7 @@ router.include_router(metrics_router)
 router.include_router(plan_trip_router, tags=["ai"])
 router.include_router(trip_state_router, prefix="/trip-state", tags=["trip-state"])
 router.include_router(groups_router)
+router.include_router(referral_router)
 router.include_router(trips_router)
 router.include_router(search_router)
 router.include_router(recommend_router, tags=["recommend"])
