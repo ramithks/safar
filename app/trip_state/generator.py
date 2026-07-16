@@ -304,15 +304,10 @@ async def _generate(trip_id: str, body: PlanRequest, user_id: str, emit: "_Emitt
             fd = await compose.generate_from_spec(
                 trip_id, spec, user_id, emit, manifest,
                 prior_graph=stored.get("graph") or None,
+                weather_task=weather_task,   # awaited pre-commit so /weather persists
             )
-            logger.info("[trip-state] generation complete for %s (composer)", trip_id)
-
-            if weather_task is not None:
-                try:
-                    await asyncio.wait_for(weather_task, timeout=10)
-                except Exception:  # noqa: BLE001 — optional section
-                    pass
             weather_task = None
+            logger.info("[trip-state] generation complete for %s (composer)", trip_id)
 
             from .my_trips import upsert_my_trip
 

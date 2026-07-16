@@ -181,10 +181,15 @@ def carry_forward_selections(prior_graph: dict | None, graph: G.TripGraph) -> li
 # ── the pipeline ──────────────────────────────────────────────────────────────
 
 async def generate_from_spec(trip_id: str, spec: dict, user_id: str, emit,
-                             manifest: dict, prior_graph: dict | None = None) -> dict:
+                             manifest: dict, prior_graph: dict | None = None,
+                             weather_task: asyncio.Task | None = None) -> dict:
     """Build the whole trip from `spec` and land ONE atomic critical commit.
     Returns the final state dict (for the My Trips mirror / memory distill).
-    Raises on catastrophic failure — the caller owns the error commit."""
+    Raises on catastrophic failure — the caller owns the error commit.
+
+    `weather_task` (the generator's concurrent weather fetch) is awaited just
+    BEFORE the critical commit — its patch must land in the emitter's buffer
+    while a persisting commit still follows, or a refresh would lose weather."""
     from app.api.v1.plan_trip.models import PlanTripRequest
     from app.api.v1.plan_trip.orchestrator import run_plan_trip
 
@@ -288,6 +293,13 @@ async def generate_from_spec(trip_id: str, spec: dict, user_id: str, emit,
     except Exception as exc:  # noqa: BLE001 — degraded (result_id None), never blocking
         logger.warning("[compose] store-first mirror failed for %s — options keep "
                        "denormalized fields only: %s", trip_id, exc)
+
+    # Weather must be buffered BEFORE the critical commit (see docstring).
+    if weather_task is not None:
+        try:
+            await asyncio.wait_for(weather_task, timeout=10)
+        except Exception:  # noqa: BLE001 — weather is an optional section
+            pass
 
     # ── ONE atomic commit: graph + projections + stay + destination + manifest ──
     patches = B._graph_patches(state, graph)
