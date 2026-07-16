@@ -14,7 +14,10 @@ deterministic (cheapest/best-by-sort) recommendation.
 import json
 import logging
 
-from app.services.vertex import brain as vertex_brain, extract_json
+# Muscle tier (v4 M6): this agent only writes the advisory "why this pick"
+# text — the pick itself falls back deterministically. Running it on the
+# volume tier keeps ~2 brain-quota calls per journey search off the books.
+from app.services.vertex import muscle as vertex_brain, extract_json
 
 logger = logging.getLogger(__name__)
 

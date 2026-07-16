@@ -219,6 +219,23 @@ def _resequence_dates(graph: G.TripGraph, start_date: str | None) -> None:
 
 # ── Live routing ─────────────────────────────────────────────────────────────────
 
+# Per-process cap on concurrent journey searches. One journey fans out to every
+# transport provider at once (each with its own breaker/concurrency cap) — this
+# keeps a multi-stop composition or a burst of edits from running unbounded
+# numbers of those fan-outs simultaneously. Loop-scoped like generation_queue
+# (Celery runs tasks under fresh asyncio.run loops).
+_JOURNEY_FANOUT = 3
+_journey_sem: tuple[int, asyncio.Semaphore] | None = None
+
+
+def _journey_semaphore() -> asyncio.Semaphore:
+    global _journey_sem
+    loop_id = id(asyncio.get_running_loop())
+    if _journey_sem is None or _journey_sem[0] != loop_id:
+        _journey_sem = (loop_id, asyncio.Semaphore(_JOURNEY_FANOUT))
+    return _journey_sem[1]
+
+
 async def _shaped_journey(from_city: str, to_city: str, date: str | None,
                           travelers: int, budget: str, user_id: str,
                           stay_nights: int = 1, include_hotels: bool = False) -> dict | None:
@@ -235,7 +252,8 @@ async def _shaped_journey(from_city: str, to_city: str, date: str | None,
             origin=from_city, destination=to_city, travelers=travelers,
             budget=budget, departure_date=date, stay_nights=max(int(stay_nights or 1), 1),
         )
-        result = await run_plan_journey(req, user_id, profile={})
+        async with _journey_semaphore():
+            result = await run_plan_journey(req, user_id, profile={})
         block = _shape_journey(result, include_hotels=include_hotels)
         return block
     except Exception as exc:  # noqa: BLE001 — a routing miss is not fatal
@@ -376,9 +394,20 @@ async def _sync_legs_after_change(state: dict, graph: G.TripGraph, user_id: str)
 
 
 def _block_has_options(block: dict | None) -> bool:
+    """True when a shaped journey block carries ANY bookable option. Multi-hop
+    same-mode routes (train → train via Delhi — every bhiwani return) nest their
+    options under `bucket.legs[].items` with an EMPTY top-level `items`, so the
+    flat check alone silently discarded successful searches — the root cause of
+    the empty-return-edge bug."""
     if not block:
         return False
-    return any((block.get(k) or {}).get("items") for k in ("flights", "trains", "buses"))
+    for key in ("flights", "trains", "buses"):
+        bucket = block.get(key) or {}
+        if bucket.get("items"):
+            return True
+        if any(isinstance(leg, dict) and leg.get("items") for leg in bucket.get("legs") or []):
+            return True
+    return False
 
 
 def _direct_route(leg_id: str, block: dict, from_city: str, to_city: str, date: str | None) -> G.RouteCandidate:

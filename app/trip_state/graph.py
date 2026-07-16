@@ -70,6 +70,10 @@ class TransportOption(BaseModel):
     # the stored graph. Older options (pre-denorm) leave it None and _sold_out
     # falls back to computing it from `raw`.
     available: Optional[bool] = None
+    # Permanent search-store reference (search_results.id) — the v4 typed link.
+    # Stamped by the store-first write at generation time; the read path
+    # hydrates `raw` back by this id (exact, no fuzzy matching).
+    result_id: Optional[str] = None
     raw: dict = Field(default_factory=dict)
 
 

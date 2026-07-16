@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     # are ALWAYS allowed — this gates only the free-text agent path.
     copilot_enabled: bool = False
 
+    # Unified spec-driven generator (trip engine v4 M3). Trips WITH stops always
+    # use it (only pipeline that can build them). Zero-stop trips stay on the
+    # baked supervisor path until this flips true (bake flag, retire after).
+    unified_generator: bool = False
+
     # Embeddings for the recommendation engine (docs/recommendation_engine.md).
     # 384-dim is deliberate: ~4k hotels, not 100M docs — half the RAM/index, no
     # measurable recall loss at this scale.

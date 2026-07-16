@@ -327,35 +327,102 @@ def _match_option_row(opt: dict, candidates: list[dict]) -> dict | None:
     return best if best_score >= 2 else None
 
 
+def _thin_items_of(state: dict) -> tuple[list[tuple[dict, dict]], list[dict]]:
+    """(edge, transport option) pairs missing raw, and stayed-stop hotel dicts
+    missing their heavy payload (photos etc.), across the persisted graph."""
+    graph = state.get("graph") or {}
+    thin_opts: list[tuple[dict, dict]] = []
+    for edge in graph.get("edges") or []:
+        for route in edge.get("routes") or []:
+            for hop in route.get("hops") or []:
+                for opt in hop.get("options") or []:
+                    if isinstance(opt, dict) and not opt.get("raw"):
+                        thin_opts.append((edge, opt))
+    thin_hotels: list[dict] = []
+    for node in graph.get("nodes") or []:
+        for hotel in ((node.get("stay") or {}).get("search_results")) or []:
+            if isinstance(hotel, dict) and hotel.get("result_id") and not hotel.get("photos"):
+                thin_hotels.append(hotel)
+    return thin_opts, thin_hotels
+
+
 async def hydrate_graph_option_raws(trip_id: str, state: dict) -> None:
     """Mutates `state['graph']` in place, reattaching store raws to thin options.
-    No-op (zero DB calls) when there is no graph or every option already carries
-    raw — i.e. for freshly generated trips and in-memory edit sessions. Never
-    raises: a hydration failure just means the projection serves thin items."""
+
+    Fast path (graph v2): options/hotels carry `result_id` — one exact
+    `IN (ids)` lookup, no matching heuristics. Legacy fallback (graph v1):
+    fuzzy scope/city + operator/clock/fare matching. No-op (zero DB calls)
+    when everything already carries raw. Never raises: a hydration failure
+    just means the projection serves thin items."""
     try:
-        edges = (state.get("graph") or {}).get("edges") or []
-        thin: list[tuple[dict, dict]] = []   # (edge, option) pairs missing raw
-        for edge in edges:
-            for route in edge.get("routes") or []:
-                for hop in route.get("hops") or []:
-                    for opt in hop.get("options") or []:
-                        if isinstance(opt, dict) and not opt.get("raw"):
-                            thin.append((edge, opt))
-        if not thin:
+        thin_opts, thin_hotels = _thin_items_of(state)
+        if not thin_opts and not thin_hotels:
             return
-        rows = await run_db(_load_transport_rows, trip_id)
-        if not rows:
-            return
-        by_edge_id: dict[int, list[dict]] = {}
+
+        # ── exact-id hydration (v4 read path) ──
+        by_id: dict[str, dict] = {}
+        for _, opt in thin_opts:
+            if opt.get("result_id"):
+                by_id[str(opt["result_id"])] = opt
+        for hotel in thin_hotels:
+            by_id[str(hotel["result_id"])] = hotel
+        exact = 0
+        if by_id:
+            raws = await run_db(SearchBatchStore.hydrate_raw, list(by_id.keys()))
+            for rid, raw in raws.items():
+                target = by_id.get(rid)
+                if target is not None and isinstance(raw, dict) and raw:
+                    if "photos" in raw or target.get("name"):   # hotel: merge raw over thin card
+                        target.update({k: v for k, v in raw.items() if k not in ("result_id",)})
+                    target["raw"] = raw
+                    exact += 1
+
+        # ── legacy fuzzy fallback for options with no stable id ──
+        legacy = [(e, o) for e, o in thin_opts if not o.get("raw") and not o.get("result_id")]
         matched = 0
-        for edge, opt in thin:
-            candidates = by_edge_id.setdefault(id(edge), _edge_candidate_rows(edge, rows))
-            row = _match_option_row(opt, candidates)
-            if row is not None:
-                opt["raw"] = row.get("raw") or {}
-                candidates.remove(row)   # one row backs one option
-                matched += 1
-        logger.info("[retrieval] rehydrated %d/%d thin options for %s",
-                    matched, len(thin), trip_id)
+        if legacy:
+            rows = await run_db(_load_transport_rows, trip_id)
+            by_edge_id: dict[int, list[dict]] = {}
+            for edge, opt in legacy:
+                candidates = by_edge_id.setdefault(id(edge), _edge_candidate_rows(edge, rows))
+                row = _match_option_row(opt, candidates)
+                if row is not None:
+                    opt["raw"] = row.get("raw") or {}
+                    candidates.remove(row)   # one row backs one option
+                    matched += 1
+        logger.info("[retrieval] hydrated %s: %d exact-id, %d fuzzy (of %d thin)",
+                    trip_id, exact, matched, len(thin_opts) + len(thin_hotels))
     except Exception as exc:  # noqa: BLE001 — reads must never fail on hydration
         logger.warning("[retrieval] raw rehydration failed for %s: %s", trip_id, exc)
+
+
+async def batch_freshness(trip_id: str) -> dict[str, dict]:
+    """scope_id → {searched_at, expires_at, stale} for the trip's NEWEST batch
+    per scope. Powers the per-leg freshness indicator (v4 §4): stale results
+    still render, flagged — never a blank screen."""
+    from datetime import datetime, timezone
+
+    def _load() -> list[dict]:
+        from app.db.client import get_db
+        return (get_db().table("search_batches")
+                .select("scope_id, kind, created_at, expires_at")
+                .eq("trip_id", trip_id)
+                .order("created_at", desc=True).execute().data or [])
+
+    try:
+        rows = await run_db(_load)
+    except Exception as exc:  # noqa: BLE001 — freshness is decoration
+        logger.debug("[retrieval] freshness lookup failed for %s: %s", trip_id, exc)
+        return {}
+    now = datetime.now(timezone.utc).isoformat()
+    out: dict[str, dict] = {}
+    for r in rows:                       # newest-first → first wins per scope
+        scope = r.get("scope_id") or ""
+        if scope in out:
+            continue
+        expires = r.get("expires_at")
+        out[scope] = {
+            "searched_at": r.get("created_at"),
+            "stale": bool(expires and str(expires) < now),
+        }
+    return out

@@ -44,6 +44,9 @@ class TripRequest(BaseModel):
     budget_tier: str = "mid"              # low | mid | high (presets)
     budget_amount: Optional[int] = None   # real ₹ ceiling, overrides tier when set
     interests: list[str] = Field(default_factory=list)
+    # Intermediate cities [{city, nights?}] — the multi-stop request. The spec
+    # copy is authoritative; this mirror keeps the runtime request complete.
+    stops: list[dict] = Field(default_factory=list)
 
 
 class TripDestination(BaseModel):
@@ -106,6 +109,9 @@ class TripState(BaseModel):
     # every regeneration reads THIS, never the graph. `request` below remains
     # the runtime working copy (return_date resync etc.); spec is the record.
     spec: dict = Field(default_factory=dict)
+    # Previous spec revisions, newest last, bounded (structured actions push
+    # the outgoing spec here before bumping version).
+    spec_history: list[dict] = Field(default_factory=list)
     request: TripRequest = Field(default_factory=TripRequest)
     destination: TripDestination = Field(default_factory=TripDestination)
     transport: TripTransport = Field(default_factory=TripTransport)

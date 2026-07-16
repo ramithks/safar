@@ -64,6 +64,16 @@ def read_events(trip_id: str, start: int = 0) -> list[dict]:
     return [json.loads(x) for x in raw]
 
 
+def reset_stream(trip_id: str) -> None:
+    """Clear the live replay buffer before a REGENERATION. The old run's
+    terminal `complete` event would otherwise close a freshly opened stream
+    instantly. The durable event log (Postgres) is untouched."""
+    try:
+        _get_redis().delete(_stream_key(trip_id))
+    except Exception as exc:  # noqa: BLE001 — stream buffer is best-effort
+        logger.debug("[trip-state] stream reset failed for %s: %s", trip_id, exc)
+
+
 class _Emitter:
     """Streams patches to the live Redis stream immediately, and persists them to
     the durable event log EXACTLY ONCE — at the authoritative `critical` emit that
@@ -271,6 +281,53 @@ async def _generate(trip_id: str, body: PlanRequest, user_id: str, emit: "_Emitt
     try:
         await emit("understanding", "Understanding your trip", [], 5)
         weather_task = asyncio.create_task(_fetch_and_emit_weather(trip_id, body, emit))
+
+        # ── Unified spec-driven pipeline (v4 M3): the ONLY path that can build
+        # multi-stop trips; zero-stop trips ride it behind the bake flag. A trip
+        # that already HAS a graph must also regenerate through the composer —
+        # the supervisor path doesn't write /graph, so it would leave a stale
+        # multi-stop graph overriding the fresh transport at projection time.
+        row = await run_db(store.get_trip_state, trip_id)
+        stored = (row or {}).get("state") or {}
+        use_composer = bool(
+            getattr(body, "stops", None)
+            or settings.unified_generator
+            or stored.get("graph")
+        )
+        if use_composer:
+            from . import compose
+
+            spec = stored.get("spec") or {}
+            if not spec:
+                spec = {**body.model_dump(), "budget_tier": body.budget, "version": 1}
+            manifest["spec_version"] = spec.get("version") or 1
+            fd = await compose.generate_from_spec(
+                trip_id, spec, user_id, emit, manifest,
+                prior_graph=stored.get("graph") or None,
+            )
+            logger.info("[trip-state] generation complete for %s (composer)", trip_id)
+
+            if weather_task is not None:
+                try:
+                    await asyncio.wait_for(weather_task, timeout=10)
+                except Exception:  # noqa: BLE001 — optional section
+                    pass
+            weather_task = None
+
+            from .my_trips import upsert_my_trip
+
+            await upsert_my_trip(trip_id, user_id, fd)
+            try:
+                from app.services.user_memory import distill_from_trip
+
+                await distill_from_trip(user_id, fd)
+            except Exception as exc:  # noqa: BLE001 — memory is advisory
+                logger.warning("[trip-state] memory distill failed for %s: %s", trip_id, exc)
+            logger.info(
+                "[trip-state] generation %s cost — %s",
+                trip_id, format_db_delta(db_stats_delta(db_before)),
+            )
+            return
 
         async def on_phase(tag: str, result, error) -> None:
             if error is not None:
