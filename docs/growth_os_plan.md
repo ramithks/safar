@@ -76,22 +76,27 @@ Backend first — everything in Phases 3–5 hangs off this.
 
 ## Phase 3 — Community hub (/community revamp)
 
-- **Hero**: "Become part of India's biggest travel community" — value props
-  as cards: Get best deals · Meet strangers who travel like you · Join group
-  trips · ₹500 off for you + ₹500 for your friend.
-- **Membership card**: branded card component showing name, member number,
-  their referral code + QR (deep link `travbuddy.in/community?ref=CODE`).
-  **Download as PNG** (canvas render, `card_{code}.png`) for sharing on
-  Instagram/WhatsApp — the card IS the referral vehicle.
-- **Live group trips rail**: from `GET /groups/live` — destination, dates,
-  seats, "Join" → existing invite flow. Empty-state: "Start one from any
-  trip you plan."
-- Keep the existing style quiz as the join step (it already collects
-  preferences); joining mints the referral code + card.
+**Page structure (fixed order — value BEFORE any form):**
 
-*Files: website `app/community/*` (rebuild client), new
-`components/community/membership-card.tsx` (+ canvas download), proxies for
-referral + live groups.*
+```
+Hero              "India's biggest travel community" + the 4 value props
+Membership Card   the card itself, personalized when signed-in (else preview)
+                  + Download PNG (code + QR — the card IS the referral vehicle)
+Travel Wallet     ₹ balance from credit_ledger + how to earn (500/500 rules)
+Invite Friends    code, share links (WhatsApp/copy), referred-count, pending
+Upcoming Trips    live public group trips rail (GET /groups/live) → join flow
+Recent Travelers  social proof strip (recent joiners: first name + style + city)
+Style Quiz        the EXISTING quiz, moved to the bottom as the join step
+FAQ               referral rules, credits, how group trips work
+```
+
+Signed-out visitors see everything (card as a blurred/sample preview, wallet
+as "what you'd earn") — the quiz/sign-in is the last section, not a gate.
+
+*Files: website `app/community/*` (rebuild client around this spine), new
+`components/community/membership-card.tsx` (+ canvas PNG download),
+`travel-wallet.tsx`, `invite-friends.tsx`, `live-trips-rail.tsx` (shared with
+homepage), proxies for referral + live groups.*
 
 ## Phase 4 — SEO scale: hotels + sitemap (66 → thousands of pages)
 
@@ -117,10 +122,31 @@ task), website `app/sitemap.ts` → sharded, new `app/hotels/city/[city]/page.ts
 
 ## Phase 5 — Homepage interconnect
 
-- **Live group trips rail** on the homepage (same component as community).
-- **Referral banner**: "Give ₹500, get ₹500" → /community.
-- Community card teaser (blurred card + "claim yours").
-- Nav: Community elevated from footer to header.
+**Design principle (hard rule):** the homepage answers ONE question —
+**"Where should I go next?"** — it is NOT a dashboard of rails. Every
+feature (community, hotels, groups, referral, packages, creators, planner,
+workstations) already wants its own section; resist that. Each addition must
+*reinforce the question* or link out quietly:
+
+- **Live group trips** appear as *answers*: "Leave with these people —
+  Udaipur, Aug 2, 3 seats left" (destination-first framing, same
+  `live-trips-rail` component as /community, capped at one row).
+- **Referral** is a single quiet line/banner ("Give ₹500, get ₹500 → join
+  the community"), not a section.
+- Hotels/workstations/creators stay in nav + footer + SEO pages — NOT new
+  homepage rails.
+- Anything that can't be phrased as a destination suggestion belongs on its
+  own page, linked from nav.
+
+## Phase 4 addendum — launch ALL pages in the sitemap (decision 2026-07-16)
+
+Sahil's call: don't drip the sitemap — **launch everything now**. All 4,856
+hotel pages (they render from master-table data; profiles enrich later),
+all city hubs, all programmatic SEO pages enter the sitemap immediately via
+sharded `generateSitemaps()`. The LLM profile generation still runs in waves
+(quality control on CONTENT), but URL discovery is not throttled. Risk
+accepted: bulk URL addition can slow initial crawl prioritization; mitigation
+is strong interlinking (city hubs) + Search Console sitemap submission.
 
 ## Sequencing & dependencies
 

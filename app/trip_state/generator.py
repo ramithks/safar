@@ -64,6 +64,18 @@ def read_events(trip_id: str, start: int = 0) -> list[dict]:
     return [json.loads(x) for x in raw]
 
 
+def _award_referrer(trip_id: str, user_id: str) -> None:
+    """First completed trip pays the user's referrer (idempotent ledger;
+    growth layer — fire-and-forget, never touches the generation result)."""
+    from app.api.v1.referral.service import award_referrer_on_first_action
+    from app.db.client import run_db
+
+    spawn_background(
+        run_db(lambda: award_referrer_on_first_action(user_id, "trip")),
+        name=f"referral-award:{trip_id}",
+    )
+
+
 def reset_stream(trip_id: str) -> None:
     """Clear the live replay buffer before a REGENERATION. The old run's
     terminal `complete` event would otherwise close a freshly opened stream
@@ -312,6 +324,7 @@ async def _generate(trip_id: str, body: PlanRequest, user_id: str, emit: "_Emitt
             from .my_trips import upsert_my_trip
 
             await upsert_my_trip(trip_id, user_id, fd)
+            _award_referrer(trip_id, user_id)
             try:
                 from app.services.user_memory import distill_from_trip
 
@@ -411,6 +424,7 @@ async def _generate(trip_id: str, body: PlanRequest, user_id: str, emit: "_Emitt
         from .my_trips import upsert_my_trip
 
         await upsert_my_trip(trip_id, user_id, fd)
+        _award_referrer(trip_id, user_id)
 
         # Learn this traveller's durable preferences from the finished plan so
         # their next trip + copilot session starts warm. Best-effort, off the
