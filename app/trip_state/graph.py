@@ -589,9 +589,14 @@ def _leg_chain_hops(block: dict, from_city: str, to_city: str,
     seg_cursor: dict[str, int] = {}
 
     def items_for(mode: str, leg: dict) -> list[dict]:
-        ld = (leg.get("live_data") or {}).get(_BUCKET_KEY[mode]) or []
-        if ld:
-            return list(ld)
+        live = leg.get("live_data") or {}
+        if _BUCKET_KEY[mode] in live:
+            # Present-but-EMPTY live data is authoritative: the planner searched
+            # this exact segment and found nothing. Falling through to the flat
+            # bucket here handed a hop its SIBLING's options (Bhiwani→Ambala
+            # showing Ambala→Chandigarh trains) — an honest empty hop instead
+            # lets the gateway fallback reroute the leg.
+            return list(live.get(_BUCKET_KEY[mode]) or [])
         bucket = block.get(_BUCKET_KEY[mode]) or {}
         segments = bucket.get("legs") or []
         if segments:

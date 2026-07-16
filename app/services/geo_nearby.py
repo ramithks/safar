@@ -192,17 +192,24 @@ async def find_gateways(
     dest_key = geo.normalize(dest_city)
     country = geo.country_of(from_city)          # None → treat as domestic (India-ish)
 
+    dest_coords = await geocode_city(dest_city)
+
     # Candidate hubs: same country as origin (or all, when origin country unknown),
-    # excluding the origin and destination themselves.
-    ranked: list[tuple[float, str]] = []
+    # excluding the origin and destination themselves. Ranked by TOTAL DETOUR
+    # (origin→hub + hub→dest), not origin proximity — a Manali→Bhiwani trip
+    # should try Delhi (on the way, a real junction) before Dehradun (nearby
+    # but sideways, and often without a route onward).
+    ranked: list[tuple[float, float, str]] = []
     for hub, (lat, lng, cc) in _HUB_COORDS.items():
         if hub in (from_key, dest_key):
             continue
         if country and cc != country:
             continue
-        ranked.append((_haversine(origin_coords, (lat, lng)), hub))
+        d_from = _haversine(origin_coords, (lat, lng))
+        detour = d_from + (_haversine(dest_coords, (lat, lng)) if dest_coords else 0)
+        ranked.append((detour, d_from, hub))
     ranked.sort(key=lambda x: x[0])
-    shortlist = ranked[:nearest_n]
+    shortlist = [(d_from, hub) for _, d_from, hub in ranked[:nearest_n]]
     if not shortlist:
         return []
 

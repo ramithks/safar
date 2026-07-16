@@ -95,7 +95,18 @@ async def _route_via_best_gateway(leg: G.TripLeg, travelers: int, budget: str,
         return None
     priced = [g for g in (gateways or []) if g.get("fare_per_person")]
     ranked = sorted(priced, key=lambda g: g["fare_per_person"]) or (gateways or [])
-    for gw in ranked[:2]:
+
+    def _has_direct_options(block: dict | None) -> bool:
+        """A gateway hop must be ONE bookable segment (flat bucket items). A hop
+        whose journey is itself a chain nests its options under bucket.legs —
+        the two-hop gateway route can't represent it, so hop_from_journey_block
+        would build an EMPTY (or worse, mixed-segment) hop. Skip that candidate
+        and try the next gateway instead."""
+        if not block:
+            return False
+        return any((block.get(k) or {}).get("items") for k in ("flights", "trains", "buses"))
+
+    for gw in ranked[:3]:
         via = gw.get("city")
         if not via:
             continue
@@ -104,7 +115,7 @@ async def _route_via_best_gateway(leg: G.TripLeg, travelers: int, budget: str,
             B._shaped_journey(via, leg.to_city, leg.date, travelers, budget, user_id,
                               stay_nights=stay_nights or 1),
         )
-        if not (B._block_has_options(hop1) and B._block_has_options(hop2)):
+        if not (_has_direct_options(hop1) and _has_direct_options(hop2)):
             continue
         hop2_search = {
             "flights": {"flights": (hop2.get("flights") or {}).get("items") or []},

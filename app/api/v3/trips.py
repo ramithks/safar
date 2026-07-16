@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from app.core.background import spawn_background
 from app.core.limiter import limiter
-from app.db.client import run_db
+from app.db.client import run_db_resilient
 from app.deps.auth import require_user
 from app.api.v1.plan_trip.models import PlanRequest, StopSpec, _validate_not_past_date
 from app.trips_doc import generate, mytrips, select, store
@@ -154,15 +154,20 @@ def _mutate_spec(spec: dict, body: ActionBody) -> str:
             raise HTTPException(status_code=400, detail="At most 4 stops per trip")
         idx = len(stops) if body.position is None else max(0, min(int(body.position), len(stops)))
         stops.insert(idx, stop.model_dump())
-        return f"added stop {stop.city}"
+        # A new stop EXTENDS the trip — its nights must never be stolen from the
+        # destination (adding 3 nights in Chandigarh used to leave Manali with 1).
+        spec["days"] = int(spec.get("days") or 3) + max(int(stop.nights or 1), 1)
+        return f"added stop {stop.city} (+{max(int(stop.nights or 1), 1)} days)"
 
     if body.type == "remove_stop":
         key = (body.city or "").strip().lower()
         stops = spec.get("stops") or []
-        kept = [s for s in stops if (s.get("city") or "").strip().lower() != key]
-        if len(kept) == len(stops):
+        removed = next((s for s in stops if (s.get("city") or "").strip().lower() == key), None)
+        if removed is None:
             raise HTTPException(status_code=400, detail=f"{body.city} is not a stop on this trip")
-        spec["stops"] = kept
+        spec["stops"] = [s for s in stops if s is not removed]
+        # Symmetric: give back the days the stop added (never below a 2-day trip).
+        spec["days"] = max(int(spec.get("days") or 3) - max(int(removed.get("nights") or 1), 1), 2)
         return f"removed stop {body.city}"
 
     if body.type == "change_dates":
@@ -222,7 +227,12 @@ async def trip_action(request: Request, trip_id: str, body: ActionBody,
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Specification invalid: {exc}") from exc
 
-    await run_db(store.archive_doc_sync, trip_id, doc, f"pre-{body.type}")
+    # Resilient: a transient transport blip must not 500 a structural action.
+    # Replaying the INSERT at worst writes a duplicate snapshot row, which the
+    # bounded per-trip retention prunes anyway.
+    await run_db_resilient(
+        lambda: store.archive_doc_sync(trip_id, doc, f"pre-{body.type}"),
+        label=f"trip_doc.archive:{trip_id}", max_seconds=45)
 
     prior_doc = dict(doc)
     doc["spec"] = spec
@@ -236,6 +246,47 @@ async def trip_action(request: Request, trip_id: str, body: ActionBody,
                 body.type, trip_id, spec.get("version"))
     return {"status": "regenerating", "applied": note,
             "spec_version": spec.get("version"), "regenerating": True}
+
+
+# ── itinerary day editing (instant path — add/reorder/delete places) ────────
+
+class ItineraryEditBody(BaseModel):
+    stop_id: str                       # stop_id or city name
+    day_index: int                     # 0-based index into that stop's days
+    activities: list[dict]             # the day's FULL new activities list
+
+
+@router.patch("/{trip_id}/itinerary")
+@limiter.limit("120/minute")
+async def edit_itinerary(request: Request, trip_id: str, body: ItineraryEditBody,
+                         user=Depends(require_user)):
+    from app.trips_doc.itinerary import edit_day_activities
+
+    row = await _get_row(trip_id)
+    _authorize_write(row, str(user.id))
+    doc = _doc_of(row)
+    try:
+        doc, note = edit_day_activities(doc, body.stop_id, body.day_index, body.activities)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await store.put_doc(trip_id, doc)
+    return {"ok": True, "note": note, "updated_at": doc.get("updated_at")}
+
+
+@router.get("/{trip_id}/places")
+@limiter.limit("60/hour")
+async def search_trip_places(request: Request, trip_id: str, stop_id: str, q: str,
+                             user=Depends(require_user)):
+    """Google-Places-verified candidates for 'Add a place' — never free text."""
+    from app.trips_doc.itinerary import search_places_for_stop
+
+    row = await _get_row(trip_id)
+    _authorize_read(row, str(user.id))
+    query = (q or "").strip()[:80]
+    if len(query) < 2:
+        raise HTTPException(status_code=400, detail="Type at least 2 characters")
+    places = await search_places_for_stop(_doc_of(row), stop_id, query)
+    return {"places": places}
 
 
 # ── explicit hotel re-search (expensive, user-invoked) ───────────────────────

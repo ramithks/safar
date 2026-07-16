@@ -118,9 +118,17 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
 
     notes = await B._sync_legs_after_change(work_state, graph, user_id)
 
-    # Gateway fallback for anything still unroutable (rare path).
+    def _has_empty_hop(leg: G.TripLeg) -> bool:
+        """A routed chain with a hop nobody can book (the planner searched that
+        exact segment and found nothing) is as unusable as no route at all."""
+        return bool(leg.routes) and any(
+            not hop.options for hop in (leg.routes[0].hops or [])
+        )
+
+    # Gateway fallback for anything unroutable — including chains with a dead
+    # hop (e.g. a via-Ambala plan whose Bhiwani→Ambala segment has no trains).
     for leg in graph.edges:
-        if leg.status == "no_route" or not leg.routes:
+        if leg.status == "no_route" or not leg.routes or _has_empty_hop(leg):
             note = await C._route_via_best_gateway(
                 leg, travelers, budget, user_id,
                 stay_nights=(graph.node(leg.to_node_id) or G.TripStop(id="", city="")).nights,
@@ -220,7 +228,47 @@ async def _fill_itineraries_and_stays(graph: G.TripGraph, stayed: list[G.TripSto
         if not node.stay.search_results:
             hotels = await B._fetch_stop_hotels(node, travelers, budget)
             B._attach_stay(node, hotels, node.nights or 1)
+
+    # The recommendation agent picks each stop's stay and says WHY — the
+    # ai_reason/is_recommended markers the hotel cards render. Best-effort,
+    # concurrent across stops; on any miss the cheapest-first fallback holds.
+    await asyncio.gather(*(
+        _recommend_stop_stay(n, travelers, budget) for n in stayed
+        if n.stay.search_results
+    ))
     return terminal_trip
+
+
+async def _recommend_stop_stay(node: G.TripStop, travelers: int, budget: str) -> None:
+    from app.agents.recommendation_agent import recommend_hotels
+
+    pool = [h for h in node.stay.search_results if isinstance(h, dict)]
+    if len(pool) < 2:
+        return
+    try:
+        res = await recommend_hotels(pool, {
+            "destination": node.city,
+            "checkin": node.arrival_date,
+            "checkout": node.departure_date,
+            "adults": travelers,
+            "nights": node.nights or 1,
+            "budget": budget,
+        })
+        idx = (res or {}).get("recommended_index")
+        if not isinstance(idx, int) or not (0 <= idx < len(pool)):
+            return
+        for h in pool:
+            h["is_recommended"] = False
+        chosen = pool[idx]
+        chosen["is_recommended"] = True
+        chosen["ai_reason"] = res.get("reason")
+        chosen["ai_pros"] = res.get("pros")
+        chosen["ai_best_for"] = res.get("best_for")
+        ru = res.get("runner_up_index")
+        if isinstance(ru, int) and 0 <= ru < len(pool) and ru != idx:
+            pool[ru]["ai_reason"] = res.get("runner_up_reason")
+    except Exception as exc:  # noqa: BLE001 — advisory only
+        logger.warning("[trip-doc] stay recommendation for %s failed: %s", node.city, exc)
 
 
 async def _wait_weather(task: asyncio.Task) -> dict:
