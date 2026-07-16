@@ -14,6 +14,7 @@ default sort. ``rank_and_filter`` is PURE and unit-tested without a DB.
 from __future__ import annotations
 
 import logging
+import re
 
 from app.db.client import run_db
 
@@ -249,3 +250,112 @@ class RetrievalService:
             except Exception as exc:  # noqa: BLE001 — one fragment must not break context
                 logger.debug("[retrieval] fragment %s failed: %s", frag_fn.__name__, exc)
         return ctx
+
+
+# ── read-time raw rehydration ────────────────────────────────────────────────
+# A trip persisted after a graph edit stores a THIN graph: every option keeps its
+# denormalized fields but loses `raw` (the provider payload the frontend
+# renders). The raws live in the search store, keyed by the same legs. Before
+# the read-time projection re-emits the option buckets, reattach each thin
+# option's raw by matching it back to its store row. Best-effort: an option with
+# no match keeps no raw and the projection falls back to a degraded thin item.
+
+def _clock_hhmm(s) -> str | None:
+    """HH:MM pulled out of a clock ('06:10') or datetime-ish string."""
+    m = re.search(r"(\d{1,2}):(\d{2})", str(s or ""))
+    return f"{int(m.group(1)):02d}:{m.group(2)}" if m else None
+
+
+def _load_transport_rows(trip_id: str) -> list[dict]:
+    """Every stored transport result for the trip, tagged with its batch's
+    scope/origin/destination (sync; run via run_db). Two queries total."""
+    from app.db.client import get_db
+    db = get_db()
+    batches = (db.table("search_batches")
+               .select("id, scope_id, origin, destination, created_at")
+               .eq("trip_id", trip_id).eq("kind", "transport")
+               .order("created_at", desc=True).execute().data or [])
+    if not batches:
+        return []
+    rows = (db.table("search_results")
+            .select("batch_id, item_type, operator, price, departs_at, raw")
+            .in_("batch_id", [b["id"] for b in batches]).execute().data or [])
+    meta = {b["id"]: b for b in batches}
+    for r in rows:
+        b = meta.get(r["batch_id"]) or {}
+        r["scope_id"] = b.get("scope_id") or ""
+        r["batch_origin"] = (b.get("origin") or "").strip().lower()
+        r["batch_destination"] = (b.get("destination") or "").strip().lower()
+    return rows
+
+
+def _edge_candidate_rows(edge: dict, rows: list[dict]) -> list[dict]:
+    """Store rows plausibly belonging to this leg: scope_id match first (the
+    post-edit sync keys batches by real leg ids), else origin/destination city
+    match (the generator's 'going'/'return' batches)."""
+    eid = str(edge.get("id") or "")
+    scoped = [r for r in rows if r["scope_id"] == eid]
+    if scoped:
+        return scoped
+    frm = (edge.get("from_city") or "").strip().lower()
+    to = (edge.get("to_city") or "").strip().lower()
+    return [r for r in rows if r["batch_origin"] == frm and r["batch_destination"] == to]
+
+
+def _match_option_row(opt: dict, candidates: list[dict]) -> dict | None:
+    """Best store row for a thin option: same mode, then ≥2 of operator /
+    departure clock / fare agreeing — enough to be unambiguous within one leg."""
+    mode = (opt.get("mode") or "").lower()
+    op = (opt.get("operator") or "").strip().lower()
+    clock = _clock_hhmm(opt.get("departure"))
+    fare = opt.get("fare_per_person")
+
+    best, best_score = None, 0
+    for r in candidates:
+        if (r.get("item_type") or "").lower() != mode:
+            continue
+        score = 0
+        if op and (r.get("operator") or "").strip().lower() == op:
+            score += 2
+        if clock and _clock_hhmm(r.get("departs_at")) == clock:
+            score += 2
+        price = r.get("price")
+        if fare is not None and price is not None and abs(float(price) - float(fare)) <= 1.0:
+            score += 1
+        if score > best_score:
+            best, best_score = r, score
+    return best if best_score >= 2 else None
+
+
+async def hydrate_graph_option_raws(trip_id: str, state: dict) -> None:
+    """Mutates `state['graph']` in place, reattaching store raws to thin options.
+    No-op (zero DB calls) when there is no graph or every option already carries
+    raw — i.e. for freshly generated trips and in-memory edit sessions. Never
+    raises: a hydration failure just means the projection serves thin items."""
+    try:
+        edges = (state.get("graph") or {}).get("edges") or []
+        thin: list[tuple[dict, dict]] = []   # (edge, option) pairs missing raw
+        for edge in edges:
+            for route in edge.get("routes") or []:
+                for hop in route.get("hops") or []:
+                    for opt in hop.get("options") or []:
+                        if isinstance(opt, dict) and not opt.get("raw"):
+                            thin.append((edge, opt))
+        if not thin:
+            return
+        rows = await run_db(_load_transport_rows, trip_id)
+        if not rows:
+            return
+        by_edge_id: dict[int, list[dict]] = {}
+        matched = 0
+        for edge, opt in thin:
+            candidates = by_edge_id.setdefault(id(edge), _edge_candidate_rows(edge, rows))
+            row = _match_option_row(opt, candidates)
+            if row is not None:
+                opt["raw"] = row.get("raw") or {}
+                candidates.remove(row)   # one row backs one option
+                matched += 1
+        logger.info("[retrieval] rehydrated %d/%d thin options for %s",
+                    matched, len(thin), trip_id)
+    except Exception as exc:  # noqa: BLE001 — reads must never fail on hydration
+        logger.warning("[retrieval] raw rehydration failed for %s: %s", trip_id, exc)

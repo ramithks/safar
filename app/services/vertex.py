@@ -60,6 +60,31 @@ def _get_http_client() -> httpx.AsyncClient:
         ),
     )
 
+# ── Region health ─────────────────────────────────────────────────────────────
+# A region that just answered 429/503 is saturated for everyone in this process,
+# not just the call that hit it. Remember that for a short cooldown so the NEXT
+# call starts in a healthy region instead of re-earning the same 429 (and its
+# retry sleep) in the primary. Regions cool down automatically; when every
+# region is cooling we fall back to the configured order.
+_region_cooldown: dict[str, float] = {}
+_REGION_COOLDOWN_S = 90.0
+
+
+def _mark_saturated(region: str, retry_after: str | None = None) -> None:
+    try:
+        cooldown = float(retry_after) if retry_after else _REGION_COOLDOWN_S
+    except ValueError:
+        cooldown = _REGION_COOLDOWN_S
+    _region_cooldown[region] = time.time() + min(cooldown, 300.0)
+
+
+def _healthy_first(regions: list[str]) -> list[str]:
+    now = time.time()
+    healthy = [r for r in regions if _region_cooldown.get(r, 0.0) <= now]
+    cooling = [r for r in regions if r not in healthy]
+    return healthy + cooling
+
+
 # ── Token cache ───────────────────────────────────────────────────────────────
 _token_cache: dict = {"token": None, "expiry": 0.0, "project_id": ""}
 
@@ -171,8 +196,11 @@ async def vertex_generate(
     from app.core.circuit_breaker import breaker_gemini, CircuitOpenError
 
     async def _run() -> str:
+        # Snapshot the rotation order once per call, healthy regions first —
+        # a saturated primary is skipped instead of retried by every caller.
+        order = _healthy_first(regions)
         for attempt in range(max_attempts):
-            location = regions[attempt % n_regions]
+            location = order[attempt % n_regions]
             url = (
                 f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}"
                 f"/locations/{location}/publishers/google/models/{model}:generateContent"
@@ -180,7 +208,8 @@ async def vertex_generate(
             r = await _get_http_client().post(url, headers=headers, json=body, timeout=timeout)
 
             if r.status_code in (429, 503) and attempt < max_attempts - 1:
-                next_location = regions[(attempt + 1) % n_regions]
+                _mark_saturated(location, r.headers.get("Retry-After"))
+                next_location = order[(attempt + 1) % n_regions]
                 cycle = (attempt + 1) // n_regions   # how many times we've wrapped the region list
                 if cycle == 0 and n_regions > 1:
                     # Fresh region still available — switch over near-instantly.

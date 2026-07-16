@@ -126,18 +126,23 @@ async def create_trip(request: Request, body: PlanRequest, user=Depends(require_
 @router.get("/{trip_id}")
 async def get_trip(trip_id: str, user=Depends(require_user)):
     from app.trip_state.graph import projected_state
+    from app.trip_state.retrieval import hydrate_graph_option_raws
 
     row = await _get_row(trip_id)
     _authorize_read(row, str(user.id))
     # Regenerate the compatibility projections (transport/itinerary/costs and the
     # DERIVED recommendation) from the canonical graph on every read — nothing
     # derived is served from a stored snapshot. No-op for graph-less legacy trips.
+    # A thin persisted graph (post-edit) first gets its option raws back from the
+    # search store so the projection can re-emit the full transport buckets.
+    state = row["state"] or {}
+    await hydrate_graph_option_raws(trip_id, state)
     return {
         "trip_id": row["id"],
         "status": row["status"],
         "visibility": row["visibility"],
         "last_seq": row["last_seq"],
-        "state": projected_state(row["state"] or {}),
+        "state": projected_state(state),
     }
 
 
