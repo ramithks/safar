@@ -28,10 +28,13 @@ _UUID_RE = re.compile(
 )
 
 # Card/list columns — light. Heavy blobs (seo_summary, all photos) only on detail.
+# LEFT-joined to profiles: every slugged hotel is a live page (master-table data
+# renders it; the LLM profile only enriches) — "launch ALL pages" means the
+# list/sitemap must not hide the not-yet-profiled 4,400.
 _LIST_COLUMNS = (
     "id,slug,name,city,destination,star_rating,review_score,review_count,"
     "property_type,photos,"
-    "hotel_profiles!inner(one_liner,personality_tags,best_for)"
+    "hotel_profiles(one_liner,personality_tags,best_for)"
 )
 _DETAIL_COLUMNS = (
     "id,slug,name,address,city,destination,lat,lon,star_rating,review_score,"
@@ -80,6 +83,37 @@ def list_hotels(
     except Exception as exc:  # noqa: BLE001
         logger.exception("[hotels] list failed: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to load hotels")
+
+
+@router.get("/cities")
+@limiter.limit("30/minute")
+def list_cities(request: Request, min_hotels: int = Query(2, ge=1)):
+    """Distinct cities with slugged hotels + counts — powers the /hotels/city
+    hub pages and their sitemap entries. Cached upstream (ISR); the scan is a
+    single-column read."""
+    try:
+        db = get_db()
+        cities: dict[str, int] = {}
+        offset = 0
+        while True:
+            rows = (db.table("hotels").select("city")
+                    .not_.is_("slug", "null").not_.is_("city", "null")
+                    .range(offset, offset + 999).execute().data or [])
+            for r in rows:
+                key = (r.get("city") or "").strip()
+                if len(key) >= 2:
+                    cities[key.title()] = cities.get(key.title(), 0) + 1
+            if len(rows) < 1000:
+                break
+            offset += 1000
+        out = sorted(
+            ({"city": c, "count": n} for c, n in cities.items() if n >= min_hotels),
+            key=lambda x: -x["count"],
+        )
+        return {"count": len(out), "cities": out}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[hotels] cities failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to load cities")
 
 
 @router.get("/{slug}")
