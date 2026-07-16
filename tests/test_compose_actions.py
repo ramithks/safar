@@ -106,3 +106,15 @@ class TestActionSpecMutation:
         with pytest.raises(HTTPException):
             self._mutate(self._spec(), type="change_dates", departure_date="2020-01-01")
 
+
+
+    def test_add_stop_extends_trip_days(self):
+        spec = self._spec()                               # 5 days, 1 stop
+        self._mutate(spec, type="add_stop", city="Pushkar", nights=3)
+        assert spec["days"] == 8                          # destination keeps its nights
+
+    def test_remove_stop_gives_days_back(self):
+        spec = self._spec()
+        self._mutate(spec, type="add_stop", city="Pushkar", nights=3)
+        self._mutate(spec, type="remove_stop", city="Pushkar")
+        assert spec["days"] == 5

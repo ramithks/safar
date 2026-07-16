@@ -25,6 +25,8 @@ def _hotels():
         {"id": "h1", "name": "Snow View", "price_per_night": 2000, "currency": "INR",
          "review_score": 8.2, "review_label": "Very good", "photos": ["http://p/1.jpg"],
          "amenities": ["wifi", "parking"], "source": "agoda",
+         "lat": 32.24, "lon": 77.18, "is_recommended": True,
+         "ai_reason": "Best balance of price and location",
          "raw": {"huge": "provider blob"}},
         {"id": "h2", "name": "Pine Resort", "price_per_night": 3000, "currency": "INR",
          "review_score": 9.0, "photos": [{"url": "http://p/2.jpg"}], "source": "booking"},
@@ -103,6 +105,8 @@ def test_trim_hotel_drops_blobs_keeps_card_fields():
     assert h["photo"] == "http://p/1.jpg"
     assert h["review_score"] == 8.2                   # original field names kept
     assert h["review_label"] == "Very good"
+    assert h["lat"] == 32.24 and h["lon"] == 77.18    # map coords survive
+    assert h["ai_reason"].startswith("Best balance")  # agent note survives
     # dict-shaped photo entries resolve too
     assert trim_hotel(_hotels()[1])["photo"] == "http://p/2.jpg"
 
@@ -122,7 +126,7 @@ def test_doc_from_graph_shape_and_recommendation():
     assert [s["stop_id"] for s in doc["itinerary"]] == ["stop-1"]
     stop = doc["itinerary"][0]
     assert stop["days"][0]["title"] == "Old Manali"
-    assert stop["hotels"]["recommended_id"] == "h1"     # cheapest
+    assert stop["hotels"]["recommended_id"] == "h1"     # the agent's is_recommended pick
 
 
 def test_doc_budget_math():
@@ -224,3 +228,45 @@ def test_initial_doc_route_and_status():
     assert doc["status"] == "planning" and doc["progress"] == 5
     assert doc["route"] == ["Delhi", "Manali", "Delhi"]
 
+
+
+# ── itinerary day editing ────────────────────────────────────────────────────
+
+def test_edit_day_activities_replaces_add_reorder_delete():
+    from app.trips_doc.itinerary import edit_day_activities
+    doc = _doc()
+    new = [{"title": "Hadimba Temple", "place_id": "x1"},
+           {"title": "Old Manali Cafe", "place_id": "x2"}]
+    doc, note = edit_day_activities(doc, "stop-1", 0, new)
+    assert doc["itinerary"][0]["days"][0]["activities"] == new
+    assert "Manali" in note and "2 places" in note
+    # city-name targeting works like hotel selection
+    doc, _ = edit_day_activities(doc, "Manali", 0, [])
+    assert doc["itinerary"][0]["days"][0]["activities"] == []
+
+
+def test_edit_day_activities_rejects_bad_targets():
+    import pytest as _pytest
+    from app.trips_doc.itinerary import edit_day_activities
+    with _pytest.raises(ValueError):
+        edit_day_activities(_doc(), "stop-9", 0, [])
+    with _pytest.raises(ValueError):
+        edit_day_activities(_doc(), "stop-1", 7, [])
+    with _pytest.raises(ValueError):
+        edit_day_activities(_doc(), "stop-1", 0, [{"no_title": True}])
+    with _pytest.raises(ValueError):
+        edit_day_activities(_doc(), "stop-1", 0, [{"title": f"p{i}"} for i in range(16)])
+
+
+def test_shape_place_builds_renderable_activity():
+    from app.trips_doc.itinerary import _shape_place
+    a = _shape_place({
+        "name": "Rock Garden", "place_id": "pid1", "rating": 4.5,
+        "user_ratings_total": 1200, "formatted_address": "Sector 1, Chandigarh",
+        "geometry": {"location": {"lat": 30.75, "lng": 76.8}},
+        "photo_reference": "REF", "types": ["tourist_attraction"],
+    })
+    assert a["title"] == "Rock Garden" and a["lat"] == 30.75
+    assert a["photo_url"] == "/api/v1/images/REF"
+    assert a["maps_url"].endswith("place_id:pid1")
+    assert a["source"] == "user_added"

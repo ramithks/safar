@@ -113,3 +113,44 @@ def test_ensure_graph_prefers_stored_graph():
                              "stops": []}).model_dump(mode="json")
     g = G.ensure_graph({"graph": stored, "request": {}})
     assert [n.city for n in g.nodes] == ["A B", "C D"]
+
+
+# ── Chain-hop item assignment: empty live_data is authoritative ──────────────────
+
+def _two_train_block(leg1_trains, leg2_trains, flat_trains):
+    """Shaped-journey block: auto → train → train → auto with per-leg live_data
+    (the bhiwani→chandigarh shape that used to hand hop 0 its sibling's rides)."""
+    return {
+        "legs": [
+            {"mode": "auto", "from": "Bhiwani", "to": "Bhiwani Junction"},
+            {"mode": "train", "from": "Bhiwani Junction", "to": "Ambala Cantt",
+             "live_data": {"trains": leg1_trains}},
+            {"mode": "train", "from": "Ambala Cantt", "to": "Chandigarh Junction",
+             "live_data": {"trains": leg2_trains}},
+            {"mode": "auto", "from": "Chandigarh Junction", "to": "Chandigarh"},
+        ],
+        "trains": {"items": flat_trains},
+    }
+
+
+def _train(name, no):
+    return {"train_name": name, "train_number": no, "cheapest_fare": 150,
+            "duration_min": 40, "departure_time": "06:00", "arrival_time": "06:40"}
+
+
+def test_chain_hop_with_empty_live_data_stays_empty():
+    amb_chd = [_train("DDN ASR EXPRESS", "14631"), _train("NETAJI EXP", "12311")]
+    block = _two_train_block([], amb_chd, flat_trains=amb_chd)  # flat = leg 2's rides
+    hops, _ = G._leg_chain_hops(block, "Bhiwani", "Chandigarh", "2026-07-19")
+    assert len(hops) == 2
+    assert hops[0].options == []                       # honest: no trains found
+    assert [o.raw["train_number"] for o in hops[1].options] == ["14631", "12311"]
+
+
+def test_chain_hop_per_leg_live_data_not_duplicated():
+    leg1 = [_train("KALKA MAIL", "12005")]
+    leg2 = [_train("DDN ASR EXPRESS", "14631")]
+    block = _two_train_block(leg1, leg2, flat_trains=leg1 + leg2)
+    hops, _ = G._leg_chain_hops(block, "Bhiwani", "Chandigarh", "2026-07-19")
+    assert [o.raw["train_number"] for o in hops[0].options] == ["12005"]
+    assert [o.raw["train_number"] for o in hops[1].options] == ["14631"]

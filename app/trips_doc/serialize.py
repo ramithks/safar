@@ -47,6 +47,8 @@ def _clean(d: dict) -> dict:
 _OPTION_DETAIL_FIELDS = (
     # common
     "source", "provider", "rating", "is_refundable",
+    # recommendation-agent notes ("why we'd pick this")
+    "ai_reason", "ai_pros", "ai_best_for", "recommendation_reason",
     # train
     "train_number", "train_name", "available_classes", "cheapest_class",
     "cheapest_fare", "from_station_name", "from_station_code",
@@ -116,7 +118,11 @@ _HOTEL_FIELDS = (
     "distance_km", "distance_from_center_km", "distance_from_search_km",
     "search_landmark", "booking_url",
     "free_cancellation", "no_prepayment", "breakfast_included",
-    "latitude", "longitude", "lat", "lng",
+    # coordinates under every provider spelling — the stays map plots these
+    "latitude", "longitude", "lat", "lng", "lon", "long",
+    # recommendation-agent notes ("why we'd pick this")
+    "ai_reason", "ai_pros", "ai_best_for", "recommendation_reason",
+    "why_recommended", "reason", "why", "is_recommended",
 )
 _MAX_HOTEL_PHOTOS = 4
 _MAX_HOTEL_AMENITIES = 8
@@ -186,7 +192,9 @@ def _stop_entry(node: G.TripStop, searched_at: str) -> dict:
     selected_id = node.stay.selected_id
     if selected_id and not any(h.get("id") == selected_id for h in hotels):
         selected_id = None
-    cheapest = min(hotels, key=lambda h: h.get("price_per_night") or 1e12) if hotels else None
+    # The recommendation-agent's pick (is_recommended) wins; else cheapest.
+    recommended = next((h for h in hotels if h.get("is_recommended")), None) \
+        or (min(hotels, key=lambda h: h.get("price_per_night") or 1e12) if hotels else None)
     return _clean({
         "stop_id": node.id,
         "city": node.city,
@@ -199,7 +207,7 @@ def _stop_entry(node: G.TripStop, searched_at: str) -> dict:
         "hotels": {
             "options": hotels,
             "selected_id": selected_id,
-            "recommended_id": cheapest.get("id") if cheapest else None,
+            "recommended_id": recommended.get("id") if recommended else None,
             "searched_at": searched_at,
         },
     })
