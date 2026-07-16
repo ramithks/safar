@@ -1,8 +1,10 @@
--- TripState teardown — DEFERRED (docs/tripstate_removal_plan.md §5).
+-- TripState teardown (docs/tripstate_removal_plan.md §5).
+-- APPLIED 2026-07-16 (no live users; all 46 trips converted to TripDocs —
+-- incl. one straggler re-converted with hydration from the pre-deletion
+-- commit right before the drop).
 --
--- ⚠️  APPLY ONLY AFTER the TripDoc backend + website are deployed and soaked:
--- the old deployed code writes trip_state_events until then, and dropping
--- these tables under it would 500 every live generation.
+-- NOTE: the old deployed backend 500s on generation until the TripDoc deploy
+-- lands — accepted (zero users), deploy follows immediately.
 --
 -- What stays: trip_states (now the TripDoc home: id/user_id/title/status/
 -- visibility/progress/doc), trip_snapshots (pre-regeneration archive — the

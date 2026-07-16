@@ -106,8 +106,3 @@ class TestActionSpecMutation:
         with pytest.raises(HTTPException):
             self._mutate(self._spec(), type="change_dates", departure_date="2020-01-01")
 
-    def test_spec_derived_from_legacy_request(self):
-        from app.trips_doc.convert import _spec_of
-        spec = _spec_of({"request": {"origin": "Delhi", "destination": "Goa",
-                                     "days": 4, "travelers": 2, "budget_tier": "low"}})
-        assert spec["origin"] == "Delhi" and spec["stops"] == [] and spec["version"] == 1

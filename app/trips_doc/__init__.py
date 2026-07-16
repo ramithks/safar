@@ -10,7 +10,6 @@ Modules:
   serialize  — in-memory TripGraph → doc, option/hotel trimming, budget math
   store      — plain get/put on trip_states.doc (idempotent writes)
   select     — pure doc mutations for instant UI actions
-  convert    — legacy trip_states.state → doc (transition-only)
   generate   — the doc-writing generation runner
   mytrips    — My Trips mirror row from a doc
 """

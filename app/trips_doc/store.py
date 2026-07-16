@@ -4,11 +4,6 @@ TripDoc persistence — plain reads/writes on `trip_states.doc`.
 No event log, no CAS, no per-trip locks, no flush queue. Every write is a
 whole-doc (or status-only) UPDATE — naturally idempotent, so the resilient
 DB path can replay it through transport storms without any reconciliation.
-
-Legacy coexistence: the old machinery writes `state` and bumps `last_seq`;
-this module never touches either. `doc["last_seq_converted"]` records the
-`last_seq` a converted doc reflects — the read path uses it to detect a doc
-made stale by a legacy write (see convert.needs_conversion).
 """
 from __future__ import annotations
 
@@ -20,7 +15,7 @@ from app.db.client import get_db, run_db, run_db_resilient
 
 logger = logging.getLogger(__name__)
 
-_ROW_COLS = "id, user_id, title, status, visibility, progress, last_seq, doc, created_at, updated_at"
+_ROW_COLS = "id, user_id, title, status, visibility, progress, doc, created_at, updated_at"
 _DOC_SIZE_WARN_BYTES = 500_000
 
 
@@ -30,14 +25,13 @@ def _now() -> str:
 
 # ── reads ────────────────────────────────────────────────────────────────────
 
-def get_row_sync(trip_id: str, with_state: bool = False) -> dict | None:
-    cols = _ROW_COLS + (", state" if with_state else "")
-    res = get_db().table("trip_states").select(cols).eq("id", trip_id).limit(1).execute()
+def get_row_sync(trip_id: str) -> dict | None:
+    res = get_db().table("trip_states").select(_ROW_COLS).eq("id", trip_id).limit(1).execute()
     return res.data[0] if res.data else None
 
 
-async def get_row(trip_id: str, with_state: bool = False) -> dict | None:
-    return await run_db(get_row_sync, trip_id, with_state)
+async def get_row(trip_id: str) -> dict | None:
+    return await run_db(get_row_sync, trip_id)
 
 
 # ── writes ───────────────────────────────────────────────────────────────────

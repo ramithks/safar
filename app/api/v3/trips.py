@@ -7,10 +7,6 @@ TripDoc endpoints.
   POST   /api/v3/trips/{id}/actions   → structural change → regenerate
   POST   /api/v3/trips/{id}/search-hotels → live hotel re-search for one stop
 
-Legacy trips (built by the old TripState machinery) are converted to a doc
-lazily on first GET; `last_seq_converted` re-triggers conversion if the old
-write path touched the trip since. Both go away with app/trip_state.
-
 NOTE: no `from __future__ import annotations` here — stringified annotations
 break FastAPI's body-model resolution under the slowapi limiter wrapper
 (the pydantic body silently becomes a query param → 422).
@@ -25,7 +21,7 @@ from app.core.limiter import limiter
 from app.db.client import run_db
 from app.deps.auth import require_user
 from app.api.v1.plan_trip.models import PlanRequest, StopSpec, _validate_not_past_date
-from app.trips_doc import convert, generate, mytrips, select, store
+from app.trips_doc import generate, mytrips, select, store
 from app.trips_doc.serialize import rerank_for_budget
 
 logger = logging.getLogger(__name__)
@@ -51,13 +47,7 @@ async def _get_row(trip_id: str) -> dict:
     return row
 
 
-async def _doc_of(row: dict) -> dict:
-    """The trip's doc, lazily converting legacy trips on first read."""
-    if convert.needs_conversion(row):
-        full = await store.get_row(str(row["id"]), with_state=True)
-        doc = await convert.doc_from_legacy_row(full)
-        await store.put_doc(str(row["id"]), doc)
-        return doc
+def _doc_of(row: dict) -> dict:
     doc = row.get("doc")
     if not doc:
         raise HTTPException(status_code=404, detail="Trip has no content yet")
@@ -95,7 +85,7 @@ async def create_trip(request: Request, body: PlanRequest, user=Depends(require_
 async def get_trip(trip_id: str, user=Depends(require_user)):
     row = await _get_row(trip_id)
     _authorize_read(row, str(user.id))
-    return _envelope(row, await _doc_of(row))
+    return _envelope(row, _doc_of(row))
 
 
 # ── instant selections (never invoke planning logic) ────────────────────────
@@ -115,7 +105,7 @@ async def select_option(request: Request, trip_id: str, body: SelectBody,
                         user=Depends(require_user)):
     row = await _get_row(trip_id)
     _authorize_write(row, str(user.id))
-    doc = await _doc_of(row)
+    doc = _doc_of(row)
     try:
         if body.kind == "transport":
             if not (body.leg_id and body.option_id):
@@ -200,7 +190,7 @@ async def trip_action(request: Request, trip_id: str, body: ActionBody,
                       user=Depends(require_user)):
     row = await _get_row(trip_id)
     _authorize_write(row, str(user.id))
-    doc = await _doc_of(row)
+    doc = _doc_of(row)
 
     if doc.get("status") == "planning":
         raise HTTPException(status_code=409, detail="A generation is already running for this trip")
@@ -264,7 +254,7 @@ async def search_hotels(request: Request, trip_id: str, body: HotelSearchBody,
 
     row = await _get_row(trip_id)
     _authorize_write(row, str(user.id))
-    doc = await _doc_of(row)
+    doc = _doc_of(row)
     try:
         doc, note = await search_stop_hotels(doc, body.stop_id,
                                              query=body.query.strip()[:120],

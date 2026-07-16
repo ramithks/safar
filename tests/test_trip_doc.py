@@ -1,15 +1,12 @@
 """
 Offline unit tests for the TripDoc layer (docs/tripstate_removal_plan.md):
 graph → doc serialization, budget math, instant selections, budget re-rank,
-selection carry-forward across regenerations, spec actions, and legacy
-state → doc conversion. No DB, no network.
+and selection carry-forward across regenerations. No DB, no network.
 """
-import asyncio
-
 import pytest
 
 from app.trip_state import graph as G
-from app.trips_doc import convert, select
+from app.trips_doc import select
 from app.trips_doc.generate import initial_doc
 from app.trips_doc.serialize import (
     carry_forward_selections,
@@ -19,10 +16,6 @@ from app.trips_doc.serialize import (
     trim_hotel,
     trim_transport_option,
 )
-
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
@@ -231,60 +224,3 @@ def test_initial_doc_route_and_status():
     assert doc["status"] == "planning" and doc["progress"] == 5
     assert doc["route"] == ["Delhi", "Manali", "Delhi"]
 
-
-def test_needs_conversion_rules():
-    legacy_state = {"meta": {"status": "ready"}}
-    # legacy trip, no doc yet
-    assert convert.needs_conversion({"doc": None, "state": legacy_state, "last_seq": 3})
-    # converted and untouched since
-    assert not convert.needs_conversion(
-        {"doc": {"last_seq_converted": 3}, "state": legacy_state, "last_seq": 3})
-    # legacy write landed after conversion
-    assert convert.needs_conversion(
-        {"doc": {"last_seq_converted": 3}, "state": legacy_state, "last_seq": 5})
-    # v3-native trip (empty state) is never reconverted
-    assert not convert.needs_conversion({"doc": {"id": "x"}, "state": {}, "last_seq": 0})
-
-
-# ── legacy state → doc conversion ────────────────────────────────────────────
-
-def _legacy_state():
-    return {
-        "meta": {"title": "Delhi to Manali", "status": "ready"},
-        "request": {"origin": "Delhi", "destination": "Manali",
-                    "departure_date": "2026-08-01", "days": 3, "stay_nights": 2,
-                    "travelers": 2, "budget_tier": "mid", "interests": []},
-        "transport": {
-            "going": {"trains": {"items": [
-                {"train_name": "Shatabdi", "train_number": "12005",
-                 "cheapest_fare": 800, "duration_min": 300,
-                 "departure_time": "06:00", "arrival_time": "11:00"}]}},
-            "return_journey": {"buses": {"items": [
-                {"bus_operator": "HRTC", "price": 900, "duration_min": 700,
-                 "departure_time": "20:00", "arrival_time": "07:40"}]}},
-        },
-        "stay": {"hotels": _hotels(), "selected": _hotels()[1]},
-        "itinerary": {"days": [{"day": 1, "title": "Old Manali"}]},
-        "weather": {"daily": [{"t": 20}], "location": "Manali"},
-        "costs": {"breakdown": {"food": 1500}},
-    }
-
-
-def test_doc_from_legacy_row_converts_graphless_trip():
-    row = {"id": "trip-legacy", "title": "Delhi to Manali", "status": "ready",
-           "last_seq": 7, "state": _legacy_state(), "created_at": "2026-07-01T00:00:00Z"}
-    doc = _run(convert.doc_from_legacy_row(row))
-    assert doc["status"] == "ready"
-    assert doc["last_seq_converted"] == 7
-    assert doc["route"][0] == "Delhi" and "Manali" in doc["route"]
-    legs = doc["transport"]
-    assert len(legs) == 2
-    assert legs[0]["hops"][0]["options"][0]["name"].startswith("Shatabdi")
-    # flat legacy stay/days landed on the terminal stop
-    stop = doc["itinerary"][0]
-    assert stop["days"][0]["title"] == "Old Manali"
-    assert stop["hotels"]["selected_id"] == "h2"
-    # legacy selected hotel (3000×2) + train 800 + bus 900 → budget carries food
-    assert doc["budget"]["breakdown"]["food"] == 1500
-    assert doc["budget"]["breakdown"]["stay"] == 6000
-    assert doc["weather"]["location"] == "Manali"

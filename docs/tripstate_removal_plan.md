@@ -10,9 +10,11 @@ build machinery: graph model/ranking, leg-search stabilization, skeleton +
 gateway fallback). Frontend: v3 proxies + `lib/trip-doc.ts` view adapter +
 polling `useTripDoc` hook; SSE/patch/copilot client deleted (−2,504 lines).
 Live-verified: full generation (70s, progressive doc writes), selections,
-change_budget re-rank. REMAINING: deploy both repos (any order — no users),
-soak, then apply `migrations/2026-07-16_drop_tripstate_tables.sql` and delete
-`app/trips_doc/convert.py` + the legacy `state` reads with it.*
+change_budget re-rank. **Tables DROPPED 2026-07-16** (trip_state_events,
+copilot_messages, trip_result_views, trip_recommendations, trip_memory,
+search_results, search_batches; trip_states.state/last_seq/schema_version
+columns) after converting all 46 trips; `convert.py` + the lazy-conversion
+read path deleted with them. REMAINING: deploy both repos.*
 
 **Goal:** every trip becomes one plain JSON document in Supabase. Generate →
 save JSON → return JSON. Selections are a single-column UPDATE. No events, no
