@@ -260,6 +260,12 @@ async def _generate(trip_id: str, body: PlanRequest, user_id: str, emit: "_Emitt
     """Run the full plan pipeline for a trip, streaming patches as agents finish."""
     from app.agents.supervisor import supervisor_run
 
+    from . import integrity
+
+    # Generation Manifest — opened before any work, committed with the result:
+    # records exactly which models/provider parsers produced this trip.
+    manifest = integrity.build_manifest(spec_version=1)
+
     weather_task: asyncio.Task | None = None
     db_before = db_stats_snapshot()
     try:
@@ -335,6 +341,7 @@ async def _generate(trip_id: str, body: PlanRequest, user_id: str, emit: "_Emitt
         final = trip_state_from_merged(merged, body.model_dump())
         final.meta.trip_id = trip_id
         final.meta.status = "ready"
+        final.meta.generation = integrity.finalize_manifest(manifest)
         fd = final.model_dump(mode="json")
         await emit(
             "complete", "Trip ready",
@@ -379,7 +386,11 @@ async def _generate(trip_id: str, body: PlanRequest, user_id: str, emit: "_Emitt
             # commit the failed status (and anything buffered) to the durable snapshot.
             await emit(
                 "error", "Trip planning failed",
-                [PatchOp(op="set", path="/meta/status", value="error")],
+                [
+                    PatchOp(op="set", path="/meta/status", value="error"),
+                    PatchOp(op="set", path="/meta/generation",
+                            value=integrity.finalize_manifest(manifest, status="failed")),
+                ],
                 100,
                 critical=True,
             )

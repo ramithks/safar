@@ -771,9 +771,18 @@ async def apply_edit(
         kind = "restore_ground_route"
         patches, reply = handle_restore_ground_route(state)
     else:
+        from copy import deepcopy
+
         from app.services.user_memory import get_memory, memory_grounding
 
         from .agent import run_agent
+
+        # Archive-before-rebuild: the agent path is the only one that can
+        # restructure the trip (legs added/removed, dates resequenced). Keep
+        # the pre-edit state so a bad rebuild is restorable
+        # (integrity.restore_snapshot) — selections skip this, they're tiny
+        # and reversible by re-selecting.
+        state_before = deepcopy(state)
 
         history = _recent_history(trip_id)
         memory = memory_grounding(await get_memory(user_id)) if user_id else ""
@@ -787,6 +796,20 @@ async def apply_edit(
         clarify_options = agent_result["clarify_options"]
         steps = agent_result["steps"]
         tools_used = agent_result["tools_used"]
+
+        if any(p.path == "/graph" or p.path.startswith("/graph/") for p in patches):
+            from app.core.background import spawn_background
+            from app.db.client import run_db
+
+            from . import integrity
+
+            gen_id = ((state_before.get("meta") or {}).get("generation") or {}).get("generation_id")
+            spawn_background(
+                run_db(lambda: integrity.archive_snapshot(
+                    trip_id, state_before,
+                    reason="pre-structural-edit", generation_id=gen_id)),
+                name=f"snapshot:{trip_id}",
+            )
 
     if patches:
         import httpx
