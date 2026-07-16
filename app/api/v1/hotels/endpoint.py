@@ -58,7 +58,9 @@ def _flatten(row: dict) -> dict:
 
 
 @router.get("")
-@limiter.limit("60/minute")
+# High ceiling on purpose: the website's static build fetches every city hub +
+# all sitemap shards from ONE IP in a burst — these are cheap indexed reads.
+@limiter.limit("600/minute")
 def list_hotels(
     request: Request,
     city: str | None = Query(None, description="Filter by city (case-insensitive)"),
@@ -86,7 +88,7 @@ def list_hotels(
 
 
 @router.get("/cities")
-@limiter.limit("30/minute")
+@limiter.limit("120/minute")
 def list_cities(request: Request, min_hotels: int = Query(2, ge=1)):
     """Distinct cities with slugged hotels + counts — powers the /hotels/city
     hub pages and their sitemap entries. Cached upstream (ISR); the scan is a
