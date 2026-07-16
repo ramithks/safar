@@ -27,6 +27,7 @@ from app.db.client import run_db
 from app.deps.auth import require_user
 from app.api.v1.plan_trip.models import PlanRequest
 from app.trip_state import empty_trip_state
+from app.trip_state import integrity
 from app.trip_state import store
 from app.trip_state.copilot import apply_edit
 from app.trip_state.generator import read_events, run_generation
@@ -58,6 +59,18 @@ class EditAction(BaseModel):
 class EditRequest(BaseModel):
     message: str = ""
     action: EditAction | None = None
+
+
+def _require_copilot_or_action(body: EditRequest) -> None:
+    """Free-text messages run the LLM agent — gated by the copilot flag.
+    Structured actions (the user driving the workspace directly) always pass."""
+    from app.config import settings
+
+    if body.action is None and not settings.copilot_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="Chat editing is disabled. Use the trip actions instead.",
+        )
 
 
 def _authorize_read(row: dict, user_id: str) -> None:
@@ -136,12 +149,24 @@ async def get_trip(trip_id: str, user=Depends(require_user)):
     # A thin persisted graph (post-edit) first gets its option raws back from the
     # search store so the projection can re-emit the full transport buckets.
     state = row["state"] or {}
+
+    # Integrity check BEFORE any mutation (hydration/projection): compare the
+    # seals stamped at commit time against the stored payload. A mismatch is
+    # surfaced (and alerted), never silently rendered — but the data is still
+    # served: degraded-visible beats a blank screen.
+    integrity_status = integrity.verify(state)
+    if integrity_status == "corrupted":
+        logger.error("[trip-state] integrity check FAILED for %s — serving flagged state", trip_id)
+        sentry_sdk.capture_message(f"trip_state integrity corrupted: {trip_id}", level="error")
+
     await hydrate_graph_option_raws(trip_id, state)
     return {
         "trip_id": row["id"],
         "status": row["status"],
         "visibility": row["visibility"],
         "last_seq": row["last_seq"],
+        "integrity": integrity_status,
+        "generation": (state.get("meta") or {}).get("generation"),
         "state": projected_state(state),
     }
 
@@ -149,11 +174,16 @@ async def get_trip(trip_id: str, user=Depends(require_user)):
 @router.get("/{trip_id}/chat")
 async def get_trip_chat(trip_id: str, user=Depends(require_user), limit: int = 100):
     """Durable copilot chat transcript — the frontend loads this on mount to
-    rehydrate the thread after a refresh."""
+    rehydrate the thread after a refresh. With the copilot flagged off this
+    degrades to an empty transcript (never an error — old clients still mount)."""
+    from app.config import settings
+
     row = await _get_row(trip_id)
     _authorize_read(row, str(user.id))
+    if not settings.copilot_enabled:
+        return {"trip_id": trip_id, "messages": [], "copilot_enabled": False}
     messages = await run_db(store.get_chat, trip_id, min(max(limit, 1), 300))
-    return {"trip_id": trip_id, "messages": messages}
+    return {"trip_id": trip_id, "messages": messages, "copilot_enabled": True}
 
 
 @router.get("/{trip_id}/stream")
@@ -212,6 +242,7 @@ async def edit_trip(request: Request, trip_id: str, body: EditRequest, user=Depe
     """Copilot command → intent router → patches over existing state."""
     row = await _get_row(trip_id)
     _authorize_write(row, str(user.id))
+    _require_copilot_or_action(body)
     message = body.message.strip()[:500]
     if not message and body.action is None:
         raise HTTPException(status_code=400, detail="Say what you'd like to change.")
@@ -242,6 +273,7 @@ async def edit_trip_stream(request: Request, trip_id: str, body: EditRequest, us
     """
     row = await _get_row(trip_id)
     _authorize_write(row, str(user.id))
+    _require_copilot_or_action(body)
     message = body.message.strip()[:500]
     if not message and body.action is None:
         raise HTTPException(status_code=400, detail="Say what you'd like to change.")
