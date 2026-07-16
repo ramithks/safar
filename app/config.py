@@ -33,19 +33,6 @@ class Settings(BaseSettings):
     vertex_model_brain: str = "gemini-2.5-flash"
     vertex_model_muscle: str = "gemini-2.5-flash-lite"
 
-    # Conversational copilot (LLM agent edit loop). OFF by default — the product
-    # direction is structured creation + structured actions
-    # (docs/trip_engine_architecture.md); flip COPILOT_ENABLED=true to bring the
-    # chat editor back. Structured EditAction requests (select_leg_option etc.)
-    # are ALWAYS allowed — this gates only the free-text agent path.
-    copilot_enabled: bool = False
-
-    # Unified spec-driven generator (trip engine v4 M3): ONE pipeline for both
-    # single-destination and multi-stop trips (live-verified for 0 and N stops).
-    # UNIFIED_GENERATOR=false falls zero-stop trips back to the legacy
-    # supervisor path — the emergency rollback, slated for retirement.
-    unified_generator: bool = True
-
     # Embeddings for the recommendation engine (docs/recommendation_engine.md).
     # 384-dim is deliberate: ~4k hotels, not 100M docs — half the RAM/index, no
     # measurable recall loss at this scale.

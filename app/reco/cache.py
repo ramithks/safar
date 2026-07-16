@@ -3,7 +3,7 @@ Redis JSON cache — the cheap layer that keeps the recommender cheap.
 
 Everything here is BEST-EFFORT: if Redis is unreachable, ``get`` returns ``None`` and
 ``set`` is a no-op, so a cache outage silently degrades to "recompute" and never
-fails a request. Mirrors the lazy-client pattern in ``app.trip_state.generator``.
+fails a request. Lazy singleton client pattern.
 """
 from __future__ import annotations
 

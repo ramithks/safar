@@ -282,15 +282,13 @@ async def supervisor_run(
     Adds a budget-intervention layer between merge and return.
 
     on_phase: optional async callback (tag, result, error) fired as each agent
-    completes — tags: "journey", "itinerary", "return_journey". Used by the
-    Trip State streaming pipeline; blocking callers just omit it.
+    completes — tags: "journey", "itinerary", "return_journey". Blocking
+    callers just omit it.
 
-    save_legacy_tables: when True (classic /api/v1/plan) the supervisor persists
-    the plan into the legacy `trips` + `trip_journey` tables (read by
-    users/endpoint.get_trip_journey). The v2 Trip State pipeline passes False:
-    it owns persistence (trip_states / trip_state_events + upsert_my_trip keyed
-    to the trip_state id), so these writes would be orphan rows with no reader —
-    and their resilient retries needlessly amplify the TLS-corruption storm.
+    save_legacy_tables: when True (classic /api/v1/plan — the mobile app) the
+    supervisor persists the plan into the `trips` + `trip_journey` tables
+    (read by users/endpoint.get_trip_journey). The TripDoc pipeline
+    (app/trips_doc) never calls the supervisor — it owns its own persistence.
     """
     stay_nights = max(1, body.days - 1)   # e.g. 4-day trip → 3 hotel nights
 
