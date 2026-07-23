@@ -9,6 +9,11 @@ from app.api.v1.onboarding.endpoint import router as onboarding_router
 from app.api.v1.discover.endpoint import router as discover_router
 from app.api.v1.hostels.endpoint import router as hostels_router
 from app.api.v1.hotels.endpoint import router as hotels_router
+from app.api.v1.marketplace.endpoint import router as marketplace_router
+from app.api.v1.marketplace.partner_ops import router as marketplace_partner_router
+from app.api.v1.marketplace.payments import router as marketplace_payments_router
+from app.api.v1.admin.endpoint import router as admin_router
+from app.api.v1.admin.trips import router as admin_trips_router
 from app.api.v1.referral.endpoint import router as referral_router
 from app.api.v1.users.endpoint import router as users_router
 from app.api.v1.reels.endpoint import router as reels_router
@@ -33,6 +38,11 @@ router.include_router(onboarding_router)
 router.include_router(discover_router)
 router.include_router(hostels_router)
 router.include_router(hotels_router)
+router.include_router(marketplace_router)
+router.include_router(marketplace_partner_router)
+router.include_router(marketplace_payments_router)
+router.include_router(admin_router)
+router.include_router(admin_trips_router)
 router.include_router(users_router)
 router.include_router(reels_router)
 router.include_router(reels_analyze_router, tags=["reels"])

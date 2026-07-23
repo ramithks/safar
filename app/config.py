@@ -85,6 +85,17 @@ class Settings(BaseSettings):
     # Bulk Explore Seeder — shared secret for POST /api/v1/bulk-generate-explore
     bulk_explore_api_key: Optional[str] = None
 
+    # Internal admin API (travbuddy_dashboard) — shared passcode sent as
+    # X-Admin-Passcode. Unset means every /api/v1/admin/* route 503s, so a
+    # missing env var fails closed instead of opening the admin surface.
+    admin_api_passcode: Optional[str] = None
+
+    # Transactional email (Resend). Admin-triggered mail (approve/reject) is
+    # sent from here; traveller/partner mail from the website. No key = no-op.
+    resend_api_key: Optional[str] = None
+    resend_from: str = "TravBuddy <hello@travbuddy.in>"
+    site_url: str = "https://travbuddy.in"
+
     # Rotating proxy — Instagram requests go through this FIRST so Instagram
     # never sees (and blocks) the server's own IP. Direct is the fallback.
     # Format: http://user:pass@host:port/
