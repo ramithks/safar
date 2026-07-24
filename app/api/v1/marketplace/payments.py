@@ -32,6 +32,8 @@ from app.api.v1.marketplace.payment_schemas import (
     CheckoutRequest,
     CheckoutResponse,
     PublicBooking,
+    QuoteRequest,
+    QuoteResponse,
     SubscribeResponse,
     VerifyRequest,
     VerifyResponse,
@@ -39,6 +41,7 @@ from app.api.v1.marketplace.payment_schemas import (
 from app.core.limiter import limiter
 from app.db.client import get_db, run_db
 from app.deps.auth import optional_user, require_user
+from app.services import marketplace_pricing as pricing
 from app.services import razorpay
 from app.services.booking_emails import send_booking_emails
 from app.services.marketplace_bookings import (
@@ -56,7 +59,6 @@ router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 # shown this price on the pricing page and charged it here, from one constant.
 STAY_PLAN_MONTHLY_RUPEES = 499
 STAY_PLAN_MONTHLY_PAISE = STAY_PLAN_MONTHLY_RUPEES * 100
-DEFAULT_COMMISSION_PCT = {"group_trip": 10, "experience": 10}
 
 REF_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no O/0, I/1
 
@@ -65,10 +67,10 @@ def booking_ref() -> str:
     return "TB-" + "".join(secrets.choice(REF_ALPHABET) for _ in range(6))
 
 
-def split_commission(amount_paise: int, pct: float) -> tuple[int, int]:
-    """Rounds the commission, never the payout, so the two always sum back."""
-    commission = round(amount_paise * pct / 100)
-    return commission, amount_paise - commission
+# split_commission lives in one place now — the pricing module — so the website,
+# this endpoint and the payout ledger cannot disagree. Re-exported for the tests
+# and callers that imported it from here historically.
+split_commission = pricing.split_commission
 
 
 def resolve_tier_price(content: dict | None, tier_title: str | None) -> int | None:
@@ -91,6 +93,241 @@ def resolve_tier_price(content: dict | None, tier_title: str | None) -> int | No
     return None
 
 
+# ── price resolution ─────────────────────────────────────────────────────────
+#
+# One place resolves a listing into the facts the pricing pipeline needs, and
+# one place runs the pipeline. Both /checkout and /quote call them, so the
+# summary a traveller sees and the amount we charge are computed by identical
+# code — the whole point of routing everything through here.
+
+
+class PricingError(HTTPException):
+    """A 4xx the traveller should see verbatim (sold out, no price, bad dates)."""
+
+
+async def _resolve_listing(item_type: str, item_id: str) -> dict:
+    """
+    Fetch a published, bookable listing and normalise it to a common shape.
+
+    Raises PricingError for anything that makes it un-bookable so the caller
+    doesn't repeat the checks. Never returns a price — that's the pipeline's job.
+    """
+    if item_type == "group_trip":
+        res = await run_db(
+            lambda: get_db()
+            .table("group_trips")
+            .select(
+                "id, slug, title, price_from, partner_id, commission_pct, seats_left, "
+                "content, booking_mode, departure_date"
+            )
+            .eq("id", item_id)
+            .eq("status", "published")
+            .maybe_single()
+            .execute()
+        )
+        row = res.data if res else None
+        if not row:
+            raise PricingError(404, "That trip is no longer available.")
+        if row.get("booking_mode") != "instant":
+            raise PricingError(409, "This trip is booked over WhatsApp. Use the enquiry form.")
+        departure = row.get("departure_date")
+        if departure:
+            try:
+                if date.fromisoformat(str(departure)[:10]) < datetime.now(timezone.utc).date():
+                    raise PricingError(409, "That departure has already left.")
+            except ValueError:
+                pass
+        row["kind"] = "group_trip"
+        return row
+
+    kind = "hotel" if item_type == "hotel" else "experience"
+    res = await run_db(
+        lambda: get_db()
+        .table("partner_listings")
+        .select(
+            "id, slug, title, price_from, partner_id, commission_pct, content, "
+            "booking_mode, kind"
+        )
+        .eq("id", item_id)
+        .eq("status", "published")
+        .eq("kind", kind)
+        .maybe_single()
+        .execute()
+    )
+    row = res.data if res else None
+    if not row:
+        noun = "stay" if kind == "hotel" else "experience"
+        raise PricingError(404, f"That {noun} is no longer available.")
+    if row.get("booking_mode") != "instant":
+        noun = "stay" if kind == "hotel" else "experience"
+        raise PricingError(409, f"This {noun} is booked over WhatsApp. Use the enquiry form.")
+    return row
+
+
+async def _season_rates(listing_id: str) -> list[dict]:
+    res = await run_db(
+        lambda: get_db()
+        .table("listing_season_rates")
+        .select("starts_on, ends_on, price")
+        .eq("listing_id", listing_id)
+        .execute()
+    )
+    return res.data or [] if res else []
+
+
+async def _resolve_coupon(
+    partner_id: str | None, item_type: str, item_id: str, code: str | None
+) -> dict | None:
+    """
+    The coupon row for a code, scoped to this partner and applicable to this
+    item, or None. Returns the row unvalidated — the pricing module decides
+    whether it applies, so checkout and quote reject it identically.
+    """
+    if not code or not partner_id:
+        return None
+    res = await run_db(
+        lambda: get_db()
+        .table("listing_coupons")
+        .select("*")
+        .eq("partner_id", partner_id)
+        .ilike("code", code.strip())
+        .eq("active", True)
+        .maybe_single()
+        .execute()
+    )
+    coupon = res.data if res else None
+    if not coupon:
+        return None
+    # A coupon scoped to a specific listing/trip only applies to that item; a
+    # null scope is partner-wide.
+    scope = coupon.get("listing_id") if item_type != "group_trip" else coupon.get("trip_id")
+    if scope and scope != item_id:
+        return None
+    return coupon
+
+
+def _validate_stay(body, content: dict) -> int:
+    """
+    Stay-only checks: dates present and ordered, minimum stay, maximum
+    occupancy. Returns the night count. Raises PricingError on any failure.
+    """
+    if not body.check_in or not body.check_out:
+        raise PricingError(422, "Please choose your check-in and check-out dates.")
+    nights = pricing.nights_between(body.check_in, body.check_out)
+    if nights < 1:
+        raise PricingError(422, "Check-out must be after check-in.")
+    if date.fromisoformat(body.check_in) < datetime.now(timezone.utc).date():
+        raise PricingError(409, "Check-in can't be in the past.")
+
+    min_nights = content.get("min_nights")
+    if isinstance(min_nights, int) and nights < min_nights:
+        raise PricingError(409, f"This stay has a {min_nights}-night minimum.")
+
+    per_room = content.get("max_occupancy_per_room")
+    rooms = getattr(body, "rooms", 1) or 1
+    guests = (getattr(body, "adults", 1) or 1) + (getattr(body, "children", 0) or 0)
+    if isinstance(per_room, int) and per_room > 0 and guests > per_room * rooms:
+        raise PricingError(
+            409, f"That's {guests} guests in {rooms} room(s); this stay allows "
+            f"{per_room} per room. Add more rooms."
+        )
+    return nights
+
+
+def _price_booking(body, listing: dict, coupon: dict | None) -> tuple[pricing.Quote, dict]:
+    """
+    Run the pipeline for any kind and return (quote, meta).
+
+    The commission rate is read from the listing row, falling back to the
+    single-source-of-truth table — never a per-endpoint constant. `meta` is the
+    audit trail we stamp on the booking so a dispute can be reconstructed.
+    """
+    content = listing.get("content") or {}
+    commission_pct = float(
+        listing.get("commission_pct")
+        if listing.get("commission_pct") is not None
+        else pricing.commission_pct_for(listing["kind"])
+    )
+
+    if listing["kind"] == "hotel":
+        nights = _validate_stay(body, content)
+        base = listing.get("price_from")
+        if not base or base < 1:
+            raise PricingError(409, "This stay has no price set. Please use the enquiry form.")
+        rates = getattr(body, "_season_rates", [])
+        q = pricing.quote_stay(
+            base_price_rupees=float(base),
+            season_rates=rates,
+            check_in=body.check_in,
+            check_out=body.check_out,
+            rooms=body.rooms,
+            commission_pct=commission_pct,
+            coupon=coupon,
+        )
+        meta = {
+            "nights": nights,
+            "rooms": body.rooms,
+            "base_price": base,
+            "coupon": coupon.get("code") if coupon else None,
+        }
+        return q, meta
+
+    # trip / experience — per-person, optional tier price
+    unit_price = resolve_tier_price(content, getattr(body, "tier_title", None)) or listing.get(
+        "price_from"
+    )
+    if not unit_price or unit_price < 1:
+        raise PricingError(409, "This listing has no price set. Please use the enquiry form.")
+    q = pricing.quote(
+        unit_prices_paise=[pricing.to_paise(float(unit_price))],
+        quantity=body.travellers,
+        commission_pct=commission_pct,
+        coupon=coupon,
+    )
+    meta = {
+        "tier": getattr(body, "tier_title", None),
+        "unit_price": unit_price,
+        "coupon": coupon.get("code") if coupon else None,
+    }
+    return q, meta
+
+
+# ── quote (price preview, charges nothing) ────────────────────────────────────
+
+
+@router.post("/quote", response_model=QuoteResponse)
+@limiter.limit("120/hour")
+async def quote_price(request: Request, body: QuoteRequest) -> QuoteResponse:
+    """
+    The booking summary a traveller sees before paying — same pipeline as
+    checkout, no Razorpay order, no row written. Keeping this on the server
+    means the summary and the charge are computed by one code path.
+    """
+    try:
+        listing = await _resolve_listing(body.item_type, body.item_id)
+        if body.item_type == "hotel":
+            body._season_rates = await _season_rates(listing["id"])
+        coupon = await _resolve_coupon(
+            listing.get("partner_id"), body.item_type, body.item_id, body.coupon_code
+        )
+        q, meta = _price_booking(body, listing, coupon)
+    except PricingError as e:
+        return QuoteResponse(ok=False, error=e.detail)
+
+    return QuoteResponse(
+        ok=True,
+        gross_paise=q.gross_paise,
+        discount_paise=q.discount_paise,
+        amount_paise=q.amount_paise,
+        commission_paise=q.commission_paise,
+        nights=meta.get("nights"),
+        coupon_applied=q.discount_paise > 0,
+        coupon_message=(
+            pricing.COUPON_REJECTIONS.get(q.coupon_rejection) if q.coupon_rejection else None
+        ),
+    )
+
+
 # ── checkout ─────────────────────────────────────────────────────────────────
 
 
@@ -104,9 +341,9 @@ async def checkout(
     """
     Open a booking.
 
-    The price is read from the database row and multiplied by the traveller
-    count here. Nothing about the amount comes from the client: a tampered body
-    can change *what* you book, never *what it costs*.
+    The price is computed by the shared pricing pipeline from the DB row, the
+    season table and the coupon row — nothing about the amount comes from the
+    client. A tampered body can change *what* you book, never *what it costs*.
 
     Creates the booking in `created` plus a matching Razorpay order. It only
     becomes `paid` in /checkout/verify or the webhook, after the signature
@@ -117,121 +354,57 @@ async def checkout(
             503, "Online booking isn't available yet. Please use the enquiry form."
         )
 
-    partner_id: str | None = None
-    seats_left: int | None = None
+    listing = await _resolve_listing(body.item_type, body.item_id)
+    partner_id = listing.get("partner_id")
+    title, slug = listing["title"], listing["slug"]
 
-    if body.item_type == "group_trip":
-        res = await run_db(
-            lambda: get_db()
-            .table("group_trips")
-            .select(
-                "id, slug, title, price_from, partner_id, commission_pct, seats_left, "
-                "content, booking_mode, departure_date"
-            )
-            .eq("id", body.item_id)
-            .eq("status", "published")
-            .maybe_single()
-            .execute()
-        )
-        row = res.data if res else None
-        if not row:
-            raise HTTPException(404, "That trip is no longer available.")
+    # Trips track seats; check before we take money.
+    seats_left = listing.get("seats_left") if body.item_type == "group_trip" else None
+    if seats_left is not None and seats_left < body.travellers:
+        raise HTTPException(409, f"Only {max(0, seats_left)} seats left.")
 
-        if row.get("booking_mode") != "instant":
-            raise HTTPException(409, "This trip is booked over WhatsApp. Use the enquiry form.")
-
-        seats_left = row.get("seats_left")
-        if seats_left is not None and seats_left < body.travellers:
-            raise HTTPException(409, f"Only {max(0, seats_left)} seats left.")
-
-        departure = row.get("departure_date")
-        if departure:
-            try:
-                if date.fromisoformat(str(departure)[:10]) < datetime.now(timezone.utc).date():
-                    raise HTTPException(409, "That departure has already left.")
-            except ValueError:
-                pass
-
-        partner_id = row.get("partner_id")
-        title, slug = row["title"], row["slug"]
-        commission_pct = float(
-            row.get("commission_pct") or DEFAULT_COMMISSION_PCT["group_trip"]
-        )
-        unit_price = resolve_tier_price(row.get("content"), body.tier_title) or row.get(
-            "price_from"
-        )
-    else:
-        res = await run_db(
-            lambda: get_db()
-            .table("partner_listings")
-            .select(
-                "id, slug, title, price_from, partner_id, commission_pct, content, "
-                "booking_mode, kind"
-            )
-            .eq("id", body.item_id)
-            .eq("status", "published")
-            .eq("kind", "experience")
-            .maybe_single()
-            .execute()
-        )
-        row = res.data if res else None
-        if not row:
-            raise HTTPException(404, "That experience is no longer available.")
-
-        if row.get("booking_mode") != "instant":
-            raise HTTPException(
-                409, "This experience is booked over WhatsApp. Use the enquiry form."
-            )
-
-        partner_id = row.get("partner_id")
-        title, slug = row["title"], row["slug"]
-        commission_pct = float(
-            row.get("commission_pct") or DEFAULT_COMMISSION_PCT["experience"]
-        )
-        unit_price = resolve_tier_price(row.get("content"), body.tier_title) or row.get(
-            "price_from"
-        )
-
-    if not unit_price or unit_price < 1:
-        raise HTTPException(409, "This listing has no price set. Please use the enquiry form.")
-
-    amount_paise = int(unit_price) * 100 * body.travellers
-    commission_paise, payout_paise = split_commission(amount_paise, commission_pct)
+    if body.item_type == "hotel":
+        body._season_rates = await _season_rates(listing["id"])
+    coupon = await _resolve_coupon(partner_id, body.item_type, body.item_id, body.coupon_code)
+    q, meta = _price_booking(body, listing, coupon)
+    meta["seats_at_checkout"] = seats_left
 
     ref = booking_ref()
+    booking_row = {
+        "ref": ref,
+        # From the verified token only. An anonymous traveller is fine; a
+        # caller-supplied user_id is not accepted at all.
+        "user_id": user.id if user else None,
+        "partner_id": partner_id,
+        "item_type": body.item_type,
+        "item_id": body.item_id,
+        "item_title": title,
+        "item_slug": slug,
+        "travel_date": body.travel_date or body.check_in,
+        "travellers": body.travellers,
+        "lead_name": body.name,
+        "lead_phone": body.phone,
+        "lead_email": body.email,
+        "notes": body.notes,
+        "source": "online",
+        "gross_paise": q.gross_paise,
+        "discount_paise": q.discount_paise,
+        "coupon_code": coupon.get("code") if coupon else None,
+        "coupon_id": coupon.get("id") if coupon else None,
+        "amount_paise": q.amount_paise,
+        "commission_paise": q.commission_paise,
+        "payout_paise": q.payout_paise,
+        "status": "created",
+        "payout_status": "held" if partner_id else "na",
+        "meta": meta,
+    }
+    if body.item_type == "hotel":
+        booking_row["check_in"] = body.check_in
+        booking_row["check_out"] = body.check_out
+        booking_row["nights"] = meta.get("nights")
+
     insert = await run_db(
-        lambda: get_db()
-        .table("bookings")
-        .insert(
-            {
-                "ref": ref,
-                # From the verified token only. An anonymous traveller is fine;
-                # a caller-supplied user_id is not accepted at all.
-                "user_id": user.id if user else None,
-                "partner_id": partner_id,
-                "item_type": body.item_type,
-                "item_id": body.item_id,
-                "item_title": title,
-                "item_slug": slug,
-                "travel_date": body.travel_date,
-                "travellers": body.travellers,
-                "lead_name": body.name,
-                "lead_phone": body.phone,
-                "lead_email": body.email,
-                "notes": body.notes,
-                "amount_paise": amount_paise,
-                "commission_paise": commission_paise,
-                "payout_paise": payout_paise,
-                "status": "created",
-                "payout_status": "held" if partner_id else "na",
-                "meta": {
-                    "tier": body.tier_title,
-                    "unit_price": unit_price,
-                    "seats_at_checkout": seats_left,
-                },
-            }
-        )
-        .execute()
+        lambda: get_db().table("bookings").insert(booking_row).execute()
     )
     if not insert.data:
         logger.error("[checkout] booking insert failed for %s", body.item_id)
@@ -240,7 +413,7 @@ async def checkout(
 
     try:
         order = await razorpay.create_order(
-            amount_paise=amount_paise,
+            amount_paise=q.amount_paise,
             receipt=ref,
             notes={"booking_ref": ref, "item_type": body.item_type, "item_slug": slug},
         )
@@ -269,7 +442,7 @@ async def checkout(
         ok=True,
         ref=ref,
         order_id=order["id"],
-        amount=amount_paise,
+        amount=q.amount_paise,
         currency="INR",
         key_id=razorpay.public_key_id(),
         name=title,
@@ -350,6 +523,7 @@ async def get_booking_by_ref(request: Request, ref: str) -> PublicBooking:
         .table("bookings")
         .select(
             "ref, item_type, item_title, item_slug, travel_date, travellers, "
+            "check_in, check_out, nights, gross_paise, discount_paise, "
             "amount_paise, status, lead_name, created_at, partner_id"
         )
         .eq("ref", ref)

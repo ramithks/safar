@@ -31,7 +31,7 @@ TERMINAL = {"refunded", "cancelled"}
 BOOKING_COLS = (
     "id, ref, status, item_type, item_id, item_title, travellers, partner_id, "
     "razorpay_payment_id, lead_name, lead_phone, lead_email, travel_date, "
-    "amount_paise, payout_paise"
+    "amount_paise, payout_paise, coupon_id"
 )
 
 
@@ -119,6 +119,19 @@ async def finalise_booking(order_id: str, payment_id: str) -> dict:
             except Exception:  # noqa: BLE001
                 logger.exception("[bookings] seat release failed for %s", booking["id"])
         return {"status": "already_paid", "ref": ref, "booking_id": booking["id"]}
+
+    # Count the coupon exactly once, on the settle that won. Guarded and atomic,
+    # so a capped code can't be over-issued by a concurrent double-settle. A
+    # failure here is logged, not fatal — the money already moved.
+    if booking.get("coupon_id"):
+        try:
+            await run_db(
+                lambda: get_db()
+                .rpc("claim_coupon", {"p_coupon": booking["coupon_id"]})
+                .execute()
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[bookings] coupon claim failed for %s", booking["id"])
 
     return {
         "status": "paid",
