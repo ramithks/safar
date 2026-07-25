@@ -383,7 +383,7 @@ async def activate_stay_plan(partner_id: str, months: int = 1) -> bool:
         logger.exception("[subscription] activate_stay_plan failed")
         return False
 
-    # Bring back anything the expiry job paused. Every kind, not just stays:
+    # Bring back everything the expiry job paused. Every kind, not just stays:
     # under V3 unified pricing the ₹499 plan gates publishing anything, so a
     # lapse pauses experiences too and paying has to un-pause them.
     try:
@@ -397,6 +397,33 @@ async def activate_stay_plan(partner_id: str, months: int = 1) -> bool:
         )
     except Exception:  # noqa: BLE001
         logger.exception("[subscription] relist after payment failed")
+
+    # Group trips lapse in two different ways, so paying has to undo both:
+    # an unbooked trip was retired outright, and a trip with travellers on it
+    # stayed published with its bookings closed.
+    today = datetime.now(timezone.utc).date().isoformat()
+    try:
+        await run_db(
+            lambda: get_db()
+            .table("group_trips")
+            .update({"status": "published"})
+            .eq("partner_id", partner_id)
+            .eq("status", "expired")
+            # Never resurrect a departure that has already left — that trip is
+            # over, and expire_departed_trips retired it on its own merits.
+            .gte("departure_date", today)
+            .execute()
+        )
+        await run_db(
+            lambda: get_db()
+            .table("group_trips")
+            .update({"bookings_closed": False})
+            .eq("partner_id", partner_id)
+            .eq("bookings_closed", True)
+            .execute()
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("[subscription] trip relist after payment failed")
 
     return True
 

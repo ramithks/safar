@@ -51,6 +51,11 @@ class _Query:
         self.filters.append(lambda r: r.get(col) in vals)
         return self
 
+    def gte(self, col, val):
+        # Dates are ISO strings here, where lexical and chronological order agree.
+        self.filters.append(lambda r: r.get(col) is not None and r[col] >= val)
+        return self
+
     @property
     def not_(self):
         return _Negated(self)
@@ -398,3 +403,77 @@ class TestRefunds:
         assert meta["base_price"] == 5000
         assert meta["coupon"] == "STAY500"
         assert meta["nights"] == 2
+
+
+# ── a lapsed plan, and what paying again undoes ──────────────────────────────
+
+
+class TestRenewalRestoresInventory:
+    """
+    The lapse policy is deliberately asymmetric (see
+    20260726_plan_lapse_policy.sql): stays and experiences are unpublished,
+    unbooked trips are unpublished, and a trip with travellers on it stays
+    published with `bookings_closed` set. Paying again has to undo all three,
+    or a partner pays ₹499 and their trips stay dark.
+    """
+
+    def _lapsed_db(self):
+        return FakeDB(
+            rows={
+                "partners": [{"id": "p1", "stay_plan_expires_at": None}],
+                "partner_listings": [
+                    {"id": "l1", "partner_id": "p1", "status": "expired"},
+                    {"id": "l2", "partner_id": "p1", "status": "published"},
+                ],
+                "group_trips": [
+                    # retired because nobody had booked it
+                    {
+                        "id": "t1",
+                        "partner_id": "p1",
+                        "status": "expired",
+                        "bookings_closed": False,
+                        "departure_date": "2099-01-01",
+                    },
+                    # stayed up for its travellers, but stopped selling
+                    {
+                        "id": "t2",
+                        "partner_id": "p1",
+                        "status": "published",
+                        "bookings_closed": True,
+                        "departure_date": "2099-01-01",
+                    },
+                    # already departed — must NOT be resurrected
+                    {
+                        "id": "t3",
+                        "partner_id": "p1",
+                        "status": "expired",
+                        "bookings_closed": False,
+                        "departure_date": "2020-01-01",
+                    },
+                ],
+            }
+        )
+
+    def test_paying_again_republishes_and_reopens(self, fake_db):
+        db = fake_db(self._lapsed_db())
+        assert run(mb.activate_stay_plan("p1", months=1)) is True
+
+        listings = {r["id"]: r for r in db.rows["partner_listings"]}
+        trips = {r["id"]: r for r in db.rows["group_trips"]}
+
+        assert listings["l1"]["status"] == "published", "an expired stay comes back"
+        assert trips["t1"]["status"] == "published", "an expired trip comes back"
+        assert trips["t2"]["bookings_closed"] is False, "a closed trip sells again"
+
+    def test_a_departed_trip_is_not_resurrected(self, fake_db):
+        db = fake_db(self._lapsed_db())
+        run(mb.activate_stay_plan("p1", months=1))
+
+        trips = {r["id"]: r for r in db.rows["group_trips"]}
+        assert trips["t3"]["status"] == "expired", "a trip that already left stays gone"
+
+    def test_the_plan_itself_is_switched_back_on(self, fake_db):
+        db = fake_db(self._lapsed_db())
+        run(mb.activate_stay_plan("p1", months=1))
+        assert db.rows["partners"][0]["stay_plan_status"] == "active"
+        assert db.rows["partners"][0]["stay_plan_expires_at"] is not None

@@ -124,7 +124,8 @@ async def _resolve_listing(item_type: str, item_id: str) -> dict:
             .table("group_trips")
             .select(
                 "id, slug, title, price_from, partner_id, commission_pct, seats_left, "
-                "content, booking_mode, departure_date, deposit_type, deposit_value"
+                "content, booking_mode, departure_date, deposit_type, deposit_value, "
+                "bookings_closed"
             )
             .eq("id", item_id)
             .eq("status", "published")
@@ -136,6 +137,11 @@ async def _resolve_listing(item_type: str, item_id: str) -> dict:
             raise PricingError(404, "That trip is no longer available.")
         if row.get("booking_mode") != "instant":
             raise PricingError(409, "This trip is booked over WhatsApp. Use the enquiry form.")
+        # The trip is still published — travellers already on it keep their page
+        # — but it sells nothing further. Set by expire_stay_plans() when the
+        # organiser's plan lapses on a trip that already has bookings.
+        if row.get("bookings_closed"):
+            raise PricingError(409, "Bookings for this trip are closed.")
         departure = row.get("departure_date")
         if departure:
             try:
