@@ -23,6 +23,7 @@ Authorization model, per endpoint:
 # NOTE: deliberately no `from __future__ import annotations` — see the note in
 # app/api/v1/admin/endpoint.py.
 import logging
+import re
 import secrets
 from datetime import date, datetime, timezone
 
@@ -237,6 +238,29 @@ def _last10(phone: str | None) -> str:
     return digits[-10:]
 
 
+# Coupons are written as ^[A-Z0-9]{3,20}$ and stored upper-cased (the website's
+# couponSchema in lib/marketplace/schemas.ts enforces it, and the DB has a
+# unique index on (partner_id, upper(code))). Redemption normalises to the same
+# shape before looking anything up.
+_CODE_RE = re.compile(r"^[A-Z0-9]{3,20}$")
+
+
+def normalise_coupon_code(code: str | None) -> str | None:
+    """
+    A submitted code as it can safely be matched, or None if it isn't one.
+
+    This exists because the lookup used to be a LIKE: `%` and `_` are wildcards
+    to Postgres, so `HIMALAYA__` matched HIMALAYA10 and applied a discount to a
+    traveller who never knew the code, and a bare `%` matched every coupon the
+    partner had (which then blew up `maybe_single` with a 500). Anything that
+    isn't a real code is rejected here rather than being handed to the matcher.
+    """
+    if not code:
+        return None
+    candidate = code.strip().upper()
+    return candidate if _CODE_RE.match(candidate) else None
+
+
 async def _resolve_coupon(
     partner_id: str | None,
     item_type: str,
@@ -254,14 +278,18 @@ async def _resolve_coupon(
     anyone else simply doesn't resolve, and the traveller is told the code
     doesn't apply rather than who it was for.
     """
-    if not code or not partner_id:
+    normalised = normalise_coupon_code(code)
+    if not normalised or not partner_id:
         return None
+    # Exact match, never LIKE — see normalise_coupon_code. Codes are stored
+    # upper-cased, so equality on the normalised form is both correct and the
+    # shape the (partner_id, upper(code)) unique index is built for.
     res = await run_db(
         lambda: get_db()
         .table("listing_coupons")
         .select("*")
         .eq("partner_id", partner_id)
-        .ilike("code", code.strip())
+        .eq("code", normalised)
         .eq("active", True)
         .maybe_single()
         .execute()
@@ -977,11 +1005,15 @@ async def razorpay_webhook(
             return {"ok": True, "handled": name}
 
         if name in ("refund.processed", "refund.created"):
-            payment_id = (
-                (payload.get("refund") or {}).get("entity") or {}
-            ).get("payment_id") or payment.get("id")
+            refund = (payload.get("refund") or {}).get("entity") or {}
+            payment_id = refund.get("payment_id") or payment.get("id")
             if payment_id:
-                await mark_refunded_by_payment(payment_id)
+                # The amount decides whether this closes the booking — a partial
+                # refund must leave the partner's remaining payout intact.
+                amount = refund.get("amount")
+                await mark_refunded_by_payment(
+                    payment_id, int(amount) if isinstance(amount, (int, float)) else None
+                )
             return {"ok": True, "handled": name}
 
         if name == "payment.failed":
@@ -990,8 +1022,18 @@ async def razorpay_webhook(
                 await cancel_unpaid_order(order_id)
             return {"ok": True, "handled": name}
     except Exception:  # noqa: BLE001
-        # Signature was valid, so the event is genuine — log it and still ack,
-        # or Razorpay will replay it every few minutes forever.
-        logger.exception("[webhook] handler threw for %s", name)
+        # Ack-on-error was the wrong trade. The events that reach here are
+        # signature-verified and money-bearing, and the usual reason a handler
+        # throws is transient — a DB blip, a pool timeout. Swallowing that
+        # returned 200, Razorpay never retried, and the booking stayed unpaid
+        # forever with the money captured: no seat claimed, no receipt, nothing
+        # in the partner's dashboard, and no error anywhere anyone would look.
+        #
+        # A retry is safe precisely because every handler below finalise_booking
+        # and record_subscription_charge is idempotent, so 500 here and let
+        # Razorpay redeliver. Razorpay backs off and gives up after ~24h, so a
+        # genuinely poisonous event cannot loop forever.
+        logger.exception("[webhook] handler threw for %s — asking Razorpay to retry", name)
+        raise HTTPException(500, "Handler failed; please retry.") from None
 
     return {"ok": True, "ignored": name}

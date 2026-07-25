@@ -28,6 +28,28 @@ logger = logging.getLogger(__name__)
 SETTLED = {"paid", "confirmed", "completed"}
 TERMINAL = {"refunded", "cancelled"}
 
+
+def _is_terminal(booking: dict) -> bool:
+    """
+    True when this booking must not be settled by an incoming capture.
+
+    `refunded` always is. `cancelled` normally is — but a booking cancelled
+    while it still has no payment against it was never actually paid for, and a
+    genuine capture arriving afterwards should still be honoured rather than
+    silently pocketed. That happens two ways: the old payment.failed handler
+    cancelled orders the traveller then retried successfully (see
+    cancel_unpaid_order), and checkout cancels a booking whose Razorpay order
+    failed to create, which a stray webhook could still reference.
+
+    Only a *signature-verified* capture reaches here, so honouring it is the
+    conservative choice: the alternative is money taken for a booking nobody
+    can see.
+    """
+    status = booking.get("status")
+    if status == "cancelled":
+        return bool(booking.get("razorpay_payment_id"))
+    return status in TERMINAL
+
 BOOKING_COLS = (
     "id, ref, status, item_type, item_id, item_title, travellers, partner_id, "
     "razorpay_payment_id, lead_name, lead_phone, lead_email, travel_date, "
@@ -57,7 +79,7 @@ async def finalise_booking(order_id: str, payment_id: str) -> dict:
         return {"status": "not_found"}
 
     ref = booking.get("ref")
-    if booking.get("status") in SETTLED or booking.get("status") in TERMINAL:
+    if booking.get("status") in SETTLED or _is_terminal(booking):
         # The other path got here first. Not an error.
         return {"status": "already_paid", "ref": ref, "booking_id": booking["id"]}
 
@@ -101,7 +123,13 @@ async def finalise_booking(order_id: str, payment_id: str) -> dict:
                 }
             )
             .eq("id", booking["id"])
-            .not_.in_("status", list(SETTLED | TERMINAL))
+            .not_.in_("status", list(SETTLED | {"refunded"}))
+            # The real single-winner guard: only a booking that has not already
+            # taken a payment can take this one. Keyed on the payment rather
+            # than the status so a booking cancelled without ever being paid can
+            # still be settled by a genuine capture (see _is_terminal), while a
+            # concurrent double-settle still lands on exactly one winner.
+            .is_("razorpay_payment_id", "null")
             .execute()
         )
         settled = bool(update.data)
@@ -152,7 +180,27 @@ async def finalise_booking(order_id: str, payment_id: str) -> dict:
 
 
 async def mark_refunded(order_id: str, payment_id: str, refunded: bool, reason: str) -> None:
-    """Settle a booking we took money for but cannot honour."""
+    """
+    Settle a booking we took money for but cannot honour.
+
+    The refund note is MERGED into `meta`, not written over it. `meta` is the
+    audit trail checkout stamped on the row — the nightly rate breakdown, the
+    coupon, the seat count at checkout, which departure was sold. Replacing it
+    wholesale destroyed exactly the evidence a refund dispute needs, at the one
+    moment someone is most likely to ask.
+    """
+    res = await run_db(
+        lambda: get_db()
+        .table("bookings")
+        .select("meta")
+        .eq("razorpay_order_id", order_id)
+        .maybe_single()
+        .execute()
+    )
+    meta = ((res.data if res else None) or {}).get("meta") or {}
+    if not isinstance(meta, dict):
+        meta = {"original_meta": meta}
+
     await run_db(
         lambda: get_db()
         .table("bookings")
@@ -161,7 +209,7 @@ async def mark_refunded(order_id: str, payment_id: str, refunded: bool, reason: 
                 "status": "refunded" if refunded else "cancelled",
                 "payout_status": "na",
                 "razorpay_payment_id": payment_id,
-                "meta": {"refund_reason": reason, "auto_refunded": refunded},
+                "meta": {**meta, "refund_reason": reason, "auto_refunded": refunded},
             }
         )
         .eq("razorpay_order_id", order_id)
@@ -169,23 +217,64 @@ async def mark_refunded(order_id: str, payment_id: str, refunded: bool, reason: 
     )
 
 
-async def mark_refunded_by_payment(payment_id: str) -> None:
-    """Refund arriving from the webhook, keyed on the payment rather than the order."""
-    await run_db(
+async def mark_refunded_by_payment(payment_id: str, refund_paise: int | None = None) -> None:
+    """
+    Refund arriving from the webhook, keyed on the payment rather than the order.
+
+    A PARTIAL refund must not close the booking. Cancellation tiers routinely
+    refund 50% or 75%, and marking the whole booking `refunded` with
+    payout_status `na` told the partner their stay was cancelled and wiped the
+    payout they were still owed on the part the traveller did not get back.
+    Only a refund that covers the captured amount settles the row; anything
+    less is recorded and left alone.
+    """
+    res = await run_db(
         lambda: get_db()
         .table("bookings")
-        .update({"status": "refunded", "payout_status": "na"})
+        .select("id, amount_paise, meta")
         .eq("razorpay_payment_id", payment_id)
+        .maybe_single()
         .execute()
+    )
+    booking = res.data if res else None
+    if not booking:
+        return
+
+    meta = booking.get("meta") if isinstance(booking.get("meta"), dict) else {}
+    captured = booking.get("amount_paise") or 0
+    # An unknown refund amount is treated as full: that is what Razorpay sends
+    # for a plain full refund, and under-refunding the record is the safer error.
+    full = refund_paise is None or refund_paise >= captured
+
+    patch: dict = {"meta": {**meta, "refunded_paise": refund_paise, "refunded_in_full": full}}
+    if full:
+        patch["status"] = "refunded"
+        patch["payout_status"] = "na"
+
+    await run_db(
+        lambda: get_db().table("bookings").update(patch).eq("id", booking["id"]).execute()
     )
 
 
 async def cancel_unpaid_order(order_id: str) -> None:
-    """payment.failed — only ever touches a booking still sitting in `created`."""
+    """
+    payment.failed — record the failed attempt WITHOUT closing the booking.
+
+    A Razorpay order survives a failed payment: Checkout lets the traveller
+    retry then and there (wrong OTP, bank timeout, insufficient balance) and the
+    retry is a new payment against the SAME order. Cancelling here used to make
+    that retry unsettleable — `finalise_booking` saw a booking in `cancelled`,
+    treated it as terminal, and returned "already_paid" without claiming seats,
+    marking it paid or sending a receipt. The traveller was charged, saw a
+    success screen, and the partner never learned the booking existed.
+
+    So a failed attempt is now only a note on the row. An order that is never
+    paid stays in `created`, which is already inert everywhere it is read.
+    """
     await run_db(
         lambda: get_db()
         .table("bookings")
-        .update({"status": "cancelled"})
+        .update({"last_payment_failed_at": datetime.now(timezone.utc).isoformat()})
         .eq("razorpay_order_id", order_id)
         .eq("status", "created")
         .execute()
@@ -337,9 +426,19 @@ async def record_subscription_charge(
     """
     A cycle was charged: ledger the payment and push the plan out a month.
 
-    Idempotent on the invoice: Razorpay replays webhooks, and the unique index
-    on `razorpay_invoice_id` turns a replay into a no-op rather than a second
-    row and a second free month.
+    Idempotent on the PAYMENT id, which is the only identifier both callers
+    always have. This used to key only on the invoice, and that quietly gave
+    away a free month to every subscriber alive:
+
+      * the browser callback (/subscribe PUT) has no invoice and passed
+        invoice_id=None, so it wrote a ledger row with a NULL invoice;
+      * the `subscription.charged` webhook for that same ₹499 arrived with a
+        real invoice id, matched nothing, and ran the whole body again.
+
+    The second insert did fail on the unique payment id — but the extension
+    below used to run regardless of whether the insert landed, so one payment
+    bought two months, and every webhook replay after that bought another. The
+    plan is now extended only by the call that genuinely wrote the ledger row.
     """
     res = await run_db(
         lambda: get_db()
@@ -354,17 +453,8 @@ async def record_subscription_charge(
         logger.error("[autopay] no partner for subscription %s", subscription_id)
         return False
 
-    if invoice_id:
-        seen = await run_db(
-            lambda: get_db()
-            .table("partner_payments")
-            .select("id")
-            .eq("razorpay_invoice_id", invoice_id)
-            .maybe_single()
-            .execute()
-        )
-        if seen and seen.data:
-            return True  # already ledgered — a replay, not a new cycle
+    if await _charge_already_ledgered(payment_id, invoice_id):
+        return True  # a replay, or the other path got here first — not a new cycle
 
     now = datetime.now(timezone.utc)
     try:
@@ -387,11 +477,39 @@ async def record_subscription_charge(
             .execute()
         )
     except Exception:  # noqa: BLE001
-        # A duplicate payment id means we have already handled this charge.
-        logger.warning("[autopay] payment row for %s not inserted (likely a replay)", payment_id)
+        # The unique index on razorpay_payment_id rejected it, so the other path
+        # won the race and has already extended the plan. Returning here is the
+        # whole point: falling through would hand out the second month.
+        logger.warning("[autopay] charge %s already ledgered by another path", payment_id)
+        await set_subscription_status(subscription_id, "active")
+        return True
 
     await set_subscription_status(subscription_id, "active")
     return await activate_stay_plan(partner["id"], months=1)
+
+
+async def _charge_already_ledgered(payment_id: str, invoice_id: str | None) -> bool:
+    """
+    True when this charge is already in `partner_payments` under either id.
+
+    Checked before the insert so the common replay costs one SELECT instead of
+    a failed INSERT; the unique index is still what makes it safe under a real
+    race.
+    """
+    for column, value in (("razorpay_payment_id", payment_id), ("razorpay_invoice_id", invoice_id)):
+        if not value:
+            continue
+        seen = await run_db(
+            lambda col=column, val=value: get_db()
+            .table("partner_payments")
+            .select("id")
+            .eq(col, val)
+            .maybe_single()
+            .execute()
+        )
+        if seen and seen.data:
+            return True
+    return False
 
 
 async def set_subscription_status(subscription_id: str, status: str) -> None:
