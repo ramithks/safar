@@ -9,6 +9,10 @@ class CheckoutRequest(BaseModel):
     item_id: str = Field(min_length=1, max_length=64)
     travellers: int = Field(default=1, ge=1, le=50)
     travel_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    # Which batch of a group trip. Required once a trip has open departures —
+    # the seats come off THAT date's inventory, and the date on the booking is
+    # read from the row, never from `travel_date`.
+    departure_id: str | None = Field(default=None, max_length=64)
     # Must match a tier title on the listing — validated against the row, never
     # trusted as a price.
     tier_title: str | None = Field(default=None, max_length=80)
@@ -38,18 +42,26 @@ class QuoteRequest(BaseModel):
     item_type: Literal["group_trip", "experience", "hotel"]
     item_id: str = Field(min_length=1, max_length=64)
     travellers: int = Field(default=1, ge=1, le=50)
+    departure_id: str | None = Field(default=None, max_length=64)
     tier_title: str | None = Field(default=None, max_length=80)
     check_in: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     check_out: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     rooms: int = Field(default=1, ge=1, le=20)
     coupon_code: str | None = Field(default=None, max_length=40)
+    # Only ever used to check a phone-targeted coupon. Never stored by /quote.
+    phone: str | None = Field(default=None, max_length=20)
 
 
 class QuoteResponse(BaseModel):
     ok: bool
     gross_paise: int = 0
     discount_paise: int = 0
+    #: gross - discount: what the booking is worth in full.
+    total_paise: int = 0
+    #: Charged now — the advance, or the whole total when the item takes none.
     amount_paise: int = 0
+    #: Due to the partner directly. Never passes through TravBuddy.
+    balance_paise: int = 0
     commission_paise: int = 0
     nights: int | None = None
     currency: str = "INR"
@@ -84,13 +96,47 @@ class VerifyResponse(BaseModel):
 
 
 class SubscribeResponse(BaseModel):
+    """
+    Checkout opens against a `subscription_id`, not an `order_id` — that is what
+    turns the ₹499 into a mandate the bank charges every month instead of a
+    payment the partner has to remember to repeat.
+    """
+
     ok: bool
-    order_id: str | None = None
+    subscription_id: str | None = None
     amount: int | None = None
     currency: str = "INR"
     key_id: str | None = None
     name: str | None = None
+    description: str | None = None
     prefill: dict[str, str] | None = None
+
+
+class SubscriptionVerifyRequest(BaseModel):
+    """
+    The Checkout callback for a subscription.
+
+    Note the field names: Razorpay hands back `razorpay_subscription_id` here,
+    not `razorpay_order_id`, and the signature is over
+    `payment_id|subscription_id` — the reverse of the order flow.
+    """
+
+    razorpay_subscription_id: str = Field(min_length=4, max_length=120)
+    razorpay_payment_id: str = Field(min_length=4, max_length=120)
+    razorpay_signature: str = Field(min_length=4, max_length=200)
+
+
+class SubscriptionStatus(BaseModel):
+    """What the plan page renders after a cancel or a status check."""
+
+    ok: bool = True
+    #: The Razorpay mandate state: none/active/pending/halted/cancelled/…
+    status: str = "none"
+    #: The gate the rest of the app reads: none/active/past_due/cancelled.
+    plan_status: str = "none"
+    #: When the paid-up period runs out. Cancelling never shortens this.
+    expires_at: str | None = None
+    error: str | None = None
 
 
 class PublicBooking(BaseModel):
@@ -116,7 +162,9 @@ class PublicBooking(BaseModel):
     # commission and payout remain excluded.
     gross_paise: int | None = None
     discount_paise: int | None = None
+    total_paise: int | None = None
     amount_paise: int | None = None
+    balance_paise: int | None = None
     status: str | None = None
     lead_name: str | None = None
     created_at: str | None = None

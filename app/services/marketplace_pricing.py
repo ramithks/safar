@@ -49,10 +49,11 @@ def _round_half_up(x: float) -> int:
 # Mirrors KIND_RULES in the website's lib/marketplace/types.ts. Every place that
 # needs a rate reads it from here — there is no second copy to drift.
 #
-#   hotel      -> ₹499/month subscription + 5% on bookings we process
-#   group_trip -> free to list            + 10%
-#   experience -> free to list            + 10%
-COMMISSION_PCT = {"hotel": 5.0, "group_trip": 10.0, "experience": 10.0}
+# V3 (unified pricing): every kind is ₹499/month + 10% on bookings we process.
+#   hotel      -> ₹499/month subscription + 10% on bookings we process
+#   group_trip -> ₹499/month subscription + 10%
+#   experience -> ₹499/month subscription + 10%
+COMMISSION_PCT = {"hotel": 10.0, "group_trip": 10.0, "experience": 10.0}
 
 
 def commission_pct_for(item_type: str) -> float:
@@ -196,6 +197,53 @@ def coupon_discount_paise(
     return max(0, min(discount, gross_paise))
 
 
+# ── the advance ──────────────────────────────────────────────────────────────
+#
+# A partner may take a deposit instead of the full price, with the balance
+# collected by them directly. Commission is 10% of what TravBuddy actually
+# processes, so the advance has a floor: without one a partner could take ₹1
+# through us and collect the rest off-platform.
+#
+# MIN_DEPOSIT_PCT is mirrored by MIN_DEPOSIT_PCT in the website's pricing.ts and
+# by CHECK constraints on partner_listings and group_trips. All three must agree.
+
+MIN_DEPOSIT_PCT = 20
+
+
+def advance_paise(total_paise: int, deposit: Optional[dict] = None) -> int:
+    """
+    What the traveller pays today, in paise.
+
+    Integer arithmetic throughout: the floor is ceil(total × 20 / 100) written
+    as (total × 20 + 99) // 100, matching the JS copy exactly rather than
+    approximately — a float ceil could differ by a paisa at a boundary.
+    """
+    if total_paise <= 0:
+        return max(0, total_paise)
+    if not deposit:
+        return total_paise
+
+    kind = deposit.get("type") or deposit.get("deposit_type") or "none"
+    value = deposit.get("value")
+    if value is None:
+        value = deposit.get("deposit_value")
+    if kind == "none" or not value:
+        return total_paise
+
+    if kind == "percent":
+        raw = _round_half_up(total_paise * float(value) / 100)
+    else:
+        raw = to_paise(float(value))
+
+    floor = (total_paise * MIN_DEPOSIT_PCT + 99) // 100
+    advance = max(raw, floor)
+
+    # Whole rupees. 25% of ₹11,999 is ₹2,999.75, and nobody wants to be charged
+    # 75 paise or to read a "Pay ₹3,000" button that bills something else.
+    # Rounded UP so the advance never dips back below the floor, then clamped.
+    return min(total_paise, ((advance + 99) // 100) * 100)
+
+
 # ── the quote ────────────────────────────────────────────────────────────────
 
 
@@ -203,7 +251,12 @@ def coupon_discount_paise(
 class Quote:
     gross_paise: int
     discount_paise: int
+    #: gross - discount. What the booking is worth in full.
+    total_paise: int
+    #: Charged now: the advance, or the whole total when there isn't one.
     amount_paise: int
+    #: total - amount. Due to the partner directly; we take no cut of it.
+    balance_paise: int
     commission_paise: int
     payout_paise: int
     coupon_rejection: Optional[str]
@@ -214,6 +267,7 @@ def quote(
     quantity: int,
     commission_pct: float,
     coupon: Optional[dict] = None,
+    deposit: Optional[dict] = None,
     now: Optional[datetime] = None,
 ) -> Quote:
     """
@@ -228,14 +282,23 @@ def quote(
 
     rejection = coupon_rejection(coupon, gross, now) if coupon else None
     discount = coupon_discount_paise(coupon, gross, now) if coupon else 0
-    amount = gross - discount
+    total = gross - discount
 
+    # The discount comes off the TOTAL, not off the advance — a traveller paying
+    # 30% up front still sees the whole coupon value, and the partner's balance
+    # shrinks by the rest of it.
+    amount = advance_paise(total, deposit)
+
+    # Commission on what we actually process. The balance never passes through
+    # TravBuddy, so it is never charged on.
     commission, payout = split_commission(amount, commission_pct)
 
     return Quote(
         gross_paise=gross,
         discount_paise=discount,
+        total_paise=total,
         amount_paise=amount,
+        balance_paise=total - amount,
         commission_paise=commission,
         payout_paise=payout,
         coupon_rejection=rejection,
@@ -250,6 +313,7 @@ def quote_stay(
     rooms: int,
     commission_pct: float,
     coupon: Optional[dict] = None,
+    deposit: Optional[dict] = None,
     now: Optional[datetime] = None,
 ) -> Quote:
     """Convenience for stays: prices each night, then quotes it."""
@@ -258,6 +322,7 @@ def quote_stay(
         quantity=rooms,
         commission_pct=commission_pct,
         coupon=coupon,
+        deposit=deposit,
         now=now,
     )
 

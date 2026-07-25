@@ -132,3 +132,156 @@ async def refund_payment(
     except Exception:  # noqa: BLE001
         logger.exception("[razorpay] refund threw")
         return False
+
+
+# ── subscriptions (Autopay) ──────────────────────────────────────────────────
+#
+# The ₹499 plan is a mandate, not a monthly invoice a partner has to remember.
+# Razorpay's model is Plan (what we sell) → Subscription (one partner's mandate)
+# → Invoice per cycle, and the charge fires server-side from then on.
+
+
+async def create_plan(*, amount_paise: int, name: str, period: str = "monthly") -> dict:
+    """
+    Create a billing plan. Called once, ever — the id is stored in
+    `platform_plans` so subsequent subscriptions reuse it. Creating a second
+    identical plan is harmless to Razorpay but would fragment our reporting.
+    """
+    if not configured():
+        raise RuntimeError("Razorpay is not configured.")
+
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        res = await client.post(
+            f"{API}/plans",
+            auth=_auth(),
+            json={
+                "period": period,
+                "interval": 1,
+                "item": {"name": name, "amount": amount_paise, "currency": "INR"},
+            },
+        )
+
+    if res.status_code >= 400:
+        logger.error("[razorpay] create_plan failed: %s %s", res.status_code, res.text[:400])
+        raise RuntimeError("Could not create the billing plan.")
+    return res.json()
+
+
+async def create_subscription(
+    *,
+    plan_id: str,
+    total_count: int = 120,
+    notes: dict | None = None,
+    notify: bool = True,
+) -> dict:
+    """
+    Open a mandate against a plan.
+
+    `total_count` is the number of cycles the mandate is authorised for, and
+    Razorpay requires one — there is no "forever". 120 months is ten years,
+    which is functionally forever for a monthly plan and still gives the
+    customer a bounded authorisation to see when they approve it.
+
+    `customer_notify` lets Razorpay send its own pre-debit notification, which
+    is mandatory for UPI Autopay anyway — better their compliant template than
+    our reimplementation of it.
+    """
+    if not configured():
+        raise RuntimeError("Razorpay is not configured.")
+
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        res = await client.post(
+            f"{API}/subscriptions",
+            auth=_auth(),
+            json={
+                "plan_id": plan_id,
+                "total_count": total_count,
+                "customer_notify": 1 if notify else 0,
+                "notes": notes or {},
+            },
+        )
+
+    if res.status_code >= 400:
+        logger.error(
+            "[razorpay] create_subscription failed: %s %s", res.status_code, res.text[:400]
+        )
+        raise RuntimeError("Could not start the subscription.")
+    return res.json()
+
+
+async def fetch_subscription(subscription_id: str) -> dict | None:
+    """The live state of a mandate. Used to reconcile when a webhook is missed."""
+    if not configured():
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            res = await client.get(f"{API}/subscriptions/{subscription_id}", auth=_auth())
+        if res.status_code >= 400:
+            logger.error("[razorpay] fetch_subscription: %s %s", res.status_code, res.text[:300])
+            return None
+        return res.json()
+    except Exception:  # noqa: BLE001
+        logger.exception("[razorpay] fetch_subscription threw")
+        return None
+
+
+async def cancel_subscription(subscription_id: str, *, at_cycle_end: bool = True) -> dict | None:
+    """
+    Cancel a mandate.
+
+    `at_cycle_end` by default: the partner has already paid for the month they
+    are in, and ending it immediately would take away days they bought. It also
+    keeps the cancellation reversible right up to the last day.
+
+    Razorpay rejects a cycle-end cancel when no billing cycle is running — the
+    case where a partner opened Checkout, never authorised the mandate, and then
+    hit Cancel. There is nothing to preserve there, so we fall back to an
+    immediate cancel rather than telling them it failed.
+    """
+    if not configured():
+        return None
+
+    async def _post(cycle_end: bool):
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            return await client.post(
+                f"{API}/subscriptions/{subscription_id}/cancel",
+                auth=_auth(),
+                json={"cancel_at_cycle_end": 1 if cycle_end else 0},
+            )
+
+    try:
+        res = await _post(at_cycle_end)
+        if res.status_code >= 400 and at_cycle_end and "billing cycle" in res.text:
+            logger.info(
+                "[razorpay] %s has no live cycle — cancelling immediately", subscription_id
+            )
+            res = await _post(False)
+
+        if res.status_code >= 400:
+            logger.error("[razorpay] cancel_subscription: %s %s", res.status_code, res.text[:300])
+            return None
+        return res.json()
+    except Exception:  # noqa: BLE001
+        logger.exception("[razorpay] cancel_subscription threw")
+        return None
+
+
+def verify_subscription_signature(
+    subscription_id: str, payment_id: str, signature: str
+) -> bool:
+    """
+    Verify the Checkout callback for a subscription.
+
+    ⚠ The signed string is `payment_id|subscription_id` — the REVERSE order of
+    the order flow's `order_id|payment_id`. Getting this backwards fails every
+    genuine subscription silently, which is exactly the sort of bug that looks
+    like "Razorpay is broken".
+    """
+    secret = settings.razorpay_key_secret
+    if not secret or not subscription_id or not payment_id or not signature:
+        return False
+
+    expected = hmac.new(
+        secret.encode(), f"{payment_id}|{subscription_id}".encode(), hashlib.sha256
+    ).hexdigest()
+    return _timing_safe_equal(expected, signature)

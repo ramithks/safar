@@ -31,7 +31,7 @@ TERMINAL = {"refunded", "cancelled"}
 BOOKING_COLS = (
     "id, ref, status, item_type, item_id, item_title, travellers, partner_id, "
     "razorpay_payment_id, lead_name, lead_phone, lead_email, travel_date, "
-    "amount_paise, payout_paise, coupon_id"
+    "amount_paise, payout_paise, coupon_id, departure_id"
 )
 
 
@@ -63,14 +63,21 @@ async def finalise_booking(order_id: str, payment_id: str) -> dict:
 
     # Seats move exactly once, and only for trips that track them. The RPC is a
     # single guarded statement: `set seats_left = seats_left - n where seats_left >= n`.
+    #
+    # Which counter moves depends on whether the booking named a departure. When
+    # it did, that date's inventory is the real one and the trip row's count is
+    # a mirror the DB trigger refreshes; when it didn't, the trip row IS the
+    # inventory (a trip from before departures existed).
     if booking.get("item_type") == "group_trip":
+        claim_fn, claim_args = (
+            ("claim_departure_seats", {"p_departure": booking["departure_id"]})
+            if booking.get("departure_id")
+            else ("claim_trip_seats", {"p_trip": booking["item_id"]})
+        )
         try:
             claim = await run_db(
                 lambda: get_db()
-                .rpc(
-                    "claim_trip_seats",
-                    {"p_trip": booking["item_id"], "p_seats": booking["travellers"]},
-                )
+                .rpc(claim_fn, {**claim_args, "p_seats": booking["travellers"]})
                 .execute()
             )
             remaining = claim.data if claim else None
@@ -107,13 +114,15 @@ async def finalise_booking(order_id: str, payment_id: str) -> dict:
     if not settled:
         if booking.get("item_type") == "group_trip":
             # Give the seats back — we claimed them for a booking that never settled.
+            release_fn, release_args = (
+                ("release_departure_seats", {"p_departure": booking["departure_id"]})
+                if booking.get("departure_id")
+                else ("release_trip_seats", {"p_trip": booking["item_id"]})
+            )
             try:
                 await run_db(
                     lambda: get_db()
-                    .rpc(
-                        "release_trip_seats",
-                        {"p_trip": booking["item_id"], "p_seats": booking["travellers"]},
-                    )
+                    .rpc(release_fn, {**release_args, "p_seats": booking["travellers"]})
                     .execute()
                 )
             except Exception:  # noqa: BLE001
@@ -285,14 +294,15 @@ async def activate_stay_plan(partner_id: str, months: int = 1) -> bool:
         logger.exception("[subscription] activate_stay_plan failed")
         return False
 
-    # Bring back anything the expiry job paused.
+    # Bring back anything the expiry job paused. Every kind, not just stays:
+    # under V3 unified pricing the ₹499 plan gates publishing anything, so a
+    # lapse pauses experiences too and paying has to un-pause them.
     try:
         await run_db(
             lambda: get_db()
             .table("partner_listings")
             .update({"status": "published", "published_at": datetime.now(timezone.utc).isoformat()})
             .eq("partner_id", partner_id)
-            .eq("kind", "hotel")
             .eq("status", "expired")
             .execute()
         )
@@ -300,3 +310,105 @@ async def activate_stay_plan(partner_id: str, months: int = 1) -> bool:
         logger.exception("[subscription] relist after payment failed")
 
     return True
+
+
+# ── autopay ──────────────────────────────────────────────────────────────────
+#
+# With a mandate in place the money arrives on its own and Razorpay tells us
+# about it. `subscription.charged` is the event that matters: it is both the
+# first payment and every renewal, so one handler covers activation and the
+# eleven months after it.
+
+PLAN_KEY = "partner_monthly"
+
+# Mirrors what a Razorpay subscription can be, mapped to what the plan gate
+# should do about it. Anything that isn't `active` stops NEW charges but does
+# not retroactively take away the period already paid for — stay_plan_expires_at
+# is what actually gates the listings.
+SUBSCRIPTION_ACTIVE = {"active", "authenticated"}
+
+
+async def record_subscription_charge(
+    subscription_id: str,
+    payment_id: str,
+    invoice_id: str | None,
+    amount_paise: int,
+) -> bool:
+    """
+    A cycle was charged: ledger the payment and push the plan out a month.
+
+    Idempotent on the invoice: Razorpay replays webhooks, and the unique index
+    on `razorpay_invoice_id` turns a replay into a no-op rather than a second
+    row and a second free month.
+    """
+    res = await run_db(
+        lambda: get_db()
+        .table("partners")
+        .select("id")
+        .eq("subscription_id", subscription_id)
+        .maybe_single()
+        .execute()
+    )
+    partner = res.data if res else None
+    if not partner:
+        logger.error("[autopay] no partner for subscription %s", subscription_id)
+        return False
+
+    if invoice_id:
+        seen = await run_db(
+            lambda: get_db()
+            .table("partner_payments")
+            .select("id")
+            .eq("razorpay_invoice_id", invoice_id)
+            .maybe_single()
+            .execute()
+        )
+        if seen and seen.data:
+            return True  # already ledgered — a replay, not a new cycle
+
+    now = datetime.now(timezone.utc)
+    try:
+        await run_db(
+            lambda: get_db()
+            .table("partner_payments")
+            .insert(
+                {
+                    "partner_id": partner["id"],
+                    "kind": "stay_subscription",
+                    "amount_paise": amount_paise,
+                    "status": "paid",
+                    "razorpay_payment_id": payment_id,
+                    "razorpay_subscription_id": subscription_id,
+                    "razorpay_invoice_id": invoice_id,
+                    "period_start": now.date().isoformat(),
+                    "period_end": (now + relativedelta(months=1)).date().isoformat(),
+                }
+            )
+            .execute()
+        )
+    except Exception:  # noqa: BLE001
+        # A duplicate payment id means we have already handled this charge.
+        logger.warning("[autopay] payment row for %s not inserted (likely a replay)", payment_id)
+
+    await set_subscription_status(subscription_id, "active")
+    return await activate_stay_plan(partner["id"], months=1)
+
+
+async def set_subscription_status(subscription_id: str, status: str) -> None:
+    """
+    Mirror the mandate's state onto the partner.
+
+    Deliberately does NOT touch `stay_plan_expires_at`: a halted mandate means
+    the next charge failed, not that the month already paid for is void. The
+    expiry job takes the listings down when that month actually runs out.
+    """
+    try:
+        await run_db(
+            lambda: get_db()
+            .table("partners")
+            .update({"subscription_status": status})
+            .eq("subscription_id", subscription_id)
+            .execute()
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("[autopay] status update failed for %s", subscription_id)

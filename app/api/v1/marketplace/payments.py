@@ -35,6 +35,8 @@ from app.api.v1.marketplace.payment_schemas import (
     QuoteRequest,
     QuoteResponse,
     SubscribeResponse,
+    SubscriptionStatus,
+    SubscriptionVerifyRequest,
     VerifyRequest,
     VerifyResponse,
 )
@@ -45,11 +47,14 @@ from app.services import marketplace_pricing as pricing
 from app.services import razorpay
 from app.services.booking_emails import send_booking_emails
 from app.services.marketplace_bookings import (
+    PLAN_KEY,
     activate_stay_plan_for_payment,
     cancel_unpaid_order,
     finalise_booking,
     mark_refunded,
     mark_refunded_by_payment,
+    record_subscription_charge,
+    set_subscription_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,7 +123,7 @@ async def _resolve_listing(item_type: str, item_id: str) -> dict:
             .table("group_trips")
             .select(
                 "id, slug, title, price_from, partner_id, commission_pct, seats_left, "
-                "content, booking_mode, departure_date"
+                "content, booking_mode, departure_date, deposit_type, deposit_value"
             )
             .eq("id", item_id)
             .eq("status", "published")
@@ -146,7 +151,7 @@ async def _resolve_listing(item_type: str, item_id: str) -> dict:
         .table("partner_listings")
         .select(
             "id, slug, title, price_from, partner_id, commission_pct, content, "
-            "booking_mode, kind"
+            "booking_mode, kind, deposit_type, deposit_value"
         )
         .eq("id", item_id)
         .eq("status", "published")
@@ -164,6 +169,57 @@ async def _resolve_listing(item_type: str, item_id: str) -> dict:
     return row
 
 
+DEPARTURE_COLS = "id, departure_date, return_date, label, seats_total, seats_left, price_from"
+
+
+async def _resolve_departure(trip: dict, departure_id: str | None) -> dict | None:
+    """
+    Which batch of a group trip is being booked, or None for a trip that has no
+    departure rows at all (the pre-departures shape, where the trip row IS the
+    departure).
+
+    A trip with exactly one open date resolves to it without the client saying
+    so — that is the old single-batch flow, and breaking it would break every
+    link already in the wild. Two or more and the choice must be explicit: the
+    seats come off one specific date, and guessing would sell the wrong one.
+    """
+    res = await run_db(
+        lambda: get_db()
+        .table("trip_departures")
+        .select(DEPARTURE_COLS)
+        .eq("trip_id", trip["id"])
+        .eq("status", "open")
+        .gte("departure_date", datetime.now(timezone.utc).date().isoformat())
+        .order("departure_date")
+        .execute()
+    )
+    departures = (res.data or []) if res else []
+    if not departures:
+        return None
+
+    if not departure_id:
+        if len(departures) == 1:
+            return departures[0]
+        raise PricingError(409, "Choose a departure date.")
+
+    for d in departures:
+        if str(d["id"]) == str(departure_id):
+            return d
+    raise PricingError(409, "That departure is no longer available. Please pick another date.")
+
+
+async def _apply_departure(listing: dict, departure_id: str | None) -> dict | None:
+    """
+    Resolve the departure and let it override the trip's base price for that
+    date. A sharing tier still wins over both — same precedence tiers already
+    have, just with one more rung under them.
+    """
+    departure = await _resolve_departure(listing, departure_id)
+    if departure and departure.get("price_from"):
+        listing["price_from"] = departure["price_from"]
+    return departure
+
+
 async def _season_rates(listing_id: str) -> list[dict]:
     res = await run_db(
         lambda: get_db()
@@ -175,13 +231,28 @@ async def _season_rates(listing_id: str) -> list[dict]:
     return res.data or [] if res else []
 
 
+def _last10(phone: str | None) -> str:
+    """Digits only, last ten — "+91 98765 43210" and "9876543210" are one person."""
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    return digits[-10:]
+
+
 async def _resolve_coupon(
-    partner_id: str | None, item_type: str, item_id: str, code: str | None
+    partner_id: str | None,
+    item_type: str,
+    item_id: str,
+    code: str | None,
+    phone: str | None = None,
 ) -> dict | None:
     """
     The coupon row for a code, scoped to this partner and applicable to this
     item, or None. Returns the row unvalidated — the pricing module decides
     whether it applies, so checkout and quote reject it identically.
+
+    A code with `target_phone` set belongs to one person. That check lives here,
+    server-side, against the phone on the booking: a targeted code posted by
+    anyone else simply doesn't resolve, and the traveller is told the code
+    doesn't apply rather than who it was for.
     """
     if not code or not partner_id:
         return None
@@ -202,6 +273,10 @@ async def _resolve_coupon(
     # null scope is partner-wide.
     scope = coupon.get("listing_id") if item_type != "group_trip" else coupon.get("trip_id")
     if scope and scope != item_id:
+        return None
+
+    target = coupon.get("target_phone")
+    if target and target != _last10(phone):
         return None
     return coupon
 
@@ -243,6 +318,12 @@ def _price_booking(body, listing: dict, coupon: dict | None) -> tuple[pricing.Qu
     audit trail we stamp on the booking so a dispute can be reconstructed.
     """
     content = listing.get("content") or {}
+    # The deposit policy is read from the DB row like every other money input —
+    # a client cannot ask to pay less up front than the partner allows.
+    deposit = {
+        "type": listing.get("deposit_type") or "none",
+        "value": listing.get("deposit_value"),
+    }
     commission_pct = float(
         listing.get("commission_pct")
         if listing.get("commission_pct") is not None
@@ -263,12 +344,14 @@ def _price_booking(body, listing: dict, coupon: dict | None) -> tuple[pricing.Qu
             rooms=body.rooms,
             commission_pct=commission_pct,
             coupon=coupon,
+            deposit=deposit,
         )
         meta = {
             "nights": nights,
             "rooms": body.rooms,
             "base_price": base,
             "coupon": coupon.get("code") if coupon else None,
+            "deposit": deposit if deposit["type"] != "none" else None,
         }
         return q, meta
 
@@ -283,11 +366,13 @@ def _price_booking(body, listing: dict, coupon: dict | None) -> tuple[pricing.Qu
         quantity=body.travellers,
         commission_pct=commission_pct,
         coupon=coupon,
+        deposit=deposit,
     )
     meta = {
         "tier": getattr(body, "tier_title", None),
         "unit_price": unit_price,
         "coupon": coupon.get("code") if coupon else None,
+        "deposit": deposit if deposit["type"] != "none" else None,
     }
     return q, meta
 
@@ -305,10 +390,16 @@ async def quote_price(request: Request, body: QuoteRequest) -> QuoteResponse:
     """
     try:
         listing = await _resolve_listing(body.item_type, body.item_id)
+        if body.item_type == "group_trip":
+            await _apply_departure(listing, body.departure_id)
         if body.item_type == "hotel":
             body._season_rates = await _season_rates(listing["id"])
         coupon = await _resolve_coupon(
-            listing.get("partner_id"), body.item_type, body.item_id, body.coupon_code
+            listing.get("partner_id"),
+            body.item_type,
+            body.item_id,
+            body.coupon_code,
+            getattr(body, "phone", None),
         )
         q, meta = _price_booking(body, listing, coupon)
     except PricingError as e:
@@ -318,7 +409,9 @@ async def quote_price(request: Request, body: QuoteRequest) -> QuoteResponse:
         ok=True,
         gross_paise=q.gross_paise,
         discount_paise=q.discount_paise,
+        total_paise=q.total_paise,
         amount_paise=q.amount_paise,
+        balance_paise=q.balance_paise,
         commission_paise=q.commission_paise,
         nights=meta.get("nights"),
         coupon_applied=q.discount_paise > 0,
@@ -358,16 +451,33 @@ async def checkout(
     partner_id = listing.get("partner_id")
     title, slug = listing["title"], listing["slug"]
 
-    # Trips track seats; check before we take money.
-    seats_left = listing.get("seats_left") if body.item_type == "group_trip" else None
+    # Trips track seats; check before we take money. Once a trip has departures
+    # the inventory lives on the chosen date, not on the trip row — the trip's
+    # own count is only a mirror of the next one.
+    departure = (
+        await _apply_departure(listing, body.departure_id)
+        if body.item_type == "group_trip"
+        else None
+    )
+    seats_left = None
+    if body.item_type == "group_trip":
+        seats_left = departure["seats_left"] if departure else listing.get("seats_left")
     if seats_left is not None and seats_left < body.travellers:
         raise HTTPException(409, f"Only {max(0, seats_left)} seats left.")
 
     if body.item_type == "hotel":
         body._season_rates = await _season_rates(listing["id"])
-    coupon = await _resolve_coupon(partner_id, body.item_type, body.item_id, body.coupon_code)
+    coupon = await _resolve_coupon(
+        partner_id, body.item_type, body.item_id, body.coupon_code, body.phone
+    )
     q, meta = _price_booking(body, listing, coupon)
     meta["seats_at_checkout"] = seats_left
+    if departure:
+        meta["departure"] = {
+            "id": departure["id"],
+            "date": departure["departure_date"],
+            "label": departure.get("label"),
+        }
 
     ref = booking_ref()
     booking_row = {
@@ -380,7 +490,12 @@ async def checkout(
         "item_id": body.item_id,
         "item_title": title,
         "item_slug": slug,
-        "travel_date": body.travel_date or body.check_in,
+        # The departure's own date beats anything the client sent: the seat came
+        # off that batch, so the booking must say so.
+        "travel_date": (
+            departure["departure_date"] if departure else (body.travel_date or body.check_in)
+        ),
+        "departure_id": departure["id"] if departure else None,
         "travellers": body.travellers,
         "lead_name": body.name,
         "lead_phone": body.phone,
@@ -389,6 +504,8 @@ async def checkout(
         "source": "online",
         "gross_paise": q.gross_paise,
         "discount_paise": q.discount_paise,
+        "total_paise": q.total_paise,
+        "balance_paise": q.balance_paise,
         "coupon_code": coupon.get("code") if coupon else None,
         "coupon_id": coupon.get("id") if coupon else None,
         "amount_paise": q.amount_paise,
@@ -523,6 +640,7 @@ async def get_booking_by_ref(request: Request, ref: str) -> PublicBooking:
         .table("bookings")
         .select(
             "ref, item_type, item_title, item_slug, travel_date, travellers, "
+            "total_paise, balance_paise, "
             "check_in, check_out, nights, gross_paise, discount_paise, "
             "amount_paise, status, lead_name, created_at, partner_id"
         )
@@ -543,7 +661,10 @@ async def _require_partner(user) -> dict:
     res = await run_db(
         lambda: get_db()
         .table("partners")
-        .select("id, brand_name, email, whatsapp, status")
+        .select(
+            "id, brand_name, email, whatsapp, status, subscription_id, "
+            "subscription_status, stay_plan_status, stay_plan_expires_at"
+        )
         .eq("owner_id", user.id)
         .maybe_single()
         .execute()
@@ -559,61 +680,63 @@ async def _require_partner(user) -> dict:
 @router.post("/subscribe", response_model=SubscribeResponse)
 @limiter.limit("30/hour")
 async def start_subscription(request: Request, user=Depends(require_user)) -> SubscribeResponse:
-    """Start the ₹499/month stay plan. The amount is a server-side constant."""
+    """
+    Start the ₹499/month plan as an AUTOPAY MANDATE.
+
+    This used to mint a one-off order every month, which meant renewal depended
+    on a partner remembering to come back and pay a listing fee. They don't, so
+    listings lapsed and it looked like our fault. Razorpay Subscriptions moves
+    the charge server-side: the partner approves a mandate once (UPI Autopay,
+    card or e-NACH) and the ₹499 is collected each month without them.
+
+    Reuses the partner's existing mandate when there is a live one, so a double
+    click can't leave someone paying twice.
+    """
     if not razorpay.configured():
         raise HTTPException(503, "Payments aren't switched on yet. Please try again shortly.")
 
     partner = await _require_partner(user)
 
-    insert = await run_db(
-        lambda: get_db()
-        .table("partner_payments")
-        .insert(
-            {
-                "partner_id": partner["id"],
-                "kind": "stay_subscription",
-                "amount_paise": STAY_PLAN_MONTHLY_PAISE,
-                "status": "created",
-            }
+    existing = partner.get("subscription_id")
+    if existing and partner.get("subscription_status") in ("active", "authenticated", "pending"):
+        raise HTTPException(
+            409, "You already have an active plan. Manage it from the Plan page."
         )
-        .execute()
-    )
-    if not insert.data:
-        raise HTTPException(500, "Could not start checkout.")
-    payment_id = insert.data[0]["id"]
+
+    plan_id = await _ensure_plan()
 
     try:
-        order = await razorpay.create_order(
-            amount_paise=STAY_PLAN_MONTHLY_PAISE,
-            receipt=f"plan-{str(payment_id)[:26]}",
-            notes={"partner_id": partner["id"], "kind": "stay_subscription"},
+        subscription = await razorpay.create_subscription(
+            plan_id=plan_id,
+            notes={"partner_id": partner["id"], "brand": partner.get("brand_name") or ""},
         )
     except Exception:  # noqa: BLE001
-        logger.exception("[subscribe] order failed")
-        await run_db(
-            lambda: get_db()
-            .table("partner_payments")
-            .update({"status": "failed"})
-            .eq("id", payment_id)
-            .execute()
-        )
-        raise HTTPException(502, "Could not start the payment.") from None
+        logger.exception("[subscribe] subscription create failed")
+        raise HTTPException(502, "Could not start the subscription.") from None
 
+    # Stored BEFORE the browser is handed the id: the webhook can arrive before
+    # the callback does, and it resolves the partner by subscription id.
     await run_db(
         lambda: get_db()
-        .table("partner_payments")
-        .update({"razorpay_order_id": order["id"]})
-        .eq("id", payment_id)
+        .table("partners")
+        .update(
+            {
+                "subscription_id": subscription["id"],
+                "subscription_status": subscription.get("status") or "created",
+            }
+        )
+        .eq("id", partner["id"])
         .execute()
     )
 
     return SubscribeResponse(
         ok=True,
-        order_id=order["id"],
+        subscription_id=subscription["id"],
         amount=STAY_PLAN_MONTHLY_PAISE,
         currency="INR",
         key_id=razorpay.public_key_id(),
-        name=f"TravBuddy Stay Plan — ₹{STAY_PLAN_MONTHLY_RUPEES}/month",
+        name="TravBuddy",
+        description=f"TravBuddy plan — ₹{STAY_PLAN_MONTHLY_RUPEES}/month, cancel anytime",
         prefill={
             "name": partner.get("brand_name") or "",
             "contact": partner.get("whatsapp") or "",
@@ -622,42 +745,126 @@ async def start_subscription(request: Request, user=Depends(require_user)) -> Su
     )
 
 
+async def _ensure_plan() -> str:
+    """
+    The Razorpay plan id, created on first use and remembered.
+
+    Kept in `platform_plans` rather than an env var so deploying this needs no
+    manual ops step — and so we never create a second plan for the same product
+    and split the reporting.
+    """
+    res = await run_db(
+        lambda: get_db()
+        .table("platform_plans")
+        .select("razorpay_plan_id")
+        .eq("key", PLAN_KEY)
+        .maybe_single()
+        .execute()
+    )
+    row = res.data if res else None
+    if row and row.get("razorpay_plan_id"):
+        return row["razorpay_plan_id"]
+
+    plan = await razorpay.create_plan(
+        amount_paise=STAY_PLAN_MONTHLY_PAISE,
+        name=f"TravBuddy plan (₹{STAY_PLAN_MONTHLY_RUPEES}/month)",
+    )
+    await run_db(
+        lambda: get_db()
+        .table("platform_plans")
+        .upsert(
+            {
+                "key": PLAN_KEY,
+                "razorpay_plan_id": plan["id"],
+                "amount_paise": STAY_PLAN_MONTHLY_PAISE,
+                "period": "monthly",
+            },
+            on_conflict="key",
+        )
+        .execute()
+    )
+    logger.info("[subscribe] created Razorpay plan %s", plan["id"])
+    return plan["id"]
+
+
 @router.put("/subscribe", response_model=VerifyResponse)
 @limiter.limit("60/hour")
 async def verify_subscription(
     request: Request,
-    body: VerifyRequest,
+    body: SubscriptionVerifyRequest,
     user=Depends(require_user),
 ) -> VerifyResponse:
-    """Verify the Checkout callback and switch the plan on."""
+    """
+    Verify the mandate callback and switch the plan on.
+
+    The signature here is over `payment_id|subscription_id` — the REVERSE of the
+    order flow. The mandate is also re-checked against the partner we stored it
+    against, so a valid signature for someone else's subscription can't upgrade
+    this account.
+    """
     partner = await _require_partner(user)
 
-    if not razorpay.verify_payment_signature(
-        body.razorpay_order_id, body.razorpay_payment_id, body.razorpay_signature
+    if not razorpay.verify_subscription_signature(
+        body.razorpay_subscription_id, body.razorpay_payment_id, body.razorpay_signature
     ):
-        logger.error("[subscribe] signature mismatch for order %s", body.razorpay_order_id)
+        logger.error(
+            "[subscribe] signature mismatch for subscription %s", body.razorpay_subscription_id
+        )
         raise HTTPException(400, "Payment could not be verified.")
 
-    # The order → partner link is stored server-side, so a valid signature for
-    # someone else's order still can't upgrade this partner's plan.
-    owned = await run_db(
+    if partner.get("subscription_id") != body.razorpay_subscription_id:
+        raise HTTPException(404, "Subscription not found.")
+
+    # The webhook is the reliable path and may already have run. This is the
+    # fast one, so the partner sees an active plan before the tab settles.
+    await record_subscription_charge(
+        body.razorpay_subscription_id,
+        body.razorpay_payment_id,
+        invoice_id=None,
+        amount_paise=STAY_PLAN_MONTHLY_PAISE,
+    )
+    return VerifyResponse(ok=True)
+
+
+@router.post("/subscribe/cancel", response_model=SubscriptionStatus)
+@limiter.limit("30/hour")
+async def cancel_plan(request: Request, user=Depends(require_user)) -> SubscriptionStatus:
+    """
+    Stop the mandate at the end of the current cycle.
+
+    Not immediately: the partner has paid for the month they're in, and taking
+    their listings down the moment they cancel would be stealing days they
+    bought. `stay_plan_expires_at` is left exactly as it is — the expiry job
+    retires the listings when the paid period genuinely runs out.
+    """
+    partner = await _require_partner(user)
+    subscription_id = partner.get("subscription_id")
+    if not subscription_id:
+        raise HTTPException(404, "You don't have an active plan.")
+
+    result = await razorpay.cancel_subscription(subscription_id, at_cycle_end=True)
+    if result is None:
+        raise HTTPException(502, "Could not cancel the plan. Please try again.")
+
+    await run_db(
         lambda: get_db()
-        .table("partner_payments")
-        .select("id")
-        .eq("razorpay_order_id", body.razorpay_order_id)
-        .eq("partner_id", partner["id"])
-        .maybe_single()
+        .table("partners")
+        .update(
+            {
+                "subscription_status": result.get("status") or "cancelled",
+                "subscription_ends_at": partner.get("stay_plan_expires_at"),
+            }
+        )
+        .eq("id", partner["id"])
         .execute()
     )
-    if not (owned.data if owned else None):
-        raise HTTPException(404, "Payment not found.")
 
-    done = await activate_stay_plan_for_payment(
-        body.razorpay_order_id, body.razorpay_payment_id
+    return SubscriptionStatus(
+        ok=True,
+        status=result.get("status") or "cancelled",
+        plan_status=partner.get("stay_plan_status") or "none",
+        expires_at=partner.get("stay_plan_expires_at"),
     )
-    if not done:
-        raise HTTPException(404, "Payment not found.")
-    return VerifyResponse(ok=True)
 
 
 # ── webhook ──────────────────────────────────────────────────────────────────
@@ -720,6 +927,45 @@ async def razorpay_webhook(
                 # This is the path that settles when the traveller closed the
                 # tab, so it owns the receipt in that case.
                 await send_booking_emails(result["booking"])
+            return {"ok": True, "handled": name}
+
+        # ── autopay ──────────────────────────────────────────────────────
+        # `subscription.charged` is both the first payment and every renewal,
+        # so one handler covers activation and the years after it. This is the
+        # path that keeps a plan alive without anyone logging in.
+        if name == "subscription.charged":
+            sub = ((payload.get("subscription") or {}).get("entity") or {})
+            invoice = ((payload.get("invoice") or {}).get("entity") or {})
+            subscription_id = sub.get("id") or payment.get("subscription_id")
+            payment_id = payment.get("id")
+            if not subscription_id or not payment_id:
+                return {"ok": True, "ignored": "no subscription ids"}
+            await record_subscription_charge(
+                subscription_id,
+                payment_id,
+                invoice_id=invoice.get("id"),
+                amount_paise=int(payment.get("amount") or STAY_PLAN_MONTHLY_PAISE),
+            )
+            return {"ok": True, "handled": name}
+
+        if name in (
+            "subscription.activated",
+            "subscription.authenticated",
+            "subscription.pending",
+            "subscription.halted",
+            "subscription.cancelled",
+            "subscription.completed",
+            "subscription.paused",
+            "subscription.resumed",
+        ):
+            sub = ((payload.get("subscription") or {}).get("entity") or {})
+            subscription_id = sub.get("id")
+            if subscription_id:
+                # Trust the entity's own status over the event name — Razorpay
+                # sends both, and the entity is what the dashboard shows.
+                await set_subscription_status(
+                    subscription_id, sub.get("status") or name.split(".", 1)[1]
+                )
             return {"ok": True, "handled": name}
 
         if name in ("refund.processed", "refund.created"):

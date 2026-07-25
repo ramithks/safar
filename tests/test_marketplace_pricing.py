@@ -8,7 +8,7 @@ the amount we charge will drift. The properties that matter:
   * seasonal rates price per night, even across a season boundary
   * discounts come off before commission
   * amount = gross - discount, and commission + payout = amount, always
-  * commission is 5% for hotels, 10% for trips/experiences, from one table
+  * commission is 10% for every kind (₹499/month + 10%), from one table
 """
 import pytest
 
@@ -44,10 +44,9 @@ def rate(starts_on, ends_on, price):
 
 
 class TestCommissionSourceOfTruth:
-    def test_hotels_are_five_percent(self):
-        assert p.commission_pct_for("hotel") == 5.0
-
-    def test_trips_and_experiences_are_ten(self):
+    def test_every_kind_is_ten_percent(self):
+        # V3 unified pricing: ₹499/month + 10% on every kind.
+        assert p.commission_pct_for("hotel") == 10.0
         assert p.commission_pct_for("group_trip") == 10.0
         assert p.commission_pct_for("experience") == 10.0
 
@@ -261,3 +260,72 @@ class TestJsMathRoundParity:
     def test_percent_discount_at_an_exact_half_matches_js(self):
         # 50 paise * 5% = 2.5 -> 3.
         assert p.coupon_discount_paise(coupon(kind="percent", value=5), 50) == 3
+
+
+# ── the advance ──────────────────────────────────────────────────────────────
+#
+# Mirrors "advancePaise" / "quote with an advance" in the website's
+# pricing.test.ts, case for case.
+
+
+class TestAdvancePaise:
+    def test_charges_the_whole_total_when_there_is_no_deposit_policy(self):
+        assert p.advance_paise(1_000_000, None) == 1_000_000
+        assert p.advance_paise(1_000_000, {"type": "none", "value": None}) == 1_000_000
+
+    def test_takes_a_percentage_of_the_total(self):
+        assert p.advance_paise(1_000_000, {"type": "percent", "value": 30}) == 300_000
+
+    def test_takes_a_flat_rupee_amount(self):
+        assert p.advance_paise(1_000_000, {"type": "fixed", "value": 2500}) == 250_000
+
+    def test_lifts_anything_below_the_floor_up_to_it(self):
+        # Commission is 10% of what we process, so a ₹1 advance on a ₹10,000 trip
+        # would be a way to route the sale around us. The floor is the guard.
+        assert p.advance_paise(1_000_000, {"type": "fixed", "value": 1}) == 200_000
+        assert p.advance_paise(1_000_000, {"type": "percent", "value": 5}) == 200_000
+        assert p.MIN_DEPOSIT_PCT == 20
+
+    def test_never_asks_for_more_than_the_total(self):
+        assert p.advance_paise(100_000, {"type": "fixed", "value": 5000}) == 100_000
+        assert p.advance_paise(100_000, {"type": "percent", "value": 100}) == 100_000
+
+    def test_never_lands_below_the_floor_or_on_part_of_a_rupee(self):
+        # 20% of ₹10.01 is ₹2.002 — the floor is 201 paise, which rounds up to a
+        # whole ₹3. Rounding DOWN would put the advance under the floor.
+        assert p.advance_paise(1001, {"type": "fixed", "value": 1}) == 300
+        # A percentage that lands on paise is rounded up to the rupee.
+        assert p.advance_paise(1_199_900, {"type": "percent", "value": 25}) == 300_000
+
+    def test_reads_the_db_row_shape_too(self):
+        # The endpoint hands this straight off a listing row.
+        assert p.advance_paise(1_000_000, {"deposit_type": "percent", "deposit_value": 30}) == 300_000
+
+
+class TestQuoteWithAnAdvance:
+    def test_splits_the_total_into_now_and_balance(self):
+        q = p.quote([1_000_000], 1, 10, deposit={"type": "percent", "value": 25})
+        assert q.total_paise == 1_000_000
+        assert q.amount_paise == 250_000
+        assert q.balance_paise == 750_000
+
+    def test_charges_commission_on_what_we_process_not_the_balance(self):
+        q = p.quote([1_000_000], 1, 10, deposit={"type": "percent", "value": 25})
+        assert q.commission_paise == 25_000
+        assert q.commission_paise + q.payout_paise == q.amount_paise
+
+    def test_behaves_exactly_as_before_when_nothing_is_deposited(self):
+        q = p.quote([1_000_000], 1, 10)
+        assert q.amount_paise == q.total_paise
+        assert q.balance_paise == 0
+
+    def test_discount_comes_off_the_total_so_the_balance_absorbs_the_rest(self):
+        q = p.quote(
+            [1_000_000], 1, 10,
+            coupon=coupon(kind="flat", value=2000),
+            deposit={"type": "percent", "value": 25},
+        )
+        assert q.total_paise == 800_000
+        assert q.amount_paise == 200_000
+        assert q.balance_paise == 600_000
+        assert q.amount_paise + q.balance_paise == q.total_paise

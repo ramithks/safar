@@ -265,10 +265,12 @@ async def submit_listing(
     kind = listing.get("kind") or "experience"
     needs_approval = NEEDS_APPROVAL.get(kind, True)
 
-    if not needs_approval and not _has_active_stay_plan(partner):
+    # V3: every kind is ₹499/month, so publishing anything needs an active plan.
+    # Stays then go live instantly; trips and experiences still go to review.
+    if not _has_active_stay_plan(partner):
         return StatusResponse(
             ok=False,
-            error="Subscribe at ₹499/month to publish your stay.",
+            error="Subscribe at ₹499/month to publish your listing.",
             needs_plan=True,
         )
 
@@ -373,6 +375,15 @@ async def submit_trip(
     gaps = _trip_gaps(trip)
     if gaps:
         return StatusResponse(ok=False, error="A few things are still missing.", gaps=gaps)
+
+    # V3: group trips are ₹499/month like everything else — a plan is required
+    # before a trip can even go to review.
+    if not _has_active_stay_plan(partner):
+        return StatusResponse(
+            ok=False,
+            error="Subscribe at ₹499/month to publish your trip.",
+            needs_plan=True,
+        )
 
     # A departure already in the past cannot be reviewed into a sellable trip.
     departure = trip.get("departure_date")
@@ -505,6 +516,68 @@ async def update_trip_seats(
         raise HTTPException(500, "Could not update seats. Please try again.")
 
     return StatusResponse(ok=True, status=trip.get("status"), listing=res.data[0])
+
+
+@router.patch(
+    "/trips/{trip_id}/departures/{departure_id}/seats", response_model=StatusResponse
+)
+@limiter.limit("120/hour")
+async def update_departure_seats(
+    request: Request,
+    trip_id: str,
+    departure_id: str,
+    body: SeatsRequest,
+    user=Depends(require_user),
+) -> StatusResponse:
+    """
+    Resize one departure's inventory.
+
+    Identical arithmetic to update_trip_seats, one level down: `seats_left`
+    moves by the DELTA, sold seats are derived from the stored row, and a total
+    below what's already sold is refused. The DB trigger mirrors the result back
+    onto the trip when this is the next open date.
+    """
+    partner = await _require_partner(user)
+    await _owned_trip(partner["id"], trip_id)
+
+    res = await run_db(
+        lambda: get_db()
+        .table("trip_departures")
+        .select("*")
+        .eq("id", departure_id)
+        .eq("trip_id", trip_id)
+        .eq("partner_id", partner["id"])
+        .maybe_single()
+        .execute()
+    )
+    departure = res.data if res else None
+    if not departure:
+        raise HTTPException(404, "Departure not found.")
+
+    old_total = departure.get("seats_total") or 0
+    old_left = departure.get("seats_left") or 0
+    sold = max(old_total - old_left, 0)
+
+    new_total = body.seats_total
+    if new_total < sold:
+        raise HTTPException(
+            409,
+            f"{sold} seat(s) are already booked on this date, so it can't be resized "
+            f"below {sold}.",
+        )
+
+    updated = await run_db(
+        lambda: get_db()
+        .table("trip_departures")
+        .update({"seats_total": new_total, "seats_left": new_total - sold})
+        .eq("id", departure_id)
+        .eq("partner_id", partner["id"])
+        .execute()
+    )
+    if not updated.data:
+        raise HTTPException(500, "Could not update seats. Please try again.")
+
+    return StatusResponse(ok=True, status="open", listing=updated.data[0])
 
 
 # ── media upload ─────────────────────────────────────────────────────────────

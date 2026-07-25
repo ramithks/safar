@@ -10,6 +10,7 @@ and /webhook — without them anyone could POST a made-up payment id and mark a
 booking paid — so they are tested against forged, replayed and tampered input
 rather than only the happy path.
 """
+import asyncio
 import hashlib
 import hmac
 import json
@@ -174,3 +175,120 @@ class TestBookingRef:
         # No O/0 or I/1 — refs get read out over the phone.
         for _ in range(200):
             assert not set(booking_ref()[3:]) & set("O0I1")
+
+
+# ── departures ───────────────────────────────────────────────────────────────
+#
+# The suite has no async plugin and doesn't need one: these drive the coroutine
+# with asyncio.run, which is the whole of what a plugin would do here.
+
+
+class _FakeResult:
+    def __init__(self, data):
+        self.data = data
+
+
+@pytest.fixture
+def departures(monkeypatch):
+    """
+    Stub the departures query so _resolve_departure can be tested for what it
+    actually decides — which date a booking lands on — without a database.
+    """
+    rows: list[dict] = []
+
+    async def fake_run_db(_fn):
+        return _FakeResult(rows)
+
+    from app.api.v1.marketplace import payments as mod
+
+    monkeypatch.setattr(mod, "run_db", fake_run_db)
+    monkeypatch.setattr(mod, "get_db", lambda: None)
+    return rows
+
+
+def _dep(dep_id: str, date: str = "2026-09-12", seats_left: int = 10, price=None) -> dict:
+    return {
+        "id": dep_id,
+        "departure_date": date,
+        "return_date": None,
+        "label": None,
+        "seats_total": 20,
+        "seats_left": seats_left,
+        "price_from": price,
+    }
+
+
+class TestResolveDeparture:
+    def test_returns_none_when_the_trip_has_no_departures(self, departures):
+        from app.api.v1.marketplace.payments import _resolve_departure
+
+        assert asyncio.run(_resolve_departure({"id": "t1"}, None)) is None
+
+    def test_auto_selects_the_only_open_date(self, departures):
+        # The pre-departures flow: one date, no id sent, and every link already
+        # in the wild keeps working.
+        from app.api.v1.marketplace.payments import _resolve_departure
+
+        departures.append(_dep("d1"))
+        assert asyncio.run(_resolve_departure({"id": "t1"}, None))["id"] == "d1"
+
+    def test_refuses_to_guess_between_two_dates(self, departures):
+        from app.api.v1.marketplace.payments import PricingError, _resolve_departure
+
+        departures.extend([_dep("d1"), _dep("d2", date="2026-10-03")])
+        with pytest.raises(PricingError):
+            asyncio.run(_resolve_departure({"id": "t1"}, None))
+
+    def test_rejects_a_departure_that_is_not_on_this_trip(self, departures):
+        from app.api.v1.marketplace.payments import PricingError, _resolve_departure
+
+        departures.append(_dep("d1"))
+        with pytest.raises(PricingError):
+            asyncio.run(_resolve_departure({"id": "t1"}, "d-somebody-elses"))
+
+    def test_departure_price_overrides_the_trip_price(self, departures):
+        from app.api.v1.marketplace.payments import _apply_departure
+
+        departures.append(_dep("d1", price=7999))
+        listing = {"id": "t1", "price_from": 8999}
+        asyncio.run(_apply_departure(listing, "d1"))
+        assert listing["price_from"] == 7999
+
+    def test_a_date_without_its_own_price_leaves_the_trip_price_alone(self, departures):
+        from app.api.v1.marketplace.payments import _apply_departure
+
+        departures.append(_dep("d1"))
+        listing = {"id": "t1", "price_from": 8999}
+        asyncio.run(_apply_departure(listing, "d1"))
+        assert listing["price_from"] == 8999
+
+
+# ── subscription signatures ──────────────────────────────────────────────────
+
+
+class TestSubscriptionSignature:
+    """
+    The subscription callback signs `payment_id|subscription_id` — the REVERSE
+    of the order flow's `order_id|payment_id`. Getting it backwards rejects
+    every genuine mandate silently, so both directions are pinned here.
+    """
+
+    def test_accepts_a_genuine_subscription_signature(self, with_secrets):
+        sig = sign("pay_123|sub_456")
+        assert razorpay.verify_subscription_signature("sub_456", "pay_123", sig)
+
+    def test_rejects_the_order_style_ordering(self, with_secrets):
+        # sub|pay instead of pay|sub — the mistake this test exists to catch.
+        sig = sign("sub_456|pay_123")
+        assert not razorpay.verify_subscription_signature("sub_456", "pay_123", sig)
+
+    def test_rejects_a_signature_for_another_subscription(self, with_secrets):
+        sig = sign("pay_123|sub_456")
+        assert not razorpay.verify_subscription_signature("sub_999", "pay_123", sig)
+
+    def test_rejects_empty_inputs_instead_of_throwing(self, with_secrets):
+        assert not razorpay.verify_subscription_signature("", "", "")
+
+    def test_fails_closed_when_no_secret_is_configured(self, without_secrets):
+        sig = hmac.new(b"anything", b"pay_123|sub_456", hashlib.sha256).hexdigest()
+        assert not razorpay.verify_subscription_signature("sub_456", "pay_123", sig)
