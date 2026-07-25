@@ -127,6 +127,26 @@ class TestCouponRejection:
         assert p.coupon_rejection(coupon(min_amount=2000), 100_000, self.now) == "below_minimum"
         assert p.coupon_rejection(coupon(min_amount=1000), 100_000, self.now) is None
 
+    def test_every_reason_has_traveller_facing_copy(self):
+        """
+        A reason with no entry in COUPON_REJECTIONS reaches the traveller as
+        `null`, which the booking widget renders as nothing at all — the code
+        silently fails to apply and they are never told why.
+        """
+        reasons = {"inactive", "not_started", "expired", "exhausted", "below_minimum"}
+        assert reasons <= set(p.COUPON_REJECTIONS)
+        assert all(p.COUPON_REJECTIONS[r].strip() for r in reasons)
+
+    def test_unknown_covers_codes_that_never_resolve(self):
+        """
+        The commonest rejection isn't in `coupon_rejection` at all: a typo, a
+        code scoped to another listing, or one targeted at someone else's phone
+        never resolves to a row, so the quote endpoint reaches for this key
+        itself. Without it the traveller typed a code, watched the total not
+        move, and was told nothing.
+        """
+        assert p.COUPON_REJECTIONS["unknown"].strip()
+
 
 class TestCouponDiscount:
     def test_flat(self):

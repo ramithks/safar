@@ -129,6 +129,13 @@ def nightly_prices(
 # ── coupons ──────────────────────────────────────────────────────────────────
 
 COUPON_REJECTIONS = {
+    # `unknown` is the one the traveller hits most: a typo, a code that belongs
+    # to another property, or a code targeted at someone else's number. None of
+    # those resolve to a row at all, so they never reach `coupon_rejection`
+    # below — the caller sets this one itself. Deliberately vague: which rule
+    # was tripped is not the traveller's business, and saying "that code is for
+    # a different hotel" leaks the partner's targeting.
+    "unknown": "That code isn't valid for this booking.",
     "inactive": "This code is no longer active.",
     "not_started": "This code isn't valid yet.",
     "expired": "This code has expired.",

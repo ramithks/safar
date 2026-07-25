@@ -415,8 +415,16 @@ async def quote_price(request: Request, body: QuoteRequest) -> QuoteResponse:
         commission_paise=q.commission_paise,
         nights=meta.get("nights"),
         coupon_applied=q.discount_paise > 0,
+        # A code that resolved but broke a rule reports that rule. A code that
+        # never resolved (typo, wrong property, targeted at another number)
+        # reports the generic refusal — without this branch the traveller typed
+        # a code, watched the total not move, and was told nothing at all.
         coupon_message=(
-            pricing.COUPON_REJECTIONS.get(q.coupon_rejection) if q.coupon_rejection else None
+            pricing.COUPON_REJECTIONS.get(q.coupon_rejection)
+            if q.coupon_rejection
+            else pricing.COUPON_REJECTIONS["unknown"]
+            if body.coupon_code and q.discount_paise == 0
+            else None
         ),
     )
 
