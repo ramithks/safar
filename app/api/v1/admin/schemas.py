@@ -23,7 +23,18 @@ class UnpublishRequest(BaseModel):
 
 class PartnerActionRequest(BaseModel):
     id: str
-    action: Literal["verify", "unverify", "suspend", "reactivate", "grant_plan"]
+    # trust_publishing / require_review flip `auto_publish` — whether this
+    # partner's submissions skip the review queue. Deliberately separate from
+    # verify/unverify, which is the traveller-facing trust badge.
+    action: Literal[
+        "verify",
+        "unverify",
+        "suspend",
+        "reactivate",
+        "grant_plan",
+        "trust_publishing",
+        "require_review",
+    ]
     months: int = Field(default=1, ge=1, le=12)
     reason: str | None = Field(default=None, max_length=500)
 

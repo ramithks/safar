@@ -32,6 +32,7 @@ class _Query:
         self.db, self.table, self.op, self.payload = db, table, op, payload
         self.filters = []
         self.single = False
+        self.limit_n = None
 
     # filters
     def eq(self, col, val):
@@ -67,6 +68,10 @@ class _Query:
         self.single = True
         return self
 
+    def limit(self, n):
+        self.limit_n = n
+        return self
+
     def _matching(self):
         rows = self.db.rows.get(self.table, [])
         return [r for r in rows if all(f(r) for f in self.filters)]
@@ -79,6 +84,8 @@ class _Query:
                 if len(rows) > 1:
                     raise RuntimeError("maybe_single matched multiple rows")
                 return _Result(rows[0] if rows else None)
+            if self.limit_n is not None:
+                rows = rows[: self.limit_n]
             return _Result(rows)
 
         if self.op == "insert":

@@ -55,7 +55,12 @@ class TripDraft(BaseModel):
     whatsapp_number: str | None = Field(default=None, max_length=20)
     seo_title: str | None = Field(default=None, max_length=70)
 
-    booking_mode: Literal["whatsapp", "enquiry", "instant"] = "whatsapp"
+    # `instant` — pay on the page — is the default because that is what every
+    # partner trip already does, and a TravBuddy-run trip defaulting to a
+    # WhatsApp enquiry made OUR trips look less trustworthy than a partner's on
+    # an otherwise identical page. Set it to whatsapp/enquiry per trip when a
+    # departure genuinely can't be sold online.
+    booking_mode: Literal["whatsapp", "enquiry", "instant"] = "instant"
 
     days: list[TripDay] = Field(default_factory=list, max_length=30)
     pricing: list[TripTier] = Field(default_factory=list, max_length=8)

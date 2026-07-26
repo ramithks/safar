@@ -259,6 +259,16 @@ async def partner_action(
         patch = {"verified": verified, "kyc_status": "verified" if verified else "pending"}
         event, message = "partner.verified" if verified else "partner.unverified", "Updated."
 
+    elif body.action in {"trust_publishing", "require_review"}:
+        trusted = body.action == "trust_publishing"
+        patch = {"auto_publish": trusted}
+        event = "partner.publishing_trusted" if trusted else "partner.review_required"
+        message = (
+            "Their submissions now go live instantly."
+            if trusted
+            else "Their submissions go to the review queue again."
+        )
+
     elif body.action in {"suspend", "reactivate"}:
         status_value = "suspended" if body.action == "suspend" else "active"
         patch = {"status": status_value}

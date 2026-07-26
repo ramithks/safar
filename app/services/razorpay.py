@@ -173,6 +173,8 @@ async def create_subscription(
     total_count: int = 120,
     notes: dict | None = None,
     notify: bool = True,
+    start_at: int | None = None,
+    offer_id: str | None = None,
 ) -> dict:
     """
     Open a mandate against a plan.
@@ -185,21 +187,32 @@ async def create_subscription(
     `customer_notify` lets Razorpay send its own pre-debit notification, which
     is mandatory for UPI Autopay anyway — better their compliant template than
     our reimplementation of it.
+
+    `start_at` (unix seconds) is how a free period is expressed: the mandate is
+    authorised now and the FIRST charge is deferred to that moment. That is the
+    whole mechanic behind a free_months plan coupon — we grant the plan time
+    ourselves and Razorpay starts billing when it runs out.
+
+    `offer_id` applies a Dashboard-created Razorpay Offer to the charges, which
+    is how percent/flat plan coupons discount real money for a set number of
+    cycles. Offers have no create API, hence the id rather than a spec.
     """
     if not configured():
         raise RuntimeError("Razorpay is not configured.")
 
+    payload: dict = {
+        "plan_id": plan_id,
+        "total_count": total_count,
+        "customer_notify": 1 if notify else 0,
+        "notes": notes or {},
+    }
+    if start_at:
+        payload["start_at"] = start_at
+    if offer_id:
+        payload["offer_id"] = offer_id
+
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        res = await client.post(
-            f"{API}/subscriptions",
-            auth=_auth(),
-            json={
-                "plan_id": plan_id,
-                "total_count": total_count,
-                "customer_notify": 1 if notify else 0,
-                "notes": notes or {},
-            },
-        )
+        res = await client.post(f"{API}/subscriptions", auth=_auth(), json=payload)
 
     if res.status_code >= 400:
         logger.error(

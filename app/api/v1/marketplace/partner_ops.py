@@ -29,19 +29,21 @@ import re
 import uuid
 from datetime import date, datetime, timezone
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 
 from app.api.v1.marketplace.partner_schemas import (
     CounterRequest,
     GapItem,
     Ok,
+    PlaceHit,
     SeatsRequest,
     StatusResponse,
 )
 from app.api.v1.marketplace.payment_schemas import AiJobRequest, UploadResponse
 from app.core.limiter import limiter
-from app.db.client import get_db, run_db
+from app.db.client import get_db, run_db, run_db_resilient
 from app.deps.auth import require_user
+from app.services import places
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
@@ -63,9 +65,11 @@ def _now() -> str:
 # ── authorization ────────────────────────────────────────────────────────────
 
 
-async def _require_partner(user) -> dict:
+async def _get_partner(user) -> dict | None:
     """
-    The caller's partner row, resolved from the verified JWT alone.
+    The caller's partner row, resolved from the verified JWT alone — or None
+    when the account has no partner profile yet. A suspended partner is
+    rejected here regardless of what the caller was trying to do.
 
     This is the only place a partner identity enters these endpoints. A request
     body never contributes to it.
@@ -73,17 +77,22 @@ async def _require_partner(user) -> dict:
     res = await run_db(
         lambda: get_db()
         .table("partners")
-        .select("id, brand_name, email, city, whatsapp, status, "
+        .select("id, brand_name, email, city, whatsapp, status, auto_publish, "
                 "stay_plan_status, stay_plan_expires_at")
         .eq("owner_id", user.id)
         .maybe_single()
         .execute()
     )
     partner = res.data if res else None
+    if partner and partner.get("status") == "suspended":
+        raise HTTPException(403, "This account is suspended. Please contact support.")
+    return partner
+
+
+async def _require_partner(user) -> dict:
+    partner = await _get_partner(user)
     if not partner:
         raise HTTPException(403, "Create your partner profile first.")
-    if partner.get("status") == "suspended":
-        raise HTTPException(403, "This account is suspended. Please contact support.")
     return partner
 
 
@@ -151,11 +160,16 @@ def _listing_gaps(listing: dict) -> list[GapItem]:
         gaps.append(GapItem(field="price_from", label="Set a starting price"))
     if not listing.get("city") and not listing.get("destination"):
         gaps.append(GapItem(field="city", label="Add the location"))
+    # A traveller who can't find the place can't get to it, and "near the bus
+    # stand" is not an address. Mirrors publishGaps in the website's
+    # lib/marketplace/publish-rules.ts.
+    if not listing.get("map_url"):
+        gaps.append(GapItem(field="map_url", label="Add a Google Maps link"))
 
     if listing.get("kind") == "hotel" and not (content.get("rooms") or []):
         gaps.append(GapItem(field="content.rooms", label="Add at least one room type"))
-    if listing.get("kind") == "experience" and not content.get("duration_hours"):
-        gaps.append(GapItem(field="content.duration_hours", label="Add how long it takes"))
+    # No duration_hours gate for experiences: the field was removed from the
+    # editor because it varies per booking and partners were guessing at it.
 
     return gaps
 
@@ -168,8 +182,24 @@ def _trip_gaps(trip: dict) -> list[GapItem]:
         gaps.append(GapItem(field="title", label="Add a title"))
     if not trip.get("destination"):
         gaps.append(GapItem(field="destination", label="Add the destination"))
+    # Mirrors tripPublishGaps in the website's lib/marketplace/publish-rules.ts.
+    # A fixed departure is useless to a traveller who can't tell where it leaves
+    # from — it's the first thing they filter on.
+    if not trip.get("origin"):
+        gaps.append(GapItem(field="origin", label="Add where the trip departs from"))
     if not trip.get("hero_image"):
         gaps.append(GapItem(field="hero_image", label="Add a cover photo"))
+    if not [url for url in (content.get("images") or {}).values() if url]:
+        gaps.append(GapItem(field="content.images", label="Add gallery photos"))
+    # A trip has no single address — the pickup point IS the place travellers
+    # have to find, at a fixed time, so that's where the map link belongs.
+    if not any((p or {}).get("map_url") for p in (content.get("pickup_points") or [])):
+        gaps.append(
+            GapItem(
+                field="content.pickup_points",
+                label="Add a pickup point with a Google Maps link",
+            )
+        )
     if len((trip.get("description") or "").strip()) < MIN_DESCRIPTION_CHARS:
         gaps.append(
             GapItem(field="description", label="Write a description (a couple of sentences)")
@@ -263,7 +293,9 @@ async def submit_listing(
         return StatusResponse(ok=False, error="A few things are still missing.", gaps=gaps)
 
     kind = listing.get("kind") or "experience"
-    needs_approval = NEEDS_APPROVAL.get(kind, True)
+    # A trusted partner skips the queue entirely — see the auto_publish column.
+    # It is service-role only, so this cannot be self-granted.
+    needs_approval = NEEDS_APPROVAL.get(kind, True) and not partner.get("auto_publish")
 
     # V3: every kind is ₹499/month, so publishing anything needs an active plan.
     # Stays then go live instantly; trips and experiences still go to review.
@@ -372,6 +404,19 @@ async def submit_trip(
     partner = await _require_partner(user)
     trip = await _owned_trip(partner["id"], trip_id)
 
+    # Already queued or live: re-submitting would reset a reviewer's place in
+    # the queue, and on a published trip it would silently take it offline.
+    # `rejected` is deliberately NOT here — fixing and resending is the point.
+    current = trip.get("status")
+    if current == "pending":
+        return StatusResponse(
+            ok=False, status=current, error="This trip is already in review."
+        )
+    if current == "published":
+        return StatusResponse(
+            ok=False, status=current, error="This trip is already live."
+        )
+
     gaps = _trip_gaps(trip)
     if gaps:
         return StatusResponse(ok=False, error="A few things are still missing.", gaps=gaps)
@@ -397,10 +442,16 @@ async def submit_trip(
         except ValueError:
             pass  # a malformed date is caught by the gaps check, not here
 
+    # A trusted partner skips the queue entirely — see the auto_publish column.
+    # It is service-role only, so this cannot be self-granted.
+    # NB: no published_at here — unlike partner_listings, group_trips has no
+    # such column.
+    next_status = "published" if partner.get("auto_publish") else "pending"
+
     res = await run_db(
         lambda: get_db()
         .table("group_trips")
-        .update({"status": "pending", "rejection_reason": None})
+        .update({"status": next_status, "rejection_reason": None})
         .eq("id", trip_id)
         .eq("partner_id", partner["id"])
         .execute()
@@ -408,7 +459,7 @@ async def submit_trip(
     if not res.data:
         raise HTTPException(500, "Could not submit your trip. Please try again.")
 
-    return StatusResponse(ok=True, status="pending", listing=res.data[0])
+    return StatusResponse(ok=True, status=next_status, listing=res.data[0])
 
 
 @router.post("/trips/{trip_id}/unpublish", response_model=StatusResponse)
@@ -580,6 +631,56 @@ async def update_departure_seats(
     return StatusResponse(ok=True, status="open", listing=updated.data[0])
 
 
+# ── place search ─────────────────────────────────────────────────────────────
+
+
+@router.get("/places", response_model=list[PlaceHit])
+@limiter.limit("120/hour")
+async def search_places_for_partner(
+    request: Request,
+    q: str = Query(min_length=3, max_length=120),
+    user=Depends(require_user),
+) -> list[PlaceHit]:
+    """
+    Look up a place by name so a partner never has to hand-paste a maps link.
+
+    Pasting was the old flow and it produced exactly what you'd expect: blank
+    fields, shortened links that had already expired, and links to the wrong
+    branch of the same hotel chain. Searching by name and picking from results
+    gives us a `place_id`, which resolves to the same pin forever.
+
+    Behind `require_user` and rate-limited because this spends Google Places
+    quota — it is not an open geocoding proxy.
+    """
+    partner = await _get_partner(user)
+    if not partner:
+        raise HTTPException(403, "Create your partner profile first.")
+
+    try:
+        results = await places.search_places(q)
+    except Exception:  # noqa: BLE001
+        logger.exception("[marketplace] place search failed")
+        raise HTTPException(502, "Could not search places right now.") from None
+
+    hits: list[PlaceHit] = []
+    for r in results:
+        pid = r.get("place_id")
+        if not pid:
+            continue
+        loc = ((r.get("geometry") or {}).get("location")) or {}
+        hits.append(
+            PlaceHit(
+                place_id=pid,
+                name=r.get("name") or q,
+                address=r.get("formatted_address"),
+                lat=loc.get("lat"),
+                lon=loc.get("lng"),
+                map_url=f"https://www.google.com/maps/place/?q=place_id:{pid}",
+            )
+        )
+    return hits
+
+
 # ── media upload ─────────────────────────────────────────────────────────────
 
 BUCKET = "marketplace-media"
@@ -609,9 +710,13 @@ async def upload_media(
     through here removes that failure mode entirely.
 
     The storage prefix is the caller's own partner id, derived from the JWT — a
-    client cannot write into another partner's folder whatever it sends.
+    client cannot write into another partner's folder whatever it sends. The
+    one exception to requiring a partner row: onboarding picks a logo before
+    the row exists, so those uploads land under onboarding/{user id} instead —
+    still a prefix owned by the verified caller.
     """
-    partner = await _require_partner(user)
+    partner = await _get_partner(user)
+    prefix = partner["id"] if partner else f"onboarding/{user.id}"
 
     mime = (file.content_type or "").split(";")[0].strip().lower()
     ext = UPLOAD_EXT.get(mime)
@@ -625,17 +730,24 @@ async def upload_media(
         raise HTTPException(413, "That image is over 5 MB. Please upload a smaller one.")
 
     safe_folder = re.sub(r"[^a-z0-9-]", "", folder or "", flags=re.I) or "misc"
-    path = f"{partner['id']}/{safe_folder}/{uuid.uuid4()}.{ext}"
+    path = f"{prefix}/{safe_folder}/{uuid.uuid4()}.{ext}"
 
     try:
-        await run_db(
+        # The generic send wrapper won't retry a POST, but this one is safe to
+        # replay: the path is a fresh uuid nothing else can race for, and
+        # upsert makes a retry after a half-sent first attempt a no-op — so a
+        # stale pooled connection (bad_record_mac / ReadError) gets a fresh
+        # client instead of failing the upload.
+        await run_db_resilient(
             lambda: get_db()
             .storage.from_(BUCKET)
             .upload(
                 path,
                 data,
-                {"content-type": mime, "cache-control": "31536000", "upsert": "false"},
-            )
+                {"content-type": mime, "cache-control": "31536000", "upsert": "true"},
+            ),
+            label="marketplace upload",
+            max_seconds=20.0,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("[marketplace] upload failed")

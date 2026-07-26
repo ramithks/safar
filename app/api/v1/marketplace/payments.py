@@ -27,14 +27,18 @@ import re
 import secrets
 from datetime import date, datetime, timezone
 
+from dateutil.relativedelta import relativedelta
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from app.api.v1.marketplace.payment_schemas import (
     CheckoutRequest,
     CheckoutResponse,
+    PlanCouponRequest,
+    PlanCouponResponse,
     PublicBooking,
     QuoteRequest,
     QuoteResponse,
+    SubscribeRequest,
     SubscribeResponse,
     SubscriptionStatus,
     SubscriptionVerifyRequest,
@@ -45,10 +49,12 @@ from app.core.limiter import limiter
 from app.db.client import get_db, run_db
 from app.deps.auth import optional_user, require_user
 from app.services import marketplace_pricing as pricing
+from app.services import plan_coupons
 from app.services import razorpay
 from app.services.booking_emails import send_booking_emails
 from app.services.marketplace_bookings import (
     PLAN_KEY,
+    activate_stay_plan,
     activate_stay_plan_for_payment,
     cancel_unpaid_order,
     finalise_booking,
@@ -719,9 +725,44 @@ async def _require_partner(user) -> dict:
     return partner
 
 
+@router.post("/subscribe/coupon", response_model=PlanCouponResponse)
+@limiter.limit("30/hour")
+async def check_plan_coupon(
+    request: Request,
+    body: PlanCouponRequest,
+    user=Depends(require_user),
+) -> PlanCouponResponse:
+    """
+    Validate a plan coupon before Checkout opens, so the partner sees what
+    they're getting rather than discovering it on a bank statement.
+
+    Answers only with what the code is worth. Rate-limited and deliberately
+    vague on failure — this is the endpoint someone would point a script at to
+    discover live campaign codes, and a uniform rejection makes a spent code
+    indistinguishable from one that never existed.
+    """
+    partner = await _require_partner(user)
+
+    coupon, reason = await plan_coupons.resolve(body.code, partner["id"])
+    if not coupon:
+        return PlanCouponResponse(ok=False, error=reason or plan_coupons.GENERIC_REJECTION)
+
+    return PlanCouponResponse(
+        ok=True,
+        code=coupon["code"],
+        kind=coupon["kind"],
+        description=plan_coupons.describe(coupon),
+        free_months=plan_coupons.free_months(coupon),
+    )
+
+
 @router.post("/subscribe", response_model=SubscribeResponse)
 @limiter.limit("30/hour")
-async def start_subscription(request: Request, user=Depends(require_user)) -> SubscribeResponse:
+async def start_subscription(
+    request: Request,
+    body: SubscribeRequest | None = None,
+    user=Depends(require_user),
+) -> SubscribeResponse:
     """
     Start the ₹499/month plan as an AUTOPAY MANDATE.
 
@@ -733,6 +774,12 @@ async def start_subscription(request: Request, user=Depends(require_user)) -> Su
 
     Reuses the partner's existing mandate when there is a live one, so a double
     click can't leave someone paying twice.
+
+    A plan coupon changes HOW the mandate is created, never whether the money
+    is real: `free_months` defers the first charge with `start_at`, percent and
+    flat attach a Razorpay offer. The coupon is only PARKED here — it is
+    redeemed when the mandate authenticates, so abandoning Checkout costs the
+    campaign nothing.
     """
     if not razorpay.configured():
         raise HTTPException(503, "Payments aren't switched on yet. Please try again shortly.")
@@ -747,14 +794,45 @@ async def start_subscription(request: Request, user=Depends(require_user)) -> Su
 
     plan_id = await _ensure_plan()
 
+    # ── coupon ───────────────────────────────────────────────────────────
+    coupon = None
+    submitted = (body.coupon_code if body else None) or None
+    if submitted:
+        coupon, reason = await plan_coupons.resolve(submitted, partner["id"])
+        if not coupon:
+            # A bad code must not quietly become a full-price mandate — the
+            # partner clicked subscribe expecting a discount.
+            raise HTTPException(400, reason or plan_coupons.GENERIC_REJECTION)
+
+    months_free = plan_coupons.free_months(coupon) if coupon else 0
+    start_at = None
+    first_charge_at = None
+    if months_free:
+        # Razorpay bills from here; we grant the free months ourselves once the
+        # mandate authenticates, so the two periods meet exactly.
+        billing_from = datetime.now(timezone.utc) + relativedelta(months=months_free)
+        start_at = int(billing_from.timestamp())
+        first_charge_at = billing_from.isoformat()
+
     try:
         subscription = await razorpay.create_subscription(
             plan_id=plan_id,
-            notes={"partner_id": partner["id"], "brand": partner.get("brand_name") or ""},
+            notes={
+                "partner_id": partner["id"],
+                "brand": partner.get("brand_name") or "",
+                **({"coupon": coupon["code"]} if coupon else {}),
+            },
+            start_at=start_at,
+            offer_id=(coupon or {}).get("razorpay_offer_id"),
         )
     except Exception:  # noqa: BLE001
         logger.exception("[subscribe] subscription create failed")
         raise HTTPException(502, "Could not start the subscription.") from None
+
+    if coupon:
+        # Parked, not redeemed. `pending_plan_coupon_id` is a guarded column, so
+        # this is the only path that can set it.
+        await plan_coupons.park_pending(partner["id"], coupon["id"])
 
     # Stored BEFORE the browser is handed the id: the webhook can arrive before
     # the callback does, and it resolves the partner by subscription id.
@@ -771,6 +849,10 @@ async def start_subscription(request: Request, user=Depends(require_user)) -> Su
         .execute()
     )
 
+    blurb = f"TravBuddy plan — ₹{STAY_PLAN_MONTHLY_RUPEES}/month, cancel anytime"
+    if coupon:
+        blurb = f"{plan_coupons.describe(coupon)}, then {blurb}"
+
     return SubscribeResponse(
         ok=True,
         subscription_id=subscription["id"],
@@ -778,12 +860,15 @@ async def start_subscription(request: Request, user=Depends(require_user)) -> Su
         currency="INR",
         key_id=razorpay.public_key_id(),
         name="TravBuddy",
-        description=f"TravBuddy plan — ₹{STAY_PLAN_MONTHLY_RUPEES}/month, cancel anytime",
+        description=blurb,
         prefill={
             "name": partner.get("brand_name") or "",
             "contact": partner.get("whatsapp") or "",
             "email": partner.get("email") or "",
         },
+        coupon_code=(coupon or {}).get("code"),
+        coupon_description=plan_coupons.describe(coupon) if coupon else None,
+        first_charge_at=first_charge_at,
     )
 
 
@@ -859,13 +944,98 @@ async def verify_subscription(
 
     # The webhook is the reliable path and may already have run. This is the
     # fast one, so the partner sees an active plan before the tab settles.
-    await record_subscription_charge(
-        body.razorpay_subscription_id,
-        body.razorpay_payment_id,
-        invoice_id=None,
-        amount_paise=STAY_PLAN_MONTHLY_PAISE,
+    await settle_authenticated_mandate(
+        partner["id"], body.razorpay_subscription_id, body.razorpay_payment_id
     )
     return VerifyResponse(ok=True)
+
+
+async def _partner_for_subscription(subscription_id):
+    """The partner a mandate belongs to, or None."""
+    res = await run_db(
+        lambda: get_db()
+        .table("partners")
+        .select("id")
+        .eq("subscription_id", subscription_id)
+        .maybe_single()
+        .execute()
+    )
+    row = res.data if res else None
+    return row["id"] if row else None
+
+
+async def grant_pending_plan_coupon(partner_id, subscription_id):
+    """
+    Redeem a parked free-months coupon now that the mandate is real, and give
+    the partner the plan time. Returns the months granted, 0 when there was no
+    free-months coupon to apply.
+
+    Safe to call from every path that learns a mandate authenticated, as often
+    as they like: `redeem_plan_coupon` hands out exactly one redemption per
+    (coupon, partner), so only one caller ever gets a non-zero answer here.
+
+    There is no ₹499 to record on this path — `start_at` pushed the first
+    invoice past the free period, so `subscription.charged` genuinely will not
+    fire for months. The ₹0 ledger row exists so the payments page can still
+    explain where the free time came from, and it is keyed on the subscription
+    rather than a payment id because the authentication event doesn't always
+    carry one.
+    """
+    months = await plan_coupons.apply_pending(partner_id, subscription_id)
+    if not months:
+        return 0
+
+    # Grant first, ledger second. A failed ledger insert is a cosmetic gap in
+    # the payments page; a lost grant is a partner who redeemed a code and got
+    # nothing for it.
+    await set_subscription_status(subscription_id, "active")
+    await activate_stay_plan(partner_id, months=months)
+
+    now = datetime.now(timezone.utc)
+    try:
+        await run_db(
+            lambda: get_db()
+            .table("partner_payments")
+            .insert(
+                {
+                    "partner_id": partner_id,
+                    "kind": "stay_subscription",
+                    "amount_paise": 0,
+                    "status": "paid",
+                    # Deterministic, so the unique index makes a second insert
+                    # a no-op no matter which path writes it.
+                    "razorpay_payment_id": f"coupon_{subscription_id}",
+                    "razorpay_subscription_id": subscription_id,
+                    "period_start": now.date().isoformat(),
+                    "period_end": (now + relativedelta(months=months)).date().isoformat(),
+                }
+            )
+            .execute()
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("[plan-coupon] could not ledger ₹0 row for %s", subscription_id)
+
+    return months
+
+
+async def settle_authenticated_mandate(partner_id, subscription_id, payment_id):
+    """
+    The browser callback's version: apply a free-months coupon if there is one,
+    otherwise record the ₹499 that was just charged.
+
+    The `granted_free_period` check is what keeps the two apart when the
+    webhook won the race. Without it this would see "no coupon to apply", take
+    the charge branch, and ledger a ₹499 nobody paid — the double-month bug of
+    2026-07-25 wearing a new hat.
+    """
+    if await grant_pending_plan_coupon(partner_id, subscription_id):
+        return
+    if await plan_coupons.granted_free_period(subscription_id):
+        return
+
+    await record_subscription_charge(
+        subscription_id, payment_id, invoice_id=None, amount_paise=STAY_PLAN_MONTHLY_PAISE
+    )
 
 
 @router.post("/subscribe/cancel", response_model=SubscriptionStatus)
@@ -1008,6 +1178,20 @@ async def razorpay_webhook(
                 await set_subscription_status(
                     subscription_id, sub.get("status") or name.split(".", 1)[1]
                 )
+                # A free-months mandate defers its first charge, so
+                # `subscription.charged` won't arrive for months and this is
+                # the only server-side event that says "the mandate is real".
+                # Without it, a partner who closed the tab mid-redirect would
+                # have an authenticated mandate and no free period.
+                #
+                # Only the coupon is applied here, never a charge: on a normal
+                # mandate the authentication payment IS the first ₹499, and
+                # `subscription.charged` records it under the same payment id.
+                # Recording anything here would buy a second month.
+                if name in ("subscription.authenticated", "subscription.activated"):
+                    owner = await _partner_for_subscription(subscription_id)
+                    if owner:
+                        await grant_pending_plan_coupon(owner, subscription_id)
             return {"ok": True, "handled": name}
 
         if name in ("refund.processed", "refund.created"):

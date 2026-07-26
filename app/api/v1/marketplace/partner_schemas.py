@@ -46,3 +46,19 @@ class StatusResponse(BaseModel):
     gaps: list[GapItem] | None = None
     needs_plan: bool = False
     listing: dict[str, Any] | None = None
+
+
+class PlaceHit(BaseModel):
+    """
+    One Google Places result, reduced to what a partner needs to confirm they
+    picked the right spot — plus the canonical maps URL we store.
+    """
+
+    place_id: str
+    name: str
+    address: str | None = None
+    lat: float | None = None
+    lon: float | None = None
+    #: https://www.google.com/maps/place/?q=place_id:… — stable, unlike a
+    #: copy-pasted share link, and resolves to the same pin forever.
+    map_url: str

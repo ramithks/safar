@@ -95,6 +95,34 @@ class VerifyResponse(BaseModel):
     code: str | None = None
 
 
+class SubscribeRequest(BaseModel):
+    """A plan coupon is the only thing the client gets to contribute here —
+    and only as a code. What it is worth is read from our own table."""
+
+    coupon_code: str | None = Field(default=None, max_length=32)
+
+
+class PlanCouponRequest(BaseModel):
+    code: str = Field(min_length=3, max_length=32)
+
+
+class PlanCouponResponse(BaseModel):
+    """
+    What a validated code is worth, in the only terms the partner needs. The
+    coupon row itself is never exposed — usage counts and campaign names are
+    ours, not theirs.
+    """
+
+    ok: bool
+    code: str | None = None
+    kind: str | None = None
+    #: One line for the UI: "First 3 months free", "50% off for 6 months".
+    description: str | None = None
+    #: Free plan months this grants outright; 0 for a Razorpay-offer discount.
+    free_months: int = 0
+    error: str | None = None
+
+
 class SubscribeResponse(BaseModel):
     """
     Checkout opens against a `subscription_id`, not an `order_id` — that is what
@@ -110,6 +138,12 @@ class SubscribeResponse(BaseModel):
     name: str | None = None
     description: str | None = None
     prefill: dict[str, str] | None = None
+    #: Echoed back when a coupon was accepted, so the UI can confirm what the
+    #: partner is actually agreeing to before Checkout opens.
+    coupon_code: str | None = None
+    coupon_description: str | None = None
+    #: When a free period defers the first charge, this is when billing starts.
+    first_charge_at: str | None = None
 
 
 class SubscriptionVerifyRequest(BaseModel):
