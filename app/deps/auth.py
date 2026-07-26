@@ -150,6 +150,26 @@ def _cache_put(token: str, user) -> None:
         )
 
 
+async def optional_user(authorization: str = Header(default=None)):
+    """
+    The verified user when a usable token is present, otherwise None.
+
+    For endpoints that serve signed-out callers but want to attribute the row
+    when they ARE signed in — marketplace checkout, where a traveller need not
+    have an account. A bad or expired token is treated as absent rather than
+    rejected: the caller loses attribution, not the ability to buy.
+
+    This must never be used for authorization. It answers "who is this, if
+    anyone", not "may they do this".
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    try:
+        return await require_user(authorization)
+    except HTTPException:
+        return None
+
+
 async def require_user(authorization: str = Header(...)):
     """
     Validates the Supabase JWT from the Authorization: Bearer <token> header.
