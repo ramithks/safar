@@ -329,10 +329,18 @@ class TestQuoteWithAnAdvance:
         assert q.amount_paise == 250_000
         assert q.balance_paise == 750_000
 
-    def test_charges_commission_on_what_we_process_not_the_balance(self):
+    def test_charges_commission_on_the_whole_booking_out_of_the_advance(self):
         q = p.quote([1_000_000], 1, 10, deposit={"type": "percent", "value": 25})
-        assert q.commission_paise == 25_000
+        assert q.commission_paise == 100_000  # 10% of the ₹10,000 booking
+        assert q.payout_paise == 150_000  # the rest of the ₹2,500 advance
         assert q.commission_paise + q.payout_paise == q.amount_paise
+
+    def test_never_charges_more_commission_than_the_advance_we_hold(self):
+        # A 40% rate against a 25% advance: capped, so the payout floors at zero
+        # rather than invoicing the partner for money we never took.
+        q = p.quote([1_000_000], 1, 40, deposit={"type": "percent", "value": 25})
+        assert q.commission_paise == q.amount_paise
+        assert q.payout_paise == 0
 
     def test_behaves_exactly_as_before_when_nothing_is_deposited(self):
         q = p.quote([1_000_000], 1, 10)

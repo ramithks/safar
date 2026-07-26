@@ -14,12 +14,14 @@ ever reaches a total.
 
 The pipeline, in order — this is the contract:
 
-    season rate (per night) -> gross -> coupon discount -> amount
+    season rate (per night) -> gross -> coupon discount -> total -> advance
                                                         -> commission + payout
 
 Discounts come off before commission, so the partner and TravBuddy share the
-cost of a promotion in proportion. Commission is rounded and the payout takes
-the remainder, so the two always sum back to the amount charged.
+cost of a promotion in proportion. Commission is charged on the TOTAL — the
+whole booking we brought the partner — and deducted from the advance we hold;
+the payout is whatever is left of that advance, so the two always sum back to
+the amount charged.
 """
 # NOTE: deliberately no `from __future__ import annotations` — keeps parity with
 # the rest of app/api/v1/marketplace, where runtime annotations matter to
@@ -207,9 +209,9 @@ def coupon_discount_paise(
 # ── the advance ──────────────────────────────────────────────────────────────
 #
 # A partner may take a deposit instead of the full price, with the balance
-# collected by them directly. Commission is 10% of what TravBuddy actually
-# processes, so the advance has a floor: without one a partner could take ₹1
-# through us and collect the rest off-platform.
+# collected by them directly. Commission is charged on the whole booking but can
+# only be *collected* out of the advance, so the advance has a floor: without one
+# a partner could take ₹1 through us and leave nothing for the fee to come from.
 #
 # MIN_DEPOSIT_PCT is mirrored by MIN_DEPOSIT_PCT in the website's pricing.ts and
 # by CHECK constraints on partner_listings and group_trips. All three must agree.
@@ -296,9 +298,17 @@ def quote(
     # shrinks by the rest of it.
     amount = advance_paise(total, deposit)
 
-    # Commission on what we actually process. The balance never passes through
-    # TravBuddy, so it is never charged on.
-    commission, payout = split_commission(amount, commission_pct)
+    # Commission is a cut of the WHOLE booking, not of the slice we happen to
+    # hold: 10% of a ₹7,999 seat is ₹800 whether the traveller pays ₹1,600 now
+    # or all of it. We take it out of the advance and hand the partner the rest,
+    # who then collects the balance directly.
+    #
+    # Capped at the advance, so a partner is never invoiced for more money than
+    # passed through us — with the 20% floor and a 10% rate the cap can't bind,
+    # but a listing carrying a rate above its advance would otherwise produce a
+    # negative payout.
+    commission = min(amount, _round_half_up(total * commission_pct / 100))
+    payout = amount - commission
 
     return Quote(
         gross_paise=gross,
