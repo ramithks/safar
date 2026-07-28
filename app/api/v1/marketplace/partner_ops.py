@@ -24,6 +24,7 @@ only runs in the client it protects is not a gate. This is the authoritative one
 # NOTE: deliberately no `from __future__ import annotations` — see the same note
 # in app/api/v1/admin/endpoint.py. PEP 563 breaks FastAPI body resolution
 # through slowapi's wrapper.
+import asyncio
 import logging
 import re
 import uuid
@@ -44,6 +45,7 @@ from app.core.limiter import limiter
 from app.db.client import get_db, run_db, run_db_resilient
 from app.deps.auth import require_user
 from app.services import places
+from app.storage import gcs
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
@@ -683,7 +685,14 @@ async def search_places_for_partner(
 
 # ── media upload ─────────────────────────────────────────────────────────────
 
+# Legacy Supabase Storage bucket. Still read from (objects written before the
+# move are served by the website's /image proxy), no longer written to.
 BUCKET = "marketplace-media"
+
+# Everything new goes to GCS under this prefix, which is also how the website's
+# /image/:id route knows which store an object lives in without a lookup table.
+GCS_PREFIX = "marketplace/"
+
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 UPLOAD_EXT = {
     "image/jpeg": "jpg",
@@ -691,6 +700,8 @@ UPLOAD_EXT = {
     "image/webp": "webp",
     "image/avif": "avif",
 }
+# uuid-named and never rewritten in place, so it is safe to cache forever.
+UPLOAD_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 
 @router.post("/upload", response_model=UploadResponse, status_code=201)
@@ -707,7 +718,15 @@ async def upload_media(
     Server-side rather than a direct browser→Storage upload for the reason the
     partner-media incident established: Storage did not honour the project's
     ES256 JWT and fell back to `anon`, 403-ing authenticated uploads. Routing
-    through here removes that failure mode entirely.
+    through here removes that failure mode entirely — and keeps the storage
+    credential in exactly one place, which is the point of having a backend.
+
+    Writes to GCS (the bucket the trips pipeline already uses). It used to write
+    to Supabase Storage in Singapore, which put three hops and two continents
+    between a partner's phone and a stored photo; partners on Indian mobile
+    connections were losing uploads part-way. Objects written before that move
+    are still served — the website's /image proxy picks the store from the path
+    prefix — so nothing needed rewriting.
 
     The storage prefix is the caller's own partner id, derived from the JWT — a
     client cannot write into another partner's folder whatever it sends. The
@@ -729,34 +748,22 @@ async def upload_media(
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, "That image is over 5 MB. Please upload a smaller one.")
 
-    safe_folder = re.sub(r"[^a-z0-9-]", "", folder or "", flags=re.I) or "misc"
-    path = f"{prefix}/{safe_folder}/{uuid.uuid4()}.{ext}"
+    # `folder` is a label inside a path we build, never a path itself: strip
+    # anything that could add a segment or climb out of the caller's prefix.
+    safe_folder = re.sub(r"[^a-z0-9-]", "", folder or "", flags=re.I)[:32] or "misc"
+    path = f"{GCS_PREFIX}{prefix}/{safe_folder}/{uuid.uuid4()}.{ext}"
 
     try:
-        # The generic send wrapper won't retry a POST, but this one is safe to
-        # replay: the path is a fresh uuid nothing else can race for, and
-        # upsert makes a retry after a half-sent first attempt a no-op — so a
-        # stale pooled connection (bad_record_mac / ReadError) gets a fresh
-        # client instead of failing the upload.
-        await run_db_resilient(
-            lambda: get_db()
-            .storage.from_(BUCKET)
-            .upload(
-                path,
-                data,
-                {"content-type": mime, "cache-control": "31536000", "upsert": "true"},
-            ),
-            label="marketplace upload",
-            max_seconds=20.0,
+        # to_thread: the GCS client is blocking, and a 5 MB PUT would otherwise
+        # sit on the event loop for the duration.
+        public = await asyncio.to_thread(
+            gcs.upload_bytes, path, data, mime, True, UPLOAD_CACHE_CONTROL
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("[marketplace] upload failed")
         raise HTTPException(500, "Upload failed. Please try again.") from exc
 
-    public_url = await run_db(
-        lambda: get_db().storage.from_(BUCKET).get_public_url(path)
-    )
-    return UploadResponse(ok=True, url=public_url, path=path)
+    return UploadResponse(ok=True, url=public, path=path)
 
 
 # ── AI import audit ──────────────────────────────────────────────────────────

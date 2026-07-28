@@ -84,16 +84,30 @@ def generate_signed_upload_url(
 
 # ── Server-side bytes upload ──────────────────────────────────────────────────
 
-def upload_bytes(blob_path: str, data: bytes, content_type: str, make_public: bool = True) -> str:
+def upload_bytes(
+    blob_path: str,
+    data: bytes,
+    content_type: str,
+    make_public: bool = True,
+    cache_control: str | None = None,
+) -> str:
     """
     Upload raw bytes directly to GCS from the server.
     Returns the public URL of the uploaded blob.
     The bucket must allow public object reads (allUsers → Storage Object Viewer),
     or set make_public=False and use signed URLs instead.
+
+    `cache_control` is stored on the object and served on every read, so a
+    caller writing immutable, uuid-named content can have it cached for a year
+    by the proxy and the browser without a second API call.
+
+    Blocking — call it from a thread (`asyncio.to_thread`) on the async path.
     """
     client = _get_client()
     bucket = client.bucket(_bucket_name())
     blob = bucket.blob(blob_path)
+    if cache_control:
+        blob.cache_control = cache_control
     blob.upload_from_string(data, content_type=content_type)
     if make_public:
         blob.make_public()
