@@ -6,26 +6,47 @@ GET  /api/v1/metrics/providers       — combined provider health (breaker + HTT
 GET  /api/v1/metrics/dashboard        — self-contained HTML dashboard (auto-refresh).
 POST /api/v1/metrics/scrapers/reset   — clear counters (e.g. before a load test).
 
-Left unauthenticated like /health so an ops dashboard or uptime probe can read
-it; it exposes no user data.
+Admin-only, all of it.
+
+These were left open like /health on the reasoning that they expose no user
+data. They expose something else: which providers we buy inventory from, our
+concurrency ceilings, our p95s and which of our suppliers is currently failing —
+an operational map of the business, served to anyone who asks. The reset
+endpoint was worse than that; it was an unauthenticated POST that let a stranger
+wipe the counters we'd use to notice an incident.
+
+`require_admin` fails closed — with no passcode configured these answer 503
+rather than opening up. Note that means the HTML dashboard no longer opens in a
+plain browser tab; fetch it with the `X-Admin-Passcode` header (curl, or the
+admin dashboard app).
 """
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
 
 from app.core.circuit_breaker import ALL_BREAKERS
+from app.core.limiter import limiter
 from app.core.metrics import METRICS
 from app.core import generation_queue
+from app.deps.admin import AdminIdentity, require_admin
 
 router = APIRouter(prefix="/metrics", tags=["metrics"])
 
 
 @router.get("/scrapers")
-async def scraper_metrics():
+@limiter.limit("120/minute")
+async def scraper_metrics(
+    request: Request,
+    _admin: AdminIdentity = Depends(require_admin),
+):
     return METRICS.snapshot()
 
 
 @router.post("/scrapers/reset")
-async def reset_scraper_metrics():
+@limiter.limit("30/minute")
+async def reset_scraper_metrics(
+    request: Request,
+    _admin: AdminIdentity = Depends(require_admin),
+):
     METRICS.reset()
     return {"status": "reset"}
 
@@ -62,7 +83,11 @@ def _providers_view() -> dict:
 
 
 @router.get("/providers")
-async def provider_health():
+@limiter.limit("120/minute")
+async def provider_health(
+    request: Request,
+    _admin: AdminIdentity = Depends(require_admin),
+):
     return {
         "generation_queue": generation_queue.stats(),
         "providers": _providers_view(),
@@ -84,7 +109,11 @@ _ROW = """<tr class="{cls}">
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
-async def provider_dashboard():
+@limiter.limit("120/minute")
+async def provider_dashboard(
+    request: Request,
+    _admin: AdminIdentity = Depends(require_admin),
+):
     q = generation_queue.stats()
     rows = []
     for name, p in sorted(_providers_view().items()):

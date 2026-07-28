@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 
 import pytest
 
@@ -102,6 +103,19 @@ class TestPaymentSignature:
         # A missing secret must never mean "accept everything".
         sig = sign("order_1|pay_1")
         assert razorpay.verify_payment_signature("order_1", "pay_1", sig) is False
+
+    def test_a_forged_signature_is_not_logged_as_an_error(self, with_secrets, caplog):
+        # The endpoint is unauthenticated, so anyone can force this branch.
+        # Logging it at ERROR turns a stray curl into a Sentry issue.
+        with caplog.at_level(logging.DEBUG, logger="app.services.razorpay"):
+            razorpay.verify_payment_signature("order_1", "pay_1", "deadbeef")
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+    def test_a_missing_secret_is_logged_as_an_error(self, without_secrets, caplog):
+        # This one *is* our fault and breaks every genuine payment.
+        with caplog.at_level(logging.DEBUG, logger="app.services.razorpay"):
+            razorpay.verify_payment_signature("order_1", "pay_1", sign("order_1|pay_1"))
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
 # ── webhook signature ────────────────────────────────────────────────────────

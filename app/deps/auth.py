@@ -133,6 +133,26 @@ def _cache_get(token: str):
     return user
 
 
+def verified_sub(token: str) -> str | None:
+    """
+    The user id for a token this process has ALREADY verified, else None.
+
+    Read-only and allocation-free: it never verifies, never touches the network,
+    and a token that was merely presented — not checked — is not in the cache
+    and so answers None.
+
+    That distinction is the point. The rate limiter used to read `sub` straight
+    out of an unverified JWT, which meant anyone could mint a token with a
+    random `sub` per request and get a fresh bucket every time — the limit that
+    is supposed to make ref enumeration impractical could be stepped around
+    with two lines of script. Dependencies resolve before the limiter runs, so
+    on an authenticated endpoint the token is in this cache by then and the
+    per-user bucket still works; everywhere else the limiter falls back to IP.
+    """
+    user = _cache_get(token)
+    return str(user.id) if user is not None else None
+
+
 def _cache_put(token: str, user) -> None:
     if len(_token_cache) >= _TOKEN_CACHE_MAX:
         _token_cache.clear()

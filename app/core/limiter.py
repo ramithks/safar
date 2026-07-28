@@ -1,33 +1,37 @@
 """
 Rate limiter.
 
-Keying: authenticated requests are keyed by the JWT `sub` (user id) so limits
-are per-user; unauthenticated requests fall back to client IP. Behind Traefik
-the IP only works because uvicorn runs with --proxy-headers (see Dockerfile) —
-without it every request would share the proxy's IP and one bucket.
+Keying: requests carrying a token this process has already VERIFIED are keyed
+by the JWT `sub` (user id) so limits are per-user; everything else falls back to
+client IP. Behind Traefik the IP only works because uvicorn runs with
+--proxy-headers (see Dockerfile) — without it every request would share the
+proxy's IP and one bucket.
+
+The "already verified" part is load-bearing. This used to decode `sub` without
+checking the signature, on the reasoning that forging a sub only moves you to a
+different bucket — which is exactly the problem: a script rotating `sub` per
+request got a fresh, empty bucket every time, so no endpoint was really limited.
+Anything that leans on the rate limit for its security (the booking-ref lookup
+leans on it entirely) had no floor under it.
 
 Storage: Redis, so counters survive restarts and are shared across workers.
 """
-import jwt
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from app.config import settings
+from app.deps.auth import verified_sub
 
 
 def _user_or_ip(request) -> str:
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
-        try:
-            # Signature is NOT verified here — that's require_user's job.
-            # For rate-limit bucketing an unverified sub is fine: forging a
-            # different sub only ever puts the attacker in a different bucket.
-            payload = jwt.decode(auth[len("Bearer "):], options={"verify_signature": False})
-            sub = payload.get("sub")
-            if sub:
-                return f"user:{sub}"
-        except jwt.InvalidTokenError:
-            pass
+        # Only a token whose signature this process has already checked earns a
+        # per-user bucket. An unverified one is indistinguishable from a forged
+        # one, and a forged one must not be able to escape the IP bucket.
+        sub = verified_sub(auth[len("Bearer "):])
+        if sub:
+            return f"user:{sub}"
     return get_remote_address(request)
 
 

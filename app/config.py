@@ -106,6 +106,12 @@ class Settings(BaseSettings):
 
     # App
     app_env: str = "development"
+    # Serve /docs, /redoc and /openapi.json. Off unless explicitly switched on:
+    # the schema is a complete map of every route, parameter and model we have,
+    # and it was being served to the public internet. Deliberately its own flag
+    # rather than `app_env != "production"` — prod is currently deployed with
+    # APP_ENV unset, so an env-name check would have left it exposed.
+    expose_api_docs: bool = False
     log_level: str = "INFO"
     temp_dir: str = "/tmp/travbuddy"
 

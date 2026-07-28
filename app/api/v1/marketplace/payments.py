@@ -629,7 +629,11 @@ async def verify_checkout(request: Request, body: VerifyRequest) -> VerifyRespon
     if not razorpay.verify_payment_signature(
         body.razorpay_order_id, body.razorpay_payment_id, body.razorpay_signature
     ):
-        logger.error("[verify] signature mismatch for order %s", body.razorpay_order_id)
+        # Warning, not error: this endpoint is unauthenticated, so a rejected
+        # signature is the guard doing its job, not a fault. At error level any
+        # curl with a made-up signature becomes a Sentry issue. A *missing*
+        # secret is logged as an error inside razorpay.verify_payment_signature.
+        logger.warning("[verify] signature mismatch for order %s", body.razorpay_order_id)
         raise HTTPException(400, "Payment could not be verified.")
 
     result = await finalise_booking(body.razorpay_order_id, body.razorpay_payment_id)
@@ -671,6 +675,22 @@ async def verify_checkout(request: Request, body: VerifyRequest) -> VerifyRespon
     )
 
 
+def _mask_name(name: str | None) -> str | None:
+    """
+    "Rishi Arora" → "Rishi A." — enough for the payer to recognise their own
+    booking, not enough to be worth harvesting.
+
+    Single-word names are returned whole: there is no surname to drop, and
+    truncating a first name helps nobody.
+    """
+    parts = (name or "").strip().split()
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return f"{parts[0]} {parts[-1][0].upper()}."
+
+
 @router.get("/bookings/{ref}", response_model=PublicBooking)
 @limiter.limit("120/hour")
 async def get_booking_by_ref(request: Request, ref: str) -> PublicBooking:
@@ -678,10 +698,17 @@ async def get_booking_by_ref(request: Request, ref: str) -> PublicBooking:
     Public-safe booking view for the confirmation page.
 
     Unauthenticated on purpose: a traveller who paid without an account has only
-    the reference, and that is the credential. The response model is the control
-    — it exposes no payment ids, commission or payout, so a guessed ref leaks
-    nothing beyond what the payer already knows. Refs are 6 chars from a
-    32-symbol alphabet, and the rate limit is what makes enumeration impractical.
+    the reference, and that is the credential. So the honest question is not
+    "who can call this" but "what does a *guessed* ref hand over" — refs are 6
+    chars from a 32-symbol alphabet, and at scale someone will eventually hit a
+    live one.
+
+    Two things narrow that. The response model carries no payment ids, no
+    commission, no payout, no partner id and no contact details; and the name is
+    masked to "Rishi A." on the way out, so a hit yields a trip, a date and an
+    amount rather than an identifiable person. The rate limit is the other half,
+    and it only became real once the limiter stopped bucketing on an unverified
+    JWT `sub` — see app/core/limiter.py.
     """
     res = await run_db(
         lambda: get_db()
@@ -690,7 +717,7 @@ async def get_booking_by_ref(request: Request, ref: str) -> PublicBooking:
             "ref, item_type, item_title, item_slug, travel_date, travellers, "
             "total_paise, balance_paise, "
             "check_in, check_out, nights, gross_paise, discount_paise, "
-            "amount_paise, status, lead_name, created_at, partner_id"
+            "amount_paise, status, lead_name, created_at"
         )
         .eq("ref", ref)
         .maybe_single()
@@ -699,6 +726,7 @@ async def get_booking_by_ref(request: Request, ref: str) -> PublicBooking:
     row = res.data if res else None
     if not row:
         raise HTTPException(404, "Booking not found.")
+    row["lead_name"] = _mask_name(row.get("lead_name"))
     return PublicBooking(**row)
 
 
@@ -934,7 +962,7 @@ async def verify_subscription(
     if not razorpay.verify_subscription_signature(
         body.razorpay_subscription_id, body.razorpay_payment_id, body.razorpay_signature
     ):
-        logger.error(
+        logger.warning(
             "[subscribe] signature mismatch for subscription %s", body.razorpay_subscription_id
         )
         raise HTTPException(400, "Payment could not be verified.")
@@ -1109,7 +1137,8 @@ async def razorpay_webhook(
     # and the HMAC will never match.
     raw = await request.body()
     if not razorpay.verify_webhook_signature(raw, x_razorpay_signature):
-        logger.error("[webhook] bad signature")
+        # Anyone can POST here; an unsigned body is expected background noise.
+        logger.warning("[webhook] bad signature")
         raise HTTPException(400, "Bad signature.")
 
     try:

@@ -68,8 +68,12 @@ app = FastAPI(
     description="Extract location timelines from Instagram Reels",
     version="1.0.0",
     lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    # Off by default — see settings.expose_api_docs. Passing None to all three
+    # is what actually unregisters the routes; leaving openapi_url set would
+    # keep the schema fetchable even with the UIs disabled.
+    docs_url="/docs" if settings.expose_api_docs else None,
+    redoc_url="/redoc" if settings.expose_api_docs else None,
+    openapi_url="/openapi.json" if settings.expose_api_docs else None,
 )
 
 app.state.limiter = limiter

@@ -178,7 +178,15 @@ class PublicBooking(BaseModel):
     The confirmation page's view of a booking.
 
     Deliberately narrow: no payment ids, no commission, no payout. The `ref` is
-    the only credential a traveller has, so this is what a `ref` may reveal.
+    the only credential a traveller has, so this is what a `ref` may reveal —
+    and therefore also what a *guessed* ref reveals, which is the lens to judge
+    every field here by.
+
+    `lead_name` is masked to a first name and an initial for that reason. The
+    payer needs to recognise their own booking, which "Rishi A." does; nobody
+    needs the full legal name of whoever a guessed ref belongs to. Phone and
+    email were never here and must not be added — a ref is a weak credential and
+    this response is sized to match it.
     """
 
     ref: str
@@ -200,9 +208,9 @@ class PublicBooking(BaseModel):
     amount_paise: int | None = None
     balance_paise: int | None = None
     status: str | None = None
+    # Masked — see the class docstring.
     lead_name: str | None = None
     created_at: str | None = None
-    partner_id: str | None = None
 
 
 class UploadResponse(BaseModel):

@@ -86,7 +86,12 @@ def verify_payment_signature(order_id: str, payment_id: str, signature: str) -> 
     the secret must equal the signature Razorpay handed the browser.
     """
     secret = settings.razorpay_key_secret
-    if not secret or not order_id or not payment_id or not signature:
+    if not secret:
+        # Our fault, not the caller's, and it fails *every* genuine payment —
+        # this is the one branch here worth an alert.
+        logger.error("[razorpay] key secret missing — no payment can be verified")
+        return False
+    if not order_id or not payment_id or not signature:
         return False
 
     expected = hmac.new(
@@ -291,7 +296,10 @@ def verify_subscription_signature(
     like "Razorpay is broken".
     """
     secret = settings.razorpay_key_secret
-    if not secret or not subscription_id or not payment_id or not signature:
+    if not secret:
+        logger.error("[razorpay] key secret missing — no mandate can be verified")
+        return False
+    if not subscription_id or not payment_id or not signature:
         return False
 
     expected = hmac.new(
