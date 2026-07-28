@@ -39,6 +39,47 @@ class PartnerActionRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 
+class PartnerLoginLinkRequest(BaseModel):
+    """
+    Ask for a one-time sign-in link into a partner's own dashboard.
+
+    `reason` is required, not polite: this is the one admin action that lets a
+    human act *as* someone else, and the audit row is the only thing that
+    distinguishes "onboarding help they asked for" from an account takeover.
+    """
+
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class PartnerInviteRequest(BaseModel):
+    """Open a dashboard for a business that has no TravBuddy account yet."""
+
+    # Shape check only — pydantic's EmailStr would pull in email-validator, and
+    # GoTrue is the real judge of whether an address is usable anyway.
+    email: str = Field(min_length=5, max_length=200, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class PartnerLoginLink(BaseModel):
+    # Null when the account exists (or was just created) but hasn't started a
+    # partner profile — the link then lands on /partner/start instead.
+    partner_id: str | None = None
+    brand: str | None = None
+    # The auth account the link signs into — shown in the dashboard so the
+    # operator can see whose session they're about to open.
+    email: str
+    # Single-use, short-lived. Exchanged by the website at /auth/confirm.
+    token_hash: str
+    # The OTP type the website must pass to verifyOtp: "magiclink", or "invite"
+    # for an account this call just created.
+    type: str
+    # Where to land once the session is live.
+    next: str
+    url: str
+    # True when this call created the auth account.
+    created_account: bool = False
+
+
 class SettlePayoutRequest(BaseModel):
     partner_id: str
     booking_ids: list[str] = Field(min_length=1, max_length=500)

@@ -22,12 +22,14 @@ reviewing.
 # QUERY parameter instead of parsing the JSON body.
 import logging
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.api.v1.admin.schemas import (
-    AuditEntry, DueGroup, Ok, PartnerActionRequest, QueueItem,
-    ReviewRequest, SettlePayoutRequest, UnpublishRequest,
+    AuditEntry, DueGroup, Ok, PartnerActionRequest, PartnerInviteRequest,
+    PartnerLoginLink, PartnerLoginLinkRequest, QueueItem, ReviewRequest,
+    SettlePayoutRequest, UnpublishRequest,
 )
 from app.core.limiter import limiter
 from app.db.client import get_db, run_db
@@ -50,6 +52,14 @@ PUBLIC_PATH = {"experience": "experiences", "group_trip": "trips"}
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _confirm_url(token_hash: str, otp_type: str, next_path: str) -> str:
+    """The website route that trades a one-time token for a session."""
+    return (
+        f"{SITE}/auth/confirm?token_hash={quote(token_hash, safe='')}"
+        f"&type={quote(otp_type, safe='')}&next={quote(next_path, safe='')}"
+    )
 
 
 async def _fetch(kind: str, item_id: str) -> dict:
@@ -311,6 +321,182 @@ async def partner_action(
         "actor": admin.actor, "partner_id": body.id, "entity_label": brand, "patch": patch,
     })
     return Ok(message=message)
+
+
+@router.post("/partners/{partner_id}/login-link", response_model=PartnerLoginLink)
+@limiter.limit("10/hour")
+async def partner_login_link(
+    request: Request,
+    partner_id: str,
+    body: PartnerLoginLinkRequest,
+    admin: AdminIdentity = Depends(require_admin),
+) -> PartnerLoginLink:
+    """
+    Mint a one-time sign-in link into a partner's OWN dashboard.
+
+    Why this exists: onboarding a partner means writing their listings the way
+    they'd write them — with the AI importer, the photo uploader and the plan
+    rules that only exist on the partner side. Rebuilding all of that behind the
+    admin passcode would be a second, worse copy of a product that already works.
+
+    What it really is: an account-takeover primitive, so it is treated like one.
+    A reason is mandatory, the link is single-use and short-lived, only partners
+    with an actual account can be targeted, and every issue lands in the audit
+    trail with the operator's name and IP. Anything done after the link is
+    redeemed is recorded as the PARTNER, not as us — that's the honest cost of
+    reusing their dashboard, and the audit row here is the only bridge back.
+    """
+    res = await run_db(
+        lambda: get_db().table("partners")
+        .select("id, brand_name, owner_id, status")
+        .eq("id", partner_id).maybe_single().execute()
+    )
+    if not res or not res.data:
+        raise HTTPException(404, "Partner not found.")
+    partner = res.data
+    brand = partner.get("brand_name")
+
+    owner_id = partner.get("owner_id")
+    if not owner_id:
+        raise HTTPException(409, "That partner has no account yet — there's nothing to sign in to.")
+
+    try:
+        account = await run_db(lambda: get_db().auth.admin.get_user_by_id(owner_id))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[admin] could not load partner account: %s", exc)
+        raise HTTPException(502, "Could not read that partner's account.") from exc
+
+    email = getattr(getattr(account, "user", None), "email", None)
+    if not email:
+        raise HTTPException(
+            409,
+            "That partner signed up without an email address, so there's no magic link to mint.",
+        )
+
+    try:
+        link = await run_db(
+            lambda: get_db().auth.admin.generate_link({
+                "type": "magiclink",
+                "email": email,
+                # Unused by our flow — the website redeems `hashed_token` at
+                # /auth/confirm — but GoTrue stamps it onto the link it builds.
+                "options": {"redirect_to": f"{SITE}/auth/confirm"},
+            })
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[admin] generate_link failed: %s", exc)
+        raise HTTPException(502, "Could not mint a sign-in link for that partner.") from exc
+
+    token_hash = link.properties.hashed_token
+
+    # The token itself never touches the audit row — the row says a link was
+    # issued and why, not how to use it.
+    await admin_audit.record(
+        actor=admin.actor, action="partner.login_link_issued",
+        entity_type="partner", entity_id=partner_id, entity_label=brand,
+        reason=body.reason, ip=admin.ip, metadata={"email": email},
+    )
+    await emit("partner.login_link_issued", {
+        "actor": admin.actor, "partner_id": partner_id, "entity_label": brand, "email": email,
+    })
+
+    return PartnerLoginLink(
+        partner_id=partner_id,
+        brand=brand,
+        email=email,
+        token_hash=token_hash,
+        type="magiclink",
+        next="/partner/dashboard",
+        url=_confirm_url(token_hash, "magiclink", "/partner/dashboard"),
+    )
+
+
+@router.post("/partners/invite", response_model=PartnerLoginLink)
+@limiter.limit("10/hour")
+async def partner_invite(
+    request: Request,
+    body: PartnerInviteRequest,
+    admin: AdminIdentity = Depends(require_admin),
+) -> PartnerLoginLink:
+    """
+    Open a dashboard for a business that hasn't signed up yet.
+
+    A partner row can only be created by the account that owns it, so onboarding
+    someone who has never touched the site needs an account first. This creates
+    one for their email (no mail is sent — `generate_link` only mints) and hands
+    back a link that lands on /partner/start, where their brand details can be
+    filled in. If the email already has an account we fall back to a plain
+    sign-in link rather than refusing.
+    """
+    email = str(body.email).strip().lower()
+
+    created = True
+    try:
+        link = await run_db(
+            lambda: get_db().auth.admin.generate_link({
+                "type": "invite",
+                "email": email,
+                "options": {"redirect_to": f"{SITE}/auth/confirm"},
+            })
+        )
+        otp_type = "invite"
+    except Exception as invite_exc:  # noqa: BLE001
+        # Overwhelmingly "email address already exists" — the useful case, not a
+        # failure. A genuine outage surfaces on the retry below.
+        logger.info("[admin] invite for %s fell back to magiclink: %s", email, invite_exc)
+        created = False
+        try:
+            link = await run_db(
+                lambda: get_db().auth.admin.generate_link({
+                    "type": "magiclink",
+                    "email": email,
+                    "options": {"redirect_to": f"{SITE}/auth/confirm"},
+                })
+            )
+            otp_type = "magiclink"
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[admin] generate_link failed for %s: %s", email, exc)
+            raise HTTPException(502, "Could not mint a sign-in link for that email.") from exc
+
+    user_id = getattr(getattr(link, "user", None), "id", None)
+
+    # They may already have a partner profile — send them to the dashboard if so,
+    # and to /partner/start if not.
+    partner_id: str | None = None
+    brand: str | None = None
+    if user_id:
+        res = await run_db(
+            lambda: get_db().table("partners").select("id, brand_name")
+            .eq("owner_id", user_id).maybe_single().execute()
+        )
+        if res and res.data:
+            partner_id = res.data.get("id")
+            brand = res.data.get("brand_name")
+
+    next_path = "/partner/dashboard" if partner_id else "/partner/start"
+    token_hash = link.properties.hashed_token
+
+    await admin_audit.record(
+        actor=admin.actor, action="partner.login_link_issued",
+        entity_type="partner", entity_id=partner_id, entity_label=brand or email,
+        reason=body.reason, ip=admin.ip,
+        metadata={"email": email, "created_account": created},
+    )
+    await emit("partner.login_link_issued", {
+        "actor": admin.actor, "partner_id": partner_id, "entity_label": brand or email,
+        "email": email, "created_account": created,
+    })
+
+    return PartnerLoginLink(
+        partner_id=partner_id,
+        brand=brand,
+        email=email,
+        token_hash=token_hash,
+        type=otp_type,
+        next=next_path,
+        url=_confirm_url(token_hash, otp_type, next_path),
+        created_account=created,
+    )
 
 
 # ── payouts ─────────────────────────────────────────────────────────────────
