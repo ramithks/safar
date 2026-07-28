@@ -28,8 +28,13 @@ from app.api.v1.admin.catalog_schemas import (
     CouponCreate,
     CouponUpdate,
     ListingPatch,
+    ListingPublishRequest,
+    ListingPublishResult,
 )
 from app.api.v1.admin.schemas import Ok
+# The publish gates live with the partner API and are imported, not restated:
+# an admin publishing for a partner must clear the same checklist they would.
+from app.api.v1.marketplace.partner_ops import _has_active_stay_plan, _listing_gaps
 from app.core.limiter import limiter
 from app.db.client import get_db, run_db
 from app.deps.admin import AdminIdentity, require_admin
@@ -208,6 +213,138 @@ async def patch_listing(
         },
     )
     return await _load_listing(listing_id)
+
+
+@router.post("/listings/{listing_id}/publish", response_model=ListingPublishResult)
+@limiter.limit("60/minute")
+async def publish_listing(
+    request: Request,
+    listing_id: str,
+    body: ListingPublishRequest,
+    admin: AdminIdentity = Depends(require_admin),
+) -> ListingPublishResult:
+    """
+    Put any partner's listing live, or take it back down.
+
+    `/review` could only act on something already sitting in the queue at
+    'pending'. A listing an admin built themselves — onboarding a partner who
+    sent their details over WhatsApp — never passes through that state, so it
+    could be written and never published. This is that missing verb.
+
+    The two gates are imported from the partner API rather than restated:
+    an admin publishing on someone's behalf must clear exactly the checklist
+    the partner would have, or the dashboard becomes a way to put half-finished
+    pages on the marketplace. The plan gate is overridable (`ignore_plan`) —
+    it's a commercial rule, not a quality one, and comping a listing while an
+    invoice is sorted out is a legitimate call.
+    """
+    row = await run_db(
+        lambda: get_db()
+        .table("partner_listings")
+        .select("*")
+        .eq("id", listing_id)
+        .maybe_single()
+        .execute()
+    )
+    if not row or not row.data:
+        raise HTTPException(404, "Listing not found.")
+    listing = row.data
+    title = listing.get("title")
+    kind = listing.get("kind") or "experience"
+    public_url = f"{SITE}/{PUBLIC_PATH.get(kind, 'experiences')}/{listing.get('slug') or ''}"
+
+    if not body.live:
+        try:
+            await run_db(
+                lambda: get_db().table("partner_listings")
+                .update({"status": "draft", "updated_at": _now()})
+                .eq("id", listing_id).execute()
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[admin] unpublish failed")
+            raise HTTPException(502, "Could not unpublish that listing.") from exc
+
+        await admin_audit.record(
+            actor=admin.actor, action="listing.unpublished",
+            entity_type="listing", entity_id=listing_id, entity_label=title,
+            reason=body.reason, ip=admin.ip, metadata={"kind": kind},
+        )
+        await emit("listing.unpublished", {
+            "actor": admin.actor, "entity_id": listing_id, "entity_label": title,
+            "partner_id": listing.get("partner_id"),
+        })
+        return ListingPublishResult(
+            ok=True, status="draft", message="Taken down. It's a draft again.",
+            public_url=public_url,
+        )
+
+    gaps = _listing_gaps(listing)
+    if gaps:
+        return ListingPublishResult(
+            ok=False,
+            status=listing.get("status") or "draft",
+            message="Not ready yet — a few things are still missing.",
+            gaps=gaps,
+            public_url=public_url,
+        )
+
+    partner_id = listing.get("partner_id")
+    if partner_id and not body.ignore_plan:
+        partner = await run_db(
+            lambda: get_db().table("partners")
+            .select("stay_plan_status, stay_plan_expires_at, brand_name")
+            .eq("id", partner_id).maybe_single().execute()
+        )
+        if partner and partner.data and not _has_active_stay_plan(partner.data):
+            return ListingPublishResult(
+                ok=False,
+                status=listing.get("status") or "draft",
+                message=(
+                    "This partner has no active ₹499 plan. Grant them a month first — "
+                    "the nightly expiry sweep would pull this back down otherwise."
+                ),
+                needs_plan=True,
+                public_url=public_url,
+            )
+
+    patch = {
+        "status": "published",
+        "published_at": _now(),
+        "approved_at": _now(),
+        "rejection_reason": None,
+        "updated_at": _now(),
+    }
+    try:
+        res = await run_db(
+            lambda: get_db().table("partner_listings").update(patch)
+            .eq("id", listing_id).execute()
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[admin] publish failed")
+        raise HTTPException(502, "Could not publish that listing.") from exc
+    if not res.data:
+        raise HTTPException(502, "Could not publish that listing.")
+
+    await admin_audit.record(
+        actor=admin.actor, action="listing.published",
+        entity_type="listing", entity_id=listing_id, entity_label=title,
+        reason=body.reason, ip=admin.ip,
+        metadata={"kind": kind, "slug": listing.get("slug"), "ignore_plan": body.ignore_plan},
+    )
+    # Same event the review queue emits on approve, so whatever notifies a
+    # partner that they're live keeps working when we publish for them.
+    await emit("listing.approved", {
+        "actor": admin.actor,
+        "kind": "experience",
+        "entity_id": listing_id,
+        "entity_label": title,
+        "partner_id": partner_id,
+        "public_url": public_url,
+    })
+
+    return ListingPublishResult(
+        ok=True, status="published", message="Published — it's live.", public_url=public_url,
+    )
 
 
 # ── plan coupons ────────────────────────────────────────────────────────────

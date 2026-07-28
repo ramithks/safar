@@ -3,6 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.api.v1.marketplace.partner_schemas import GapItem
+
 CouponKind = Literal["free_months", "percent", "flat"]
 
 
@@ -100,3 +102,31 @@ class CouponUpdate(BaseModel):
     campaign: str | None = Field(default=None, max_length=80)
     ends_at: str | None = None
     usage_limit: int | None = Field(default=None, ge=1, le=1_000_000)
+
+
+# ── publishing someone else's listing ───────────────────────────────────────
+
+
+class ListingPublishRequest(BaseModel):
+    """`live=False` takes it back down to a draft."""
+
+    live: bool = True
+    reason: str | None = Field(default=None, max_length=500)
+    #: Publish although the partner has no active ₹499 plan. Off by default:
+    #: the nightly expiry sweep pulls unpaid stays back down, so publishing
+    #: without one usually just produces a listing that vanishes overnight.
+    ignore_plan: bool = False
+
+
+class ListingPublishResult(BaseModel):
+    """
+    Always 200 — a refusal here is an answer the editor renders, not an error.
+    `gaps` is the same checklist the partner sees in their own dashboard.
+    """
+
+    ok: bool
+    status: str
+    message: str
+    gaps: list[GapItem] = []
+    needs_plan: bool = False
+    public_url: str | None = None
