@@ -324,7 +324,10 @@ async def partner_action(
 
 
 @router.post("/partners/{partner_id}/login-link", response_model=PartnerLoginLink)
-@limiter.limit("10/hour")
+# Keyed by IP, and the passcode is already the real gate — 10/hour turned out to
+# lock an operator out mid-onboarding, since a token spent by a link preview
+# costs a retry and everyone behind one office IP shares the bucket.
+@limiter.limit("30/hour")
 async def partner_login_link(
     request: Request,
     partner_id: str,
@@ -412,7 +415,7 @@ async def partner_login_link(
 
 
 @router.post("/partners/invite", response_model=PartnerLoginLink)
-@limiter.limit("10/hour")
+@limiter.limit("30/hour")
 async def partner_invite(
     request: Request,
     body: PartnerInviteRequest,
