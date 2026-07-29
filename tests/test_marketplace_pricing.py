@@ -357,3 +357,59 @@ class TestQuoteWithAnAdvance:
         assert q.amount_paise == 200_000
         assert q.balance_paise == 600_000
         assert q.amount_paise + q.balance_paise == q.total_paise
+
+
+# ── per-night price overrides ────────────────────────────────────────────────
+#
+# listing_availability.price_override is the finest-grained price a partner can
+# set. These cases are mirrored verbatim by "price overrides" in the website's
+# lib/marketplace/pricing.test.ts — the two engines must agree night for night,
+# or the quote a traveller sees and the amount they are charged diverge.
+
+
+class TestPriceOverrides:
+    RATES = [{"starts_on": "2026-09-01", "ends_on": "2026-09-30", "price": 5000}]
+
+    def test_no_overrides_leaves_the_season_rate_alone(self):
+        assert p.nightly_prices(3000, self.RATES, "2026-09-01", "2026-09-04") == [
+            500000,
+            500000,
+            500000,
+        ]
+
+    def test_an_override_beats_the_season_rate_for_that_night(self):
+        out = p.nightly_prices(
+            3000, self.RATES, "2026-09-01", "2026-09-04", {"2026-09-02": 9000}
+        )
+        assert out == [500000, 900000, 500000]
+
+    def test_an_override_beats_the_base_price_outside_any_season(self):
+        out = p.nightly_prices(3000, [], "2026-12-01", "2026-12-03", {"2026-12-01": 7000})
+        assert out == [700000, 300000]
+
+    def test_an_override_for_a_night_outside_the_stay_is_ignored(self):
+        out = p.nightly_prices(
+            3000, self.RATES, "2026-09-01", "2026-09-03", {"2026-09-20": 9999}
+        )
+        assert out == [500000, 500000]
+
+    def test_a_zero_override_is_not_a_free_night(self):
+        # 0 is how "no override" arrives from a nullable integer column; a
+        # partner cannot set a price of zero, so it must fall through.
+        out = p.nightly_prices(
+            3000, self.RATES, "2026-09-01", "2026-09-03", {"2026-09-01": 0}
+        )
+        assert out == [500000, 500000]
+
+    def test_quote_stay_carries_the_overrides_through(self):
+        q = p.quote_stay(
+            base_price_rupees=3000,
+            season_rates=self.RATES,
+            check_in="2026-09-01",
+            check_out="2026-09-03",
+            rooms=2,
+            commission_pct=10.0,
+            price_overrides={"2026-09-01": 8000},
+        )
+        # (8000 + 5000) * 2 rooms = 26,000
+        assert q.gross_paise == 2600000

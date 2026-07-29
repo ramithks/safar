@@ -109,7 +109,11 @@ def rate_for_day(rates: list[dict], day: str) -> Optional[dict]:
 
 
 def nightly_prices(
-    base_price_rupees: float, rates: list[dict], check_in: str, check_out: str
+    base_price_rupees: float,
+    rates: list[dict],
+    check_in: str,
+    check_out: str,
+    overrides: Optional[dict] = None,
 ) -> list[int]:
     """
     Per-night prices in paise across a stay.
@@ -117,12 +121,27 @@ def nightly_prices(
     A stay straddling a season boundary is priced night by night, not by
     whichever rate the check-in date landed in — the part naive code gets wrong,
     and the part the guest notices.
+
+    Precedence, most specific first:
+
+        listing_availability.price_override  (this one night)
+          → listing_season_rates             (this date range)
+            → the listing's base price
+
+    A per-night override wins because it is the finer instrument: a partner who
+    reprices one date during a season is correcting that season, not restating
+    it. `overrides` maps "YYYY-MM-DD" to whole rupees.
     """
     nights = nights_between(check_in, check_out)
     start = _parse_day(check_in)
+    overrides = overrides or {}
     out: list[int] = []
     for i in range(nights):
         day = (date.fromordinal(start.toordinal() + i)).isoformat()
+        override = overrides.get(day)
+        if override:
+            out.append(to_paise(override))
+            continue
         r = rate_for_day(rates, day)
         out.append(to_paise(r["price"] if r else base_price_rupees))
     return out
@@ -332,10 +351,13 @@ def quote_stay(
     coupon: Optional[dict] = None,
     deposit: Optional[dict] = None,
     now: Optional[datetime] = None,
+    price_overrides: Optional[dict] = None,
 ) -> Quote:
     """Convenience for stays: prices each night, then quotes it."""
     return quote(
-        unit_prices_paise=nightly_prices(base_price_rupees, season_rates, check_in, check_out),
+        unit_prices_paise=nightly_prices(
+            base_price_rupees, season_rates, check_in, check_out, price_overrides
+        ),
         quantity=rooms,
         commission_pct=commission_pct,
         coupon=coupon,

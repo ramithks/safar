@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from dateutil.relativedelta import relativedelta
 
 from app.db.client import get_db, run_db
+from app.services import marketplace_availability
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,10 @@ def _is_terminal(booking: dict) -> bool:
 BOOKING_COLS = (
     "id, ref, status, item_type, item_id, item_title, travellers, partner_id, "
     "razorpay_payment_id, lead_name, lead_phone, lead_email, travel_date, "
-    "amount_paise, payout_paise, coupon_id, departure_id"
+    "amount_paise, payout_paise, coupon_id, departure_id, "
+    # Stays claim per-night inventory, so finalisation needs to know which room
+    # type and how many of it, over which nights.
+    "room_type_id, rooms, check_in, check_out"
 )
 
 
@@ -109,6 +113,18 @@ async def finalise_booking(order_id: str, payment_id: str) -> dict:
             logger.exception("[bookings] claim_trip_seats failed for %s", booking["id"])
             return {"status": "sold_out", "ref": ref, "booking_id": booking["id"]}
 
+    # Stays claim rooms the same way, and for the same reason: the check at
+    # checkout time was advisory, and between it and this moment another
+    # traveller can have taken the last room. `claim` books every night in the
+    # range or none of them, and returns False when it could not — which surfaces
+    # as the same `sold_out` refund path the trips use.
+    #
+    # A booking with no room type on it predates the listing having any, so
+    # nothing is tracked and nothing is claimed.
+    if booking.get("item_type") == "hotel":
+        if not await marketplace_availability.claim(booking):
+            return {"status": "sold_out", "ref": ref, "booking_id": booking["id"]}
+
     # The guard in the WHERE clause is what makes a concurrent double-settle
     # land on exactly one winner.
     try:
@@ -155,6 +171,10 @@ async def finalise_booking(order_id: str, payment_id: str) -> dict:
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("[bookings] seat release failed for %s", booking["id"])
+        elif booking.get("item_type") == "hotel":
+            # Same reasoning as the seats above: we held rooms for a booking
+            # that then lost the settle race, so they go back.
+            await marketplace_availability.release(booking)
         return {"status": "already_paid", "ref": ref, "booking_id": booking["id"]}
 
     # Count the coupon exactly once, on the settle that won. Guarded and atomic,
@@ -231,7 +251,9 @@ async def mark_refunded_by_payment(payment_id: str, refund_paise: int | None = N
     res = await run_db(
         lambda: get_db()
         .table("bookings")
-        .select("id, amount_paise, meta")
+        .select(
+            "id, amount_paise, meta, item_type, room_type_id, rooms, check_in, check_out"
+        )
         .eq("razorpay_payment_id", payment_id)
         .maybe_single()
         .execute()
@@ -254,6 +276,13 @@ async def mark_refunded_by_payment(payment_id: str, refund_paise: int | None = N
     await run_db(
         lambda: get_db().table("bookings").update(patch).eq("id", booking["id"]).execute()
     )
+
+    # A stay refunded in full is a stay nobody is coming for: the rooms go back
+    # on sale. A partial refund leaves the booking live (see the docstring), so
+    # the rooms stay held — releasing them there would resell a room the
+    # traveller still holds.
+    if full and booking.get("item_type") == "hotel":
+        await marketplace_availability.release(booking)
 
 
 async def cancel_unpaid_order(order_id: str) -> None:

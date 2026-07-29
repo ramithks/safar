@@ -41,7 +41,12 @@ READY = {
     "price_from": 2000,
     "city": "Kundapura",
     "map_url": "https://maps.app.goo.gl/x",
-    "content": {"rooms": [{"name": "Garden room", "price": 2000, "occupancy": 2}]},
+    "address": "Anjuna Beach Road, Anjuna, Goa 403509",
+    "content": {
+        "rooms": [{"name": "Garden room", "price": 2000, "occupancy": 2, "units": 3}],
+        "checkin": "2:00 PM",
+        "checkout": "11:00 AM",
+    },
 }
 
 PAID = {
