@@ -48,6 +48,7 @@ from app.api.v1.marketplace.payment_schemas import (
 from app.core.limiter import limiter
 from app.db.client import get_db, run_db
 from app.deps.auth import optional_user, require_user
+from app.services import marketplace_availability as availability
 from app.services import marketplace_pricing as pricing
 from app.services import plan_coupons
 from app.services import razorpay
@@ -242,6 +243,37 @@ async def _season_rates(listing_id: str) -> list[dict]:
         .execute()
     )
     return res.data or [] if res else []
+
+
+async def _resolve_room_type(listing_id: str, room_type_id: str | None) -> str | None:
+    """
+    Bind a requested room type to THIS listing, or fall back to its only one.
+
+    The id arrives in the request body, so it cannot be trusted: a room type
+    belonging to another property would otherwise be written onto the booking
+    and decrement that partner's inventory when the payment settles. Anything
+    that does not belong to this listing is dropped rather than rejected —
+    booking without a room type simply claims nothing, which is the same
+    behaviour a listing that has not set up rooms already gets.
+
+    A single-room-type listing needs no choice from the traveller, so it is
+    resolved implicitly. That is what makes the whole feature work for the
+    homestays that have exactly one room and never touch the picker.
+    """
+    types = await availability.room_types(listing_id)
+    if not types:
+        return None
+    if room_type_id:
+        for t in types:
+            if t["id"] == room_type_id:
+                return t["id"]
+        logger.warning(
+            "[checkout] room type %s does not belong to listing %s",
+            room_type_id,
+            listing_id,
+        )
+        return None
+    return types[0]["id"] if len(types) == 1 else None
 
 
 def _last10(phone: str | None) -> str:
@@ -445,8 +477,20 @@ async def quote_price(request: Request, body: QuoteRequest) -> QuoteResponse:
     except PricingError as e:
         return QuoteResponse(ok=False, error=e.detail)
 
+    # Advisory only, and read after pricing so a failure here costs the
+    # traveller a greyed-out date rather than the whole quote. The authoritative
+    # guard is claim_stay_nights at finalise time.
+    stock: dict = {}
+    if body.item_type == "hotel":
+        stock = await availability.check_stay(
+            listing["id"], body.check_in, body.check_out, body.rooms, body.room_type_id
+        )
+
     return QuoteResponse(
         ok=True,
+        sold_out_nights=stock.get("sold_out_nights") or [],
+        units_left=stock.get("units_left"),
+        min_nights=stock.get("min_nights"),
         gross_paise=q.gross_paise,
         discount_paise=q.discount_paise,
         total_paise=q.total_paise,
@@ -513,6 +557,26 @@ async def checkout(
     if seats_left is not None and seats_left < body.travellers:
         raise HTTPException(409, f"Only {max(0, seats_left)} seats left.")
 
+    # Stays check stock before we take money, for the same reason trips check
+    # seats. It cannot be authoritative — another traveller can take the last
+    # room between here and the payment landing, which finalise_booking handles
+    # by refunding — but refusing an order we can already see is doomed beats
+    # charging for it and refunding a minute later.
+    room_type_id = None
+    if body.item_type == "hotel":
+        room_type_id = await _resolve_room_type(listing["id"], body.room_type_id)
+        stock = await availability.check_stay(
+            listing["id"], body.check_in, body.check_out, body.rooms, room_type_id
+        )
+        if stock.get("min_nights"):
+            raise HTTPException(
+                409, f"This property needs a minimum stay of {stock['min_nights']} nights."
+            )
+        if not stock["ok"]:
+            nights = stock.get("sold_out_nights") or []
+            shown = ", ".join(nights[:3]) + ("…" if len(nights) > 3 else "")
+            raise HTTPException(409, f"Not available on {shown}. Please pick other dates.")
+
     if body.item_type == "hotel":
         body._season_rates = await _season_rates(listing["id"])
     coupon = await _resolve_coupon(
@@ -567,6 +631,11 @@ async def checkout(
         booking_row["check_in"] = body.check_in
         booking_row["check_out"] = body.check_out
         booking_row["nights"] = meta.get("nights")
+        booking_row["rooms"] = body.rooms
+        # Resolved against the listing above, never taken from the body as-is:
+        # a room type id belonging to someone else's property would otherwise
+        # decrement their inventory.
+        booking_row["room_type_id"] = room_type_id
 
     insert = await run_db(
         lambda: get_db().table("bookings").insert(booking_row).execute()

@@ -24,8 +24,16 @@ def _stay(**over):
         "description": "x" * 200,
         "price_from": 2400,
         "city": "Manali",
+        # Address, room capacity and the check-in/out times joined the bar when
+        # rooms became real inventory — a room with no count can only ever sell
+        # one, and the times print on the guest's confirmation.
+        "address": "Solang Road, Manali, Himachal Pradesh 175131",
         "map_url": "https://maps.app.goo.gl/abc",
-        "content": {"rooms": [{"name": "Deluxe"}]},
+        "content": {
+            "rooms": [{"name": "Deluxe", "units": 4}],
+            "checkin": "2:00 PM",
+            "checkout": "11:00 AM",
+        },
     }
     base.update(over)
     return base

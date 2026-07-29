@@ -51,7 +51,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 
 MIN_PHOTOS = 3
-MIN_DESCRIPTION_CHARS = 120
+# A stay or experience needs a sentence, not an essay — 120 read as "write
+# three paragraphs" and was the gate partners stalled on longest. Trips keep
+# the higher bar: a traveller pays upfront for a fixed departure and has
+# nothing else to go on. Mirrors PUBLISH_RULES in the website's
+# lib/marketplace/publish-rules.ts; the two must agree or the editor shows
+# ready and this refuses.
+MIN_DESCRIPTION_CHARS = 40
+MIN_TRIP_DESCRIPTION_CHARS = 120
 MIN_PRICE = 100
 
 # Mirrors KIND_RULES in the website's lib/marketplace/types.ts.
@@ -156,20 +163,38 @@ def _listing_gaps(listing: dict) -> list[GapItem]:
         gaps.append(GapItem(field="photos", label=f"Add at least {MIN_PHOTOS} photos"))
     if len((listing.get("description") or "").strip()) < MIN_DESCRIPTION_CHARS:
         gaps.append(
-            GapItem(field="description", label="Write a description (a couple of sentences)")
+            GapItem(field="description", label="Write a line or two about the place")
         )
     if not listing.get("price_from") or listing["price_from"] < MIN_PRICE:
         gaps.append(GapItem(field="price_from", label="Set a starting price"))
     if not listing.get("city") and not listing.get("destination"):
         gaps.append(GapItem(field="city", label="Add the location"))
+    # The map pin is where to go; the address is what a guest reads out to a
+    # driver, and what shows on their confirmation. Neither substitutes.
+    if len((listing.get("address") or "").strip()) < 6:
+        gaps.append(GapItem(field="address", label="Add the street address"))
     # A traveller who can't find the place can't get to it, and "near the bus
     # stand" is not an address. Mirrors publishGaps in the website's
     # lib/marketplace/publish-rules.ts.
     if not listing.get("map_url"):
         gaps.append(GapItem(field="map_url", label="Add a Google Maps link"))
 
-    if listing.get("kind") == "hotel" and not (content.get("rooms") or []):
-        gaps.append(GapItem(field="content.rooms", label="Add at least one room type"))
+    if listing.get("kind") == "hotel":
+        rooms = [r for r in (content.get("rooms") or []) if (r or {}).get("name", "").strip()]
+        if not rooms:
+            gaps.append(GapItem(field="content.rooms", label="Add at least one room type"))
+        elif any((r.get("units") or 0) < 1 for r in rooms):
+            # Capacity is entered on the listing and nowhere else, so a room
+            # without it cannot be counted against — it would sell one and stop.
+            gaps.append(
+                GapItem(field="content.rooms", label="Say how many of each room you have")
+            )
+        # Check-in and check-out drive the confirmation email and the guest's
+        # travel planning; "ask us" is not an answer at 11pm.
+        if not (content.get("checkin") or "").strip() or not (content.get("checkout") or "").strip():
+            gaps.append(
+                GapItem(field="content.checkin", label="Set your check-in and check-out times")
+            )
     # No duration_hours gate for experiences: the field was removed from the
     # editor because it varies per booking and partners were guessing at it.
 
@@ -202,7 +227,7 @@ def _trip_gaps(trip: dict) -> list[GapItem]:
                 label="Add a pickup point with a Google Maps link",
             )
         )
-    if len((trip.get("description") or "").strip()) < MIN_DESCRIPTION_CHARS:
+    if len((trip.get("description") or "").strip()) < MIN_TRIP_DESCRIPTION_CHARS:
         gaps.append(
             GapItem(field="description", label="Write a description (a couple of sentences)")
         )

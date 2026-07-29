@@ -23,6 +23,10 @@ class CheckoutRequest(BaseModel):
     check_in: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     check_out: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     rooms: int = Field(default=1, ge=1, le=20)
+    # Which room type the nights come off. Optional: a listing that has not set
+    # up room types tracks no inventory, and the booking simply claims nothing.
+    # Validated against the listing before it reaches the booking row.
+    room_type_id: str | None = Field(default=None, max_length=64)
     adults: int = Field(default=1, ge=1, le=40)
     children: int = Field(default=0, ge=0, le=40)
 
@@ -47,6 +51,7 @@ class QuoteRequest(BaseModel):
     check_in: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     check_out: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     rooms: int = Field(default=1, ge=1, le=20)
+    room_type_id: str | None = Field(default=None, max_length=64)
     coupon_code: str | None = Field(default=None, max_length=40)
     # Only ever used to check a phone-targeted coupon. Never stored by /quote.
     phone: str | None = Field(default=None, max_length=20)
@@ -67,6 +72,14 @@ class QuoteResponse(BaseModel):
     currency: str = "INR"
     coupon_applied: bool = False
     coupon_message: str | None = None
+    #: Nights in the requested range that cannot take the requested rooms.
+    #: Empty for a listing that tracks no inventory — see
+    #: app/services/marketplace_availability.py.
+    sold_out_nights: list[str] = Field(default_factory=list)
+    #: Fewest rooms free on any night of the range, or None when untracked.
+    units_left: int | None = None
+    #: The min-stay the requested range breaks, when it breaks one.
+    min_nights: int | None = None
     error: str | None = None
 
 
