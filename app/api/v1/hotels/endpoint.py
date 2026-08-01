@@ -72,16 +72,30 @@ def list_hotels(
     try:
         db = get_db()
         q = (
-            db.table("hotels").select(_LIST_COLUMNS)
+            db.table("hotels").select(_LIST_COLUMNS, count="exact")
             .not_.is_("slug", "null")
         )
         if city:
             q = q.ilike("city", city)
         if destination:
             q = q.ilike("destination", destination)
-        q = q.order("review_score", desc=True).range(offset, offset + limit - 1)
-        rows = [_flatten(r) for r in (q.execute().data or [])]
-        return {"count": len(rows), "hotels": rows}
+        # `id` is the tiebreaker that makes pagination STABLE. review_score is
+        # null for most of the catalog and heavily tied where it isn't, and
+        # Postgres gives no defined order within a tie — so ordering on it
+        # alone let the same offset return different rows on every call.
+        # Sitemap shards then overlapped ~44% and silently dropped thousands of
+        # hotels. Never remove this second key. nullslast keeps rated hotels on
+        # the early pages, where crawlers spend their budget.
+        q = (
+            q.order("review_score", desc=True, nullsfirst=False)
+            .order("id")
+            .range(offset, offset + limit - 1)
+        )
+        res = q.execute()
+        rows = [_flatten(r) for r in (res.data or [])]
+        # `total` is the full filtered catalog size; `count` stays page-length
+        # for backwards compatibility with existing callers.
+        return {"count": len(rows), "total": res.count, "hotels": rows}
     except Exception as exc:  # noqa: BLE001
         logger.exception("[hotels] list failed: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to load hotels")
