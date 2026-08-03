@@ -16,7 +16,7 @@ partner-facing mail (the backend's Resend usage is admin-only), so this returns
 the booking on the transition to `paid` and the caller sends exactly once.
 """
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from dateutil.relativedelta import relativedelta
 
@@ -314,6 +314,10 @@ async def cancel_unpaid_order(order_id: str) -> None:
 
 SUBSCRIPTION_SETTLED = {"paid", "refunded"}
 
+#: How much plan time one billing cycle buys. The plan is billed yearly
+#: (founding-partner pricing, 2026-08-03), so a cycle is twelve months.
+PLAN_PERIOD_MONTHS = 12
+
 
 async def activate_stay_plan_for_payment(order_id: str, payment_id: str) -> bool:
     """
@@ -339,7 +343,7 @@ async def activate_stay_plan_for_payment(order_id: str, payment_id: str) -> bool
         return True  # already handled
 
     now = datetime.now(timezone.utc)
-    period_end = (now + timedelta(days=31)).date()
+    period_end = (now + relativedelta(months=PLAN_PERIOD_MONTHS)).date()
 
     try:
         await run_db(
@@ -361,13 +365,16 @@ async def activate_stay_plan_for_payment(order_id: str, payment_id: str) -> bool
         logger.exception("[subscription] payment update failed")
         return True  # genuine subscription order; don't fall through to bookings
 
-    await activate_stay_plan(payment["partner_id"], months=1)
+    await activate_stay_plan(payment["partner_id"], months=PLAN_PERIOD_MONTHS)
     return True
 
 
-async def activate_stay_plan(partner_id: str, months: int = 1) -> bool:
+async def activate_stay_plan(partner_id: str, months: int = PLAN_PERIOD_MONTHS) -> bool:
     """
     Activate (or extend) the ₹499 stay plan and un-pause the partner's stays.
+
+    `months` defaults to one full billing cycle. Coupons pass their own number
+    of free months, which is why this is a count and not just "a cycle".
 
     Extends from max(now, current expiry) so an early renewal never loses days.
     `stay_plan_*` are guarded columns — this is service-role only by design.
@@ -461,10 +468,15 @@ async def activate_stay_plan(partner_id: str, months: int = 1) -> bool:
 #
 # With a mandate in place the money arrives on its own and Razorpay tells us
 # about it. `subscription.charged` is the event that matters: it is both the
-# first payment and every renewal, so one handler covers activation and the
-# eleven months after it.
+# first payment and every renewal, so one handler covers activation and every
+# renewal after it.
 
-PLAN_KEY = "partner_monthly"
+# The plan is billed YEARLY (founding-partner pricing, 2026-08-03). The key
+# deliberately changes with the period: `_ensure_plan` caches a Razorpay plan id
+# against it, and reusing "partner_monthly" would hand every new subscriber the
+# old monthly plan forever. The old row stays put so existing mandates still
+# reconcile against the plan they were opened on.
+PLAN_KEY = "partner_yearly"
 
 # Mirrors what a Razorpay subscription can be, mapped to what the plan gate
 # should do about it. Anything that isn't `active` stops NEW charges but does
@@ -480,7 +492,7 @@ async def record_subscription_charge(
     amount_paise: int,
 ) -> bool:
     """
-    A cycle was charged: ledger the payment and push the plan out a month.
+    A cycle was charged: ledger the payment and push the plan out a full year.
 
     Idempotent on the PAYMENT id, which is the only identifier both callers
     always have. This used to key only on the invoice, and that quietly gave
@@ -527,7 +539,9 @@ async def record_subscription_charge(
                     "razorpay_subscription_id": subscription_id,
                     "razorpay_invoice_id": invoice_id,
                     "period_start": now.date().isoformat(),
-                    "period_end": (now + relativedelta(months=1)).date().isoformat(),
+                    "period_end": (
+                        now + relativedelta(months=PLAN_PERIOD_MONTHS)
+                    ).date().isoformat(),
                 }
             )
             .execute()
@@ -541,7 +555,7 @@ async def record_subscription_charge(
         return True
 
     await set_subscription_status(subscription_id, "active")
-    return await activate_stay_plan(partner["id"], months=1)
+    return await activate_stay_plan(partner["id"], months=PLAN_PERIOD_MONTHS)
 
 
 async def _charge_already_ledgered(payment_id: str, invoice_id: str | None) -> bool:

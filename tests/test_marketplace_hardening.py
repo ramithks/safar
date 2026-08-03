@@ -221,11 +221,11 @@ class TestSubscriptionChargeIsIdempotent:
             },
         )
 
-    def test_browser_callback_then_webhook_grants_one_month(self, fake_db, monkeypatch):
+    def test_browser_callback_then_webhook_grants_one_cycle(self, fake_db, monkeypatch):
         db = fake_db(self._db())
         months_seen = []
 
-        async def fake_activate(partner_id, months=1):
+        async def fake_activate(partner_id, months=mb.PLAN_PERIOD_MONTHS):
             months_seen.append(months)
             return True
 
@@ -236,14 +236,14 @@ class TestSubscriptionChargeIsIdempotent:
         # 2. Razorpay's webhook reports the same charge, this time with an invoice
         run(mb.record_subscription_charge("sub_1", "pay_1", invoice_id="inv_1", amount_paise=49900))
 
-        assert len(months_seen) == 1, "one ₹499 charge must extend the plan exactly once"
+        assert months_seen == [12], "one ₹499 charge must buy exactly one year, once"
         assert len(db.rows["partner_payments"]) == 1, "and must leave exactly one ledger row"
 
-    def test_webhook_replay_does_not_add_a_month(self, fake_db, monkeypatch):
+    def test_webhook_replay_does_not_add_a_cycle(self, fake_db, monkeypatch):
         db = fake_db(self._db())
         months_seen = []
 
-        async def fake_activate(partner_id, months=1):
+        async def fake_activate(partner_id, months=mb.PLAN_PERIOD_MONTHS):
             months_seen.append(months)
             return True
 
@@ -263,7 +263,7 @@ class TestSubscriptionChargeIsIdempotent:
         db = fake_db(self._db())
         months_seen = []
 
-        async def fake_activate(partner_id, months=1):
+        async def fake_activate(partner_id, months=mb.PLAN_PERIOD_MONTHS):
             months_seen.append(months)
             return True
 
@@ -272,7 +272,7 @@ class TestSubscriptionChargeIsIdempotent:
         run(mb.record_subscription_charge("sub_1", "pay_1", invoice_id="inv_1", amount_paise=49900))
         run(mb.record_subscription_charge("sub_1", "pay_2", invoice_id="inv_2", amount_paise=49900))
 
-        assert len(months_seen) == 2, "next month's charge is a new cycle and must extend the plan"
+        assert months_seen == [12, 12], "next year's charge is a new cycle and must extend the plan"
         assert len(db.rows["partner_payments"]) == 2
 
 

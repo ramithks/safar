@@ -141,7 +141,7 @@ async def refund_payment(
 
 # ── subscriptions (Autopay) ──────────────────────────────────────────────────
 #
-# The ₹499 plan is a mandate, not a monthly invoice a partner has to remember.
+# The ₹499 plan is a mandate, not an invoice a partner has to remember.
 # Razorpay's model is Plan (what we sell) → Subscription (one partner's mandate)
 # → Invoice per cycle, and the charge fires server-side from then on.
 
@@ -175,7 +175,7 @@ async def create_plan(*, amount_paise: int, name: str, period: str = "monthly") 
 async def create_subscription(
     *,
     plan_id: str,
-    total_count: int = 120,
+    total_count: int = 10,
     notes: dict | None = None,
     notify: bool = True,
     start_at: int | None = None,
@@ -185,9 +185,10 @@ async def create_subscription(
     Open a mandate against a plan.
 
     `total_count` is the number of cycles the mandate is authorised for, and
-    Razorpay requires one — there is no "forever". 120 months is ten years,
-    which is functionally forever for a monthly plan and still gives the
-    customer a bounded authorisation to see when they approve it.
+    Razorpay requires one — there is no "forever". Callers pass a count that
+    suits the plan's period (the ₹499 plan is yearly, so ten), which is
+    functionally forever and still gives the customer a bounded authorisation
+    to see when they approve it. Razorpay caps a yearly plan at 100.
 
     `customer_notify` lets Razorpay send its own pre-debit notification, which
     is mandatory for UPI Autopay anyway — better their compliant template than

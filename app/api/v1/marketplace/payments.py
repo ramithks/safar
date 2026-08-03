@@ -70,8 +70,15 @@ router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 
 # Mirrors KIND_RULES in the website's lib/marketplace/types.ts. The partner is
 # shown this price on the pricing page and charged it here, from one constant.
-STAY_PLAN_MONTHLY_RUPEES = 499
-STAY_PLAN_MONTHLY_PAISE = STAY_PLAN_MONTHLY_RUPEES * 100
+#
+# Founding-partner pricing (2026-08-03): ₹499 buys a YEAR, not a month.
+STAY_PLAN_YEARLY_RUPEES = 499
+STAY_PLAN_YEARLY_PAISE = STAY_PLAN_YEARLY_RUPEES * 100
+
+# Cycles a mandate is authorised for. Razorpay demands a finite number, and its
+# ceiling for a yearly plan is 100 — ten years is plenty and still shows the
+# partner a bounded authorisation when they approve it.
+PLAN_TOTAL_CYCLES = 10
 
 REF_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no O/0, I/1
 
@@ -861,13 +868,13 @@ async def start_subscription(
     user=Depends(require_user),
 ) -> SubscribeResponse:
     """
-    Start the ₹499/month plan as an AUTOPAY MANDATE.
+    Start the ₹499/year founding-partner plan as an AUTOPAY MANDATE.
 
-    This used to mint a one-off order every month, which meant renewal depended
+    This used to mint a one-off order every cycle, which meant renewal depended
     on a partner remembering to come back and pay a listing fee. They don't, so
     listings lapsed and it looked like our fault. Razorpay Subscriptions moves
     the charge server-side: the partner approves a mandate once (UPI Autopay,
-    card or e-NACH) and the ₹499 is collected each month without them.
+    card or e-NACH) and the ₹499 is collected each year without them.
 
     Reuses the partner's existing mandate when there is a live one, so a double
     click can't leave someone paying twice.
@@ -914,6 +921,7 @@ async def start_subscription(
     try:
         subscription = await razorpay.create_subscription(
             plan_id=plan_id,
+            total_count=PLAN_TOTAL_CYCLES,
             notes={
                 "partner_id": partner["id"],
                 "brand": partner.get("brand_name") or "",
@@ -946,14 +954,14 @@ async def start_subscription(
         .execute()
     )
 
-    blurb = f"TravBuddy plan — ₹{STAY_PLAN_MONTHLY_RUPEES}/month, cancel anytime"
+    blurb = f"TravBuddy plan — ₹{STAY_PLAN_YEARLY_RUPEES}/year, cancel anytime"
     if coupon:
         blurb = f"{plan_coupons.describe(coupon)}, then {blurb}"
 
     return SubscribeResponse(
         ok=True,
         subscription_id=subscription["id"],
-        amount=STAY_PLAN_MONTHLY_PAISE,
+        amount=STAY_PLAN_YEARLY_PAISE,
         currency="INR",
         key_id=razorpay.public_key_id(),
         name="TravBuddy",
@@ -990,8 +998,9 @@ async def _ensure_plan() -> str:
         return row["razorpay_plan_id"]
 
     plan = await razorpay.create_plan(
-        amount_paise=STAY_PLAN_MONTHLY_PAISE,
-        name=f"TravBuddy plan (₹{STAY_PLAN_MONTHLY_RUPEES}/month)",
+        amount_paise=STAY_PLAN_YEARLY_PAISE,
+        name=f"TravBuddy plan (₹{STAY_PLAN_YEARLY_RUPEES}/year)",
+        period="yearly",
     )
     await run_db(
         lambda: get_db()
@@ -1000,8 +1009,8 @@ async def _ensure_plan() -> str:
             {
                 "key": PLAN_KEY,
                 "razorpay_plan_id": plan["id"],
-                "amount_paise": STAY_PLAN_MONTHLY_PAISE,
-                "period": "monthly",
+                "amount_paise": STAY_PLAN_YEARLY_PAISE,
+                "period": "yearly",
             },
             on_conflict="key",
         )
@@ -1131,7 +1140,7 @@ async def settle_authenticated_mandate(partner_id, subscription_id, payment_id):
         return
 
     await record_subscription_charge(
-        subscription_id, payment_id, invoice_id=None, amount_paise=STAY_PLAN_MONTHLY_PAISE
+        subscription_id, payment_id, invoice_id=None, amount_paise=STAY_PLAN_YEARLY_PAISE
     )
 
 
@@ -1141,7 +1150,7 @@ async def cancel_plan(request: Request, user=Depends(require_user)) -> Subscript
     """
     Stop the mandate at the end of the current cycle.
 
-    Not immediately: the partner has paid for the month they're in, and taking
+    Not immediately: the partner has paid for the year they're in, and taking
     their listings down the moment they cancel would be stealing days they
     bought. `stay_plan_expires_at` is left exactly as it is — the expiry job
     retires the listings when the paid period genuinely runs out.
@@ -1254,7 +1263,7 @@ async def razorpay_webhook(
                 subscription_id,
                 payment_id,
                 invoice_id=invoice.get("id"),
-                amount_paise=int(payment.get("amount") or STAY_PLAN_MONTHLY_PAISE),
+                amount_paise=int(payment.get("amount") or STAY_PLAN_YEARLY_PAISE),
             )
             return {"ok": True, "handled": name}
 
