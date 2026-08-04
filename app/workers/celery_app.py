@@ -23,7 +23,7 @@ celery_app = Celery(
     # Task modules the worker must import so their @task functions register. Without
     # this, tasks defined outside celery_app.py (e.g. the recommendation workers) are
     # never discovered and beat's schedule fires into the void.
-    include=["app.workers.reco_tasks"],
+    include=["app.workers.reco_tasks", "app.workers.partner_tasks"],
 )
 
 
@@ -67,6 +67,12 @@ celery_app.conf.update(
         },
         "reco-fit-centroids-weekly": {
             "task": "travbuddy.reco.fit_centroids", "schedule": 7 * 24 * 3600,
+        },
+        # Hourly, not nightly: an intro rate ends at a wall-clock moment, and a
+        # partner who watches their dashboard flip a rate the morning after it
+        # expired asks why. Cheap — it touches only rows that have lapsed.
+        "partner-intro-commission-hourly": {
+            "task": "travbuddy.partners.revert_intro_commission", "schedule": 3600,
         },
     },
 )

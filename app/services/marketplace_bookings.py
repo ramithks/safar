@@ -22,6 +22,7 @@ from dateutil.relativedelta import relativedelta
 
 from app.db.client import get_db, run_db
 from app.services import marketplace_availability
+from app.services import partner_terms
 
 logger = logging.getLogger(__name__)
 
@@ -314,9 +315,20 @@ async def cancel_unpaid_order(order_id: str) -> None:
 
 SUBSCRIPTION_SETTLED = {"paid", "refunded"}
 
-#: How much plan time one billing cycle buys. The plan is billed yearly
-#: (founding-partner pricing, 2026-08-03), so a cycle is twelve months.
+#: How much plan time one billing cycle buys ON STANDARD TERMS. The standard
+#: plan is billed yearly (founding-partner pricing, 2026-08-03), so a cycle is
+#: twelve months.
+#:
+#: ⚠ Never use this as the length of a cycle for a specific partner — ask
+#: `cycle_months(partner_id)`. A partner on a ₹299/MONTH deal whose charge
+#: bought twelve months of plan would pay us ₹299 a year and know it.
 PLAN_PERIOD_MONTHS = 12
+
+
+async def cycle_months(partner_id: str) -> int:
+    """Months of plan one billing cycle buys for this partner."""
+    terms = await partner_terms.resolve(partner_id)
+    return partner_terms.period_months(terms["billing_period"])
 
 
 async def activate_stay_plan_for_payment(order_id: str, payment_id: str) -> bool:
@@ -342,8 +354,9 @@ async def activate_stay_plan_for_payment(order_id: str, payment_id: str) -> bool
     if payment.get("status") in SUBSCRIPTION_SETTLED:
         return True  # already handled
 
+    months = await cycle_months(payment["partner_id"])
     now = datetime.now(timezone.utc)
-    period_end = (now + relativedelta(months=PLAN_PERIOD_MONTHS)).date()
+    period_end = (now + relativedelta(months=months)).date()
 
     try:
         await run_db(
@@ -365,20 +378,25 @@ async def activate_stay_plan_for_payment(order_id: str, payment_id: str) -> bool
         logger.exception("[subscription] payment update failed")
         return True  # genuine subscription order; don't fall through to bookings
 
-    await activate_stay_plan(payment["partner_id"], months=PLAN_PERIOD_MONTHS)
+    await activate_stay_plan(payment["partner_id"], months=months)
     return True
 
 
-async def activate_stay_plan(partner_id: str, months: int = PLAN_PERIOD_MONTHS) -> bool:
+async def activate_stay_plan(partner_id: str, months: int | None = None) -> bool:
     """
-    Activate (or extend) the ₹499 stay plan and un-pause the partner's stays.
+    Activate (or extend) the stay plan and un-pause the partner's stays.
 
-    `months` defaults to one full billing cycle. Coupons pass their own number
-    of free months, which is why this is a count and not just "a cycle".
+    `months=None` means one full billing cycle for THIS partner — twelve on the
+    standard yearly plan, one for a partner on a monthly deal. Coupons pass
+    their own number of free months, which is why this is a count and not just
+    "a cycle".
 
     Extends from max(now, current expiry) so an early renewal never loses days.
     `stay_plan_*` are guarded columns — this is service-role only by design.
     """
+    if months is None:
+        months = await cycle_months(partner_id)
+
     res = await run_db(
         lambda: get_db()
         .table("partners")
@@ -492,7 +510,13 @@ async def record_subscription_charge(
     amount_paise: int,
 ) -> bool:
     """
-    A cycle was charged: ledger the payment and push the plan out a full year.
+    A cycle was charged: ledger the payment and push the plan out one cycle.
+
+    A cycle is the partner's own — twelve months on the standard yearly plan,
+    one on a monthly deal. This used to be a fixed twelve, which was correct
+    while there was exactly one plan and becomes a giveaway the moment there
+    isn't: a ₹299/month mandate charging monthly would have bought a year of
+    listing time every time it fired.
 
     Idempotent on the PAYMENT id, which is the only identifier both callers
     always have. This used to key only on the invoice, and that quietly gave
@@ -524,6 +548,7 @@ async def record_subscription_charge(
     if await _charge_already_ledgered(payment_id, invoice_id):
         return True  # a replay, or the other path got here first — not a new cycle
 
+    months = await cycle_months(partner["id"])
     now = datetime.now(timezone.utc)
     try:
         await run_db(
@@ -540,7 +565,7 @@ async def record_subscription_charge(
                     "razorpay_invoice_id": invoice_id,
                     "period_start": now.date().isoformat(),
                     "period_end": (
-                        now + relativedelta(months=PLAN_PERIOD_MONTHS)
+                        now + relativedelta(months=months)
                     ).date().isoformat(),
                 }
             )
@@ -555,7 +580,7 @@ async def record_subscription_charge(
         return True
 
     await set_subscription_status(subscription_id, "active")
-    return await activate_stay_plan(partner["id"], months=PLAN_PERIOD_MONTHS)
+    return await activate_stay_plan(partner["id"], months=months)
 
 
 async def _charge_already_ledgered(payment_id: str, invoice_id: str | None) -> bool:
@@ -582,6 +607,13 @@ async def _charge_already_ledgered(payment_id: str, invoice_id: str | None) -> b
     return False
 
 
+#: A mandate in one of these states will never charge again. Anything else —
+#: including `halted`, whose last charge failed — can still collect, so its
+#: billed amount stays on record and stays comparable against the partner's
+#: terms.
+MANDATE_DEAD = {"cancelled", "completed", "expired"}
+
+
 async def set_subscription_status(subscription_id: str, status: str) -> None:
     """
     Mirror the mandate's state onto the partner.
@@ -589,12 +621,28 @@ async def set_subscription_status(subscription_id: str, status: str) -> None:
     Deliberately does NOT touch `stay_plan_expires_at`: a halted mandate means
     the next charge failed, not that the month already paid for is void. The
     expiry job takes the listings down when that month actually runs out.
+
+    That distinction is load-bearing beyond the listings now. A partner's
+    commission entitlement is gated on the paid-through DATE, so leaving it
+    alone here is what stops one bounced autopay from moving them off the rate
+    they were promised. They keep the deal for exactly as long as they paid for,
+    and lose it only if the period genuinely runs out unrenewed.
+
+    A mandate that reaches a dead state also stops being something the partner
+    can be mis-billed by, so its recorded price is cleared — otherwise a
+    cancelled ₹499/year mandate would keep being reported as a mismatch against
+    their new ₹299/month terms forever.
     """
+    patch: dict = {"subscription_status": status}
+    if status in MANDATE_DEAD:
+        patch["billed_amount_paise"] = None
+        patch["billed_period"] = None
+
     try:
         await run_db(
             lambda: get_db()
             .table("partners")
-            .update({"subscription_status": status})
+            .update(patch)
             .eq("subscription_id", subscription_id)
             .execute()
         )

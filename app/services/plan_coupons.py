@@ -6,7 +6,7 @@ traveller's booking. These discount what the partner pays us, so they are the
 marketing lever: hand out FOUNDER6, the partner types it at subscribe, and the
 first six months are free.
 
-Two shapes, because Razorpay bills them differently:
+Four shapes, because Razorpay bills them differently:
 
   free_months   We own the whole mechanic: the plan is granted for N months and
                 the mandate is created with `start_at` set past the free period,
@@ -17,6 +17,17 @@ Two shapes, because Razorpay bills them differently:
                 of cycles. Offers cannot be created over the API, so the coupon
                 row carries the `razorpay_offer_id` of an offer built in the
                 Dashboard, and we pass it to subscription create.
+
+  deal          Not a discount at all — a different deal. The code carries its
+                own price, billing period and commission rate, and the partner
+                is put on a Razorpay plan built for those terms rather than on
+                the standard one with money taken off. This is what "₹299/month
+                + 5%" is: there is no ₹499 being discounted anywhere.
+
+                It is also the shape to reach for by default, because it needs
+                nothing from the Razorpay Dashboard — we mint the plan on first
+                use. percent/flat exist for discounting the standard plan; a
+                bespoke price is cleaner as its own plan.
 
 WHEN the discount lands is the security-relevant part. Validation happens at
 subscribe, but redemption happens only once the mandate is AUTHENTICATED — see
@@ -30,6 +41,8 @@ import re
 from datetime import datetime, timezone
 
 from app.db.client import get_db, run_db
+from app.services import partner_terms
+from app.services.partner_terms import DEFAULT_COMMISSION_PCT as DEFAULT_AFTER_INTRO
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +90,9 @@ def describe(coupon):
     value = coupon.get("value") or 0
     months = coupon.get("duration_months")
 
+    if kind == "deal":
+        return _describe_deal(coupon)
+
     if kind == "free_months":
         return "1 month free" if value == 1 else f"{value} months free"
 
@@ -84,6 +100,58 @@ def describe(coupon):
     if not months:
         return f"{amount} off"
     return f"{amount} off for {'1 month' if months == 1 else f'{months} months'}"
+
+
+def _describe_deal(coupon):
+    """
+    "₹299/month · 5% commission", or the two-part version when the rate is
+    introductory: the partner has to be told what happens after it lapses, at
+    the moment they type the code rather than in the month it changes.
+    """
+    fee = int(coupon.get("plan_amount_paise") or 0)
+    period = coupon.get("plan_period") or "yearly"
+    money = f"₹{fee // 100:,}/{'month' if period == 'monthly' else 'year'}" if fee else "Free"
+
+    pct = coupon.get("commission_pct")
+    if pct is None:
+        return money
+
+    pct = float(pct)
+    rate = "no commission" if pct == 0 else f"{pct:g}% commission"
+    intro = coupon.get("commission_months")
+    if not intro:
+        return f"{money} · {rate}"
+
+    window = "1 month" if intro == 1 else f"{intro} months"
+    return f"{money} · {rate} for {window}, then {DEFAULT_AFTER_INTRO:g}%"
+
+
+def deal_terms(coupon):
+    """
+    The terms a deal code puts the partner on, or None for the other kinds.
+
+    Shaped for `partner_terms.apply`, so the subscribe path can hand it straight
+    over without knowing what a coupon is.
+    """
+    if not coupon or coupon.get("kind") != "deal":
+        return None
+    fee = int(coupon.get("plan_amount_paise") or 0)
+    return {
+        "fee_paise": fee,
+        "period": coupon.get("plan_period") or "yearly",
+        "commission": (
+            float(coupon["commission_pct"])
+            if coupon.get("commission_pct") is not None
+            else DEFAULT_AFTER_INTRO
+        ),
+        "commission_months": coupon.get("commission_months"),
+        # A paid deal lives as long as the plan is paid up; a ₹0 one has no
+        # subscription to be conditional on, so gating it on one would revoke
+        # the rate the first time the granted period lapsed with nothing able
+        # to renew it. `apply` derives the same thing from the fee, but stating
+        # it here keeps the coupon's meaning readable at the call site.
+        "entitlement": "subscription" if fee > 0 else "permanent",
+    }
 
 
 async def resolve(code, partner_id):
@@ -148,6 +216,13 @@ async def resolve(code, partner_id):
     # belt-and-braces against a row edited around it.
     if coupon["kind"] in ("percent", "flat") and not coupon.get("razorpay_offer_id"):
         logger.error("[plan-coupon] %s has no razorpay_offer_id", coupon.get("code"))
+        return None, GENERIC_REJECTION
+
+    # Same reasoning for a deal code: no price means we cannot build a plan for
+    # it, and accepting it would subscribe the partner to standard ₹499 terms
+    # while telling them they were getting ₹299.
+    if coupon["kind"] == "deal" and not coupon.get("plan_period"):
+        logger.error("[plan-coupon] deal %s has no plan_period", coupon.get("code"))
         return None, GENERIC_REJECTION
 
     return coupon, None
@@ -271,6 +346,33 @@ async def apply_pending(partner_id, subscription_id):
             partner_id,
         )
         return 0
+
+    # A deal code's real payload is the terms, not the months. Written here
+    # rather than at subscribe for the same reason the redemption is: until the
+    # mandate authenticates, nobody has agreed to anything, and a partner who
+    # opened Checkout and closed it must not walk away on 0% commission.
+    #
+    # Behind the one-redemption-per-partner guard above, so a replayed webhook
+    # cannot re-apply terms an admin has since corrected by hand.
+    terms = deal_terms(coupon)
+    if terms:
+        try:
+            await partner_terms.apply(
+                partner_id,
+                source="coupon",
+                coupon_id=coupon["id"],
+                notes=f"Redeemed {coupon.get('code')}",
+                **terms,
+            )
+        except Exception:  # noqa: BLE001
+            # The redemption is spent and cannot be replayed, so failing quietly
+            # would leave the partner on standard terms holding a used code.
+            # Loud, and recoverable by hand from the redemption row.
+            logger.exception(
+                "[plan-coupon] TERMS NOT APPLIED for partner %s after redeeming %s",
+                partner_id,
+                coupon.get("code"),
+            )
 
     logger.info(
         "[plan-coupon] %s redeemed by partner %s (%s months)",

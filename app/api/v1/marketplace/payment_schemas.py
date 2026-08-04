@@ -157,6 +157,15 @@ class SubscribeResponse(BaseModel):
     coupon_description: str | None = None
     #: When a free period defers the first charge, this is when billing starts.
     first_charge_at: str | None = None
+    #: How often `amount` is collected — "monthly" or "yearly". Stated rather
+    #: than inferred: the UI has to render "₹299/month", and parsing that back
+    #: out of `description` breaks the first time the wording changes.
+    period: str = "yearly"
+    #: True when the partner is on commission-only terms: there is no mandate to
+    #: authorise, `subscription_id` is null, and the plan is already switched on.
+    #: The UI must check this BEFORE opening Checkout — Razorpay rejects ₹0 and
+    #: the partner would see a broken button instead of "you're live".
+    nothing_to_pay: bool = False
 
 
 class SubscriptionVerifyRequest(BaseModel):

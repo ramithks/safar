@@ -50,6 +50,7 @@ from app.db.client import get_db, run_db
 from app.deps.auth import optional_user, require_user
 from app.services import marketplace_availability as availability
 from app.services import marketplace_pricing as pricing
+from app.services import partner_terms
 from app.services import plan_coupons
 from app.services import razorpay
 from app.services.booking_emails import send_booking_emails
@@ -68,17 +69,24 @@ from app.services.marketplace_bookings import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 
-# Mirrors KIND_RULES in the website's lib/marketplace/types.ts. The partner is
-# shown this price on the pricing page and charged it here, from one constant.
+# Mirrors KIND_RULES in the website's lib/marketplace/types.ts. This is the
+# STANDARD deal — what a partner gets without a code and without a negotiation.
+# What any given partner actually pays comes from `partner_terms`, which falls
+# back to exactly these numbers when they have no row.
 #
 # Founding-partner pricing (2026-08-03): ₹499 buys a YEAR, not a month.
 STAY_PLAN_YEARLY_RUPEES = 499
 STAY_PLAN_YEARLY_PAISE = STAY_PLAN_YEARLY_RUPEES * 100
 
-# Cycles a mandate is authorised for. Razorpay demands a finite number, and its
-# ceiling for a yearly plan is 100 — ten years is plenty and still shows the
-# partner a bounded authorisation when they approve it.
-PLAN_TOTAL_CYCLES = 10
+# Cycles a mandate is authorised for. Razorpay demands a finite number, and the
+# right one depends on the period: ten yearly cycles is a decade, but ten
+# MONTHLY cycles is a mandate that quietly completes itself in ten months and
+# stops collecting. Razorpay's ceiling is 100 either way.
+PLAN_TOTAL_CYCLES = {"yearly": 10, "monthly": 100}
+
+
+def _total_cycles(period: str) -> int:
+    return PLAN_TOTAL_CYCLES.get(period, 10)
 
 REF_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no O/0, I/1
 
@@ -388,13 +396,19 @@ def _validate_stay(body, content: dict) -> int:
     return nights
 
 
-def _price_booking(body, listing: dict, coupon: dict | None) -> tuple[pricing.Quote, dict]:
+async def _price_booking(body, listing: dict, coupon: dict | None) -> tuple[pricing.Quote, dict]:
     """
     Run the pipeline for any kind and return (quote, meta).
 
-    The commission rate is read from the listing row, falling back to the
-    single-source-of-truth table — never a per-endpoint constant. `meta` is the
-    audit trail we stamp on the booking so a dispute can be reconstructed.
+    The commission rate comes from the PARTNER'S TERMS, not from the listing.
+    The listing carries a copy that `partner_terms.sync_listings` keeps in step,
+    but a copy is exactly what it is: if a backfill ever failed, or a listing
+    were created between a deal landing and the sync running, the stale number
+    on the row would silently overcharge a partner who was sold 5%. Terms are
+    the one place that cannot be stale.
+
+    The rate is returned in `meta` and frozen onto the booking, because this
+    answer is only true today — see the snapshot note in the deals migration.
     """
     content = listing.get("content") or {}
     # The deposit policy is read from the DB row like every other money input —
@@ -403,10 +417,16 @@ def _price_booking(body, listing: dict, coupon: dict | None) -> tuple[pricing.Qu
         "type": listing.get("deposit_type") or "none",
         "value": listing.get("deposit_value"),
     }
-    commission_pct = float(
-        listing.get("commission_pct")
-        if listing.get("commission_pct") is not None
-        else pricing.commission_pct_for(listing["kind"])
+    commission_pct = await partner_terms.commission_pct(
+        listing.get("partner_id"),
+        # A NULL partner_id is what makes a trip OURS (see admin/trips.py), and
+        # ours are stamped 0 — there is nobody to take a cut from. Falling
+        # through to the kind's 10% here would have TravBuddy invoicing itself.
+        fallback=(
+            float(listing["commission_pct"])
+            if listing.get("commission_pct") is not None
+            else pricing.commission_pct_for(listing["kind"])
+        ),
     )
 
     if listing["kind"] == "hotel":
@@ -431,6 +451,7 @@ def _price_booking(body, listing: dict, coupon: dict | None) -> tuple[pricing.Qu
             "base_price": base,
             "coupon": coupon.get("code") if coupon else None,
             "deposit": deposit if deposit["type"] != "none" else None,
+            "commission_pct": commission_pct,
         }
         return q, meta
 
@@ -452,6 +473,7 @@ def _price_booking(body, listing: dict, coupon: dict | None) -> tuple[pricing.Qu
         "unit_price": unit_price,
         "coupon": coupon.get("code") if coupon else None,
         "deposit": deposit if deposit["type"] != "none" else None,
+        "commission_pct": commission_pct,
     }
     return q, meta
 
@@ -480,7 +502,7 @@ async def quote_price(request: Request, body: QuoteRequest) -> QuoteResponse:
             body.coupon_code,
             getattr(body, "phone", None),
         )
-        q, meta = _price_booking(body, listing, coupon)
+        q, meta = await _price_booking(body, listing, coupon)
     except PricingError as e:
         return QuoteResponse(ok=False, error=e.detail)
 
@@ -589,7 +611,7 @@ async def checkout(
     coupon = await _resolve_coupon(
         partner_id, body.item_type, body.item_id, body.coupon_code, body.phone
     )
-    q, meta = _price_booking(body, listing, coupon)
+    q, meta = await _price_booking(body, listing, coupon)
     meta["seats_at_checkout"] = seats_left
     if departure:
         meta["departure"] = {
@@ -629,6 +651,11 @@ async def checkout(
         "coupon_id": coupon.get("id") if coupon else None,
         "amount_paise": q.amount_paise,
         "commission_paise": q.commission_paise,
+        # The rate that produced commission_paise, frozen here for good. The
+        # partner may be on 5% next month; this booking stays on whatever they
+        # agreed to today, and the row can say so without anyone reconstructing
+        # it from a terms history.
+        "commission_pct": meta.get("commission_pct"),
         "payout_paise": q.payout_paise,
         "status": "created",
         "payout_status": "held" if partner_id else "na",
@@ -896,8 +923,6 @@ async def start_subscription(
             409, "You already have an active plan. Manage it from the Plan page."
         )
 
-    plan_id = await _ensure_plan()
-
     # ── coupon ───────────────────────────────────────────────────────────
     coupon = None
     submitted = (body.coupon_code if body else None) or None
@@ -907,6 +932,60 @@ async def start_subscription(
             # A bad code must not quietly become a full-price mandate — the
             # partner clicked subscribe expecting a discount.
             raise HTTPException(400, reason or plan_coupons.GENERIC_REJECTION)
+
+    # ── what they're being put on ────────────────────────────────────────
+    #
+    # Precedence: a deal code beats terms an admin already set, which beat the
+    # standard plan. The code is the thing the partner just typed and is
+    # watching the screen about, so it wins the tie.
+    deal = plan_coupons.deal_terms(coupon)
+    if deal:
+        amount_paise, period = deal["fee_paise"], deal["period"]
+    else:
+        terms = await partner_terms.resolve(partner["id"])
+        amount_paise = int(terms["subscription_fee_paise"])
+        period = terms["billing_period"]
+
+    # A commission-only partner has nothing to authorise. Sending them to
+    # Checkout for ₹0 fails at Razorpay's minimum-amount check and looks like a
+    # broken button, so their plan is simply switched on.
+    #
+    # Granted for the ENTITLEMENT's length, not one billing cycle. A ₹0 deal has
+    # no mandate to renew it, so granting twelve months would quietly retire
+    # their listings a year later with nothing able to bring them back — the
+    # partner was promised "indefinitely" and would discover otherwise.
+    if amount_paise <= 0:
+        # A ₹0 deal code has to be redeemed HERE. Every other code is redeemed
+        # when the mandate authenticates, and a ₹0 deal never opens one — so
+        # parking it would leave the partner holding a validated code that never
+        # became terms, on the standard 10% they were told they had escaped.
+        #
+        # Redeeming at this point is safe precisely because there is no money:
+        # the "abandoned Checkout" hole that makes early redemption dangerous
+        # elsewhere needs a Checkout to abandon.
+        if deal:
+            await plan_coupons.park_pending(partner["id"], coupon["id"])
+            await plan_coupons.apply_pending(partner["id"], None)
+
+        await _grant_free_plan(partner["id"], deal, period)
+
+        # No mandate exists, so nothing is being collected — say so, or a later
+        # terms change would compare against a stale billed amount and report a
+        # mismatch with a subscription that isn't there.
+        await partner_terms.clear_billing(partner["id"])
+
+        return SubscribeResponse(
+            ok=True,
+            nothing_to_pay=True,
+            amount=0,
+            period=period,
+            description=(
+                "You're on custom terms with no subscription fee — "
+                "your listings are live."
+            ),
+        )
+
+    plan_id = await _ensure_plan(amount_paise, period)
 
     months_free = plan_coupons.free_months(coupon) if coupon else 0
     start_at = None
@@ -921,7 +1000,7 @@ async def start_subscription(
     try:
         subscription = await razorpay.create_subscription(
             plan_id=plan_id,
-            total_count=PLAN_TOTAL_CYCLES,
+            total_count=_total_cycles(period),
             notes={
                 "partner_id": partner["id"],
                 "brand": partner.get("brand_name") or "",
@@ -941,6 +1020,12 @@ async def start_subscription(
 
     # Stored BEFORE the browser is handed the id: the webhook can arrive before
     # the callback does, and it resolves the partner by subscription id.
+    #
+    # `billed_*` records what THIS mandate will charge, which is not the same
+    # question as what the partner's terms say — Razorpay cannot reprice a live
+    # mandate, so the two drift the moment an admin renegotiates. Writing it
+    # here, at the only moment we know the mandate's real price, is what lets
+    # the dashboard show the disagreement instead of assuming it away.
     await run_db(
         lambda: get_db()
         .table("partners")
@@ -948,20 +1033,33 @@ async def start_subscription(
             {
                 "subscription_id": subscription["id"],
                 "subscription_status": subscription.get("status") or "created",
+                "billed_amount_paise": amount_paise,
+                "billed_period": period,
             }
         )
         .eq("id", partner["id"])
         .execute()
     )
 
-    blurb = f"TravBuddy plan — ₹{STAY_PLAN_YEARLY_RUPEES}/year, cancel anytime"
-    if coupon:
+    # What Checkout says, built from what they are actually being charged rather
+    # than from the standard price — a ₹299/month partner reading "₹499/year" on
+    # the Razorpay sheet is a support ticket at best.
+    blurb = (
+        f"TravBuddy plan — ₹{amount_paise // 100:,}/"
+        f"{'month' if period == 'monthly' else 'year'}, cancel anytime"
+    )
+    if coupon and not deal:
         blurb = f"{plan_coupons.describe(coupon)}, then {blurb}"
+    elif deal:
+        # A deal code IS the price, so "X, then ₹299/month" would be nonsense.
+        # Its own description already carries the commission half of the deal.
+        blurb = f"TravBuddy plan — {plan_coupons.describe(coupon)}, cancel anytime"
 
     return SubscribeResponse(
         ok=True,
         subscription_id=subscription["id"],
-        amount=STAY_PLAN_YEARLY_PAISE,
+        amount=amount_paise,
+        period=period,
         currency="INR",
         key_id=razorpay.public_key_id(),
         name="TravBuddy",
@@ -977,19 +1075,76 @@ async def start_subscription(
     )
 
 
-async def _ensure_plan() -> str:
+#: How long a permanent (₹0) entitlement grants the plan for. There is no
+#: mandate to renew it, so the grant has to outlive any realistic partner
+#: relationship — the deal ends when an admin ends it, not when a clock does.
+#: Expressed as months because `activate_stay_plan` counts in months.
+PERMANENT_PLAN_MONTHS = 1200  # a century
+
+
+async def _grant_free_plan(partner_id: str, deal: dict | None, period: str) -> None:
     """
-    The Razorpay plan id, created on first use and remembered.
+    Switch on the plan for a partner with no subscription fee.
+
+    The length comes from the entitlement, not the billing period: `permanent`
+    means it must not lapse on its own, and `until` means it lapses on the date
+    the deal names. Both are read back from the resolved terms rather than
+    guessed, so a coupon and an admin edit behave identically.
+    """
+    terms = await partner_terms.resolve(partner_id)
+    entitlement = terms.get("entitlement") or ("permanent" if not deal else "subscription")
+
+    if entitlement == "permanent":
+        months = PERMANENT_PLAN_MONTHS
+    elif entitlement == "until":
+        expires = terms.get("entitlement_expires_at")
+        parsed = (
+            datetime.fromisoformat(str(expires).replace("Z", "+00:00")) if expires else None
+        )
+        remaining = (parsed - datetime.now(timezone.utc)).days if parsed else 0
+        months = max(1, remaining // 30)
+    else:
+        months = partner_terms.period_months(period)
+
+    await activate_stay_plan(partner_id, months=months)
+
+
+def _plan_key(amount_paise: int, period: str) -> str:
+    """
+    The `platform_plans` key for a price point.
+
+    The amount is IN the key, not just in the row. A key of "partner_monthly"
+    caches one Razorpay plan id, so the first ₹499/month deal would hand its
+    plan to every later ₹299/month partner and bill them ₹499 — the failure the
+    2026-08-03 annual migration hit when it reused the monthly key, and the
+    reason the standard plan's key still carries no amount (`partner_yearly`,
+    grandfathered below so live mandates keep reconciling against it).
+    """
+    if amount_paise == STAY_PLAN_YEARLY_PAISE and period == "yearly":
+        return PLAN_KEY
+    return f"partner_{period}_{amount_paise}"
+
+
+async def _ensure_plan(amount_paise: int = STAY_PLAN_YEARLY_PAISE, period: str = "yearly") -> str:
+    """
+    The Razorpay plan id for a price point, created on first use and remembered.
 
     Kept in `platform_plans` rather than an env var so deploying this needs no
-    manual ops step — and so we never create a second plan for the same product
-    and split the reporting.
+    manual ops step — and so we never create a second plan for the same price
+    and split the reporting. A deal code at a new price mints its own plan the
+    first time somebody redeems it; every partner after that reuses it.
+
+    This is why a bespoke price is a `deal` coupon rather than a percent/flat
+    one: Razorpay Offers have no create API and must be built by hand in their
+    Dashboard, but plans do, so a new price point costs no ops work at all.
     """
+    key = _plan_key(amount_paise, period)
+
     res = await run_db(
         lambda: get_db()
         .table("platform_plans")
         .select("razorpay_plan_id")
-        .eq("key", PLAN_KEY)
+        .eq("key", key)
         .maybe_single()
         .execute()
     )
@@ -997,26 +1152,27 @@ async def _ensure_plan() -> str:
     if row and row.get("razorpay_plan_id"):
         return row["razorpay_plan_id"]
 
+    rupees = amount_paise // 100
     plan = await razorpay.create_plan(
-        amount_paise=STAY_PLAN_YEARLY_PAISE,
-        name=f"TravBuddy plan (₹{STAY_PLAN_YEARLY_RUPEES}/year)",
-        period="yearly",
+        amount_paise=amount_paise,
+        name=f"TravBuddy plan (₹{rupees}/{'month' if period == 'monthly' else 'year'})",
+        period=period,
     )
     await run_db(
         lambda: get_db()
         .table("platform_plans")
         .upsert(
             {
-                "key": PLAN_KEY,
+                "key": key,
                 "razorpay_plan_id": plan["id"],
-                "amount_paise": STAY_PLAN_YEARLY_PAISE,
-                "period": "yearly",
+                "amount_paise": amount_paise,
+                "period": period,
             },
             on_conflict="key",
         )
         .execute()
     )
-    logger.info("[subscribe] created Razorpay plan %s", plan["id"])
+    logger.info("[subscribe] created Razorpay plan %s (%s)", plan["id"], key)
     return plan["id"]
 
 
@@ -1127,20 +1283,30 @@ async def grant_pending_plan_coupon(partner_id, subscription_id):
 async def settle_authenticated_mandate(partner_id, subscription_id, payment_id):
     """
     The browser callback's version: apply a free-months coupon if there is one,
-    otherwise record the ₹499 that was just charged.
+    otherwise record the charge that just landed.
 
     The `granted_free_period` check is what keeps the two apart when the
     webhook won the race. Without it this would see "no coupon to apply", take
-    the charge branch, and ledger a ₹499 nobody paid — the double-month bug of
+    the charge branch, and ledger money nobody paid — the double-month bug of
     2026-07-25 wearing a new hat.
+
+    The amount is read from the partner's terms, not from the standard price.
+    This path has no Razorpay payment object to read an amount off (the webhook
+    does, and uses it), so terms are the only thing that knows a ₹299/month
+    partner did not just pay ₹499. Ordered after `grant_pending_plan_coupon` so
+    a deal code's terms are already written by the time we read them.
     """
     if await grant_pending_plan_coupon(partner_id, subscription_id):
         return
     if await plan_coupons.granted_free_period(subscription_id):
         return
 
+    terms = await partner_terms.resolve(partner_id)
     await record_subscription_charge(
-        subscription_id, payment_id, invoice_id=None, amount_paise=STAY_PLAN_YEARLY_PAISE
+        subscription_id,
+        payment_id,
+        invoice_id=None,
+        amount_paise=int(terms["subscription_fee_paise"]),
     )
 
 

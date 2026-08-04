@@ -13,6 +13,7 @@ import pytest
 
 from app.api.v1.marketplace.payments import normalise_coupon_code
 from app.services import marketplace_bookings as mb
+from app.services import partner_terms
 
 
 # ── a very small PostgREST stand-in ──────────────────────────────────────────
@@ -28,8 +29,9 @@ class _Result:
 
 
 class _Query:
-    def __init__(self, db, table, op, payload=None):
+    def __init__(self, db, table, op, payload=None, conflict=None):
         self.db, self.table, self.op, self.payload = db, table, op, payload
+        self.conflict = conflict
         self.filters = []
         self.single = False
         self.limit_n = None
@@ -55,6 +57,10 @@ class _Query:
     def gte(self, col, val):
         # Dates are ISO strings here, where lexical and chronological order agree.
         self.filters.append(lambda r: r.get(col) is not None and r[col] >= val)
+        return self
+
+    def lte(self, col, val):
+        self.filters.append(lambda r: r.get(col) is not None and r[col] <= val)
         return self
 
     @property
@@ -105,6 +111,27 @@ class _Query:
                 row.update(self.payload)
             return _Result(hit)
 
+        if self.op == "upsert":
+            # Modelled on the conflict column rather than on all of them: every
+            # upsert in these paths targets a primary key.
+            rows = self.db.rows.setdefault(self.table, [])
+            key = self.conflict
+            existing = next(
+                (r for r in rows if key and r.get(key) == self.payload.get(key)), None
+            )
+            if existing:
+                existing.update(self.payload)
+                return _Result([existing])
+            rows.append(dict(self.payload))
+            return _Result([rows[-1]])
+
+        if self.op == "delete":
+            hit = self._matching()
+            self.db.rows[self.table] = [
+                r for r in self.db.rows.get(self.table, []) if r not in hit
+            ]
+            return _Result(hit)
+
         raise AssertionError(self.op)
 
 
@@ -114,6 +141,11 @@ class _Negated:
 
     def in_(self, col, vals):
         self.q.filters.append(lambda r: r.get(col) not in vals)
+        return self.q
+
+    def is_(self, col, val):
+        assert val == "null", f"fake only models is_(col, 'null'), got {val!r}"
+        self.q.filters.append(lambda r: r.get(col) is not None)
         return self.q
 
 
@@ -150,11 +182,25 @@ class _Table:
     def update(self, payload):
         return _Query(self.db, self.name, "update", payload)
 
+    def upsert(self, payload, on_conflict=None):
+        return _Query(self.db, self.name, "upsert", payload, conflict=on_conflict)
+
+    def delete(self):
+        return _Query(self.db, self.name, "delete")
+
 
 @pytest.fixture
 def fake_db(monkeypatch):
+    """
+    Install the stand-in everywhere the paths under test read from.
+
+    `partner_terms` too, not just `marketplace_bookings`: a cycle's length is
+    now the partner's own rather than a constant, so settling a charge reads
+    their terms. Patching only one module let that read reach the real client.
+    """
     def _install(db):
         monkeypatch.setattr(mb, "get_db", lambda: db)
+        monkeypatch.setattr(partner_terms, "get_db", lambda: db)
         return db
 
     return _install

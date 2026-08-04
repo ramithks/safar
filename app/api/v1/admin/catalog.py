@@ -25,11 +25,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from app.api.v1.admin.catalog_schemas import (
     AdminCoupon,
     AdminListing,
+    BillingMismatch,
     CouponCreate,
     CouponUpdate,
     ListingPatch,
     ListingPublishRequest,
     ListingPublishResult,
+    MandateRealignResult,
+    PartnerTerms,
+    PartnerTermsUpdate,
 )
 from app.api.v1.admin.schemas import Ok
 # The publish gates live with the partner API and are imported, not restated:
@@ -39,7 +43,10 @@ from app.core.limiter import limiter
 from app.db.client import get_db, run_db
 from app.deps.admin import AdminIdentity, require_admin
 from app.services import admin_audit
+from app.services import partner_terms as terms_service
+from app.services import razorpay
 from app.services.events import emit
+from app.services.marketplace_bookings import set_subscription_status
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -347,6 +354,314 @@ async def publish_listing(
     )
 
 
+# ── partner terms ───────────────────────────────────────────────────────────
+#
+# The negotiated-deal path. Coupons cover deals you can hand out as a code, but
+# B2B is agreed on a call: "₹299/month and 5% and we'll list your other two
+# properties". Manufacturing a single-use coupon to express that was the
+# alternative, and it puts a fake campaign in the reporting forever.
+#
+# This is also the only way to change an EXISTING subscriber's terms — a coupon
+# only ever applies at subscribe.
+
+
+async def _partner_or_404(partner_id: str) -> dict:
+    res = await run_db(
+        lambda: get_db()
+        .table("partners")
+        .select(
+            "id, brand_name, subscription_id, subscription_status, "
+            "billed_amount_paise, billed_period, stay_plan_expires_at"
+        )
+        .eq("id", partner_id)
+        .maybe_single()
+        .execute()
+    )
+    if not res or not res.data:
+        raise HTTPException(404, "Partner not found.")
+    return res.data
+
+
+async def _terms_payload(
+    partner: dict, stale: list[str] | None = None
+) -> PartnerTerms:
+    """
+    A partner's resolved terms, with everything an operator needs to act on.
+
+    The coupon is read only for its CODE, and only as a label. A redeemed
+    coupon is not the contract — its terms were materialised into
+    `partner_terms` at redemption, and editing, disabling or deleting the code
+    afterwards changes nothing here. That is the point of materialising them.
+    """
+    partner_id = partner["id"]
+    terms = await terms_service.resolve(partner_id)
+
+    code = None
+    if terms.get("source_coupon_id"):
+        found = await run_db(
+            lambda: get_db()
+            .table("platform_coupons")
+            .select("code")
+            .eq("id", terms["source_coupon_id"])
+            .maybe_single()
+            .execute()
+        )
+        code = (found.data or {}).get("code") if found else None
+
+    mismatch = await terms_service.billing_mismatch(partner, terms)
+
+    return PartnerTerms(
+        partner_id=partner_id,
+        subscription_fee_paise=int(terms["subscription_fee_paise"]),
+        billing_period=terms["billing_period"],
+        commission_pct=float(terms["commission_pct"]),
+        commission_expires_at=(
+            str(terms["commission_expires_at"]) if terms.get("commission_expires_at") else None
+        ),
+        base_commission_pct=float(terms.get("base_commission_pct") or 0),
+        entitlement=terms.get("entitlement") or "subscription",
+        entitlement_expires_at=(
+            str(terms["entitlement_expires_at"])
+            if terms.get("entitlement_expires_at")
+            else None
+        ),
+        effective_at=str(terms["effective_at"]) if terms.get("effective_at") else None,
+        lapsed=bool(terms.get("lapsed")),
+        intro_ended=bool(terms.get("intro_ended")),
+        source=terms.get("source") or "default",
+        source_coupon_id=terms.get("source_coupon_id"),
+        source_coupon_code=code,
+        notes=terms.get("notes"),
+        summary=terms_service.describe(terms),
+        billing_mismatch=BillingMismatch(**mismatch) if mismatch else None,
+        stale_listings=stale or [],
+    )
+
+
+@router.get("/partners/{partner_id}/terms", response_model=PartnerTerms)
+@limiter.limit("120/minute")
+async def get_partner_terms(
+    request: Request,
+    partner_id: str,
+    _admin: AdminIdentity = Depends(require_admin),
+) -> PartnerTerms:
+    """
+    What this partner is on. A partner with no row is on standard terms, and
+    this reports those rather than 404ing — "no custom deal" is an answer.
+    """
+    partner = await _partner_or_404(partner_id)
+    return await _terms_payload(partner)
+
+
+@router.put("/partners/{partner_id}/terms", response_model=PartnerTerms)
+@limiter.limit("60/minute")
+async def set_partner_terms(
+    request: Request,
+    partner_id: str,
+    body: PartnerTermsUpdate,
+    admin: AdminIdentity = Depends(require_admin),
+) -> PartnerTerms:
+    """
+    Put a partner on a negotiated deal.
+
+    Takes effect on the NEXT booking and the NEXT billing cycle. Nothing already
+    sold moves: `bookings.commission_pct` is a snapshot, and a mandate Razorpay
+    is already collecting keeps its amount until it is cancelled and reopened.
+    Say so out loud when the fee changes, because "I changed it in the dashboard
+    and they're still being charged ₹499" is otherwise a bug report.
+    """
+    partner = await _partner_or_404(partner_id)
+    before = await terms_service.resolve(partner_id)
+
+    if body.entitlement == "until" and not body.entitlement_expires_at:
+        raise HTTPException(400, "An 'until' entitlement needs an end date.")
+
+    # One timestamp for the whole change: the audit row, the terms row and the
+    # intro window all date from the same instant, so "when did this deal start"
+    # has exactly one answer.
+    effective_at = datetime.now(timezone.utc)
+
+    try:
+        applied = await terms_service.apply(
+            partner_id,
+            fee_paise=body.subscription_fee_paise,
+            period=body.billing_period,
+            commission=body.commission_pct,
+            commission_months=body.commission_months,
+            base_commission=body.base_commission_pct,
+            entitlement=body.entitlement,
+            entitlement_expires_at=body.entitlement_expires_at,
+            source="admin",
+            notes=body.notes,
+            effective_at=effective_at,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[admin] terms update failed")
+        raise HTTPException(502, "Could not update those terms.") from exc
+
+    # Recorded on the audit row rather than left for someone to notice: a fee
+    # change that leaves the mandate collecting the old amount is the single
+    # most likely thing to be misread as "the system did it".
+    mismatch = await terms_service.billing_mismatch(partner, applied)
+
+    await admin_audit.record(
+        actor=admin.actor,
+        action="partner.terms_changed",
+        entity_type="partner",
+        entity_id=partner_id,
+        entity_label=partner.get("brand_name"),
+        reason=body.reason,
+        ip=admin.ip,
+        metadata={
+            "effective_at": effective_at.isoformat(),
+            "from": {
+                "fee_paise": before["subscription_fee_paise"],
+                "period": before["billing_period"],
+                "commission_pct": before["commission_pct"],
+                "commission_expires_at": (
+                    str(before["commission_expires_at"])
+                    if before.get("commission_expires_at")
+                    else None
+                ),
+                "entitlement": before.get("entitlement"),
+            },
+            "to": {
+                "fee_paise": body.subscription_fee_paise,
+                "period": body.billing_period,
+                "commission_pct": body.commission_pct,
+                "commission_months": body.commission_months,
+                "entitlement": applied.get("entitlement"),
+                "entitlement_expires_at": body.entitlement_expires_at,
+            },
+            "notes": body.notes,
+            # Set when Razorpay is now collecting something these terms don't
+            # describe. Someone has to act on it; the audit says who knew.
+            "billing_mismatch": mismatch,
+            "stale_listings": applied.get("stale_listings") or None,
+        },
+    )
+    await emit(
+        "partner.terms_changed",
+        {
+            "actor": admin.actor,
+            "partner_id": partner_id,
+            "entity_label": partner.get("brand_name"),
+            "billing_mismatch": bool(mismatch),
+        },
+    )
+    return await _terms_payload(partner, stale=applied.get("stale_listings"))
+
+
+@router.delete("/partners/{partner_id}/terms", response_model=PartnerTerms)
+@limiter.limit("60/minute")
+async def reset_partner_terms(
+    request: Request,
+    partner_id: str,
+    admin: AdminIdentity = Depends(require_admin),
+) -> PartnerTerms:
+    """Put a partner back on standard terms, listings included."""
+    partner = await _partner_or_404(partner_id)
+    before = await terms_service.resolve(partner_id)
+
+    try:
+        await terms_service.clear(partner_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[admin] terms reset failed")
+        raise HTTPException(502, "Could not reset those terms.") from exc
+
+    await admin_audit.record(
+        actor=admin.actor,
+        action="partner.terms_reset",
+        entity_type="partner",
+        entity_id=partner_id,
+        entity_label=partner.get("brand_name"),
+        ip=admin.ip,
+        metadata={
+            "effective_at": datetime.now(timezone.utc).isoformat(),
+            "from": terms_service.describe(before),
+        },
+    )
+    return await _terms_payload(partner)
+
+
+@router.post("/partners/{partner_id}/terms/realign", response_model=MandateRealignResult)
+@limiter.limit("30/minute")
+async def realign_mandate(
+    request: Request,
+    partner_id: str,
+    admin: AdminIdentity = Depends(require_admin),
+) -> MandateRealignResult:
+    """
+    Cancel a mandate that no longer matches the partner's terms, so they can
+    re-subscribe at the agreed price.
+
+    THE RAZORPAY CONSTRAINT this exists for: a subscription is bound to the plan
+    it was created against, and there is no API to move it to another one.
+    Re-pricing therefore means cancelling and reopening — there is no in-place
+    edit to reach for, and pretending otherwise is what leaves a partner told
+    they're on ₹299/month while ₹499/year keeps leaving their account.
+
+    Why cancelling immediately does not rob them: `stay_plan_expires_at` is
+    untouched, and that — not the mandate — is what keeps their listings up.
+    They stay live for the period they already paid for, and re-subscribing
+    extends from that date rather than from today (`activate_stay_plan` extends
+    from max(now, current expiry)), so no time is lost either.
+
+    Why it cannot double-charge: the old mandate is dead before the partner can
+    open Checkout again, and `/subscribe` refuses to start a second one while a
+    live mandate exists. There is never a moment with two mandates collecting.
+    """
+    partner = await _partner_or_404(partner_id)
+    subscription_id = partner.get("subscription_id")
+
+    mismatch = await terms_service.billing_mismatch(partner)
+    if not mismatch:
+        raise HTTPException(
+            409,
+            "Their mandate already matches their terms — nothing to realign.",
+        )
+
+    result = await razorpay.cancel_subscription(subscription_id, at_cycle_end=False)
+    if result is None:
+        raise HTTPException(502, "Razorpay would not cancel that mandate. Try again.")
+
+    await set_subscription_status(subscription_id, result.get("status") or "cancelled")
+
+    await admin_audit.record(
+        actor=admin.actor,
+        action="partner.mandate_realigned",
+        entity_type="partner",
+        entity_id=partner_id,
+        entity_label=partner.get("brand_name"),
+        ip=admin.ip,
+        metadata={
+            "effective_at": datetime.now(timezone.utc).isoformat(),
+            "cancelled_subscription_id": subscription_id,
+            "was_billing": mismatch,
+            "paid_through": str(partner.get("stay_plan_expires_at") or ""),
+        },
+    )
+    await emit(
+        "partner.mandate_realigned",
+        {
+            "actor": admin.actor,
+            "partner_id": partner_id,
+            "entity_label": partner.get("brand_name"),
+        },
+    )
+
+    fresh = await _partner_or_404(partner_id)
+    return MandateRealignResult(
+        ok=True,
+        message=(
+            "Mandate cancelled. Their listings stay live until "
+            f"{str(partner.get('stay_plan_expires_at') or 'their paid period ends')[:10]}; "
+            "ask them to subscribe again from their Plan page to start the new terms."
+        ),
+        terms=await _terms_payload(fresh),
+    )
+
+
 # ── plan coupons ────────────────────────────────────────────────────────────
 
 
@@ -357,6 +672,12 @@ def _as_coupon(row: dict, used: int) -> AdminCoupon:
         kind=row["kind"],
         value=row["value"],
         duration_months=row.get("duration_months"),
+        plan_amount_paise=row.get("plan_amount_paise"),
+        plan_period=row.get("plan_period"),
+        commission_pct=(
+            float(row["commission_pct"]) if row.get("commission_pct") is not None else None
+        ),
+        commission_months=row.get("commission_months"),
         razorpay_offer_id=row.get("razorpay_offer_id"),
         description=row.get("description"),
         campaign=row.get("campaign"),
@@ -426,14 +747,32 @@ async def create_coupon(
         raise HTTPException(
             400,
             "Percent and flat coupons need a Razorpay offer id — create the offer "
-            "in the Razorpay Dashboard first. Free-month coupons need nothing.",
+            "in the Razorpay Dashboard first. Free-month and deal coupons need nothing.",
         )
+
+    if body.kind == "deal":
+        if body.plan_amount_paise is None or not body.plan_period:
+            raise HTTPException(
+                400, "A deal code needs a price and a billing period."
+            )
+        # An intro period with no rate to be introductory ABOUT is the one way
+        # to build a code that promises a discount and delivers standard terms.
+        if body.commission_months and body.commission_pct is None:
+            raise HTTPException(
+                400,
+                "This code sets an intro period but no commission rate. Set the "
+                "rate it starts on, or clear the intro months.",
+            )
 
     row = {
         "code": body.code.strip().upper(),
         "kind": body.kind,
         "value": body.value,
         "duration_months": body.duration_months,
+        "plan_amount_paise": body.plan_amount_paise,
+        "plan_period": body.plan_period,
+        "commission_pct": body.commission_pct,
+        "commission_months": body.commission_months,
         "razorpay_offer_id": body.razorpay_offer_id,
         "description": body.description,
         "campaign": body.campaign,
