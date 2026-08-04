@@ -19,6 +19,8 @@ amenities as display strings, not codes.
 """
 from __future__ import annotations
 
+from app.services.partner_stays import pin_partners
+
 # ── Budget → sort (hotels). Budget always wins over an explicit sort. ─────────
 _BUDGET_SORT = {"low": "price_asc", "mid": "recommended", "high": "rating"}
 
@@ -419,13 +421,21 @@ def apply_hotel_filters(hotels: list[dict], filters: dict | None) -> list[dict]:
 
 
 def sort_hotels(hotels: list[dict], sort: str | None) -> list[dict]:
-    """Order a merged hotel list by a canonical sort key ('recommended' = as-is)."""
+    """Order a merged hotel list by a canonical sort key ('recommended' = as-is).
+
+    Partner rows stay pinned on top through every sort — they are a separate,
+    tagged group above the results, not competitors inside them (see
+    app/services/partner_stays.pin_partners). Their order *within* the group
+    still follows the chosen sort.
+    """
     if sort == "price_asc":
-        return sorted(hotels, key=lambda h: _price_of(h) or 999_999)
-    if sort == "price_desc":
-        return sorted(hotels, key=lambda h: -(_price_of(h) or 0))
-    if sort == "rating":
-        return sorted(hotels, key=lambda h: -(
+        ordered = sorted(hotels, key=lambda h: _price_of(h) or 999_999)
+    elif sort == "price_desc":
+        ordered = sorted(hotels, key=lambda h: -(_price_of(h) or 0))
+    elif sort == "rating":
+        ordered = sorted(hotels, key=lambda h: -(
             float(h.get("review_score") or h.get("star_rating") or h.get("google_rating") or 0)
         ))
-    return hotels
+    else:
+        ordered = hotels
+    return pin_partners(ordered)

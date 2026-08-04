@@ -7,6 +7,13 @@ Sources searched simultaneously:
 
 Results are filtered to hotels within max_distance_km of the destination,
 deduplicated by name, and sorted richest-first (booking_url + price + photos).
+
+TravBuddy's own partner stays are then PINNED above that merged list (see
+app/services/partner_stays). They are not scored against OTA rows and never
+enter the ranking — they are a small, tagged group on top, because they are the
+only stays we can actually take a booking for. Injecting them here rather than
+per-endpoint means every surface (quick search, planner, workspace, mobile)
+gets them from one place.
 """
 import asyncio
 import logging
@@ -28,10 +35,18 @@ from app.services.hotels_filters import (
     sort_hotels,
 )
 from app.services.hotels_destination import normalize_destination, distance_km_for
+from app.services.partner_stays import (
+    PARTNER_SOURCE, merge_partner_stays, partner_stays,
+)
 
 # Fixed per-source fetch size. No user-facing limit — each API still needs a page
 # size (Booking self-caps at 25); the merged list is returned in full.
 _PER_SOURCE = 40
+
+# Partner inventory is two indexed reads plus an availability check per listing.
+# It runs beside the scrapers, so this ceiling only ever fires if Supabase is
+# in trouble — and then the OTA list must still ship on time.
+_PARTNER_TIMEOUT_S = 6.0
 
 # Per-night price thresholds for soft budget filtering, by currency
 _BUDGET_PRICE_RANGE: dict[str, dict[str, tuple[int, int]]] = {
@@ -91,6 +106,16 @@ class HotelService:
         persona      = derive_travel_type(adults, travel_type)
         ptypes       = explicit_types or preferred_types(persona, budget)
         canonical_sort = filters.get("sort") or budget_to_hotel_sort(budget) or sort or "recommended"
+
+        # Our own inventory, fetched alongside the scrapers so it costs no extra
+        # wall time. `dest.query` is the canonical lowercase city, which is what
+        # partners type into their listing's city/destination.
+        partners_task = asyncio.create_task(
+            partner_stays(
+                city or destination, checkin, checkout, rooms=rooms,
+                price_min=filters.get("price_min"), price_max=filters.get("price_max"),
+            )
+        )
 
         emt_r, booking_r, agoda_r, ixigo_r = await asyncio.gather(
             breaker_emt.call(
@@ -154,10 +179,16 @@ class HotelService:
             emt_status, booking_status, agoda_status, ixigo_status,
         )
 
+        partners = await self._await_partners(partners_task)
+
         if not all_hotels:
-            return {"hotels": [], "source": "none", "nights": nights,
+            # Every OTA came back empty (or broke). Partner inventory is still
+            # bookable, so a screen with our own stays beats an empty one.
+            return {"hotels": partners, "source": PARTNER_SOURCE if partners else "none",
+                    "nights": nights,
                     "travel_type": persona, "property_types": ptypes,
                     "filters_applied": filters or None, "filters_relaxed": False,
+                    "partner_count": len(partners),
                     "destination": dest.display_name, "dest_class": dest.dest_class}
 
         total_raw = len(all_hotels)
@@ -199,17 +230,34 @@ class HotelService:
         # the /plan path. Idempotent upsert on (source, source_hotel_id).
         self._persist_master(hotels_with_map, dest.display_name)
 
+        # Pinned LAST, and after _persist_master on purpose: partner listings are
+        # our own rows, not scraped OTA inventory, and must never be written into
+        # the hotels master table as if they were.
+        merged = merge_partner_stays(hotels_with_map, partners)
+
         return {
-            "hotels": hotels_with_map,
-            "source": "+".join(sources),
+            "hotels": merged,
+            "source": "+".join(sources + ([PARTNER_SOURCE] if partners else [])),
             "nights": nights,
             "travel_type": persona,
             "property_types": ptypes,
             "filters_applied": filters or None,
             "filters_relaxed": relaxed,
+            "partner_count": len(partners),
             "destination": dest.display_name,
             "dest_class": dest.dest_class,
         }
+
+    @staticmethod
+    async def _await_partners(task) -> list[dict]:
+        """Partner inventory is additive — a failure or a slow read gives an
+        empty list and the OTA results ship exactly as before."""
+        try:
+            return await asyncio.wait_for(task, timeout=_PARTNER_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001
+            task.cancel()
+            logger.warning("[hotels] partner stays unavailable: %s", type(exc).__name__)
+            return []
 
 
     @staticmethod

@@ -16,7 +16,9 @@ Design rules, in priority order:
      `is_featured`, or any other paid signal. (The design doc originally
      proposed a featured boost for the marketplace; it is deliberately absent
      here — a paid boost inside an AI recommendation is exactly the OTA
-     behaviour we are positioning against.)
+     behaviour we are positioning against.) Partner stays ARE pinned above hotel
+     search results, which is a placement, not a re-ranking — see
+     docs/partner_stays_in_search.md for why the two don't contradict.
   3. **Never invent a reason.** Every `why` line is emitted only by the scorer
      that actually fired, from real values on the row.
   4. **The planner stays dumb.** It renders `sections[]` and `day_matches[]`

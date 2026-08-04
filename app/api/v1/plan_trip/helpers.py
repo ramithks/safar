@@ -266,7 +266,13 @@ def rank_hotels(hotels: list[dict], budget: str = "mid") -> list[dict]:
     high stay quality-led. NOTE the old blend used `min(1, 10000/price)`, which
     saturates at 1.0 for anything under ₹10k — so price never differentiated two
     cheap hotels. We normalise against the cheapest in THIS result set instead.
+
+    Partner stays are pinned above the ranked list instead of being scored into
+    it — they are the stays TravBuddy can actually take a booking for, and the
+    card tags them as such.
     """
+    from app.services.partner_stays import pin_partners
+
     if budget == "low":
         prices = [p for p in (_hotel_price(h) for h in hotels) if p > 0]
         cheapest = min(prices) if prices else 0.0
@@ -279,14 +285,14 @@ def rank_hotels(hotels: list[dict], budget: str = "mid") -> list[dict]:
             price_n = (cheapest / price) if price > 0 and cheapest > 0 else 0.0
             return price_n * 0.8 + min(1.0, review / 10.0) * 0.2
 
-        return sorted(hotels, key=_score_low, reverse=True)
+        return pin_partners(sorted(hotels, key=_score_low, reverse=True))
 
     def _score(h: dict) -> float:
         review = float(h.get("review_score") or h.get("ta_rating") or h.get("star_rating") or 0)
         price = _hotel_price(h)
         price_eff = min(1.0, 10000 / price) if price > 0 else 0.5
         return review * 0.6 + price_eff * 10 * 0.4
-    return sorted(hotels, key=_score, reverse=True)
+    return pin_partners(sorted(hotels, key=_score, reverse=True))
 
 
 

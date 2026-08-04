@@ -62,10 +62,20 @@ def _sort_trains(trains: list[dict], sort: str) -> list[dict]:
 
 # ── Recommended helper ────────────────────────────────────────────────────────
 
-def _tag_recommended(items: list[dict]) -> list[dict]:
-    """Mark the first item (best by the applied sort) as is_recommended=True."""
+def _tag_recommended(items: list[dict], skip_partners: bool = False) -> list[dict]:
+    """Mark the first item (best by the applied sort) as is_recommended=True.
+
+    `skip_partners` moves the flag past TravBuddy's own pinned stays: those lead
+    the list because we can book them, not because the ranking chose them, and
+    "recommended" has to keep meaning "the best of what we searched". They carry
+    their own Partner tag, so nothing goes unlabelled.
+    """
+    pick = next(
+        (i for i, item in enumerate(items) if not (skip_partners and item.get("is_partner"))),
+        None,
+    )
     for i, item in enumerate(items):
-        item["is_recommended"] = (i == 0)
+        item["is_recommended"] = (i == pick)
     return items
 
 
@@ -159,7 +169,9 @@ async def search_hotels(body: HotelSearchRequest, _user=Depends(require_user)):
         (result.get("filters_applied") or {}).get("sort")
         or budget_to_hotel_sort(body.budget) or body.sort
     )
-    hotels = _tag_recommended(_sort_hotels(result.get("hotels") or [], effective_sort))
+    hotels = _tag_recommended(
+        _sort_hotels(result.get("hotels") or [], effective_sort), skip_partners=True
+    )
     cheapest = min(
         (
             h.get("price_per_night") or h.get("estimated_price_per_night")
@@ -168,7 +180,9 @@ async def search_hotels(body: HotelSearchRequest, _user=Depends(require_user)):
         ),
         default=None,
     )
-    top = hotels[0] if hotels else None
+    # The `recommended` block describes the flagged item, which is the best
+    # SEARCHED stay — partner rows sit above it and are surfaced separately.
+    top = next((h for h in hotels if h.get("is_recommended")), None)
     recommended = {
         "name": top.get("name"),
         "property_type": top.get("property_type"),

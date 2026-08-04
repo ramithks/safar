@@ -123,6 +123,14 @@ _HOTEL_FIELDS = (
     # recommendation-agent notes ("why we'd pick this")
     "ai_reason", "ai_pros", "ai_best_for", "recommendation_reason",
     "why_recommended", "reason", "why", "is_recommended",
+    # TravBuddy partner stays — the card renders the Partner tag off these and
+    # links to /stays/{listing_slug} instead of an OTA. Dropping any of them
+    # turns a bookable partner row into an anonymous hotel.
+    "is_partner", "partner_name", "partner_slug", "partner_verified",
+    "listing_id", "listing_slug", "booking_mode", "available_rooms", "city",
+    # strike-through pricing — emitted by the Agoda/Booking parsers and by
+    # partner stays alike, so the card shows "₹3,600 ₹3,900 · 8% off"
+    "price_original", "savings", "discount_pct", "discount_label",
 )
 _MAX_HOTEL_PHOTOS = 4
 _MAX_HOTEL_AMENITIES = 8

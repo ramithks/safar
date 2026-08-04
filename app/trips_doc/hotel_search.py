@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.services.hotels import HotelService
 from app.services.hotels_filters import sanitize_hotel_filters
+from app.services.partner_stays import pin_partners
 from app.services.places import search_places
 
 from .serialize import compute_budget, trim_hotel
@@ -132,9 +133,12 @@ async def search_stop_hotels(doc: dict, stop_id: str, query: str = "",
                 if len(kept) >= _MIN_NEARBY:
                     located = kept
                     break
-        hotels = (located + unlocated)[:_MAX_RESULTS]
-    else:
-        hotels = hotels[:_MAX_RESULTS]
+        hotels = located + unlocated
+
+    # Distance to the landmark just re-ordered everything; partner stays go back
+    # on top, where the merged list had them — and BEFORE the cap, so a partner
+    # stay a few km out isn't cut from the list it was meant to lead.
+    hotels = pin_partners(hotels)[:_MAX_RESULTS]
 
     trimmed = [trim_hotel(h) for h in hotels]
     cheapest = min(trimmed, key=lambda h: h.get("price_per_night") or 1e12) if trimmed else None
