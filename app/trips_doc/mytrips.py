@@ -47,10 +47,32 @@ def _itinerary_data(doc: dict) -> dict:
     }
 
 
+async def _current_owner(trip_id: str, fallback: str) -> str:
+    """
+    The trip's owner *now*, not when generation started.
+
+    A guest who signs up while the build is still running has their trip_states
+    row moved to the new account by claim_guest_trip(). The user_id captured at
+    generation start is stale by then, and writing it here would hand the My
+    Trips row back to the abandoned anonymous user — the trip would vanish from
+    My Trips even though the workspace still opened fine.
+    """
+    from . import store
+
+    try:
+        row = await store.get_row(trip_id)
+        if row and row.get("user_id"):
+            return str(row["user_id"])
+    except Exception as exc:  # noqa: BLE001 — advisory; fall back to the caller's id
+        logger.warning("[trip-doc] owner lookup failed for %s: %s", trip_id, exc)
+    return fallback
+
+
 async def upsert_my_trip(trip_id: str, user_id: str, doc: dict) -> None:
     """Best-effort upsert of the My Trips row. Never raises."""
     if not user_id:
         return
+    user_id = await _current_owner(trip_id, user_id)
     try:
         spec = doc.get("spec") or {}
         transport = doc.get("transport") or []

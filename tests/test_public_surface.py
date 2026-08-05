@@ -102,9 +102,37 @@ class TestLimiterKeying:
         from app.core import limiter as limiter_mod
 
         # Stand in for "this process already checked the signature".
-        monkeypatch.setattr(limiter_mod, "verified_sub", lambda token: "real-user-id")
+        monkeypatch.setattr(
+            limiter_mod, "verified_identity", lambda token: ("real-user-id", False)
+        )
         key = limiter_mod._user_or_ip(self._request({"authorization": "Bearer whatever"}))
         assert key == "user:real-user-id"
+
+    def test_anonymous_users_share_the_ip_bucket(self, monkeypatch):
+        """
+        Guests are free to mint, so a per-user bucket would be no bucket at all:
+        one POST /auth/v1/signup buys a fresh `sub` and a fresh allowance. Every
+        guest on an IP must land in that IP's bucket, however many they create.
+        """
+        from app.core import limiter as limiter_mod
+
+        counter = iter(range(100))
+        monkeypatch.setattr(
+            limiter_mod,
+            "verified_identity",
+            lambda token: (f"guest-{next(counter)}", True),
+        )
+
+        keys = {
+            limiter_mod._user_or_ip(self._request({"authorization": f"Bearer tok{i}"}))
+            for i in range(25)
+        }
+        assert keys == {"203.0.113.7"}
+
+    def test_verified_identity_answers_none_for_an_unverified_token(self):
+        from app.deps.auth import verified_identity
+
+        assert verified_identity("some.unverified.token") is None
 
     def test_garbage_in_the_header_does_not_raise(self):
         from app.core.limiter import _user_or_ip

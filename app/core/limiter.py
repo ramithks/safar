@@ -20,7 +20,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from app.config import settings
-from app.deps.auth import verified_sub
+from app.deps.auth import verified_identity
 
 
 def _user_or_ip(request) -> str:
@@ -29,9 +29,18 @@ def _user_or_ip(request) -> str:
         # Only a token whose signature this process has already checked earns a
         # per-user bucket. An unverified one is indistinguishable from a forged
         # one, and a forged one must not be able to escape the IP bucket.
-        sub = verified_sub(auth[len("Bearer "):])
-        if sub:
-            return f"user:{sub}"
+        identity = verified_identity(auth[len("Bearer "):])
+        if identity:
+            sub, is_anonymous = identity
+            # ...and only an account that COST something earns one. An
+            # anonymous (guest) user is free and unlimited: a single
+            # unauthenticated POST /auth/v1/signup mints a fresh, validly
+            # signed token with a brand-new `sub`. Keying those per-user would
+            # hand out an empty bucket on demand — the same defeat as the
+            # forged-sub bug above, just with real signatures. Guests share the
+            # IP bucket, which is what actually caps guest trip generation.
+            if not is_anonymous:
+                return f"user:{sub}"
     return get_remote_address(request)
 
 

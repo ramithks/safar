@@ -89,7 +89,14 @@ def _verify_local(token: str):
     else:
         return None
 
-    return SimpleNamespace(id=payload["sub"], email=payload.get("email"))
+    return SimpleNamespace(
+        id=payload["sub"],
+        email=payload.get("email"),
+        # Carried so the rate limiter can tell a guest apart from a real
+        # account. The remote path returns Supabase's own User, which already
+        # has this attribute; keep the two shapes in step.
+        is_anonymous=bool(payload.get("is_anonymous", False)),
+    )
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -151,6 +158,20 @@ def verified_sub(token: str) -> str | None:
     """
     user = _cache_get(token)
     return str(user.id) if user is not None else None
+
+
+def verified_identity(token: str) -> tuple[str, bool] | None:
+    """
+    (user_id, is_anonymous) for a token this process has ALREADY verified.
+
+    Same read-only contract as verified_sub. The anonymity flag exists because
+    a per-user rate-limit bucket is only meaningful when obtaining a user costs
+    something — see the note in app/core/limiter.py.
+    """
+    user = _cache_get(token)
+    if user is None:
+        return None
+    return str(user.id), bool(getattr(user, "is_anonymous", False))
 
 
 def _cache_put(token: str, user) -> None:
