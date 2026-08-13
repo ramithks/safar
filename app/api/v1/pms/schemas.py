@@ -284,3 +284,184 @@ class TaskCreateRequest(BaseModel):
 
 class TaskStatusRequest(BaseModel):
     status: str
+
+
+class TaskOut(BaseModel):
+    id: str
+    propertyId: str
+    code: str
+    title: str
+    category: str
+    priority: str
+    status: str
+    roomNumber: str | None = None
+    reservationId: str | None = None
+    assigneeId: str | None = None
+    assigneeName: str | None = None
+    createdBy: str
+    conversationId: str | None = None
+    sourceChannel: str | None = None
+    guestName: str | None = None
+    createdAt: datetime
+    resolvedAt: datetime | None = None
+
+    @staticmethod
+    def from_row(row: dict) -> "TaskOut":
+        return TaskOut(
+            id=row["id"],
+            propertyId=row["property_id"],
+            code=row["code"],
+            title=row["title"],
+            category=row["category"],
+            priority=row["priority"],
+            status=row["status"],
+            roomNumber=row.get("room_number"),
+            reservationId=row.get("reservation_id"),
+            assigneeId=row.get("assignee_member"),
+            assigneeName=row.get("assignee_name"),
+            createdBy=row["created_by"],
+            conversationId=row.get("conversation_id"),
+            sourceChannel=row.get("source_channel"),
+            guestName=row.get("guest_name"),
+            createdAt=row["created_at"],
+            resolvedAt=row.get("resolved_at"),
+        )
+
+
+# ── workspace: who the caller is, and what they may open ─────────────────────
+
+class MembershipOut(BaseModel):
+    partnerId: str
+    memberId: str | None
+    role: str
+    # Flattened from role + per-member grants, so the client never reimplements
+    # the permission table. The server's copy stays authoritative: this list is
+    # for deciding which buttons to draw, never for deciding what is allowed.
+    permissions: list[str]
+    # Empty means every property of the partner.
+    propertyIds: list[str]
+
+
+class MeOut(BaseModel):
+    profileId: str
+    email: str | None = None
+    fullName: str | None = None
+    memberships: list[MembershipOut]
+
+
+class PropertyOut(BaseModel):
+    id: str
+    slug: str
+    name: str
+    propertyType: str
+    city: str
+    state: str
+    timezone: str
+    currency: str
+    checkInTime: str
+    checkOutTime: str
+    totalRooms: int
+    gstin: str | None = None
+    status: str
+
+    @staticmethod
+    def from_row(row: dict) -> "PropertyOut":
+        return PropertyOut(
+            id=row["id"],
+            slug=row["slug"],
+            name=row["name"],
+            propertyType=row["property_type"],
+            city=row.get("city") or "",
+            state=row.get("state") or "",
+            timezone=row.get("timezone") or "Asia/Kolkata",
+            currency=row.get("currency") or "INR",
+            # Postgres hands back '14:00:00'; the PWA renders 'HH:MM'.
+            checkInTime=str(row.get("check_in_time") or "14:00")[:5],
+            checkOutTime=str(row.get("check_out_time") or "11:00")[:5],
+            totalRooms=row.get("total_rooms") or 0,
+            gstin=row.get("gstin"),
+            status=row["status"],
+        )
+
+
+class RoomTypeOut(BaseModel):
+    id: str
+    propertyId: str
+    code: str
+    name: str
+    totalUnits: int
+    maxOccupancy: int
+    standardOccupancy: int
+    bedType: str
+    sortOrder: int
+    isActive: bool
+
+    @staticmethod
+    def from_row(row: dict) -> "RoomTypeOut":
+        return RoomTypeOut(
+            id=row["id"],
+            propertyId=row["property_id"],
+            code=row["code"],
+            name=row["name"],
+            totalUnits=row["total_units"],
+            maxOccupancy=row["max_occupancy"],
+            standardOccupancy=row["standard_occupancy"],
+            bedType=row.get("bed_type") or "",
+            sortOrder=row.get("sort_order") or 0,
+            isActive=row["is_active"],
+        )
+
+
+class RatePlanOut(BaseModel):
+    id: str
+    propertyId: str
+    roomTypeId: str
+    code: str
+    name: str
+    mealPlan: str
+    audience: str
+    basePricePaise: int
+    refundable: bool
+    inclusions: list[str]
+    isActive: bool
+
+    @staticmethod
+    def from_row(row: dict) -> "RatePlanOut":
+        return RatePlanOut(
+            id=row["id"],
+            propertyId=row["property_id"],
+            roomTypeId=row["room_type_id"],
+            code=row["code"],
+            name=row["name"],
+            mealPlan=row["meal_plan"],
+            audience=row["audience"],
+            basePricePaise=row["base_price_paise"],
+            refundable=row["refundable"],
+            inclusions=row.get("inclusions") or [],
+            isActive=row["is_active"],
+        )
+
+
+class SourceMixOut(BaseModel):
+    source: str
+    bookings: int
+    revenuePaise: int
+
+
+class TodayStatsOut(BaseModel):
+    date: date
+    occupancyPct: float
+    occupancyDeltaPct: float
+    adrPaise: int
+    revparPaise: int
+    roomsSold: int
+    roomsAvailable: int
+    arrivals: int
+    arrivalsPending: int
+    departures: int
+    departuresPending: int
+    inHouse: int
+    revenueTodayPaise: int
+    openTasks: int
+    unreadConversations: int
+    bySource: list[SourceMixOut]

@@ -32,26 +32,91 @@ from app.api.v1.pms.schemas import (
     FolioEntryOut,
     FolioOut,
     FolioPostRequest,
+    MeOut,
     NightlyOut,
+    PropertyOut,
     QuoteOut,
     QuoteRequest,
     RatePlanOptionOut,
+    RatePlanOut,
     ReservationOut,
     RoomOut,
     RoomStatusRequest,
+    RoomTypeOut,
     StayOptionOut,
     TaskCreateRequest,
+    TaskOut,
     TaskStatusRequest,
+    TodayStatsOut,
 )
 from app.core.limiter import limiter
 from app.db.client import get_db, run_db
+from app.deps.auth import require_user
 from app.deps.property import require_member
 from app.services.pms import availability as availability_service
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
+from app.services.pms import workspace as workspace_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/pms", tags=["pms"])
+
+
+# ── workspace ────────────────────────────────────────────────────────────────
+# What the PWA asks before it can render anything: who am I, and which hotels
+# may I open. Both derive from the JWT alone. Note these two take `require_user`
+# rather than `require_member` — there is no property in the path yet, which is
+# exactly why they must do their own scoping and never take a hint from the
+# client about which partner to look at.
+
+@router.get("/me", response_model=MeOut)
+@limiter.limit("120/minute")
+async def get_me(request: Request, user=Depends(require_user)):
+    """
+    The caller, and their role at each partner they belong to.
+
+    `permissions` is flattened from the role table plus per-member grants so the
+    client can decide which buttons to draw. It is not a security boundary and
+    must never be treated as one — every route re-derives the same answer
+    server-side through `require_member`.
+    """
+    return await workspace_service.me(str(user.id))
+
+
+@router.get("/properties", response_model=list[PropertyOut])
+@limiter.limit("120/minute")
+async def list_properties(request: Request, user=Depends(require_user)):
+    """Every property this person may open, and only those."""
+    rows = await workspace_service.list_properties(str(user.id))
+    return [PropertyOut.from_row(r) for r in rows]
+
+
+@router.get("/properties/{property_id}/today", response_model=TodayStatsOut)
+@limiter.limit("120/minute")
+async def get_today(request: Request, property_id: str, member=Depends(require_member())):
+    """Occupancy, ADR, RevPAR and the arrival/departure counts for today."""
+    return await workspace_service.today_stats(property_id)
+
+
+@router.get("/properties/{property_id}/room-types", response_model=list[RoomTypeOut])
+@limiter.limit("120/minute")
+async def list_room_types(request: Request, property_id: str, member=Depends(require_member())):
+    rows = await workspace_service.list_room_types(property_id)
+    return [RoomTypeOut.from_row(r) for r in rows]
+
+
+@router.get("/properties/{property_id}/rate-plans", response_model=list[RatePlanOut])
+@limiter.limit("120/minute")
+async def list_rate_plans(request: Request, property_id: str, member=Depends(require_member())):
+    rows = await workspace_service.list_rate_plans(property_id)
+    return [RatePlanOut.from_row(r) for r in rows]
+
+
+@router.get("/properties/{property_id}/tasks", response_model=list[TaskOut])
+@limiter.limit("120/minute")
+async def list_tasks(request: Request, property_id: str, member=Depends(require_member("tasks"))):
+    rows = await workspace_service.list_tasks(property_id)
+    return [TaskOut.from_row(r) for r in rows]
 
 
 # ── availability ─────────────────────────────────────────────────────────────
@@ -240,6 +305,29 @@ async def create_reservation(
     return ReservationOut.from_row(row)
 
 
+@router.get("/properties/{property_id}/reservations/{reservation_id}",
+            response_model=ReservationOut)
+@limiter.limit("240/minute")
+async def get_reservation(
+    request: Request,
+    property_id: str,
+    reservation_id: str,
+    member=Depends(require_member()),
+):
+    """
+    One reservation, for the detail drawer.
+
+    Scoped by property in the query rather than fetched by id alone: a
+    reservation id from another hotel must 404 here exactly as a property id
+    does, or the drawer becomes the enumeration oracle the rest of the API is
+    careful not to be.
+    """
+    row = await workspace_service.get_reservation(property_id, reservation_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Reservation not found")
+    return ReservationOut.from_row(row)
+
+
 @router.post("/properties/{property_id}/reservations/{reservation_id}/check-in",
              response_model=ReservationOut)
 @limiter.limit("120/minute")
@@ -375,7 +463,7 @@ async def set_room_status(
     return await frontdesk_service.set_room_status(property_id, room_id, body.status)
 
 
-@router.post("/properties/{property_id}/tasks")
+@router.post("/properties/{property_id}/tasks", response_model=TaskOut)
 @limiter.limit("120/minute")
 async def create_task(
     request: Request,
@@ -389,7 +477,7 @@ async def create_task(
     The id is supplied by the caller. A retry, a double-tap, or an outbox replay
     all resolve to the same ticket rather than three.
     """
-    return await frontdesk_service.create_task(
+    row = await frontdesk_service.create_task(
         property_id,
         task_id=body.id,
         title=body.title,
@@ -402,9 +490,10 @@ async def create_task(
         created_by=body.createdBy,
         member=member,
     )
+    return TaskOut.from_row(row)
 
 
-@router.post("/properties/{property_id}/tasks/{task_id}/status")
+@router.post("/properties/{property_id}/tasks/{task_id}/status", response_model=TaskOut)
 @limiter.limit("240/minute")
 async def set_task_status(
     request: Request,
@@ -413,4 +502,5 @@ async def set_task_status(
     body: TaskStatusRequest,
     member=Depends(require_member("tasks")),
 ):
-    return await frontdesk_service.set_task_status(property_id, task_id, body.status, member)
+    row = await frontdesk_service.set_task_status(property_id, task_id, body.status, member)
+    return TaskOut.from_row(row)
