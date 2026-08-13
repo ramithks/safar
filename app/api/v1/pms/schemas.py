@@ -279,9 +279,10 @@ class AriEditOut(BaseModel):
 
 
 class NightAuditRequest(BaseModel):
-    # Omitted means today. A past date lets a property close days it missed;
-    # a future one posts nothing beyond each stay's own departure, so it cannot
-    # be used to bill a guest in advance.
+    # Omitted means the night that has just ended on the *property's* clock —
+    # yesterday, locally. A past date lets a property close days it missed; a
+    # future one posts nothing beyond each stay's own departure, so it cannot be
+    # used to bill a guest in advance.
     businessDate: date | None = None
 
 

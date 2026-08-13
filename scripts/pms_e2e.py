@@ -28,7 +28,8 @@ a different partner who must not see the property exists at all.
 """
 import base64, json, random, subprocess, sys, urllib.request, urllib.error, uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 REF = "rdlozqvuywtgsodunait"
 SB = f"https://{REF}.supabase.co"
@@ -539,6 +540,52 @@ st, _ = http(f"{API}/properties/{PROP}/rates", "PATCH", {
     "ratePlanId": STD_PLAN, "fromDate": str(w_from),
     "toDate": str(w_from + timedelta(days=500)), "pricePaise": 100000}, manager)
 check("and so is a range long enough to be a typo", st == 400, f"got {st}")
+
+print("\n── the property clock ──")
+# "Today" used to be the server's date, which on Supabase is UTC. Between 18:30
+# and 00:00 UTC — 00:00 to 05:30 IST — every Indian property was shown the wrong
+# day: yesterday's arrivals, and folios dated to a day that had already closed.
+# Nobody caught it because nobody works a desk during a code review.
+st, props = http(f"{API}/properties", headers=reception)
+prop_row = next((p for p in props if p["id"] == PROP), None)
+check("the property reports its timezone", bool(prop_row and prop_row.get("timezone")),
+      str(prop_row and prop_row.get("timezone")))
+tz_name = prop_row["timezone"]
+
+utc_now = datetime.now(tz=ZoneInfo("UTC"))
+local_today = utc_now.astimezone(ZoneInfo(tz_name)).date()
+
+st, today_clock = http(f"{API}/properties/{PROP}/today", headers=reception)
+check("today reports the property's own date, not the server's",
+      st == 200 and today_clock["date"] == str(local_today),
+      f"api={today_clock.get('date')} local={local_today} utc={utc_now.date()}")
+
+# The assertion that would have caught the bug. It only *differs* from the UTC
+# date for part of the day, so it is stated rather than relied on: when the two
+# dates disagree, the API must side with the hotel.
+if local_today != utc_now.date():
+    check("and when the two disagree, the hotel wins",
+          today_clock["date"] != str(utc_now.date()),
+          f"api={today_clock['date']} utc={utc_now.date()}")
+else:
+    check("and when the two agree, so does the API",
+          today_clock["date"] == str(utc_now.date()))
+
+# The audit with no date closes the night that has just ended, locally. A
+# manager pressing the button at 15:00 and the hourly sweep must land on the
+# same day, or a night gets billed twice or not at all.
+st, audit_default = http(f"{API}/properties/{PROP}/night-audit", "POST", {}, manager)
+check("a night audit with no date closes yesterday on the property's clock",
+      st == 200 and audit_default["businessDate"] == str(local_today - timedelta(days=1)),
+      f"{st} {audit_default.get('businessDate')} expected {local_today - timedelta(days=1)}")
+
+# Whoever is in house has been billed through the close, so re-running it is a
+# no-op — which is what makes the hourly sweep safe.
+st, audit_repeat = http(f"{API}/properties/{PROP}/night-audit", "POST", {}, manager)
+check("and re-running it posts nothing", audit_repeat["entries"] == 0, str(audit_repeat))
+
+st, audit_forbidden = http(f"{API}/properties/{PROP}/night-audit", "POST", {}, housekeeper)
+check("a housekeeper cannot close the day", st == 403, f"{st} {str(audit_forbidden)[:80]}")
 
 print("\n── today's arrivals: the count and the list agree ──")
 # These were two different definitions in two files — the count included

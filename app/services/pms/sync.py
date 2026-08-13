@@ -24,9 +24,10 @@ never the client's. A front desk PC with a wrong clock would otherwise skip
 every change in the gap.
 """
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.db.client import get_db, run_db
+from app.services.pms import clock
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,11 @@ async def changes_since(property_id: str, since: str | None) -> dict:
                 q = q.gt(column, since)
             return q.order(column).limit(PAGE).execute().data or []
 
-        today = date.today()
+        # The property's date. The client prunes to a window around *its* idea
+        # of today, which is the hotel's; a server window built from UTC would
+        # be off by a day for half of every IST evening, and the row that fell
+        # between them would never be delivered.
+        today = clock.business_date(property_id)
         floor = (today - timedelta(days=WORKING_SET_PAST_DAYS)).isoformat()
         ceiling = (today + timedelta(days=WORKING_SET_FUTURE_DAYS)).isoformat()
 

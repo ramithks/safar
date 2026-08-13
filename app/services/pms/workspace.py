@@ -20,10 +20,11 @@ Getting ADR wrong is not a rounding error; it is the number a property prices
 next season on.
 """
 import logging
-from datetime import date, timedelta
+from datetime import timedelta
 
 from app.db.client import get_db, run_db
 from app.deps.property import ROLE_PERMS
+from app.services.pms import clock
 
 logger = logging.getLogger(__name__)
 
@@ -239,8 +240,11 @@ async def today_stats(property_id: str) -> dict:
     Deliberately one round trip's worth of queries rather than a view: these
     numbers change on every check-in, and a materialised view that is correct
     only until the next one is worse than no view.
+
+    "Today" is the property's, not the server's — a desk in Goa opening the
+    screen at 00:15 is looking at the day that has just started.
     """
-    today = date.today()
+    today = await clock.abusiness_date(property_id)
     today_s = today.isoformat()
 
     def _read():

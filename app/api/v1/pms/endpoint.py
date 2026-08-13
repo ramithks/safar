@@ -63,6 +63,7 @@ from app.deps.auth import require_user
 from app.deps.property import require_member
 from app.services.pms import ari as ari_service
 from app.services.pms import availability as availability_service
+from app.services.pms import clock
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
 from app.services.pms import sync as sync_service
@@ -396,7 +397,10 @@ async def list_reservations(
     list that changes the moment a connection drops leaves the desk with no way
     to tell which version is right.
     """
-    today = date.today().isoformat()
+    # The property's date, from services/pms/clock — the same source
+    # `today_stats` uses. Two definitions of "today" is exactly how the count
+    # and the list came to disagree in the first place.
+    today = await clock.abusiness_date_iso(property_id)
 
     def _read():
         db = get_db()

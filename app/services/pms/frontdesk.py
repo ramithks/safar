@@ -22,15 +22,16 @@ from datetime import date, datetime, timezone
 from fastapi import HTTPException, status
 
 from app.db.client import get_db, run_db
+from app.services.pms import clock
 
 logger = logging.getLogger(__name__)
 
 
-def _business_date(prop_timezone: str | None = None) -> str:
+def _business_date(property_id: str) -> str:
     # The property's business date, not the server's. A folio posted at 00:30
     # IST belongs to the day that has just started, and a server thinking in UTC
-    # would file it under yesterday.
-    return datetime.now(timezone.utc).date().isoformat()
+    # would file it under yesterday. See services/pms/clock.py.
+    return clock.business_date_iso(property_id)
 
 
 async def check_in(property_id: str, reservation_id: str, room_id: str, member) -> dict:
@@ -114,7 +115,7 @@ async def check_in(property_id: str, reservation_id: str, room_id: str, member) 
             "post_room_nights",
             {
                 "p_reservation": reservation_id,
-                "p_through": _business_date(),
+                "p_through": _business_date(property_id),
                 "p_posted_by": member.display_name or "Front desk",
             },
         ).execute()
@@ -319,22 +320,48 @@ async def run_night_audit(property_id: str, business_date: str | None = None) ->
     """
     Post the room nights for everyone in house.
 
-    pg_cron runs this nightly. It is exposed to the desk as well because the
+    pg_cron sweeps this hourly, closing each property's day once its own local
+    midnight has passed. It is exposed to the desk as well because the
     interesting case is the property that was closed, offline, or simply not
     looked at for two days: a manager needs to be able to bring the folios up to
-    date without waiting for 01:30, and it is safe to press because
+    date without waiting for the sweep, and it is safe to press because
     `post_room_nights` is idempotent — running it four times posts each night
     once.
+
+    With no date, this closes the night that has just ended on the *property's*
+    clock — `clock.audit_date_for`, the same arithmetic `run_night_audit_due()`
+    uses, so pressing the button at 15:00 and the 01:05 sweep agree.
     """
 
     def _run():
+        target = business_date or clock.audit_date_for(property_id).isoformat()
         rows = get_db().rpc(
             "run_night_audit",
-            {"p_property": property_id, "p_business_date": business_date or _business_date()},
+            {"p_property": property_id, "p_business_date": target},
         ).execute().data or []
         summary = rows[0] if rows else {"reservations": 0, "entries": 0}
+
+        # Record the close, so "did last night run" is a query rather than a
+        # hunch — and so the hourly sweep does not re-close a day a human
+        # already closed by hand.
+        try:
+            get_db().table("night_audit_runs").upsert(
+                {
+                    "property_id": property_id,
+                    "business_date": target,
+                    "reservations": summary.get("reservations", 0),
+                    "entries": summary.get("entries", 0),
+                    "trigger": "manual",
+                },
+                on_conflict="property_id,business_date",
+            ).execute()
+        except Exception:
+            # The charges are posted; failing to write the diary entry is not a
+            # reason to tell the manager the audit failed.
+            logger.warning("could not record night audit run", exc_info=True)
+
         return {
-            "businessDate": business_date or _business_date(),
+            "businessDate": target,
             "reservations": summary.get("reservations", 0),
             "entries": summary.get("entries", 0),
         }
