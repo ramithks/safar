@@ -37,6 +37,7 @@ from app.api.v1.pms.schemas import (
     QuoteRequest,
     RatePlanOptionOut,
     ReservationOut,
+    RoomOut,
     RoomStatusRequest,
     StayOptionOut,
     TaskCreateRequest,
@@ -315,6 +316,52 @@ async def post_folio(
 
 
 # ── rooms and tasks ──────────────────────────────────────────────────────────
+
+@router.get("/properties/{property_id}/rooms", response_model=list[RoomOut])
+@limiter.limit("120/minute")
+async def list_rooms(
+    request: Request,
+    property_id: str,
+    member=Depends(require_member()),
+):
+    """
+    Every room in the property, with whoever is currently in it.
+
+    Read by two screens that want opposite things: housekeeping wants the
+    status board, and check-in wants the list of rooms it may actually assign.
+    Both need the occupant, because a room can be clean and still unavailable —
+    resolving that in the client would mean shipping the arrivals list to a
+    housekeeper who has no business reading it.
+    """
+    def _read():
+        db = get_db()
+        rooms = (
+            db.table("rooms")
+            .select("*")
+            .eq("property_id", property_id)
+            .order("number")
+            .execute()
+            .data
+            or []
+        )
+        if not rooms:
+            return [], {}
+        # One query for the whole floor rather than one per room.
+        stays = (
+            db.table("reservations")
+            .select("id,room_id,guest_name,check_out")
+            .eq("property_id", property_id)
+            .eq("status", "checked_in")
+            .not_.is_("room_id", "null")
+            .execute()
+            .data
+            or []
+        )
+        return rooms, {s["room_id"]: s for s in stays}
+
+    rooms, occupants = await run_db(_read)
+    return [RoomOut.from_row(r, occupants.get(r["id"])) for r in rooms]
+
 
 @router.post("/properties/{property_id}/rooms/{room_id}/status")
 @limiter.limit("240/minute")

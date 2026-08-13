@@ -12,8 +12,18 @@ never be one — a rupee amount that has been through a float has already lost t
 argument with an accountant.
 """
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
+
+# The six values `quotes.discount_reason` will accept. This is a category, not
+# a sentence — "why the rate moved", so margin can be read by cause later. It
+# is spelled out here because the alternative is what happened in testing: the
+# field typed as free text, a receptionist writing "regular guest", and the
+# check constraint turning a reasonable entry into a 500. Refuse it at the edge
+# with a message naming the six, or it fails four layers down.
+# Keep in sync with 20260813_hotel_os_4_reservations.sql.
+DiscountReason = Literal["volume", "negotiation", "coupon", "creator", "loyalty", "manual"]
 
 
 # ── availability ─────────────────────────────────────────────────────────────
@@ -54,7 +64,7 @@ class QuoteRequest(BaseModel):
     # A *request*. Clamped server-side against the property's floor — see
     # services/pms/pricing.py. This is why an agent may ask for anything.
     discountPct: int = Field(default=0, ge=0, le=100)
-    discountReason: str | None = None
+    discountReason: DiscountReason | None = None
     conversationId: str | None = None
 
 
@@ -77,7 +87,7 @@ class QuoteOut(BaseModel):
     nightly: list[NightlyOut]
     grossPaise: int
     discountPaise: int
-    discountReason: str | None = None
+    discountReason: DiscountReason | None = None
     taxPaise: int
     totalPaise: int
     tokenPaise: int
@@ -214,6 +224,49 @@ class FolioPostRequest(BaseModel):
 
 class RoomStatusRequest(BaseModel):
     status: str
+
+
+class RoomOccupantOut(BaseModel):
+    reservationId: str
+    guestName: str
+    checkOut: date
+
+
+class RoomOut(BaseModel):
+    id: str
+    propertyId: str
+    roomTypeId: str
+    number: str
+    floor: str
+    housekeepingStatus: str
+    isActive: bool
+    outOfOrderReason: str | None = None
+    outOfOrderUntil: date | None = None
+    # Present only while a stay occupies the room. The room picker at check-in
+    # needs this to grey out a room that is physically clean but still has
+    # someone in it — "clean" and "free" are different questions.
+    occupiedBy: RoomOccupantOut | None = None
+
+    @staticmethod
+    def from_row(row: dict, occupant: dict | None = None) -> "RoomOut":
+        return RoomOut(
+            id=row["id"],
+            propertyId=row["property_id"],
+            roomTypeId=row["room_type_id"],
+            number=row["number"],
+            # The PWA types `floor` as a plain string and groups by it; a null
+            # would land as the literal "null" in a heading.
+            floor=row.get("floor") or "",
+            housekeepingStatus=row["housekeeping_status"],
+            isActive=row["is_active"],
+            outOfOrderReason=row.get("out_of_order_reason"),
+            outOfOrderUntil=row.get("out_of_order_until"),
+            occupiedBy=RoomOccupantOut(
+                reservationId=occupant["id"],
+                guestName=occupant["guest_name"],
+                checkOut=occupant["check_out"],
+            ) if occupant else None,
+        )
 
 
 class TaskCreateRequest(BaseModel):

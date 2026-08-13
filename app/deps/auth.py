@@ -211,12 +211,17 @@ async def optional_user(authorization: str = Header(default=None)):
         return None
 
 
-async def require_user(authorization: str = Header(...)):
+async def require_user(authorization: str | None = Header(None)):
     """
     Validates the Supabase JWT from the Authorization: Bearer <token> header.
     Returns an object with .id (and .email) on success, raises 401 on failure.
+
+    The header is declared optional so a *missing* one is refused here rather
+    than by FastAPI's validation layer, which would answer 422. No credentials
+    is not a malformed request — and the frontend keys "logged out" off 401, so
+    a 422 leaves it retrying a call that can never succeed.
     """
-    if not authorization.startswith("Bearer "):
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authorization header")
 
     token = authorization[len("Bearer "):]
