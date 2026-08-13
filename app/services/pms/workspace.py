@@ -31,6 +31,32 @@ logger = logging.getLogger(__name__)
 # anything. Kept as one tuple so no query forgets one of them.
 LIVE_STATUSES = ("pending", "confirmed", "checked_in", "checked_out")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# The front-desk buckets, defined exactly once.
+#
+# These used to be written twice — a count here and a list in the reservations
+# endpoint — with different status sets, so Today said "6 arrivals" while the
+# arrivals list showed 4 and neither was wrong on its own terms. A number and
+# the list behind it disagreeing is worse than either being wrong, because the
+# receptionist has no way to work out which to trust.
+#
+# `pending` is excluded: an unconfirmed booking is not expected at the desk
+# today. `checked_out` is included: a guest who arrived this morning and left
+# this afternoon still arrived today, and dropping them would make the count
+# fall during the day for no visible reason.
+# ─────────────────────────────────────────────────────────────────────────────
+ARRIVAL_STATUSES = ("confirmed", "checked_in", "checked_out")
+DEPARTURE_STATUSES = ("checked_in", "checked_out")
+IN_HOUSE_STATUSES = ("checked_in",)
+
+
+def is_arrival(row: dict, business_date: str) -> bool:
+    return row["check_in"] == business_date and row["status"] in ARRIVAL_STATUSES
+
+
+def is_departure(row: dict, business_date: str) -> bool:
+    return row["check_out"] == business_date and row["status"] in DEPARTURE_STATUSES
+
 
 def _memberships_for(profile_id: str) -> list[dict]:
     """
@@ -186,10 +212,12 @@ async def list_tasks(property_id: str, limit: int = 200) -> list[dict]:
     return await run_db(_read)
 
 
-async def get_reservation(property_id: str, reservation_id: str) -> dict | None:
+async def get_reservation(property_id: str, reservation_id: str) -> tuple[dict, int] | None:
+    """The reservation and what is currently on its folio, as one answer."""
     def _read():
+        db = get_db()
         rows = (
-            get_db().table("reservations")
+            db.table("reservations")
             .select("*")
             .eq("property_id", property_id)
             .eq("id", reservation_id)
@@ -197,7 +225,10 @@ async def get_reservation(property_id: str, reservation_id: str) -> dict | None:
             .execute()
             .data
         )
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        balance = db.rpc("folio_balance", {"p_reservation": reservation_id}).execute().data
+        return rows[0], int(balance or 0)
     return await run_db(_read)
 
 
@@ -265,8 +296,10 @@ async def today_stats(property_id: str) -> dict:
         if s["nights"]
     )
 
-    arrivals = [s for s in stays if s["check_in"] == today_s]
-    departures = [s for s in stays if s["check_out"] == today_s]
+    # Same predicate the arrivals *list* is built from, so the number on Today
+    # and the rows behind it cannot disagree.
+    arrivals = [s for s in stays if is_arrival(s, today_s)]
+    departures = [s for s in stays if is_departure(s, today_s)]
 
     cutoff = (today - timedelta(days=30)).isoformat()
     by_source: dict[str, dict] = {}

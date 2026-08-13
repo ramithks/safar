@@ -22,21 +22,28 @@ marketplace/partner_ops.py.
 # FastAPI body resolution through slowapi's wrapper. Same note as
 # api/v1/admin/endpoint.py.
 import logging
-from datetime import date
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.api.v1.pms.schemas import (
+    AriEditOut,
     BookingRequest,
     CheckInRequest,
     FolioEntryOut,
     FolioOut,
     FolioPostRequest,
+    InventoryEditRequest,
+    InventoryNightOut,
     MeOut,
+    NightAuditOut,
+    NightAuditRequest,
     NightlyOut,
     PropertyOut,
     QuoteOut,
     QuoteRequest,
+    RateEditRequest,
+    RateNightOut,
     RatePlanOptionOut,
     RatePlanOut,
     ReservationOut,
@@ -44,6 +51,7 @@ from app.api.v1.pms.schemas import (
     RoomStatusRequest,
     RoomTypeOut,
     StayOptionOut,
+    SyncOut,
     TaskCreateRequest,
     TaskOut,
     TaskStatusRequest,
@@ -53,9 +61,11 @@ from app.core.limiter import limiter
 from app.db.client import get_db, run_db
 from app.deps.auth import require_user
 from app.deps.property import require_member
+from app.services.pms import ari as ari_service
 from app.services.pms import availability as availability_service
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
+from app.services.pms import sync as sync_service
 from app.services.pms import workspace as workspace_service
 
 logger = logging.getLogger(__name__)
@@ -171,6 +181,140 @@ async def get_availability(
     ]
 
 
+# ── sync ─────────────────────────────────────────────────────────────────────
+
+# Property-scoped in the path, like every other route here, rather than
+# `/pms/sync?propertyId=`. `require_member` resolves the property from the path
+# parameter, and giving one endpoint a second way to name its property means a
+# second way to get that check wrong.
+@router.get("/properties/{property_id}/sync", response_model=SyncOut)
+@limiter.limit("60/minute")
+async def sync(
+    request: Request,
+    property_id: str,
+    since: datetime | None = Query(None),
+    member=Depends(require_member()),
+):
+    """
+    Everything that changed for this property since a cursor — including what
+    was deleted.
+
+    The deletions are the point. The PWA refreshes IndexedDB by merging, and a
+    merge can add or update but never remove, so a reservation deleted on the
+    server would stay on an offline arrivals list indefinitely. Absence from a
+    normal list response cannot stand in for deletion — that response is
+    filtered and windowed, and half the rows are legitimately missing from it.
+    Only the server knows the difference, so only the server can say.
+
+    `fullResync` is set when this answer cannot be trusted to be complete: no
+    cursor, a truncated page, or a cursor older than the oldest deletion still
+    on record. The client's job then is to discard its local copy, not to merge
+    what it got. A sync that cannot admit it lost track will eventually hand
+    back a confident, wrong answer instead.
+
+    `serverTime` is what to send as the next `since` — the server's clock, so a
+    desk PC that is running fast cannot skip a window of changes.
+    """
+    changes = await sync_service.changes_since(
+        property_id, since.isoformat() if since else None
+    )
+    return SyncOut(
+        serverTime=changes["serverTime"],
+        fullResync=changes["fullResync"],
+        reservations=[ReservationOut.from_row(r) for r in changes["reservations"]],
+        rooms=[RoomOut.from_row(r) for r in changes["rooms"]],
+        tasks=[TaskOut.from_row(r) for r in changes["tasks"]],
+        folioEntries=[FolioEntryOut.from_row(r) for r in changes["folioEntries"]],
+        deleted=changes["deleted"],
+    )
+
+
+# ── calendar (ARI) ───────────────────────────────────────────────────────────
+#
+# Reads are open to any member: a receptionist needs to see what is left tonight.
+# Writes need `rates`, which is the permission a manager has and a receptionist
+# does not — pricing the property is not a front-desk decision.
+
+@router.get("/properties/{property_id}/inventory", response_model=list[InventoryNightOut])
+@limiter.limit("120/minute")
+async def get_inventory(
+    request: Request,
+    property_id: str,
+    from_date: date = Query(..., alias="from"),
+    days: int = Query(30, ge=1, le=120),
+    member=Depends(require_member()),
+):
+    """Per-night stock for the calendar grid, with sparse inheritance resolved."""
+    return await ari_service.get_inventory(property_id, from_date, days)
+
+
+@router.get("/properties/{property_id}/rates", response_model=list[RateNightOut])
+@limiter.limit("120/minute")
+async def get_rates(
+    request: Request,
+    property_id: str,
+    from_date: date = Query(..., alias="from"),
+    days: int = Query(30, ge=1, le=120),
+    member=Depends(require_member()),
+):
+    """Per-night price and restrictions, per rate plan."""
+    return await ari_service.get_rates(property_id, from_date, days)
+
+
+@router.patch("/properties/{property_id}/inventory", response_model=AriEditOut)
+@limiter.limit("60/minute")
+async def edit_inventory(
+    request: Request,
+    property_id: str,
+    body: InventoryEditRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    Change stock over a date range.
+
+    One call for the whole range rather than one per night: a half-applied
+    "block the last week of December" leaves a property with a hole nobody
+    typed, and thirty round trips from a browser is thirty chances to be
+    interrupted. Cutting stock below what is already sold is refused with the
+    night named, never clamped.
+    """
+    nights = await ari_service.set_inventory(
+        property_id,
+        room_type_id=body.roomTypeId,
+        from_date=body.fromDate,
+        to_date=body.toDate,
+        units_total=body.unitsTotal,
+        units_blocked=body.unitsBlocked,
+        stop_sell=body.stopSell,
+        oversell=body.oversellAllowance,
+    )
+    return AriEditOut(nights=nights)
+
+
+@router.patch("/properties/{property_id}/rates", response_model=AriEditOut)
+@limiter.limit("60/minute")
+async def edit_rates(
+    request: Request,
+    property_id: str,
+    body: RateEditRequest,
+    member=Depends(require_member("rates")),
+):
+    """Change price and restrictions over a date range. Null means leave alone."""
+    nights = await ari_service.set_rates(
+        property_id,
+        rate_plan_id=body.ratePlanId,
+        from_date=body.fromDate,
+        to_date=body.toDate,
+        price_paise=body.pricePaise,
+        min_stay=body.minStay,
+        max_stay=body.maxStay,
+        closed_to_arrival=body.closedToArrival,
+        closed_to_departure=body.closedToDeparture,
+        closed=body.closed,
+    )
+    return AriEditOut(nights=nights)
+
+
 # ── quotes ───────────────────────────────────────────────────────────────────
 
 @router.post("/properties/{property_id}/quotes", response_model=QuoteOut)
@@ -245,10 +389,12 @@ async def list_reservations(
     """
     The reservation list, and the three front-desk buckets.
 
-    The bucket definitions are duplicated in the PWA's offline cache
-    (src/data/filters.ts) so an offline arrivals list means the same thing. If
-    these two ever disagree, the list changes the moment a connection drops and
-    the desk has no way to tell which one is right.
+    The status sets come from `services/pms/workspace`, which is also where
+    Today's counts come from — one definition, so the headline number and the
+    list underneath it are the same query with a different projection. They are
+    mirrored again in the PWA's offline cache (src/data/filters.ts), because a
+    list that changes the moment a connection drops leaves the desk with no way
+    to tell which version is right.
     """
     today = date.today().isoformat()
 
@@ -257,11 +403,11 @@ async def list_reservations(
         q = db.table("reservations").select("*").eq("property_id", property_id)
 
         if bucket == "arrivals":
-            q = q.eq("check_in", today).in_("status", ["confirmed", "checked_in"])
+            q = q.eq("check_in", today).in_("status", list(workspace_service.ARRIVAL_STATUSES))
         elif bucket == "departures":
-            q = q.eq("check_out", today).in_("status", ["checked_in", "checked_out"])
+            q = q.eq("check_out", today).in_("status", list(workspace_service.DEPARTURE_STATUSES))
         elif bucket == "inhouse":
-            q = q.eq("status", "checked_in")
+            q = q.in_("status", list(workspace_service.IN_HOUSE_STATUSES))
 
         # Half-open overlap: a stay is in the window if it has not ended before
         # it and has not started after it.
@@ -273,10 +419,18 @@ async def list_reservations(
             escaped = search.replace("%", r"\%").replace(",", " ")
             q = q.or_(f"guest_name.ilike.%{escaped}%,ref.ilike.%{escaped}%,guest_phone.ilike.%{escaped}%")
 
-        return q.order("check_in").limit(limit).execute().data or []
+        rows = q.order("check_in").limit(limit).execute().data or []
+        # One grouped query for the whole property rather than one per row: the
+        # arrivals list is the screen a receptionist reloads all shift, and
+        # N+1 against the folio is how it gets slow enough to be worked around.
+        balances = {
+            b["reservation_id"]: b["balance_paise"]
+            for b in (db.rpc("folio_balances", {"p_property": property_id}).execute().data or [])
+        }
+        return rows, balances
 
-    rows = await run_db(_read)
-    return [ReservationOut.from_row(r) for r in rows]
+    rows, balances = await run_db(_read)
+    return [ReservationOut.from_row(r, folio_balance=balances.get(r["id"], 0)) for r in rows]
 
 
 @router.post("/properties/{property_id}/reservations", response_model=ReservationOut)
@@ -322,10 +476,11 @@ async def get_reservation(
     does, or the drawer becomes the enumeration oracle the rest of the API is
     careful not to be.
     """
-    row = await workspace_service.get_reservation(property_id, reservation_id)
-    if row is None:
+    found = await workspace_service.get_reservation(property_id, reservation_id)
+    if found is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Reservation not found")
-    return ReservationOut.from_row(row)
+    row, balance = found
+    return ReservationOut.from_row(row, folio_balance=balance)
 
 
 @router.post("/properties/{property_id}/reservations/{reservation_id}/check-in",
@@ -401,6 +556,32 @@ async def post_folio(
         member=member,
     )
     return FolioEntryOut.from_row(row)
+
+
+@router.post("/properties/{property_id}/night-audit", response_model=NightAuditOut)
+@limiter.limit("6/minute")
+async def run_night_audit(
+    request: Request,
+    property_id: str,
+    body: NightAuditRequest | None = None,
+    member=Depends(require_member("folio")),
+):
+    """
+    Bring every in-house folio up to date.
+
+    Normally pg_cron's job. Exposed because a property that was offline for two
+    days needs a way to catch up, and because "press this and see" is a far
+    better answer than telling a manager to wait until 01:30. Safe to press
+    repeatedly — each night posts exactly once, enforced by a unique key on the
+    ledger rather than by a check the caller could race.
+
+    The business date is accepted so a property can close a day it has already
+    passed. It cannot be used to post the future: nights are only ever posted up
+    to the reservation's own departure.
+    """
+    return await frontdesk_service.run_night_audit(
+        property_id, business_date=(body.businessDate.isoformat() if body and body.businessDate else None)
+    )
 
 
 # ── rooms and tasks ──────────────────────────────────────────────────────────

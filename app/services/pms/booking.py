@@ -180,8 +180,20 @@ async def create_quote(
                         "units": units,
                         "adults": adults,
                         "children": children,
+                        # Both the tariff the guest was shown and the money that
+                        # tariff resolves to, per night. The second is what the
+                        # night audit posts, so it is decided here — once, by the
+                        # pricing service — rather than re-derived later from a
+                        # total and a night count. See the header of
+                        # 20260814_hotel_os_6_night_audit.sql.
                         "nightly_paise": [
-                            {"date": d.isoformat(), "price_paise": p} for d, p in nightly
+                            {
+                                "date": n.date.isoformat(),
+                                "price_paise": n.gross_paise // units,
+                                "room_paise": n.room_paise,
+                                "tax_paise": n.tax_paise,
+                            }
+                            for n in priced.nights
                         ],
                         "gross_paise": priced.gross_paise,
                         "discount_paise": priced.discount_paise,
@@ -368,16 +380,29 @@ async def create_reservation(
 
         db.table("quotes").update({"status": "converted"}).eq("id", q["id"]).execute()
 
-        # The per-night trail, so a folio stays reconstructible and a partial
-        # cancellation has something to work from.
-        nights_rows = [
-            {
-                "reservation_id": reservation["id"],
-                "date": n["date"],
-                "rate_paise": n["price_paise"],
-            }
-            for n in (q.get("nightly_paise") or [])
-        ]
+        # The per-night trail. This is what the night audit posts from, which is
+        # why the money is copied off the quote rather than recomputed: the
+        # guest agreed to these numbers, and a stay whose folio is rebuilt from
+        # a total divided by a night count will not sum back to them.
+        nights_rows = []
+        for n in q.get("nightly_paise") or []:
+            if "room_paise" not in n:
+                # A quote issued before per-night money existed. Quotes live 15
+                # minutes, so this is all but unreachable — and refusing is far
+                # better than guessing, because the guess becomes a charge.
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "This quote was issued under older pricing. Please re-check availability.",
+                )
+            nights_rows.append(
+                {
+                    "reservation_id": reservation["id"],
+                    "date": n["date"],
+                    "rate_paise": n["price_paise"],
+                    "room_paise": n["room_paise"],
+                    "tax_paise": n["tax_paise"],
+                }
+            )
         if nights_rows:
             db.table("reservation_nights").insert(nights_rows).execute()
 

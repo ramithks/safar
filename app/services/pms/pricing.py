@@ -50,6 +50,29 @@ class NightlyRate:
 
 
 @dataclass
+class NightMoney:
+    """
+    One night, resolved to money.
+
+    The folio is posted from these, one line per night, rather than from a total
+    divided by a night count. That is not a presentation choice: the night audit
+    has to be able to post night three without knowing what it did about nights
+    one and two, and a stay whose discount does not divide evenly has to still
+    sum to the number the guest agreed to.
+    """
+    date: date
+    # Tariff × units, before anything is taken off.
+    gross_paise: int
+    # This night's share of the stay discount. The last night carries the
+    # rounding remainder so the shares sum exactly to the stay discount.
+    discount_paise: int
+    # What this night puts on the folio as a room charge: gross − discount.
+    room_paise: int
+    # GST for this night, at this night's slab.
+    tax_paise: int
+
+
+@dataclass
 class PricedStay:
     nightly: list[NightlyRate]
     units: int
@@ -64,6 +87,9 @@ class PricedStay:
     # shows this to a human; an agent must never present the requested number.
     clamped_from_pct: int | None = None
     tax_breakdown: dict[str, int] = field(default_factory=dict)
+    # Per-night money, in stay order. Sums to (gross − discount) and to tax, by
+    # construction — see NightMoney.
+    nights: list[NightMoney] = field(default_factory=list)
 
 
 def nights_between(check_in: date, check_out: date) -> int:
@@ -115,26 +141,43 @@ def price_stay(
     # Tax per night, at that night's slab, on the discounted rate. Spreading the
     # discount evenly across nights keeps the slab decision honest: a discount
     # that drops a night below ₹7,500 genuinely drops it into the lower slab.
+    #
+    # The allocation runs whether or not tax applies, because the night audit
+    # needs the per-night room charge either way. Only the tax line is
+    # conditional.
     tax = 0
     breakdown: dict[str, int] = {}
-    if not tax_inclusive:
-        remaining_discount = discount
-        for i, n in enumerate(nightly):
-            night_gross = n.price_paise * units
-            # Give the last night whatever rounding left over, so the per-night
-            # discounts sum exactly to `discount` rather than to discount ± 1.
-            if i == len(nightly) - 1:
-                night_discount = remaining_discount
-            else:
-                night_discount = round(discount * night_gross / gross) if gross else 0
-                remaining_discount -= night_discount
+    per_night: list[NightMoney] = []
+    remaining_discount = discount
+    for i, n in enumerate(nightly):
+        night_gross = n.price_paise * units
+        # Give the last night whatever rounding left over, so the per-night
+        # discounts sum exactly to `discount` rather than to discount ± 1.
+        if i == len(nightly) - 1:
+            night_discount = remaining_discount
+        else:
+            night_discount = round(discount * night_gross / gross) if gross else 0
+            remaining_discount -= night_discount
 
-            night_net = night_gross - night_discount
+        night_net = night_gross - night_discount
+
+        night_tax = 0
+        if not tax_inclusive:
             per_unit = night_net // units if units else night_net
             pct = gst_pct_for_night(per_unit)
             night_tax = round(night_net * pct / 100)
             tax += night_tax
             breakdown[f"{pct}%"] = breakdown.get(f"{pct}%", 0) + night_tax
+
+        per_night.append(
+            NightMoney(
+                date=n.date,
+                gross_paise=night_gross,
+                discount_paise=night_discount,
+                room_paise=night_net,
+                tax_paise=night_tax,
+            )
+        )
 
     net = gross - discount
     total = net + tax
@@ -153,6 +196,7 @@ def price_stay(
         balance_paise=total - token,
         clamped_from_pct=clamped_from,
         tax_breakdown=breakdown,
+        nights=per_night,
     )
 
 

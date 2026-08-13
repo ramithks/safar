@@ -135,6 +135,13 @@ class ReservationOut(BaseModel):
     totalPaise: int
     paidPaise: int
     balancePaise: int
+    # What is actually on the folio right now, summed from the ledger. Differs
+    # from balancePaise only before the stay is fully billed — a booking whose
+    # nights the audit has not reached yet is contracted for money it has not
+    # been charged for. At check-out they are equal, because check-out posts
+    # every remaining night before it lets anyone settle. Null where the caller
+    # did not ask for it.
+    folioBalancePaise: int | None = None
     source: str
     status: str
     paymentStatus: str
@@ -142,8 +149,9 @@ class ReservationOut(BaseModel):
     createdAt: datetime
 
     @staticmethod
-    def from_row(row: dict) -> "ReservationOut":
+    def from_row(row: dict, folio_balance: int | None = None) -> "ReservationOut":
         return ReservationOut(
+            folioBalancePaise=folio_balance,
             id=row["id"],
             ref=row["ref"],
             propertyId=row["property_id"],
@@ -209,6 +217,78 @@ class FolioEntryOut(BaseModel):
 class FolioOut(BaseModel):
     entries: list[FolioEntryOut]
     balancePaise: int
+
+
+# ── calendar (ARI) ───────────────────────────────────────────────────────────
+
+class InventoryNightOut(BaseModel):
+    roomTypeId: str
+    date: date
+    unitsTotal: int
+    unitsBooked: int
+    unitsHeld: int
+    unitsBlocked: int
+    unitsLeft: int
+    stopSell: bool
+
+
+class RateNightOut(BaseModel):
+    ratePlanId: str
+    date: date
+    pricePaise: int
+    minStay: int | None = None
+    closedToArrival: bool
+    closedToDeparture: bool
+    closed: bool
+
+
+class AriEditBase(BaseModel):
+    # Inclusive both ends. A manager selecting "the 3rd to the 5th" on the
+    # calendar means three nights; the half-open convention belongs to stays,
+    # where it stops a departure morning counting as a night.
+    fromDate: date
+    toDate: date
+
+
+class InventoryEditRequest(AriEditBase):
+    roomTypeId: str
+    # Every field is optional and null means *leave it alone*. That is what lets
+    # "stop selling this weekend" avoid also writing today's inherited unit
+    # count into two rows that will then stop following the room type.
+    unitsTotal: int | None = Field(None, ge=0)
+    unitsBlocked: int | None = Field(None, ge=0)
+    stopSell: bool | None = None
+    oversellAllowance: int | None = Field(None, ge=0)
+
+
+class RateEditRequest(AriEditBase):
+    ratePlanId: str
+    pricePaise: int | None = Field(None, ge=0)
+    minStay: int | None = Field(None, ge=1)
+    maxStay: int | None = Field(None, ge=1)
+    closedToArrival: bool | None = None
+    closedToDeparture: bool | None = None
+    closed: bool | None = None
+
+
+class AriEditOut(BaseModel):
+    # How many nights were written. The calendar shows this back, because "saved"
+    # with no number is exactly how a range edit that silently applied to one
+    # night goes unnoticed.
+    nights: int
+
+
+class NightAuditRequest(BaseModel):
+    # Omitted means today. A past date lets a property close days it missed;
+    # a future one posts nothing beyond each stay's own departure, so it cannot
+    # be used to bill a guest in advance.
+    businessDate: date | None = None
+
+
+class NightAuditOut(BaseModel):
+    businessDate: date
+    reservations: int
+    entries: int
 
 
 class FolioPostRequest(BaseModel):
@@ -465,3 +545,23 @@ class TodayStatsOut(BaseModel):
     openTasks: int
     unreadConversations: int
     bySource: list[SourceMixOut]
+
+
+# ── sync ─────────────────────────────────────────────────────────────────────
+
+class SyncOut(BaseModel):
+    # Echo this back as the next `since`. The server's clock, never the
+    # client's: a front desk PC running ten minutes fast would otherwise skip
+    # every change in the gap and never learn it had.
+    serverTime: datetime
+    # The local copy cannot be brought up to date incrementally — replace it.
+    # Set when there was no cursor, when a page was truncated, or when the
+    # cursor predates the oldest deletion still on record.
+    fullResync: bool
+    reservations: list[ReservationOut]
+    rooms: list[RoomOut]
+    tasks: list[TaskOut]
+    folioEntries: list[FolioEntryOut]
+    # Ids that stopped existing, by entity. The one thing a merge cannot express
+    # and a client cannot infer: absence from a filtered list is not deletion.
+    deleted: dict[str, list[str]]

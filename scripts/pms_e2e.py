@@ -84,6 +84,7 @@ def check(label, cond, detail=""):
 reception   = signin("deepak@casamandala.in")    # frontdesk + folio + housekeeping + tasks
 housekeeper = signin("anita@casamandala.in")     # housekeeping + tasks only
 outsider    = signin("nobody@example.com")       # a different partner entirely
+manager     = signin("priya@casamandala.in")     # + rates, which the desk deliberately lacks
 
 # Every run books a real room and never gives it back, so a fixed window would
 # quietly exhaust the room type after a dozen runs and the failures would look
@@ -209,16 +210,88 @@ before_extra = sum(e["amountPaise"] for e in folio["entries"] if e["description"
 check("the extra moved the balance by exactly its amount",
       folio["balancePaise"] == before_extra + 90000, f"{folio['balancePaise']} vs {before_extra}+90000")
 
-st, settle = http(f"{API}/properties/{PROP}/reservations/{RES}/folio", "POST",
-                  {"kind": "payment", "description": "Settled at desk", "amountPaise": folio["balancePaise"],
-                   "method": "card", "idempotencyKey": str(uuid.uuid4())}, reception)
-check("payment posted", st == 200, f"{st} {settle}")
-st, folio2 = http(f"{API}/properties/{PROP}/reservations/{RES}/folio", headers=reception)
-check("folio settles to zero", folio2["balancePaise"] == 0, str(folio2["balancePaise"]))
+print("\n── night audit ──")
+# The bug this section exists for: check-in used to post one room charge,
+# computed pre-tax as (gross - discount) / nights, and nothing ever posted the
+# rest. A two-night stay therefore checked out with a settled folio while the
+# reservation still showed a balance — observed on TB-TXW3FM, folio ₹0 against
+# a reservation balance of ₹3,264.
+#
+# This run's stay is deliberately hundreds of days out (see RUN), so nothing has
+# been slept yet and nothing should be billed. `businessDate` is what lets the
+# audit be tested on the day it actually applies rather than by waiting.
+st, folio_pre = http(f"{API}/properties/{PROP}/reservations/{RES}/folio", headers=reception)
+rooms_before = sum(1 for e in folio_pre["entries"] if e["kind"] == "room")
+check("checking a guest in early bills no nights they have not had",
+      rooms_before == 0, f"{rooms_before} room lines already posted")
+
+st, audit1 = http(f"{API}/properties/{PROP}/night-audit", "POST", {"businessDate": str(ci)}, reception)
+check("the audit runs and reports what it did", st == 200 and audit1["entries"] > 0, f"{st} {audit1}")
+st, folio_n1 = http(f"{API}/properties/{PROP}/reservations/{RES}/folio", headers=reception)
+n1_rooms = [e for e in folio_n1["entries"] if e["kind"] == "room"]
+n1_tax = [e for e in folio_n1["entries"] if e["kind"] == "tax"]
+check("the first night posts a room line", len(n1_rooms) == 1, str([e["description"] for e in n1_rooms]))
+check("and its GST as a separate line", len(n1_tax) == 1, str([e["description"] for e in n1_tax]))
+check("the second night is not billed before it is slept", len(n1_rooms) == 1)
+
+st, audit2 = http(f"{API}/properties/{PROP}/night-audit", "POST", {"businessDate": str(ci)}, reception)
+check("running the audit twice posts nothing the second time", audit2["entries"] == 0, str(audit2))
+st, folio_again = http(f"{API}/properties/{PROP}/reservations/{RES}/folio", headers=reception)
+check("and the balance is unmoved — no duplicate charge",
+      folio_again["balancePaise"] == folio_n1["balancePaise"],
+      f"{folio_n1['balancePaise']} -> {folio_again['balancePaise']}")
+check("the ledger has not grown either",
+      len(folio_again["entries"]) == len(folio_n1["entries"]),
+      f"{len(folio_n1['entries'])} -> {len(folio_again['entries'])}")
+
+# ── the false settled state ───────────────────────────────────────────────────
+# Settle what the folio currently shows, then try to check out. The remaining
+# night has not been posted yet, so a check-out that trusted the folio as it
+# stands would let the guest walk out owing a night.
+st, _ = http(f"{API}/properties/{PROP}/reservations/{RES}/folio", "POST",
+             {"kind": "payment", "description": "Settled on the visible balance",
+              "amountPaise": folio_again["balancePaise"], "method": "card",
+              "idempotencyKey": str(uuid.uuid4())}, reception)
+st, folio_zero = http(f"{API}/properties/{PROP}/reservations/{RES}/folio", headers=reception)
+check("the folio reads zero before the last night is posted",
+      folio_zero["balancePaise"] == 0, str(folio_zero["balancePaise"]))
+
+st, refused = http(f"{API}/properties/{PROP}/reservations/{RES}/check-out", "POST", {}, reception)
+check("check-out posts the rest of the stay and then refuses — no false settle",
+      st == 409, f"got {st} {str(refused)[:160]}")
+st, folio_full = http(f"{API}/properties/{PROP}/reservations/{RES}/folio", headers=reception)
+full_rooms = [e for e in folio_full["entries"] if e["kind"] == "room"]
+check("every night of the stay is now on the folio", len(full_rooms) == 2,
+      str([e["description"] for e in full_rooms]))
+check("and the balance is what is genuinely outstanding",
+      folio_full["balancePaise"] > 0, str(folio_full["balancePaise"]))
 
 print("\n── check-out ──")
+st, settle = http(f"{API}/properties/{PROP}/reservations/{RES}/folio", "POST",
+                  {"kind": "payment", "description": "Settled at desk",
+                   "amountPaise": folio_full["balancePaise"], "method": "card",
+                   "idempotencyKey": str(uuid.uuid4())}, reception)
+check("payment posted", st == 200, f"{st} {settle}")
 st, out = http(f"{API}/properties/{PROP}/reservations/{RES}/check-out", "POST", {}, reception)
 check("checked out", st == 200 and out.get("status") == "checked_out", f"{st} {str(out)[:160]}")
+
+st, final = http(f"{API}/properties/{PROP}/reservations/{RES}", headers=reception)
+st, folio_end = http(f"{API}/properties/{PROP}/reservations/{RES}/folio", headers=reception)
+check("the folio is settled", folio_end["balancePaise"] == 0, str(folio_end["balancePaise"]))
+check("and the reservation agrees with it — the bug that shipped",
+      final["totalPaise"] - final["paidPaise"] == folio_end["balancePaise"],
+      f"reservation {final['totalPaise'] - final['paidPaise']} vs folio {folio_end['balancePaise']}")
+check("the drawer's folio figure is the folio's own",
+      final["folioBalancePaise"] == folio_end["balancePaise"],
+      f"{final.get('folioBalancePaise')} vs {folio_end['balancePaise']}")
+check("room charges plus tax equal what was sold, plus the add-on",
+      sum(e["amountPaise"] for e in folio_end["entries"] if e["kind"] in ("room", "tax", "addon"))
+      == final["totalPaise"],
+      f"{sum(e['amountPaise'] for e in folio_end['entries'] if e['kind'] in ('room','tax','addon'))}"
+      f" vs {final['totalPaise']}")
+
+st, after_out = http(f"{API}/properties/{PROP}/night-audit", "POST", {"businessDate": str(co)}, reception)
+check("a departed stay is not swept again", after_out["entries"] == 0, str(after_out))
 
 print("\n── tasks ──")
 tid = str(uuid.uuid4())
@@ -375,6 +448,171 @@ if q2.get("id"):
         "quoteId": q2["id"], "guestName": "Double Submit", "guestPhone": "+910000000001"}, reception)
     check("a quote converts once; the double-submit is refused",
           st == 200 and st2 != 200, f"first={st} second={st2}")
+
+print("\n── calendar reads ──")
+cal_from = date.today() + timedelta(days=RUN + 20)
+st, inv = http(f"{API}/properties/{PROP}/inventory?from={cal_from}&days=7", headers=reception)
+check("inventory reads", st == 200 and isinstance(inv, list) and inv, f"{st} {str(inv)[:120]}")
+check("seven nights per room type", all(
+    sum(1 for n in inv if n["roomTypeId"] == rt) == 7
+    for rt in {n["roomTypeId"] for n in inv}), f"n={len(inv)}")
+check("a night with no row of its own still carries the room type's units",
+      all(n["unitsTotal"] > 0 for n in inv), str(inv[0]))
+st, rates = http(f"{API}/properties/{PROP}/rates?from={cal_from}&days=7", headers=reception)
+check("rates read", st == 200 and isinstance(rates, list) and rates, f"{st} {str(rates)[:120]}")
+check("and inherit the rate plan's base price where absent",
+      all(r["pricePaise"] > 0 for r in rates), str(rates[0]))
+
+print("\n── calendar writes ──")
+STD_RT = std["roomTypeId"]
+STD_PLAN = plan["ratePlanId"]
+w_from, w_to = cal_from, cal_from + timedelta(days=6)
+
+st, wrote = http(f"{API}/properties/{PROP}/rates", "PATCH", {
+    "ratePlanId": STD_PLAN, "fromDate": str(w_from), "toDate": str(w_to),
+    "pricePaise": 654300}, manager)
+check("a week of pricing is one call", st == 200 and wrote["nights"] == 7, f"{st} {wrote}")
+st, rates2 = http(f"{API}/properties/{PROP}/rates?from={w_from}&days=7", headers=reception)
+mine = [r for r in rates2 if r["ratePlanId"] == STD_PLAN]
+check("every night of the range took the price", all(r["pricePaise"] == 654300 for r in mine),
+      str(sorted({r["pricePaise"] for r in mine})))
+
+# The property that makes a sparse calendar safe to edit: an omitted field is
+# left alone, not written as zero. Editing min-stay must not freeze the price.
+st, wrote2 = http(f"{API}/properties/{PROP}/rates", "PATCH", {
+    "ratePlanId": STD_PLAN, "fromDate": str(w_from), "toDate": str(w_from + timedelta(days=2)),
+    "minStay": 2}, manager)
+check("a restriction can be set on its own", st == 200 and wrote2["nights"] == 3, f"{st} {wrote2}")
+st, rates3 = http(f"{API}/properties/{PROP}/rates?from={w_from}&days=7", headers=reception)
+mine3 = [r for r in rates3 if r["ratePlanId"] == STD_PLAN]
+check("without disturbing the price — omitted means leave alone",
+      all(r["pricePaise"] == 654300 for r in mine3), str(sorted({r["pricePaise"] for r in mine3})))
+check("and the minimum stay landed on exactly three nights",
+      sum(1 for r in mine3 if r["minStay"] == 2) == 3,
+      str([(r["date"], r["minStay"]) for r in mine3]))
+
+st, wrote3 = http(f"{API}/properties/{PROP}/inventory", "PATCH", {
+    "roomTypeId": STD_RT, "fromDate": str(w_from), "toDate": str(w_from + timedelta(days=1)),
+    "stopSell": True}, manager)
+check("stop-sell is a range edit too", st == 200 and wrote3["nights"] == 2, f"{st} {wrote3}")
+st, inv2 = http(f"{API}/properties/{PROP}/inventory?from={w_from}&days=7", headers=reception)
+stopped = [n for n in inv2 if n["roomTypeId"] == STD_RT and n["stopSell"]]
+check("two nights are off sale", len(stopped) == 2, str([n["date"] for n in stopped]))
+st, wrote4 = http(f"{API}/properties/{PROP}/inventory", "PATCH", {
+    "roomTypeId": STD_RT, "fromDate": str(w_from), "toDate": str(w_from + timedelta(days=1)),
+    "stopSell": False}, manager)
+check("and can be put back", st == 200, f"{st} {wrote4}")
+
+print("\n── the calendar cannot oversell or cross a property ──")
+# The stay booked at the top of this run is still holding a room on those
+# nights. Cutting stock under it must be refused with the night named, not
+# clamped — property_availability floors at zero, so a silent accept would hide
+# a sold room until arrival day.
+st, refused = http(f"{API}/properties/{PROP}/inventory", "PATCH", {
+    "roomTypeId": STD_RT, "fromDate": str(ci), "toDate": str(ci),
+    "unitsTotal": 0}, manager)
+check("cutting stock below what is booked is refused", st == 409, f"got {st} {str(refused)[:200]}")
+check("and the refusal says which night", "already has" in str(refused), str(refused)[:200])
+
+st, _ = http(f"{API}/properties/{PROP}/rates", "PATCH", {
+    "ratePlanId": STD_PLAN, "fromDate": str(w_from), "toDate": str(w_from),
+    "pricePaise": 100000}, housekeeper)
+check("a housekeeper cannot price the property", st == 403, f"got {st}")
+st, _ = http(f"{API}/properties/{PROP}/rates", "PATCH", {
+    "ratePlanId": STD_PLAN, "fromDate": str(w_from), "toDate": str(w_from),
+    "pricePaise": 100000}, reception)
+check("nor can a receptionist — pricing is not a front-desk decision", st == 403, f"got {st}")
+st, _ = http(f"{API}/properties/{PROP}/inventory", "PATCH", {
+    "roomTypeId": STD_RT, "fromDate": str(w_from), "toDate": str(w_from),
+    "unitsTotal": 1}, housekeeper)
+check("nor change its stock", st == 403, f"got {st}")
+st, _ = http(f"{API}/properties/{PROP}/rates", "PATCH", {
+    "ratePlanId": STD_PLAN, "fromDate": str(w_from), "toDate": str(w_from),
+    "pricePaise": 100000}, outsider)
+check("another partner's staff get 404, not a price change", st == 404, f"got {st}")
+
+st, _ = http(f"{API}/properties/{PROP}/rates", "PATCH", {
+    "ratePlanId": STD_PLAN, "fromDate": str(w_to), "toDate": str(w_from),
+    "pricePaise": 100000}, manager)
+check("a backwards range is refused", st == 400, f"got {st}")
+st, _ = http(f"{API}/properties/{PROP}/rates", "PATCH", {
+    "ratePlanId": STD_PLAN, "fromDate": str(w_from),
+    "toDate": str(w_from + timedelta(days=500)), "pricePaise": 100000}, manager)
+check("and so is a range long enough to be a typo", st == 400, f"got {st}")
+
+print("\n── today's arrivals: the count and the list agree ──")
+# These were two different definitions in two files — the count included
+# checked-out stays and the list did not — so Today said one number and the
+# screen below it showed another, with no way to tell which was right.
+st, today_stats = http(f"{API}/properties/{PROP}/today", headers=reception)
+check("today reads", st == 200, f"{st} {str(today_stats)[:120]}")
+st, arrivals_list = http(f"{API}/properties/{PROP}/reservations?bucket=arrivals", headers=reception)
+check("the arrivals count equals the length of the arrivals list",
+      today_stats["arrivals"] == len(arrivals_list),
+      f"count={today_stats['arrivals']} list={len(arrivals_list)}")
+st, dep_list = http(f"{API}/properties/{PROP}/reservations?bucket=departures", headers=reception)
+check("and the same holds for departures",
+      today_stats["departures"] == len(dep_list),
+      f"count={today_stats['departures']} list={len(dep_list)}")
+st, inhouse_list = http(f"{API}/properties/{PROP}/reservations?bucket=inhouse", headers=reception)
+check("in-house counts units, and every unit belongs to a listed stay",
+      today_stats["inHouse"] == sum(r["units"] for r in inhouse_list),
+      f"count={today_stats['inHouse']} list={sum(r['units'] for r in inhouse_list)}")
+
+print("\n── sync and tombstones ──")
+st, sync1 = http(f"{API}/properties/{PROP}/sync", headers=reception)
+check("a first sync reads", st == 200, f"{st} {str(sync1)[:160]}")
+check("and asks for a full resync, because there was no cursor",
+      sync1["fullResync"] is True, str(sync1.get("fullResync")))
+check("it carries the server's own clock as the next cursor",
+      isinstance(sync1.get("serverTime"), str) and sync1["serverTime"], str(sync1.get("serverTime")))
+cursor = sync1["serverTime"]
+
+st, sync2 = http(f"{API}/properties/{PROP}/sync?since={cursor}", headers=reception)
+check("an immediate second sync has nothing to say", st == 200 and not sync2["deleted"],
+      str(sync2.get("deleted")))
+
+# A reservation deleted on the server. This is the case an offline cache cannot
+# discover on its own: it refreshes by merging, and a merge never removes.
+st, doomed_q = quote_for(1, ci_=far_in, co_=far_out)
+st, doomed = http(f"{API}/properties/{PROP}/reservations", "POST", {
+    "quoteId": doomed_q["id"], "guestName": "Will Be Deleted",
+    "guestPhone": "+910000000009"}, reception)
+check("a reservation to delete was created", st == 200, f"{st} {str(doomed)[:120]}")
+st, sync3 = http(f"{API}/properties/{PROP}/sync?since={cursor}", headers=reception)
+# Not in the changes: sync mirrors the client's working set, which is
+# [today-2, today+14], and every booking this script makes is hundreds of days
+# out so it cannot exhaust near-term stock. Asserting its absence is the point —
+# shipping rows the client prunes on arrival is wasted bandwidth on a hotel
+# connection.
+check("a booking outside the working-set window is not shipped to the cache",
+      not any(r["id"] == doomed["id"] for r in sync3["reservations"]),
+      f"n={len(sync3['reservations'])}")
+cursor2 = sync3["serverTime"]
+
+# Rooms are not date-windowed, so this is what proves changes flow at all.
+st, room_touch = http(f"{API}/properties/{PROP}/rooms/{room['id']}/status", "POST",
+                      {"status": "inspected"}, reception)
+st, sync_rooms = http(f"{API}/properties/{PROP}/sync?since={cursor2}", headers=reception)
+check("a changed room comes back as a change",
+      any(r["id"] == room["id"] for r in sync_rooms["rooms"]),
+      f"n={len(sync_rooms['rooms'])}")
+check("and an unchanged one does not",
+      len(sync_rooms["rooms"]) == 1, f"n={len(sync_rooms['rooms'])}")
+
+sql(f"delete from public.reservations where id = '{doomed['id']}';")
+st, sync4 = http(f"{API}/properties/{PROP}/sync?since={cursor2}", headers=reception)
+check("the deletion comes back as a tombstone",
+      doomed["id"] in (sync4["deleted"].get("reservation") or []),
+      str(sync4.get("deleted")))
+check("and not as a change, because there is no row left to send",
+      not any(r["id"] == doomed["id"] for r in sync4["reservations"]),
+      f"n={len(sync4['reservations'])}")
+
+st, _ = http(f"{API}/properties/{PROP}/sync", headers=outsider)
+check("another partner's staff cannot sync this property", st == 404, f"got {st}")
+st, _ = http(f"{API}/properties/{PROP}/sync")
+check("and an unauthenticated sync is 401, not 422", st == 401, f"got {st}")
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

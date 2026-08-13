@@ -26,7 +26,7 @@ from app.db.client import get_db, run_db
 logger = logging.getLogger(__name__)
 
 
-def _today(prop_timezone: str | None = None) -> str:
+def _business_date(prop_timezone: str | None = None) -> str:
     # The property's business date, not the server's. A folio posted at 00:30
     # IST belongs to the day that has just started, and a server thinking in UTC
     # would file it under yesterday.
@@ -103,22 +103,20 @@ async def check_in(property_id: str, reservation_id: str, room_id: str, member) 
         if not updated.data:
             raise HTTPException(status.HTTP_409_CONFLICT, "This reservation changed while you were working on it")
 
-        per_night = round((r["gross_paise"] - r["discount_paise"]) / max(r["nights"], 1))
-        db.table("folio_entries").insert(
+        # Post the nights due so far, so the folio is never empty while a guest
+        # is resident and a late check-in does not owe two nights it has not
+        # been billed for. Everything after today is the night audit's job.
+        #
+        # `post_room_nights` is idempotent on the folio's unique key, so a
+        # replayed check-in — an outbox draining after an outage, two
+        # receptionists pressing at once — posts nothing the second time.
+        db.rpc(
+            "post_room_nights",
             {
-                "reservation_id": reservation_id,
-                "property_id": property_id,
-                "partner_id": r["partner_id"],
-                "kind": "room",
-                "description": f"Room charge · {r['check_in']}",
-                "amount_paise": per_night,
-                "posted_by_member": member.member_id,
-                "posted_by_name": member.display_name or "Front desk",
-                # Deterministic: a replay of the same check-in cannot post the
-                # first night twice.
-                "idempotency_key": f"night:{reservation_id}:{r['check_in']}",
+                "p_reservation": reservation_id,
+                "p_through": _business_date(),
+                "p_posted_by": member.display_name or "Front desk",
             },
-            upsert=True,
         ).execute()
 
         return updated.data[0]
@@ -141,7 +139,7 @@ async def check_out(property_id: str, reservation_id: str, member) -> dict:
 
         res = (
             db.table("reservations")
-            .select("id,status,room_id,total_paise,paid_paise,partner_id")
+            .select("id,status,room_id,check_in,check_out,total_paise,paid_paise,partner_id")
             .eq("id", reservation_id)
             .eq("property_id", property_id)
             .limit(1)
@@ -155,6 +153,27 @@ async def check_out(property_id: str, reservation_id: str, member) -> dict:
             return r
         if r["status"] != "checked_in":
             raise HTTPException(status.HTTP_409_CONFLICT, "This guest is not checked in")
+
+        # Bill the whole stay before deciding whether it is settled. Without
+        # this, a guest departing before the night audit has caught up walks out
+        # on a folio that reads zero because the nights were never posted — the
+        # balance check would pass on an incomplete bill, which is a worse
+        # failure than refusing a legitimate check-out.
+        #
+        # Through the departure date, which posts every night of the stay:
+        # nights are half-open, so no night row is dated check_out. A guest
+        # leaving early still owes the nights the reservation sold — the room
+        # was held and could not be re-let, and shortening a stay is an
+        # amendment somebody makes deliberately, not a side effect of walking to
+        # the desk.
+        db.rpc(
+            "post_room_nights",
+            {
+                "p_reservation": reservation_id,
+                "p_through": r["check_out"],
+                "p_posted_by": member.display_name or "Front desk",
+            },
+        ).execute()
 
         entries = (
             db.table("folio_entries")
@@ -213,7 +232,11 @@ async def post_folio_entry(
     if amount_paise == 0:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "A folio entry cannot be zero")
 
-    signed = -abs(amount_paise) if kind in ("payment", "refund") else abs(amount_paise)
+    # Only a payment is negative. A refund hands money back, so it *undoes* a
+    # payment and moves the balance the same way a charge does — storing it
+    # negative, as this did until the night-audit work, made refunding a guest
+    # look like collecting from them twice.
+    signed = -abs(amount_paise) if kind == "payment" else abs(amount_paise)
 
     def _write():
         db = get_db()
@@ -259,20 +282,64 @@ async def post_folio_entry(
             .execute()
         ).data[0]
 
-        # paid_paise on the reservation is a denormalised convenience for the
-        # arrivals list. The folio remains authoritative.
-        if kind == "payment":
-            paid = r["paid_paise"] + abs(signed)
-            db.table("reservations").update(
-                {
-                    "paid_paise": paid,
-                    "payment_status": "paid" if paid >= r["total_paise"] else "partially_paid",
-                }
-            ).eq("id", reservation_id).execute()
+        # Keep the reservation's two running totals in step with the folio.
+        #
+        # They answer a different question from the folio — what the stay is
+        # contracted to cost and what has been collected, versus what has been
+        # billed so far — but they must not be able to *contradict* it. The rule
+        # is one line: a charge raises the total, a payment raises paid, a refund
+        # lowers it. Miss any of those and the drawer and the folio disagree,
+        # which is the bug this milestone exists to close.
+        #
+        # Room nights are not here on purpose: post_room_nights writes them
+        # straight to the folio and they were already in total_paise the moment
+        # the booking was taken.
+        patch: dict = {}
+        if kind in ("room", "addon", "tax", "adjustment"):
+            patch["total_paise"] = r["total_paise"] + signed
+        elif kind == "payment":
+            patch["paid_paise"] = r["paid_paise"] + abs(signed)
+        elif kind == "refund":
+            patch["paid_paise"] = max(0, r["paid_paise"] - abs(signed))
+
+        if patch:
+            total = patch.get("total_paise", r["total_paise"])
+            paid = patch.get("paid_paise", r["paid_paise"])
+            patch["payment_status"] = (
+                "paid" if paid >= total else "partially_paid" if paid > 0 else "unpaid"
+            )
+            db.table("reservations").update(patch).eq("id", reservation_id).execute()
 
         return entry
 
     return await run_db(_write)
+
+
+async def run_night_audit(property_id: str, business_date: str | None = None) -> dict:
+    """
+    Post the room nights for everyone in house.
+
+    pg_cron runs this nightly. It is exposed to the desk as well because the
+    interesting case is the property that was closed, offline, or simply not
+    looked at for two days: a manager needs to be able to bring the folios up to
+    date without waiting for 01:30, and it is safe to press because
+    `post_room_nights` is idempotent — running it four times posts each night
+    once.
+    """
+
+    def _run():
+        rows = get_db().rpc(
+            "run_night_audit",
+            {"p_property": property_id, "p_business_date": business_date or _business_date()},
+        ).execute().data or []
+        summary = rows[0] if rows else {"reservations": 0, "entries": 0}
+        return {
+            "businessDate": business_date or _business_date(),
+            "reservations": summary.get("reservations", 0),
+            "entries": summary.get("entries", 0),
+        }
+
+    return await run_db(_run)
 
 
 async def get_folio(property_id: str, reservation_id: str) -> dict:
