@@ -30,9 +30,11 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import settings
 from app.db.client import get_db, run_db
+from app.services import billing
 from app.services.messaging import credentials as creds_module
 from app.services.messaging import templates as templates_module
 from app.services.messaging.channels import (
+    INSUFFICIENT_CREDITS,
     NO_CONNECTION,
     PROVIDER_FAILED,
     WINDOW_CLOSED,
@@ -433,6 +435,31 @@ async def send(
     if body is None and template is None:
         raise MessagingError(PROVIDER_FAILED, "nothing to send")
 
+    # The credit gate on outbound, and it is deliberately narrow.
+    #
+    # It applies only to a *proactive* template send — a pre-arrival nudge, a
+    # follow-up, a re-engagement. Those are the things §8.9 pauses at zero.
+    #
+    # It does not apply to:
+    #   · a reply to a guest, agent or human. The window is open because
+    #     somebody wrote to the hotel, and leaving them unanswered to collect a
+    #     credit debt is not a decision this codebase offers.
+    #   · a booking confirmation, payment receipt, cancellation or check-in
+    #     link. Those draw on the overdraft — withholding a confirmation for a
+    #     room a guest has already paid for is structurally impossible here,
+    #     which is the point of `overdraft_limit` existing at all.
+    if purpose and not billing.is_critical(purpose):
+        decision = await billing.allowed(
+            usage_type="whatsapp.marketing",
+            property_id=conversation["property_id"],
+        )
+        if not decision.allowed:
+            raise MessagingError(
+                INSUFFICIENT_CREDITS,
+                f"proactive {purpose} messages are paused: the account is out of credits "
+                f"(balance {decision.balance}). Replies and confirmations still send.",
+            )
+
     reference = client_reference or f"msg:{uuid.uuid4()}"
     message, replayed = await run_db(_queue_outbound, conversation, {
         "body": body, "template": template, "author": author,
@@ -516,7 +543,7 @@ def _apply_status(update: DeliveryUpdate) -> dict | None:
     db = get_db()
     rows = (
         db.table("conversation_messages")
-        .select("id,delivery_status,metadata")
+        .select("id,delivery_status,metadata,property_id,conversation_id")
         .eq("channel", update.channel)
         .eq("external_id", update.external_id)
         .limit(1)
@@ -536,10 +563,11 @@ def _apply_status(update: DeliveryUpdate) -> dict | None:
 
     metadata = {**(row.get("metadata") or {}), "statuses": history[-10:]}
 
-    # Meta's billing dimensions, kept beside the message they describe. A rate
-    # card will read these; nothing here turns them into money, because nobody
-    # has agreed a price yet and a plausible-looking number now would be a
-    # decision made by accident.
+    # Meta's billing dimensions, kept beside the message they describe. The
+    # charge itself is raised in `apply_delivery_status` below — not here,
+    # because this runs on the DB executor thread and charging is async, and
+    # not in the webhook handler, because a status for a message we never sent
+    # must not become a charge.
     billing = {
         k: v for k, v in {
             "conversationId": update.conversation_id_external,
@@ -566,7 +594,37 @@ def _apply_status(update: DeliveryUpdate) -> dict | None:
 
 
 async def apply_delivery_status(update: DeliveryUpdate) -> dict | None:
-    return await run_db(_apply_status, update)
+    row = await run_db(_apply_status, update)
+    if row is None:
+        return None
+
+    # The conversation window is the unit Meta charges for, and the callback is
+    # the only place it is ever named. Charged once per window: the key is
+    # Meta's conversation id, and Meta repeats the block on several statuses.
+    #
+    # `billable is False` is Meta telling us this one is free — a service
+    # conversation inside the free tier, or a re-delivery. Charging the hotel
+    # for something we were not charged for would be indefensible; recording it
+    # at a zero rate we invented would be worse.
+    if update.conversation_id_external and update.billable is not False:
+        try:
+            from app.services.ai import usage as usage_mod
+
+            await usage_mod.record_conversation(
+                property_id=row.get("property_id"),
+                channel=update.channel,
+                category=update.conversation_category or "service",
+                external_conversation_id=update.conversation_id_external,
+                conversation_id=row.get("conversation_id"),
+                message_id=row.get("id"),
+                country=update.recipient_country,
+                pricing_model=update.pricing_model,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("could not meter conversation %s",
+                           update.conversation_id_external, exc_info=True)
+
+    return row
 
 
 # ── human takeover ───────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 """Request/response models for the internal admin API."""
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -128,3 +129,50 @@ class AuditEntry(BaseModel):
 class Ok(BaseModel):
     ok: bool = True
     message: str | None = None
+
+
+# ── AI usage and margin (§9.2) ───────────────────────────────────────────────
+#
+# An internal operating instrument, not a reporting feature to add when finance
+# asks. Two things surface here that nothing else will: some hotels are
+# excellent accounts, and some lean on expensive AI far past what their plan
+# covers. Without this view, the first signal of the second kind is a bad
+# quarter.
+
+class MarginRow(BaseModel):
+    billingAccountId: str
+    partnerId: str | None = None
+    account: str
+    propertyName: str | None = None
+    creditsConsumed: int = 0
+    # What we paid the providers, in paise. Micros are the storage unit; nobody
+    # reads a dashboard in millionths of a rupee.
+    costPaise: int = 0
+    revenuePaise: int = 0
+    marginPaise: int = 0
+    marginPct: float | None = None
+    events: int = 0
+    topUsageType: str | None = None
+    costByProvider: dict = {}
+
+
+class MarginReport(BaseModel):
+    periodStart: date
+    periodEnd: date
+    rows: list[MarginRow] = []
+    totalCostPaise: int = 0
+    totalRevenuePaise: int = 0
+    totalMarginPaise: int = 0
+    blendedMarginPct: float | None = None
+
+
+class CreditGrantRequest(BaseModel):
+    billingAccountId: str
+    credits: int = Field(..., gt=0, le=1_000_000)
+    kind: Literal["free", "trial", "subscription", "purchased",
+                  "bonus", "adjustment", "promotional"] = "purchased"
+    # The idempotency key, and required for that reason. A retried grant that
+    # lands twice is money given away.
+    reference: str = Field(..., min_length=4, max_length=120)
+    expiresAt: datetime | None = None
+    note: str | None = Field(None, max_length=400)

@@ -488,9 +488,23 @@ st, rates3 = http(f"{API}/properties/{PROP}/rates?from={w_from}&days=7", headers
 mine3 = [r for r in rates3 if r["ratePlanId"] == STD_PLAN]
 check("without disturbing the price — omitted means leave alone",
       all(r["pricePaise"] == 654300 for r in mine3), str(sorted({r["pricePaise"] for r in mine3})))
-check("and the minimum stay landed on exactly three nights",
-      sum(1 for r in mine3 if r["minStay"] == 2) == 3,
-      str([(r["date"], r["minStay"]) for r in mine3]))
+# Differential, not absolute. This script writes to the real database with a
+# randomly chosen window, so a night in the read range may already carry a
+# min-stay some earlier run left there — counting 2s across the whole week
+# measured the history of the database, not this write. Comparing against the
+# read taken moments ago is both immune to that and strictly stronger: it now
+# also catches a write that spills onto a night which held a *different* value.
+before_min = {r["date"]: r["minStay"] for r in mine}
+targets = {str(w_from + timedelta(days=d)) for d in range(3)}
+check("and the minimum stay landed on exactly the three nights asked for",
+      all(r["minStay"] == 2 for r in mine3 if r["date"] in targets),
+      str([(r["date"], r["minStay"]) for r in mine3 if r["date"] in targets]))
+check("and on no other night in the range",
+      all(r["minStay"] == before_min.get(r["date"])
+          for r in mine3 if r["date"] not in targets),
+      str([(r["date"], before_min.get(r["date"]), r["minStay"])
+           for r in mine3 if r["date"] not in targets
+           and r["minStay"] != before_min.get(r["date"])]))
 
 st, wrote3 = http(f"{API}/properties/{PROP}/inventory", "PATCH", {
     "roomTypeId": STD_RT, "fromDate": str(w_from), "toDate": str(w_from + timedelta(days=1)),

@@ -47,6 +47,10 @@ NO_CONNECTION = "CHANNEL_NOT_CONNECTED"
 PROVIDER_FAILED = "PROVIDER_FAILED"
 PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
 NOT_CONFIGURED = "CHANNEL_NOT_CONFIGURED"
+# Only ever raised for *proactive* outbound — a nudge, a follow-up, a campaign.
+# A reply to a guest who is waiting, and any transactional message, draws on the
+# wallet's overdraft instead. See services/billing.
+INSUFFICIENT_CREDITS = "INSUFFICIENT_CREDITS"
 
 
 @dataclass(frozen=True)
@@ -102,8 +106,11 @@ class DeliveryUpdate:
     # on the status callback and nowhere else, so discarding it means the only
     # record of what we were charged for lives in Meta's invoice.
     #
-    # Captured now, priced later. Nothing here converts to money: a rate card
-    # will, once somebody has agreed one. See services/ai/usage.py.
+    # These are now the `dimension` a rate card resolves on — the category picks
+    # the usage type, the country picks the rate. See
+    # `usage.record_conversation`, which is charged from `apply_delivery_status`
+    # and keyed on `conversation_id_external` so the several callbacks inside
+    # one window resolve to one charge.
     conversation_id_external: str | None = None
     conversation_category: str | None = None
     pricing_model: str | None = None

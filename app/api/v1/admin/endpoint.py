@@ -21,13 +21,14 @@ reviewing.
 # fails to resolve it — every POST then reports the Pydantic model as a missing
 # QUERY parameter instead of parsing the JSON body.
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.api.v1.admin.schemas import (
-    AuditEntry, DueGroup, Ok, PartnerActionRequest, PartnerInviteRequest,
+    AuditEntry, CreditGrantRequest, DueGroup,
+    MarginReport, MarginRow, Ok, PartnerActionRequest, PartnerInviteRequest,
     PartnerLoginLink, PartnerLoginLinkRequest, QueueItem, ReviewRequest,
     SettlePayoutRequest, UnpublishRequest,
 )
@@ -35,6 +36,7 @@ from app.core.limiter import limiter
 from app.db.client import get_db, run_db
 from app.deps.admin import AdminIdentity, require_admin
 from app.services import admin_audit
+from app.services import billing as billing_service
 from app.services.events import emit
 
 # Importing registers the @on(...) handlers.
@@ -649,3 +651,153 @@ def audit(
 ) -> list[AuditEntry]:
     """Who did what, newest first."""
     return [AuditEntry(**row) for row in admin_audit.recent(limit=limit, action=action)]
+
+
+# ── AI usage and margin ─────────────────────────────────────────────────────
+#
+# Live from the first paying hotel, because the levers it exposes are all data
+# and none of them is a code change:
+#
+#   one usage type unprofitable everywhere  →  raise its rate, or move it to a
+#                                              cheaper model
+#   one hotel unprofitable                  →  a higher plan, or cap that agent
+#   a provider raised prices                →  update provider_cost_rates
+#   blended margin thin                     →  adjust the plan's allowances
+#
+# Separating price from cost is what makes every one of those possible without
+# touching the product, and this endpoint is where you see whether you need to.
+
+@router.get("/ai-margin", response_model=MarginReport)
+@limiter.limit("30/minute")
+async def ai_margin(
+    request: Request,
+    period_start: date | None = Query(None),
+    period_end: date | None = Query(None),
+    recompute: bool = Query(False),
+    _admin: AdminIdentity = Depends(require_admin),
+) -> MarginReport:
+    """
+    What each hotel consumed, what it cost us, and what it earned.
+
+    Reads `billing_period_summary`, which a nightly job materialises — per-event
+    aggregation does not survive real conversation volume. `recompute=true`
+    refreshes it first, for the case where you are looking at today.
+
+    Cash basis: revenue is money actually received in the period. Consumed
+    credits are deliberately NOT counted as revenue — included credits were
+    already paid for in the subscription, and counting their consumption again
+    double-counts. A hotel burning a large free grant shows as the cost centre
+    it genuinely is during trial, which is the honest picture.
+    """
+    today = datetime.now(timezone.utc).date()
+    start = period_start or today.replace(day=1)
+    end = period_end or (start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+
+    if recompute:
+        await run_db(lambda: get_db().rpc("compute_all_period_summaries", {
+            "p_start": start.isoformat(), "p_end": end.isoformat(),
+        }).execute())
+
+    def _read():
+        db = get_db()
+        rows = (
+            db.table("billing_period_summary")
+            .select("*,billing_accounts(name,partner_id),properties(name)")
+            .eq("period_start", start.isoformat())
+            .eq("period_end", end.isoformat())
+            .limit(1000).execute().data or []
+        )
+        return rows
+
+    rows = await run_db(_read)
+
+    out: list[MarginRow] = []
+    for r in rows:
+        # The account-level row and its per-property rows both live here. Only
+        # the account rows are totalled, or every hotel is counted twice.
+        account = r.get("billing_accounts") or {}
+        cost_paise = int(r.get("provider_cost_inr_micros") or 0) // 10000
+        revenue = int(r.get("subscription_revenue_paise") or 0) + \
+            int(r.get("credit_purchase_revenue_paise") or 0)
+        by_type = r.get("usage_by_type") or {}
+        top = max(by_type.items(), key=lambda kv: (kv[1] or {}).get("credits", 0),
+                  default=(None, None))[0] if by_type else None
+        out.append(MarginRow(
+            billingAccountId=r["billing_account_id"],
+            partnerId=account.get("partner_id"),
+            account=account.get("name") or "—",
+            propertyName=(r.get("properties") or {}).get("name"),
+            creditsConsumed=int(r.get("credits_consumed") or 0),
+            costPaise=cost_paise,
+            revenuePaise=revenue,
+            marginPaise=revenue - cost_paise,
+            marginPct=round((revenue - cost_paise) / revenue * 100, 1) if revenue else None,
+            events=int(r.get("event_count") or 0),
+            topUsageType=top,
+            costByProvider=r.get("cost_by_provider") or {},
+        ))
+
+    account_level = [
+        row for row, raw in zip(out, rows) if raw.get("property_id") is None
+    ]
+    total_cost = sum(r.costPaise for r in account_level)
+    total_revenue = sum(r.revenuePaise for r in account_level)
+
+    return MarginReport(
+        periodStart=start,
+        periodEnd=end,
+        rows=sorted(out, key=lambda r: r.marginPaise),
+        totalCostPaise=total_cost,
+        totalRevenuePaise=total_revenue,
+        totalMarginPaise=total_revenue - total_cost,
+        blendedMarginPct=(round((total_revenue - total_cost) / total_revenue * 100, 1)
+                          if total_revenue else None),
+    )
+
+
+@router.post("/credits/grant", response_model=Ok)
+@limiter.limit("20/minute")
+async def grant_credits(
+    request: Request,
+    body: CreditGrantRequest,
+    admin: AdminIdentity = Depends(require_admin),
+) -> Ok:
+    """
+    A manual top-up. The internal tool, deliberately without a customer UI.
+
+    Self-service purchase arrives with the Razorpay work; for the first ten
+    hotels a top-up is a conversation followed by this call, and building a
+    checkout before anyone is consuming anything would mean designing billing UX
+    against imagined behaviour.
+
+    `reference` is the idempotency key and is required: a retried grant that
+    lands twice is money given away, and the caller is the only one who knows
+    whether this is the same top-up or a second one.
+    """
+    result = await billing_service.grant(
+        billing_account_id=body.billingAccountId,
+        kind=body.kind,
+        credits=body.credits,
+        idempotency_key=f"admin:{body.reference}",
+        expires_at=body.expiresAt.isoformat() if body.expiresAt else None,
+        source_type="admin",
+        actor_type="admin",
+        metadata={"note": body.note or "", "by": admin.actor},
+    )
+    await admin_audit.record(
+        actor=admin.actor,
+        action="credits.grant",
+        entity_type="billing_account",
+        entity_id=body.billingAccountId,
+        reason=body.note,
+        ip=admin.ip,
+        metadata={
+            "credits": body.credits, "kind": body.kind, "reference": body.reference,
+            # True when this call was a retry of one that already landed. Worth
+            # recording: it is the difference between "we granted twice" and
+            # "somebody pressed the button twice and the key held".
+            "duplicate": bool(result.get("duplicate")),
+            "balanceAfter": result.get("balance_after"),
+        },
+    )
+    return Ok(message=f"{body.credits} credits granted")

@@ -391,12 +391,30 @@ check("message → action → run → conversation joins in one query",
 
 usage = usage_of(faq_run["id"])
 by_type = {u["usage_type"]: u for u in usage}
-check("a conversation turn was metered", "ai.conversation_turn" in by_type, str(list(by_type)))
+# The turn is charged as what the agent IS, not as a generic turn. Which model
+# answered is a routing decision; "a guest conversation" is what the hotel
+# bought, and it is the row on the rate card.
+TURN = "ai.guest_conversation"
+check("a guest conversation was metered", TURN in by_type, str(list(by_type)))
 check("with the provider and model on it",
-      by_type["ai.conversation_turn"]["model"] == settings.hotel_model_conversation,
-      str(by_type["ai.conversation_turn"].get("model")))
-check("and token counts", by_type["ai.conversation_turn"]["tokens_in"] > 0,
-      str(by_type["ai.conversation_turn"].get("tokens_in")))
+      by_type[TURN]["model"] == settings.hotel_model_conversation,
+      str(by_type[TURN].get("model")))
+check("and token counts", by_type[TURN]["tokens_in"] > 0,
+      str(by_type[TURN].get("tokens_in")))
+check("priced against the rate card rather than left at zero",
+      by_type[TURN]["credits_charged"] > 0, str(by_type[TURN].get("credits_charged")))
+# The cost side ran and found nothing to charge, which is the correct answer:
+# this suite scripts the model with EchoProvider, and a fake provider genuinely
+# costs nothing. Asserting a rupee figure here would mean seeding a cost rate
+# for a provider that does not bill us — inventing the number this whole
+# two-card design exists to keep honest. The real-provider assertion lives in
+# scripts/vertex_e2e.py, against real Gemini.
+check("and the cost side resolved independently, finding no rate for a fake provider",
+      by_type[TURN]["provider_cost_inr_micros"] == 0
+      and (by_type[TURN].get("cost_snapshot") or {}).get("reason") is not None,
+      str(by_type[TURN].get("cost_snapshot"))[:160])
+check("with the rate it used frozen onto the event",
+      bool(by_type[TURN].get("rate_snapshot")), str(by_type[TURN].get("rate_snapshot"))[:120])
 check("the outbound WhatsApp message was metered separately",
       "whatsapp.message_sent" in by_type, str(list(by_type)))
 check("pointing at the message it charges for",
@@ -471,7 +489,7 @@ full = sql(f"""
     join public.agent_runs r    on r.id = a.run_id
     join public.conversations c on c.id = r.conversation_id
     join public.conversation_messages m on m.conversation_id = c.id and m.direction = 'outbound'
-    join public.usage_events u  on u.run_id = r.id and u.usage_type = 'ai.conversation_turn'
+    join public.usage_events u  on u.run_id = r.id and u.usage_type = 'ai.guest_conversation'
    where t.id = '{task["id"]}' limit 1;""")
 check("conversation → run → action → task → outbound message → usage event, all joined",
       isinstance(full, list) and len(full) == 1, str(full)[:240])

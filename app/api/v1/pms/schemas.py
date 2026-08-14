@@ -740,3 +740,59 @@ class UsageMeterOut(BaseModel):
     unit: str
     used: float
     billable: bool
+    # Which meter this belongs under. Driven by `usage_types.display_group`, so
+    # a new billable type appears in the right place without a frontend change.
+    group: str = "Usage"
+    category: str = "platform"
+
+
+class UsageGroupOut(BaseModel):
+    """
+    One meter, the way §8.10 says to show it:
+
+        AI Usage
+        1,240 / 2,000
+        ────────────────░░░░
+        Resets 1 September
+
+    Usage against an allowance, not a credit balance. Credits are an internal
+    monetization abstraction and a hotelier in Manali should never feel they are
+    managing a token balance to answer a guest.
+    """
+    group: str
+    category: str
+    used: float
+    allowance: float | None = None
+    items: list[UsageMeterOut] = []
+
+
+class UsageEventOut(BaseModel):
+    """
+    One line item. Carries what the hotel was charged and deliberately not what
+    it cost us — that column is not granted to the browser role, and this model
+    has no field for it so nothing can add one by accident.
+    """
+    id: str
+    usageType: str
+    displayName: str
+    group: str = "Usage"
+    agentName: str | None = None
+    conversationId: str | None = None
+    units: float = 0
+    creditsCharged: int = 0
+    provider: str | None = None
+    model: str | None = None
+    status: str = "charged"
+    createdAt: datetime
+
+
+class BillingSummaryOut(BaseModel):
+    plan: str | None = None
+    period_start: date | None = None
+    period_end: date | None = None
+    # ok · low · critical · empty. Drives the banner and nothing else; the
+    # numbers behind it are only surfaced in the purchase flow and the export.
+    tier: str = "unknown"
+    balance: int = 0
+    available: int = 0
+    groups: list[UsageGroupOut] = []

@@ -320,15 +320,21 @@ async def run_turn(
         "error": error,
     })
 
-    # Measured, not charged — see services/ai/usage.py. Written after the run is
-    # closed and swallowed on failure: a meter that can take down a guest
-    # conversation is a worse bug than a meter with a gap in it.
+    # Charged after the run, when the real token counts are known — never
+    # before, and never as a two-phase commit on a conversational turn. The
+    # gate is `billing.allowed()`, consulted by the caller before any of this
+    # happened; by the time we are here the work is done and the ledger records
+    # it whatever the balance says.
+    #
+    # Swallowed on failure inside billing.charge(): a meter that can take down
+    # a guest conversation is a worse bug than a meter with a gap in it.
     try:
         await usage_mod.record_run(
             run_id=run_id,
             property_id=ctx.property_id,
             partner_id=ctx.partner_id,
             agent_id=ctx.principal.agent_id,
+            agent_type=ctx.principal.agent_type,
             conversation_id=ctx.conversation_id,
             usage=turn_usage,
             action_ids=action_ids,

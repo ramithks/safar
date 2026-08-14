@@ -229,15 +229,25 @@ check("and the provider", row["provider"] == "vertex_ai", str(row.get("provider"
 check("with real token counts", (row["tokens_in"] or 0) > 0 and (row["tokens_out"] or 0) > 0,
       f"{row.get('tokens_in')}/{row.get('tokens_out')}")
 
-usage = sql(f"""select usage_type, model, tokens_in, tokens_out,
-                       metadata->'providerCost'->>'models' as models
+usage = sql(f"""select usage_type, model, tokens_in, tokens_out, credits_charged,
+                       provider_cost_native_micros, provider_cost_inr_micros, fx_rate,
+                       metadata->>'models' as models
                   from public.usage_events where run_id = '{result.run_id}'
-                   and usage_type = 'ai.conversation_turn';""")
+                   and usage_type = 'ai.guest_conversation';""")
 check("a usage event was written for the turn",
       isinstance(usage, list) and len(usage) == 1, str(usage)[:200])
 check("carrying the provider's own cost, kept apart from the hotel's unit",
       usage[0]["tokens_in"] > 0 and settings.hotel_model_conversation in (usage[0]["models"] or ""),
       str(usage[0]))
+# The two numbers, from two independent tables, on one real event. This is the
+# assertion that the cost card and the rate card actually both resolved — a
+# turn priced but not costed is a hole in the margin report, and a turn costed
+# but not priced is an invoice line nobody will send.
+check("priced in credits from the rate card",
+      usage[0]["credits_charged"] > 0, str(usage[0].get("credits_charged")))
+check("and costed in provider micros from the cost card, with the FX frozen",
+      usage[0]["provider_cost_native_micros"] > 0 and usage[0]["fx_rate"] is not None,
+      f"{usage[0].get('provider_cost_native_micros')} @ {usage[0].get('fx_rate')}")
 
 
 # ── 2. the guest's own booking ───────────────────────────────────────────────

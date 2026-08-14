@@ -33,6 +33,7 @@ from app.api.v1.pms.schemas import (
     AgentDecisionRequest,
     AgentOut,
     AriEditOut,
+    BillingSummaryOut,
     BookingRequest,
     CheckInRequest,
     ConversationHandlerRequest,
@@ -65,12 +66,15 @@ from app.api.v1.pms.schemas import (
     TaskOut,
     TaskStatusRequest,
     TodayStatsOut,
+    UsageEventOut,
+    UsageGroupOut,
     UsageMeterOut,
 )
 from app.core.limiter import limiter
 from app.db.client import get_db, run_db
 from app.deps.auth import require_user
 from app.deps.property import require_member
+from app.services import billing
 from app.services.pms import ari as ari_service
 from app.services.pms import availability as availability_service
 from app.services.pms import clock
@@ -1215,13 +1219,181 @@ async def get_usage_meters(
     for e in events:
         totals[e["usage_type"]] = totals.get(e["usage_type"], 0) + float(e["quantity"])
 
-    return [
-        UsageMeterOut(
-            code=code,
-            label=(types.get(code) or {}).get("name") or code,
-            unit=(types.get(code) or {}).get("unit") or "unit",
-            used=used,
-            billable=bool((types.get(code) or {}).get("billable", True)),
+    return [_meter(code, used, types.get(code) or {}) for code, used in sorted(totals.items())]
+
+
+def _meter(code: str, used: float, spec: dict) -> UsageMeterOut:
+    return UsageMeterOut(
+        code=code,
+        label=spec.get("name") or code,
+        unit=spec.get("unit") or "unit",
+        used=used,
+        billable=bool(spec.get("billable", True)),
+        group=spec.get("display_group") or "Usage",
+        category=spec.get("category") or "platform",
+    )
+
+
+@router.get("/properties/{property_id}/billing", response_model=BillingSummaryOut)
+@limiter.limit("60/minute")
+async def get_billing_summary(
+    request: Request,
+    property_id: str,
+    member=Depends(require_member("billing")),
+):
+    """
+    The usage meters, and how much room is left in them.
+
+    **Usage against an allowance, never a credit count.** The hotel sees "AI
+    Usage 1,240 / 2,000, resets 1 September"; the credits underneath are an
+    internal monetization abstraction and surface only in the purchase flow and
+    the ledger export.
+
+    The period is the subscription's, not a rolling 30 days, because "resets on
+    the 1st" is a promise and a rolling window is not one.
+
+    Nothing here is a gate. It is what the banner reads; the decision to stop an
+    AI reply is taken in the pipeline, against the same wallet, before a run
+    opens.
+    """
+    account = await billing.account_for_property(property_id)
+    if not account:
+        return BillingSummaryOut(tier="unknown")
+
+    def _read():
+        db = get_db()
+        sub = (
+            db.table("subscriptions")
+            .select("current_period_start,current_period_end,"
+                    "subscription_plans(code,name,included_allowances)")
+            .eq("billing_account_id", account)
+            .in_("status", ["trialing", "active"])
+            .order("current_period_start", desc=True)
+            .limit(1).execute().data or []
         )
-        for code, used in sorted(totals.items())
+        types = {t["code"]: t for t in (db.table("usage_types").select("*").execute().data or [])}
+        return (sub[0] if sub else None), types
+
+    subscription, types = await run_db(_read)
+    state = await billing.wallet_state(account)
+
+    period_start = _as_date(subscription and subscription.get("current_period_start"))
+    period_end = _as_date(subscription and subscription.get("current_period_end"))
+    plan = ((subscription or {}).get("subscription_plans") or {})
+    allowances = plan.get("included_allowances") or {}
+
+    since = (period_start.isoformat() if period_start
+             else (datetime.now(timezone.utc) - timedelta(days=30)).date().isoformat())
+
+    def _events():
+        return (
+            get_db().table("usage_events").select("usage_type,quantity")
+            .eq("property_id", property_id).gte("created_at", since)
+            .neq("status", "reversed")
+            .limit(10000).execute().data or []
+        )
+
+    events = await run_db(_events)
+    totals: dict[str, float] = {}
+    for e in events:
+        totals[e["usage_type"]] = totals.get(e["usage_type"], 0) + float(e["quantity"])
+
+    # Grouped by what the hotel recognises, which is `display_group`. The
+    # allowance is keyed by category, because an allowance is a commercial
+    # promise about a family of things and the display grouping is a label.
+    groups: dict[str, UsageGroupOut] = {}
+    for code, used in sorted(totals.items()):
+        spec = types.get(code) or {}
+        if not spec.get("billable", True):
+            continue
+        meter = _meter(code, used, spec)
+        group = groups.get(meter.group)
+        if group is None:
+            group = UsageGroupOut(
+                group=meter.group, category=meter.category, used=0,
+                allowance=_as_float(allowances.get(meter.category)), items=[],
+            )
+            groups[meter.group] = group
+        group.used += used
+        group.items.append(meter)
+
+    return BillingSummaryOut(
+        plan=plan.get("name") or plan.get("code"),
+        period_start=period_start,
+        period_end=period_end,
+        tier=str(state.get("tier") or "unknown"),
+        balance=int(state.get("balance") or 0),
+        available=int(state.get("available") or 0),
+        groups=list(groups.values()),
+    )
+
+
+@router.get("/properties/{property_id}/usage/events", response_model=list[UsageEventOut])
+@limiter.limit("60/minute")
+async def list_usage_events(
+    request: Request,
+    property_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    member=Depends(require_member("reports")),
+):
+    """
+    The line items behind the meters.
+
+    What was consumed, when, by which agent, and what it was charged. **Not
+    what it cost us** — `provider_cost_inr_micros` is not granted to the
+    browser role at all, and it is not selected here either. That column is the
+    margin on this hotel's account, and printing it beside their own usage
+    would be a pricing disclosure rather than transparency.
+    """
+    def _read():
+        db = get_db()
+        rows = (
+            db.table("usage_events")
+            .select("id,usage_type,quantity,credits_charged,provider,model,"
+                    "agent_id,conversation_id,status,created_at")
+            .eq("property_id", property_id)
+            .order("created_at", desc=True)
+            .limit(limit).execute().data or []
+        )
+        types = {t["code"]: t for t in (db.table("usage_types").select("*").execute().data or [])}
+        agents = {
+            a["id"]: a for a in
+            (db.table("agents").select("id,name,agent_type")
+             .eq("property_id", property_id).execute().data or [])
+        }
+        return rows, types, agents
+
+    rows, types, agents = await run_db(_read)
+    return [
+        UsageEventOut(
+            id=r["id"],
+            usageType=r["usage_type"],
+            displayName=(types.get(r["usage_type"]) or {}).get("name") or r["usage_type"],
+            group=(types.get(r["usage_type"]) or {}).get("display_group") or "Usage",
+            agentName=(agents.get(r.get("agent_id")) or {}).get("name"),
+            conversationId=r.get("conversation_id"),
+            units=float(r.get("quantity") or 0),
+            creditsCharged=int(r.get("credits_charged") or 0),
+            provider=r.get("provider"),
+            model=r.get("model"),
+            status=r.get("status") or "charged",
+            createdAt=r["created_at"],
+        )
+        for r in rows
     ]
+
+
+def _as_date(value) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def _as_float(value) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None

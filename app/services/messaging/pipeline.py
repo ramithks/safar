@@ -36,6 +36,7 @@ from app.db.client import get_db, run_db
 from app.services.ai import context as ai_context
 from app.services.ai import runtime
 from app.services.ai.errors import AgentError
+from app.services import billing
 from app.services.messaging import service as messaging
 
 logger = logging.getLogger(__name__)
@@ -190,6 +191,30 @@ async def process_conversation(conversation_id: str, *, provider=None) -> dict:
         # nothing and leaves no trace. This is the whole of "human takeover
         # stops autonomous replies".
         return {"processed": 0, "reason": f"handler is {conversation.get('handler')}"}
+
+    # The credit gate, and the only one on this path.
+    #
+    # Checked before the run rather than after it, because a turn that has
+    # already happened is charged regardless — the ledger records consumption,
+    # not intent. At zero the agent stops and the conversation goes to the
+    # inbox, which is §8.9: AI and messaging degrade, and nothing else does.
+    #
+    # A person resumes it. That is deliberate rather than a limitation: an
+    # agent silently reappearing mid-thread after a top-up, several messages
+    # into a conversation a human has been holding, is worse than asking the
+    # hotel to hand it back.
+    #
+    # `billing.allowed()` fails open, so a Supabase outage does not read to a
+    # hotelier as being cut off for non-payment.
+    decision = await billing.allowed(
+        usage_type=billing.usage_type_for_agent("guest"),
+        property_id=conversation["property_id"],
+    )
+    if not decision.allowed:
+        logger.info("agent paused on conversation %s: %s (balance %s)",
+                    conversation_id, decision.reason, decision.balance)
+        await messaging.request_human(conversation["id"], conversation["property_id"])
+        return {"processed": 0, "reason": decision.reason, "tier": decision.tier}
 
     processed = 0
     runs: list[str] = []
