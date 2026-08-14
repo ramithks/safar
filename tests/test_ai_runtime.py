@@ -130,7 +130,7 @@ def make_ctx(
         partner_id=PARTNER,
         config_id="config-1",
         config_version=1,
-        model="gpt-5-mini",
+        model="",   # empty: the router decides by tier
         conversation_id=conversation_id,
         reservation_id=reservation_id,
         guest_name="Nisha Kapoor",
@@ -440,5 +440,6 @@ def test_a_run_records_the_config_version_that_produced_it(db):
     row = db.rows("agent_runs")[0]
     assert row["config_id"] == "config-1"
     assert row["config_version"] == 1
-    assert row["model"] == "gpt-5-mini"
-    assert row["provider"] == "openai"
+    from app.config import settings
+    assert row["model"] == settings.hotel_model_conversation
+    assert row["provider"] == "echo"

@@ -191,14 +191,22 @@ async def process_conversation(conversation_id: str, *, provider=None) -> dict:
         # stops autonomous replies".
         return {"processed": 0, "reason": f"handler is {conversation.get('handler')}"}
 
-    pending = await run_db(_pending, conversation_id)
-    if not pending:
-        return {"processed": 0, "reason": "nothing pending"}
-
     processed = 0
     runs: list[str] = []
 
-    for message in pending:
+    # Re-queried each pass rather than snapshotted once.
+    #
+    # The bug this shape fixes: a guest's second message arriving *while* this
+    # worker held the lock was never answered. Its own task found the lock held
+    # and returned; this worker had already computed its work list before that
+    # message existed. Nobody came back for it, and the guest sat unanswered
+    # with no error anywhere. Caught by scripts/celery_ordering_e2e.py.
+    while processed < MAX_DRAIN:
+        pending = await run_db(_pending, conversation_id)
+        if not pending:
+            break
+
+        message = pending[0]
         try:
             ctx = await ai_context.load_context(
                 property_id=conversation["property_id"],
@@ -257,6 +265,8 @@ async def process_conversation(conversation_id: str, *, provider=None) -> dict:
         if not messaging.agent_may_answer(conversation):
             break
 
+    if not processed:
+        return {"processed": 0, "reason": "nothing pending"}
     return {"processed": processed, "runs": runs}
 
 

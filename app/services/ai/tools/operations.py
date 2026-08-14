@@ -37,13 +37,22 @@ PRIORITIES = ("low", "normal", "high", "urgent")
 class CreateTaskArgs(BaseModel):
     title: str = Field(
         min_length=4, max_length=120,
-        description="What needs doing, in the hotel's words. 'AC not cooling in 204'.",
+        description=(
+            "What needs doing, in the hotel's words: 'air conditioning not "
+            "cooling', 'two extra towels', 'tap dripping in the bathroom'. "
+            "Do not put a room number in the title — the room is set from the "
+            "guest's booking."
+        ),
     )
     category: str = Field(description=f"One of: {', '.join(CATEGORIES)}.")
     priority: str = Field(default="normal", description=f"One of: {', '.join(PRIORITIES)}.")
     room_number: str | None = Field(
         default=None, max_length=12,
-        description="The guest's room, when the job is in a room.",
+        description=(
+            "Only for a job that is NOT in this guest's own room — a public "
+            "area, or a room they have named explicitly. Leave empty otherwise: "
+            "their room comes from their booking."
+        ),
     )
 
 
@@ -88,11 +97,18 @@ async def create_task(args: CreateTaskArgs, ctx: AgentContext) -> tuple[dict, st
             "I've noted that — let me get someone from the team to you.",
         )
 
-    room = args.room_number
-    if not room and ctx.reservation_id:
-        # The guest's own room, from the reservation this conversation is about.
-        # Better than asking someone with a broken air conditioner what room
-        # they are in.
+    # The guest's own room wins over anything the model supplied.
+    #
+    # The reservation is authoritative about which door this guest is behind;
+    # a `room_number` argument is a string a language model produced, and the
+    # first version of this tool had an example containing a room number, which
+    # the model then reused for a guest staying somewhere else. A maintenance
+    # job on the wrong door is a stranger being woken up at eleven at night.
+    #
+    # The argument is still honoured when the conversation has no booking — a
+    # walk-in enquiry, or somebody reporting a broken light in the lobby.
+    room = None
+    if ctx.reservation_id:
         def _reservation():
             rows = (
                 get_db()
@@ -109,6 +125,9 @@ async def create_task(args: CreateTaskArgs, ctx: AgentContext) -> tuple[dict, st
 
         stay = await run_db(_reservation)
         room = await read_tools.room_number_for(stay) if stay else None
+
+    if not room:
+        room = args.room_number
 
     task_id = str(uuid.uuid4())
     try:

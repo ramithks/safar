@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 
 from app.config import settings
 from app.db.client import get_db, run_db
-from app.services.ai import prompts, registry, usage as usage_mod
+from app.services.ai import model_router, prompts, registry, usage as usage_mod
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import AgentError, ProviderError
 from app.services.ai.providers import ModelStep, Provider, for_name
@@ -49,7 +49,8 @@ registry.load_all()
 
 # ── the run and action rows ──────────────────────────────────────────────────
 
-def _open_run(ctx: AgentContext, trigger: str, summary: str | None) -> str:
+def _open_run(ctx: AgentContext, trigger: str, summary: str | None,
+              provider: str, model: str) -> str:
     def _write():
         row = {
             "agent_id": ctx.principal.agent_id,
@@ -62,8 +63,8 @@ def _open_run(ctx: AgentContext, trigger: str, summary: str | None) -> str:
             "trigger": trigger,
             "summary": summary,
             "status": "running",
-            "provider": ctx.provider,
-            "model": ctx.model,
+            "provider": provider,
+            "model": model,
         }
         return get_db().table("agent_runs").insert(row).execute().data[0]["id"]
 
@@ -182,6 +183,7 @@ async def run_turn(
     trigger: str = "message",
     provider: Provider | None = None,
     summary: str | None = None,
+    task: str = "guest_conversation",
 ) -> RunResult:
     """
     One guest turn, from a message to a reply.
@@ -190,12 +192,30 @@ async def run_turn(
     because it is the transport that knows which messages were actually
     delivered. `provider` is injectable so the tests can script the model and
     then assert on the database rather than on prose.
+
+    `task` is a *capability*, not a model. `model_router` turns it into a model,
+    a thinking budget and a token ceiling, so no model id appears in this file
+    — see services/ai/model_router.py for why that indirection earns its keep.
     """
     started = time.monotonic()
     llm = provider or for_name(ctx.provider)
-    turn_usage = usage_mod.TurnUsage(provider=llm.name, model=ctx.model)
 
-    run_id = await run_db(_open_run, ctx, trigger, summary)
+    # `agent_configs.model` is the exception, not the rule. Empty means "let the
+    # router decide", which is what almost every property wants — a model id
+    # pinned on a config row is one that has to be edited per hotel when a tier
+    # moves. A property given a specific model for a reason still keeps it, and
+    # the tier still decides how hard it thinks and how much it may say.
+    choice = model_router.select(
+        agent_type=ctx.principal.agent_type, task=task, override_model=ctx.model or None
+    )
+    params = {
+        "temperature": ctx.params.get("temperature", choice.temperature),
+        "max_output_tokens": ctx.params.get("max_output_tokens", choice.max_output_tokens),
+        "thinking_budget": ctx.params.get("thinking_budget", choice.thinking_budget),
+    }
+    turn_usage = usage_mod.TurnUsage(provider=llm.name, model=choice.model)
+
+    run_id = await run_db(_open_run, ctx, trigger, summary, llm.name, choice.model)
     ctx.run_id = run_id
 
     messages: list[dict] = [{"role": "system", "content": prompts.build_system_prompt(ctx)}]
@@ -216,9 +236,10 @@ async def run_turn(
     try:
         for _turn in range(settings.agent_max_tool_turns):
             step: ModelStep = await llm.step(
-                model=ctx.model, messages=messages, tools=tools, params=ctx.params
+                model=choice.model, messages=messages, tools=tools, params=params
             )
-            turn_usage.add_tokens(step.tokens_in, step.tokens_out)
+            turn_usage.add_tokens(step.tokens_in, step.tokens_out, step.tokens_thought)
+            turn_usage.used_model(choice.model)
 
             if not step.wants_tools:
                 reply = (step.reply or "").strip() or None
@@ -311,6 +332,7 @@ async def run_turn(
             conversation_id=ctx.conversation_id,
             usage=turn_usage,
             action_ids=action_ids,
+            latency_ms=latency,
         )
     except Exception:  # noqa: BLE001
         logger.warning("could not record usage for run %s", run_id, exc_info=True)

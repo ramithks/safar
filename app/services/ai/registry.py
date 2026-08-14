@@ -53,6 +53,7 @@ def tool(
     creates_result: bool = False,
     always_requires_approval: bool = False,
     scoped_to_conversation: bool = False,
+    revalidate: Callable | None = None,
 ) -> Callable:
     """
     Declare a tool.
@@ -79,6 +80,7 @@ def tool(
             creates_result=creates_result,
             always_requires_approval=always_requires_approval,
             scoped_to_conversation=scoped_to_conversation,
+            revalidate=revalidate,
         )
         return fn
 
@@ -121,11 +123,23 @@ def describe_for_provider(ctx: AgentContext) -> list[dict]:
     ]
 
 
-async def execute(name: str, arguments: dict[str, Any], ctx: AgentContext) -> ToolOutcome:
+async def execute(
+    name: str,
+    arguments: dict[str, Any],
+    ctx: AgentContext,
+    *,
+    approved: bool = False,
+) -> ToolOutcome:
     """
     The only way to run a tool. Never raises for an expected refusal — a refusal
     is an outcome the model must see and answer, not an exception that ends the
     turn.
+
+    `approved=True` means a human with the 'agents' permission has stood in for
+    the autonomy level on this specific action. It skips **only** the autonomy
+    gate. Permission, grant, argument validation and the tool's own
+    revalidation all still run — a manager can lend their judgement, not their
+    access, and cannot approve a tool the agent was never granted.
     """
     started = time.monotonic()
 
@@ -164,7 +178,7 @@ async def execute(name: str, arguments: dict[str, Any], ctx: AgentContext) -> To
         )
         return refusal(ToolInputInvalid(f"{spec.name} arguments rejected — {detail}"))
 
-    verdict = autonomy.decide(spec, ctx)
+    verdict = autonomy.EXECUTE if approved else autonomy.decide(spec, ctx)
     if verdict == autonomy.REFUSE:
         return refusal(
             AgentError(
@@ -179,6 +193,15 @@ async def execute(name: str, arguments: dict[str, Any], ctx: AgentContext) -> To
         out = refusal(exc)
         out.input = args.model_dump(mode="json")
         return out
+
+    # Between the proposal and the approval, the hotel moved. Checked here
+    # rather than inside the tool so a tool author cannot forget it, and only on
+    # the approval path — a live turn was never stale to begin with.
+    if approved and spec.revalidate is not None:
+        try:
+            await spec.revalidate(args, ctx)
+        except AgentError as exc:
+            return refusal(exc)
 
     try:
         result = spec.fn(args, ctx)

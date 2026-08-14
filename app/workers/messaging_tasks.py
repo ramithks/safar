@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 @celery_app.task(
     name="travbuddy.messaging.process_conversation",
+    bind=True,
     # Retried by us, not by Celery's default. A model call that failed once will
     # usually fail again immediately; the backoff is what makes the second
     # attempt worth making.
@@ -31,15 +32,22 @@ logger = logging.getLogger(__name__)
     max_retries=3,
     acks_late=True,
 )
-def process_conversation_task(conversation_id: str) -> dict:
+def process_conversation_task(self, conversation_id: str) -> dict:
     from app.services.messaging.pipeline import conversation_lock, process_conversation
 
     with conversation_lock(conversation_id) as acquired:
         if not acquired:
-            # Somebody else is answering this conversation. Their drain will
-            # pick up whatever arrived while they were working, because it
-            # reads pending messages rather than the one it was handed.
-            logger.debug("conversation %s is already being processed", conversation_id)
-            return {"processed": 0, "reason": "locked"}
+            # Somebody else is answering this conversation. Come back rather
+            # than give up.
+            #
+            # Returning here was a real bug: the holder computed its work list
+            # before this message was persisted, so nobody ever answered it and
+            # the guest sat in silence with no error recorded anywhere. The
+            # drain now re-queries, which fixes it from the other side — this
+            # retry is the belt to that pair of braces, and it is what covers
+            # the case where the holder finishes in the gap between its last
+            # query and releasing the lock.
+            logger.debug("conversation %s is busy, retrying shortly", conversation_id)
+            raise self.retry(countdown=3, max_retries=10)
 
         return asyncio.run(process_conversation(conversation_id))

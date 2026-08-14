@@ -77,6 +77,8 @@ from app.services.pms import clock
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
 from app.services.pms import sync as sync_service
+from app.services.ai import approvals
+from app.services.ai import model_router
 from app.services.messaging import service as messaging_service
 from app.services.messaging.channels import MessagingError
 from app.services.pms import workspace as workspace_service
@@ -880,6 +882,15 @@ async def set_conversation_handler(
     return ConversationOut.from_row(row, window_open=messaging_service.window_open(row))
 
 
+def _load_action(action_id: str, property_id: str) -> dict | None:
+    rows = (
+        get_db().table("agent_actions").select("*")
+        .eq("id", action_id).eq("property_id", property_id)
+        .limit(1).execute().data or []
+    )
+    return rows[0] if rows else None
+
+
 def _load_conversation(property_id: str, conversation_id: str) -> dict | None:
     rows = (
         get_db().table("conversations").select("*")
@@ -953,14 +964,21 @@ async def list_agents(
     for a in agents:
         config = configs.get(a.get("active_config_id")) or {}
         stats = runs.get(a["id"]) or {}
+        # The *effective* model, not the configured one. Most properties leave
+        # `agent_configs.model` empty and let the router choose by tier, and a
+        # screen that showed "—" there would be telling a hotelier their agent
+        # has no model when it plainly has one.
+        effective = config.get("model") or model_router.select(
+            agent_type=a["agent_type"], task="guest_conversation"
+        ).model
         out.append(AgentOut(
             id=a["id"],
             propertyId=a["property_id"],
             agentType=a["agent_type"],
             name=a["name"],
             autonomyLevel=a["autonomy_level"],
-            model=config.get("model") or "",
-            provider=config.get("provider") or "",
+            model=effective,
+            provider=config.get("provider") or model_router.PROVIDER_VERTEX,
             isActive=a["status"] == "active",
             status=a["status"],
             channels=a.get("channels") or [],
@@ -1088,45 +1106,66 @@ async def decide_agent_action(
     member=Depends(require_member("agents")),
 ):
     """
-    Approve or reject a proposed action.
+    Approve or reject a proposed action — and, on approval, run it.
 
-    Recorded server-side with who decided and when — a decision that only
-    existed in a browser is not a decision anyone can audit, and this row is
-    what an owner reads six months later when they ask why a discount went out.
+    Recorded server-side with who decided and when: a decision that only existed
+    in a browser is not a decision anyone can audit, and this row is what an
+    owner reads six months later when they ask why a discount went out.
 
-    **Approving records the decision; it does not yet execute the action.**
-    Running an approved quote or booking means replaying a tool call against
-    inventory that has moved since it was proposed, which needs its own
-    re-validation path. Saying so here rather than shipping an Approve button
-    that silently does half of what it says.
+    **Approving executes, after revalidating.** A proposal and its approval are
+    separated by however long a manager takes to look at their phone, and in
+    that time a room sells or a quote expires. `services/ai/approvals` re-derives
+    every check the runtime made and adds the tool's own staleness test, then
+    runs it. A stale proposal comes back as a 409 naming what changed, and the
+    action is terminal — the recovery is a fresh proposal, not another press.
     """
-    def _write():
-        db = get_db()
-        current = (
-            db.table("agent_actions").select("*")
-            .eq("id", action_id).eq("property_id", property_id)
-            .limit(1).execute().data or []
-        )
-        if not current:
-            return None, "not_found"
-        if current[0]["status"] != "awaiting_approval":
-            return current[0], "already_decided"
+    if body.decision == "rejected":
+        def _reject():
+            db = get_db()
+            current = (
+                db.table("agent_actions").select("*")
+                .eq("id", action_id).eq("property_id", property_id)
+                .limit(1).execute().data or []
+            )
+            if not current:
+                return None, "not_found"
+            if current[0]["status"] != "awaiting_approval":
+                return current[0], "already_decided"
+            rows = db.table("agent_actions").update({
+                "status": "rejected",
+                "refusal_reason": body.note or "Rejected by a manager",
+                "approved_by": member.profile_id,
+                "approved_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", action_id).execute().data
+            return (rows[0] if rows else None), None
 
-        rows = db.table("agent_actions").update({
-            "status": body.decision,
-            "approved_by": member.profile_id,
-            "approved_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", action_id).execute().data
-        return (rows[0] if rows else None), None
-
-    row, problem = await run_db(_write)
-    if problem == "not_found" or row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Action not found")
-    if problem == "already_decided":
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"This action is already {row['status'].replace('_', ' ')}",
+        row, problem = await run_db(_reject)
+        if problem == "not_found" or row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Action not found")
+        if problem == "already_decided":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"This action is already {row['status'].replace('_', ' ')}",
+            )
+    else:
+        result = await approvals.execute_approved(
+            action_id=action_id, property_id=property_id, member=member
         )
+        if not result.ok:
+            if result.code == "ACTION_NOT_FOUND":
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Action not found")
+            # 409, not 500. The request was fine; the hotel moved. The code and
+            # the detail both go back so the desk is told what changed rather
+            # than that something went wrong.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {"code": result.code, "detail": result.detail},
+            )
+
+        found = await run_db(_load_action, action_id, property_id)
+        if found is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Action not found")
+        row = found
 
     return AgentActionOut(
         id=row["id"], agentId=row["agent_id"], runId=row["run_id"],

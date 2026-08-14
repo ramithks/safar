@@ -153,8 +153,6 @@ async def vertex_generate(
     response_schema: a Gemini-compatible JSON schema — enables native
     structured output (forces responseMimeType to application/json).
     """
-    token, project_id = _get_access_token()
-    regions = _regions()
     model = model or settings.vertex_model_brain
 
     if isinstance(contents, str):
@@ -179,11 +177,31 @@ async def vertex_generate(
         gc["maxOutputTokens"] = max_output_tokens
     body["generationConfig"] = gc
 
-    # Retry on 429/503 by rotating through regions. While fresh regions remain
-    # in the current cycle we switch almost instantly (tiny jitter only); once
-    # every region has been tried we fall back to exponential backoff before
-    # cycling again. This keeps a rate-limited call from blocking on long sleeps
-    # in a single saturated region (which was blowing the supervisor's budget).
+    data = await _post_generate(body, model=model, timeout=timeout)
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+async def _post_generate(body: dict, *, model: str, timeout: float) -> dict:
+    """
+    POST generateContent, rotating regions on 429/503, and return the raw JSON.
+
+    Retry on 429/503 by rotating through regions. While fresh regions remain in
+    the current cycle we switch almost instantly (tiny jitter only); once every
+    region has been tried we fall back to exponential backoff before cycling
+    again. This keeps a rate-limited call from blocking on long sleeps in a
+    single saturated region (which was blowing the supervisor's budget).
+
+    Extracted from `vertex_generate` so the hotel agent runtime can reuse this
+    machinery instead of growing a second one. Everything the agent needs that
+    text generation does not — function declarations, a system instruction, a
+    thinking budget, the usage metadata — differs only in the request body and
+    in which part of the response the caller reads. The token cache, the region
+    cooldown, the retry ladder and the circuit breaker are the same problem for
+    both, and duplicating them would mean a saturated region punishing the agent
+    runtime that the trip planner had already learned to avoid.
+    """
+    token, project_id = _get_access_token()
+    regions = _regions()
     n_regions = len(regions)
     max_attempts = max(6, n_regions + 2)
     base_delay = 5.0
@@ -195,7 +213,7 @@ async def vertex_generate(
     # own region-retry loop below (guard imposes no timeout).
     from app.core.circuit_breaker import breaker_gemini, CircuitOpenError
 
-    async def _run() -> str:
+    async def _run() -> dict:
         # Snapshot the rotation order once per call, healthy regions first —
         # a saturated primary is skipped instead of retried by every caller.
         order = _healthy_first(regions)
@@ -229,8 +247,7 @@ async def vertex_generate(
             r.raise_for_status()
             break
 
-        data = r.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        return r.json()
 
     try:
         async with breaker_gemini.guard():
@@ -240,6 +257,61 @@ async def vertex_generate(
         # failure so the supervisor degrades the affected agent, same as a raise
         # from _run would.
         raise RuntimeError("Vertex temporarily unavailable (circuit open)")
+
+
+async def vertex_generate_call(
+    contents: list[dict],
+    *,
+    model: str,
+    system_instruction: str | None = None,
+    tools: list[dict] | None = None,
+    temperature: float | None = None,
+    max_output_tokens: int | None = None,
+    thinking_budget: int | None = None,
+    timeout: float = 120.0,
+) -> dict:
+    """
+    generateContent for an agent turn: function declarations in, a candidate out.
+
+    The difference from `vertex_generate` is the whole reason this exists. That
+    one returns `parts[0].text` and hardcodes `thinkingBudget: 0`, both of which
+    are right for a structured-extraction call and wrong for an agent — an agent
+    turn may answer with a `functionCall` part and no text at all, and dropping
+    the rest of the candidate would silently discard the tool call.
+
+    Returns the raw candidate plus `usageMetadata`, because the caller needs the
+    token counts for the meter and the finish reason for the audit trail.
+
+    `thinking_budget` is passed through rather than fixed: routing decides how
+    much reasoning a task is worth (see services/ai/model_router.py), and a
+    classification call and a rate negotiation should not cost the same.
+    """
+    body: dict = {"contents": contents}
+
+    if system_instruction:
+        # A separate field, not a first user turn. Gemini treats it differently,
+        # and it keeps the hotel's own instructions out of the message list where
+        # a later turn could be mistaken for part of the conversation.
+        body["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+
+    if tools:
+        body["tools"] = [{"functionDeclarations": tools}]
+        # AUTO, explicitly. The model decides whether a message needs a tool;
+        # forcing a call would make "what time is breakfast" invent one, and
+        # forbidding calls would make the agent useless.
+        body["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
+
+    gc: dict = {}
+    if temperature is not None:
+        gc["temperature"] = temperature
+    if max_output_tokens:
+        gc["maxOutputTokens"] = max_output_tokens
+    if thinking_budget is not None:
+        gc["thinkingConfig"] = {"thinkingBudget": thinking_budget}
+    if gc:
+        body["generationConfig"] = gc
+
+    return await _post_generate(body, model=model, timeout=timeout)
 
 
 def extract_json(raw: str) -> dict:

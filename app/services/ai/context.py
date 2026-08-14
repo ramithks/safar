@@ -86,7 +86,7 @@ class AgentContext:
     # an action months old can still be read against what produced it.
     config_id: str | None = None
     config_version: int | None = None
-    provider: str = "openai"
+    provider: str = "vertex_ai"
     model: str = ""
     params: dict = field(default_factory=dict)
     persona: dict = field(default_factory=dict)
@@ -313,7 +313,7 @@ async def load_context(
         partner_id=partner_id,
         config_id=config["id"],
         config_version=config["version"],
-        provider=config.get("provider") or "openai",
+        provider=config.get("provider") or "vertex_ai",
         model=config["model"],
         params=config.get("params") or {},
         persona=config.get("persona") or {},

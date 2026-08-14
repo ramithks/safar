@@ -83,7 +83,9 @@ def _provision(
             "persona": definition.persona,
             "provider": provider,
             "model": model,
-            "params": {"temperature": 0.3, "max_output_tokens": 700},
+            # Empty: the router's tier decides temperature and the token
+            # ceiling. A property that wants its own can set them here.
+            "params": {},
             "knowledge_scope": list(definition.knowledge_scope),
             "escalation_rules": definition.escalation_rules,
             "created_by": created_by,
@@ -120,11 +122,9 @@ async def provision(
     partner_id: str,
     agent_type: str = "guest",
     model: str | None = None,
-    provider: str = "openai",
+    provider: str = "vertex_ai",
     created_by: str | None = None,
 ) -> dict:
-    from app.config import settings
-
     definition = get_definition(agent_type)
     if not definition.available:
         raise AgentNotConfigured(
@@ -143,7 +143,9 @@ async def provision(
         property_id,
         partner_id,
         definition,
-        model or settings.openai_model_agent,
+        # Empty by default: the router picks by tier. A model id on a config row
+        # is one somebody has to edit per hotel every time a tier moves.
+        model or "",
         provider,
         created_by,
     )

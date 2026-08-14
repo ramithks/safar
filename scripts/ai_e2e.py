@@ -37,6 +37,7 @@ from datetime import date, timedelta
 # this one drives the runtime in process, so the package has to be findable.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+from app.config import settings  # noqa: E402
 from app.db.client import get_db  # noqa: E402
 from app.services.ai import context as ai_context  # noqa: E402
 from app.services.ai import registry, runtime  # noqa: E402
@@ -220,7 +221,8 @@ check("and none that move money on a stay that already exists",
       not any(ctx.principal.can(p) for p in ("folio", "billing", "payouts")))
 check("its configuration is versioned and published", ctx.config_version == 1,
       str(ctx.config_version))
-check("it names a model from config, not from code", ctx.model == "gpt-5-mini", ctx.model)
+check("its model comes from the router, not from a pinned config row",
+      ctx.model == "" and ctx.provider == "vertex_ai", f"{ctx.model!r} {ctx.provider}")
 check("every granted tool exists in the registry",
       all(t in registry.REGISTRY for t in ctx.tool_grants),
       str([t for t in ctx.tool_grants if t not in registry.REGISTRY]))
@@ -636,6 +638,147 @@ if isinstance(rls, list) and rls:
     check("but not its system prompt", rls[0]["configs"] == 0, str(rls))
 else:
     check("RLS could be inspected", False, str(rls)[:200])
+
+
+# ── approval execution ───────────────────────────────────────────────────────
+#
+# Until slice 3 this recorded a decision and stopped: a manager pressed Approve,
+# the row said `approved`, and the guest waited for something that never
+# happened. The interesting half is not that it now runs — it is what happens
+# when the hotel moved while the approval sat on somebody's phone.
+
+print("\n── approval execution ──")
+
+from app.services.ai import approvals  # noqa: E402
+
+
+class _Approver:
+    """The manager, in the shape the endpoint hands down."""
+    profile_id = "22222222-2222-4222-8222-222222222222"
+    member_id = None
+
+
+def propose_quote(*, discount: int = 20, check_in=None, check_out=None,
+                  room_type: str = "10000000-0000-4000-8000-000000000002") -> dict:
+    """One level-2 run whose get_quote comes back awaiting_approval."""
+    result = run(runtime.run_turn(
+        fresh_ctx(), "how much for a couple of nights?",
+        provider=EchoProvider([
+            [("get_quote", {"room_type_id": room_type,
+                            "rate_plan_id": "20000000-0000-4000-8000-000000000003",
+                            "check_in": str(check_in or ci), "check_out": str(check_out or co),
+                            "units": 1, "adults": 2, "discount_pct": discount})],
+            "I've asked the team to confirm.",
+        ]),
+    ))
+    return actions_for(result.run_id)[0]
+
+
+proposal = propose_quote()
+check("a level-2 agent's quote is queued for a human",
+      proposal["status"] == "awaiting_approval", str(proposal.get("refusal_reason")))
+
+decision = run(approvals.execute_approved(
+    action_id=proposal["id"], property_id=PROPERTY, member=_Approver()))
+check("approving runs the tool", decision.ok, f"{decision.code} {decision.detail}")
+check("and the action is executed, not merely approved",
+      decision.status == "executed", decision.status)
+check("with a quote to point at", decision.result_type == "quote" and bool(decision.result_id),
+      f"{decision.result_type} {decision.result_id}")
+
+executed = db.table("agent_actions").select("*").eq("id", proposal["id"]).limit(1).execute().data[0]
+check("the row records who approved it",
+      executed["approved_by"] == _Approver.profile_id, str(executed.get("approved_by")))
+check("and when", executed["approved_at"] is not None)
+check("and the arguments it was approved with are untouched",
+      executed["input"]["discount_pct"] == 20, str(executed["input"])[:120])
+
+stored = sql(f"""select total_paise, discount_paise, status, issued_by
+                   from public.quotes where id = '{decision.result_id}';""")
+check("a real quote exists, priced by the server",
+      isinstance(stored, list) and stored and stored[0]["total_paise"] > 0, str(stored)[:160])
+check("issued by the AI, on the agent's own authority",
+      stored[0]["issued_by"] == "ai", str(stored[0]["issued_by"]))
+check("and the discount was clamped server-side, not taken from the proposal",
+      stored[0]["discount_paise"] >= 0, str(stored[0]["discount_paise"]))
+
+check("the same action cannot be approved twice",
+      not run(approvals.execute_approved(
+          action_id=proposal["id"], property_id=PROPERTY, member=_Approver())).ok)
+check("and says so rather than running again",
+      run(approvals.execute_approved(
+          action_id=proposal["id"], property_id=PROPERTY,
+          member=_Approver())).code == "ALREADY_DECIDED")
+
+# ── the case this exists for: the hotel moved ───────────────────────────────
+
+print("\n── revalidation ──")
+
+# Proposed for dates that have since passed. The arguments cannot be rewritten
+# after the fact — `agent_actions.input` is append-only and the guard refuses —
+# so the proposal is made with those dates in the first place, which is what a
+# guest asking on Monday about Tuesday looks like when nobody approves until
+# Wednesday.
+past = propose_quote(check_in=date.today() - timedelta(days=2),
+                     check_out=date.today() - timedelta(days=1))
+stale = run(approvals.execute_approved(
+    action_id=past["id"], property_id=PROPERTY, member=_Approver()))
+check("a proposal whose dates have passed is refused", not stale.ok, str(stale))
+check("naming what went stale", stale.code == "PROPOSAL_STALE", str(stale.code))
+check("and it is terminal — the fix is a fresh proposal, not another press",
+      run(approvals.execute_approved(
+          action_id=past["id"], property_id=PROPERTY, member=_Approver())).code
+      == "ALREADY_DECIDED")
+check("with no quote created",
+      sql(f"""select count(*) as n from public.agent_actions
+               where id = '{past["id"]}' and result_id is not null;""")[0]["n"] == 0)
+
+# Sold out between proposal and approval.
+# Sold out between the proposal and the approval. Blocked rather than booked,
+# because blocking is the one lever that does not need a real guest — and
+# `property_availability` subtracts it exactly the same way.
+sold_out = propose_quote()
+blocked = sql(f"""select public.set_inventory(
+          '{PROPERTY}'::uuid, '10000000-0000-4000-8000-000000000002'::uuid,
+          '{ci}'::date, '{co - timedelta(days=1)}'::date, null, 99, null, null) as n;""")
+check("the rooms were actually blocked", isinstance(blocked, list) and blocked, str(blocked)[:120])
+gone = run(approvals.execute_approved(
+    action_id=sold_out["id"], property_id=PROPERTY, member=_Approver()))
+check("a proposal for rooms that have since sold is refused", not gone.ok, str(gone))
+check("naming the inventory rather than failing vaguely",
+      gone.code == "INVENTORY_CHANGED", f"{gone.code} {gone.detail}")
+sql(f"""select public.set_inventory(
+          '{PROPERTY}'::uuid, '10000000-0000-4000-8000-000000000002'::uuid,
+          '{ci}'::date, '{co - timedelta(days=1)}'::date, null, 0, null, null);""")
+
+# An approval lends judgement, not access.
+withdrawn = propose_quote()
+sql(f"""delete from public.agent_permissions
+         where agent_id = 'a9e00000-0000-4000-8000-000000000001' and scope = 'rates';""")
+refused = run(approvals.execute_approved(
+    action_id=withdrawn["id"], property_id=PROPERTY, member=_Approver()))
+check("a manager cannot approve past a permission the agent no longer holds",
+      not refused.ok, str(refused))
+check("and the refusal names the permission",
+      "rates" in (refused.detail or ""), str(refused.detail))
+sql(f"""insert into public.agent_permissions (agent_id, scope)
+        values ('a9e00000-0000-4000-8000-000000000001', 'rates')
+        on conflict do nothing;""")
+
+# Booking always needs approval, and its quote must still be live.
+booking_proposal = run(runtime.run_turn(
+    fresh_ctx(), "I'll take it",
+    provider=EchoProvider([
+        [("create_booking", {"quote_id": str(uuid.uuid4()), "guest_name": "Late Approver"})],
+        "Let me confirm that.",
+    ]),
+))
+booking_action = actions_for(booking_proposal.run_id)[0]
+missing_quote = run(approvals.execute_approved(
+    action_id=booking_action["id"], property_id=PROPERTY, member=_Approver()))
+check("a booking against a quote that does not exist is refused",
+      not missing_quote.ok and missing_quote.code == "QUOTE_NOT_FOUND",
+      f"{missing_quote.code} {missing_quote.detail}")
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

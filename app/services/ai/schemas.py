@@ -67,6 +67,18 @@ class ToolSpec:
     # conversation before anything is returned.
     scoped_to_conversation: bool = False
 
+    # Checked again just before an *approved* proposal executes.
+    #
+    # A proposal and its approval are separated by however long a manager takes
+    # to look at their phone. In that time a room can sell, a quote can expire
+    # and a rate can move. Running the tool on the strength of the approval
+    # alone would execute a decision somebody made about a hotel that no longer
+    # exists — so a mutating tool that can go stale declares how to tell.
+    #
+    # Raises `AgentError` to refuse. Absent means the tool cannot go stale,
+    # which is true of raising a ticket and false of almost anything priced.
+    revalidate: Callable[..., Awaitable[None]] | None = None
+
     def json_schema(self) -> dict:
         """The argument schema, in the shape a provider expects."""
         schema = self.input_model.model_json_schema()

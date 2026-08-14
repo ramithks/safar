@@ -31,19 +31,49 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TurnUsage:
-    """One run's consumption, in the dimensions the rate card will price."""
+    """
+    One run's consumption.
+
+    **Two things, kept apart on purpose.**
+
+    `tokens_*` and `model` are what the *provider* charged TravBuddy. They are a
+    cost, they are denominated in a vendor's units, and they change when Google
+    changes a price list.
+
+    `units` is what the *hotel* consumed: conversation turns, messages. That is
+    what a rate card will price, and it is deliberately not derived from tokens
+    — a hotel billed by the token would pay more for a chatty guest than for a
+    demanding one, which is both unsellable and wrong.
+
+    Recording both now, separately, is what lets a later rate card compute
+    provider_cost and credits_charged independently. Collapsing them into one
+    number today would be a decision nobody has made yet, made permanently.
+    """
 
     provider: str = ""
     model: str = ""
     tokens_in: int = 0
     tokens_out: int = 0
+    # Reasoning tokens, where the provider reports them separately. Billed, and
+    # not the same thing as output — a rate card will treat them differently.
+    tokens_thought: int = 0
+    # Every model this run touched. A turn that escalated from the workhorse to
+    # the reasoning tier cost two different prices, and one `model` field would
+    # hide the expensive half.
+    models: list[str] = field(default_factory=list)
+
     # usage_type -> count. `ai.conversation_turn` is the billable unit a hotel
     # understands; the per-tool counts are for the operator's own cost model.
     units: dict[str, int] = field(default_factory=dict)
 
-    def add_tokens(self, tokens_in: int, tokens_out: int) -> None:
+    def add_tokens(self, tokens_in: int, tokens_out: int, tokens_thought: int = 0) -> None:
         self.tokens_in += tokens_in
         self.tokens_out += tokens_out
+        self.tokens_thought += tokens_thought
+
+    def used_model(self, model: str) -> None:
+        if model and model not in self.models:
+            self.models.append(model)
 
     def count(self, usage_type: str, n: int = 1) -> None:
         self.units[usage_type] = self.units.get(usage_type, 0) + n
@@ -87,6 +117,7 @@ async def record_run(
     conversation_id: str | None,
     usage: TurnUsage,
     action_ids: dict[str, list[str]] | None = None,
+    latency_ms: int | None = None,
 ) -> int:
     """
     Write the events for one finished run.
@@ -95,6 +126,10 @@ async def record_run(
     per tool call for the operator's own cost model. The token counts ride on
     the turn, because that is where the provider cost actually lands.
     """
+    # The customer-facing unit is one turn, whatever it cost us to produce.
+    # The provider's side of the bargain rides in `metadata` — tokens, thinking
+    # tokens, every model the run touched — so the two can be priced
+    # independently when there is a rate card to price them with.
     rows: list[dict] = [{
         "property_id": property_id,
         "partner_id": partner_id,
@@ -107,6 +142,15 @@ async def record_run(
         "agent_id": agent_id,
         "run_id": run_id,
         "conversation_id": conversation_id,
+        "metadata": {
+            "providerCost": {
+                "tokensIn": usage.tokens_in,
+                "tokensOut": usage.tokens_out,
+                "tokensThought": usage.tokens_thought,
+                "models": usage.models or ([usage.model] if usage.model else []),
+                "latencyMs": latency_ms,
+            },
+        },
         "idempotency_key": idempotency_key(run_id, "ai.conversation_turn"),
     }]
 

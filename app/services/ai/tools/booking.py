@@ -37,6 +37,53 @@ class HoldArgs(BaseModel):
     hold_id: str = Field(description="From get_quote.")
 
 
+async def _revalidate_booking(args: "BookingArgs", ctx: AgentContext) -> None:
+    """
+    Is the quote a manager approved still the quote we would honour?
+
+    This is the case the whole revalidation path exists for. A quote holds
+    inventory for fifteen minutes and carries a price. Approve it twenty minutes
+    later and the hold has expired, the room may have sold, and the price on the
+    row is a promise nobody is standing behind any more.
+
+    Consuming it anyway would sell a room the hotel no longer has at a price it
+    no longer offers, on the strength of an approval that was true when it was
+    given.
+    """
+    from datetime import datetime, timezone
+
+    def _read():
+        rows = (
+            get_db().table("quotes")
+            .select("id,property_id,status,expires_at,total_paise,hold_id")
+            .eq("id", args.quote_id).limit(1).execute().data or []
+        )
+        return rows[0] if rows else None
+
+    quote = await run_db(_read)
+    if not quote or quote["property_id"] != ctx.property_id:
+        raise OutOfScope(
+            f"QUOTE_NOT_FOUND: quote {args.quote_id} is not this property's",
+            "Something is out of step with that price — the team will follow up.",
+        )
+
+    if quote["status"] != "active":
+        raise OutOfScope(
+            f"QUOTE_CONSUMED: the quote is {quote['status']}, not active",
+            "That price has already been used — the team will follow up.",
+        )
+
+    expires = quote.get("expires_at")
+    if expires:
+        when = datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+        if when < datetime.now(timezone.utc):
+            raise OutOfScope(
+                f"QUOTE_EXPIRED: the quote expired at {when.isoformat()} and "
+                "its hold has been released",
+                "That price has expired — the team will send you a fresh one.",
+            )
+
+
 @tool(
     name="create_booking",
     description=(
@@ -51,6 +98,7 @@ class HoldArgs(BaseModel):
     usage_type="ai.tool_booking",
     result_type="reservation",
     creates_result=True,
+    revalidate=_revalidate_booking,
     # Even at level 3. The first hotel to let an AI take bookings unattended
     # will not be the first hotel to try it, and the queue costs a manager ten
     # seconds against a booking they cannot un-take.

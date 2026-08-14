@@ -393,7 +393,7 @@ usage = usage_of(faq_run["id"])
 by_type = {u["usage_type"]: u for u in usage}
 check("a conversation turn was metered", "ai.conversation_turn" in by_type, str(list(by_type)))
 check("with the provider and model on it",
-      by_type["ai.conversation_turn"]["model"] == "gpt-5-mini",
+      by_type["ai.conversation_turn"]["model"] == settings.hotel_model_conversation,
       str(by_type["ai.conversation_turn"].get("model")))
 check("and token counts", by_type["ai.conversation_turn"]["tokens_in"] > 0,
       str(by_type["ai.conversation_turn"].get("tokens_in")))

@@ -46,24 +46,35 @@ class Settings(BaseSettings):
     vertex_fallback_service_account_json: Optional[str] = None  # full SA JSON string
 
     # ── Hotel OS agent runtime (services/ai) ────────────────────────────────
-    # OpenAI, not Vertex. The runtime is provider-agnostic — `providers.py`
-    # dispatches on `agent_configs.provider` — but the hotel agents run on
-    # OpenAI, and the Gemini tiers above stay where they are, serving the
-    # traveller-side pipeline.
+    # Gemini on Vertex, through the same `services/vertex.py` the traveller-side
+    # pipeline uses — same project, same credentials, same region rotation, same
+    # circuit breaker. One AI provider architecture, not two.
     #
-    # Model ids live here and nowhere else, matching the rule above. `agent` is
-    # the tool-calling loop: a guest turn is a short reasoning step over a
-    # dozen tool schemas, run thousands of times a month, so the cheap tier is
-    # the right default and the expensive one is the exception. `reason` is for
-    # the escalations — a complaint being triaged, an owner asking why revenue
-    # moved — where a wrong answer costs more than the tokens.
-    openai_api_key: Optional[str] = None
-    openai_base_url: str = "https://api.openai.com/v1"
-    openai_model_agent: str = "gpt-5-mini"
-    openai_model_reason: str = "gpt-5.1"
+    # Model ids live here and nowhere else, matching the rule above, and the
+    # runtime asks `model_router` for a *capability* rather than naming any of
+    # these. Three tiers because guest traffic is not one workload:
+    #
+    #   conversation  the workhorse. A guest turn is a short reasoning step over
+    #                 twenty tool schemas, run thousands of times a month.
+    #   reasoning     the exception. A rate negotiation, a cancellation dispute,
+    #                 an owner asking why revenue moved — where a wrong answer
+    #                 costs more than the tokens.
+    #   classify      routing, intent, language, spam. Never worth the others.
+    #
+    # **The 3.x family is the intended target and is not yet reachable.**
+    # gemini-3-flash, gemini-3.1-pro and gemini-3.1-flash-lite all return 404
+    # for project travbuddy-499007 — in us-central1, us-east5, europe-west4 and
+    # global, on both v1 and v1beta1. Credentials are fine; the models are not
+    # enabled for this project. So the tiers run on 2.5, which is verified
+    # working with function calling, and moving is three lines here once access
+    # lands: the router, the provider and the tool conversion name no model.
+    hotel_model_conversation: str = "gemini-2.5-flash"       # target: gemini-3-flash
+    hotel_model_reasoning: str = "gemini-2.5-pro"            # target: gemini-3.1-pro
+    hotel_model_classify: str = "gemini-2.5-flash-lite"      # target: gemini-3.1-flash-lite
+
     # Per request, not per turn. A guest waiting on WhatsApp will forgive thirty
     # seconds; a hung socket holding a worker is a different problem.
-    openai_timeout_seconds: float = 30.0
+    hotel_model_timeout_seconds: float = 45.0
     # How many times the model may call tools before the runtime stops it. Six
     # is generous for "look up the booking, raise a ticket, assign it"; a loop
     # that needs more is a loop that has stopped making progress.

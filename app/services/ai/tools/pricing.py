@@ -43,6 +43,43 @@ class QuoteArgs(BaseModel):
     )
 
 
+async def _revalidate_quote(args: "QuoteArgs", ctx: AgentContext) -> None:
+    """
+    Is this still a stay we can sell, at the moment of approval?
+
+    A manager approving a proposal five minutes later is approving the *idea* of
+    quoting — the price itself has not been computed yet, so there is no stale
+    number to honour. What can have gone stale is whether the stay is sellable
+    at all: the dates can have passed and the last room can have sold while the
+    approval sat on somebody's phone.
+
+    Executing anyway would produce a quote for a room that does not exist and
+    hold inventory the hotel has already sold.
+    """
+    from app.services.pms import availability as availability_service
+    from app.services.pms import clock
+
+    today = clock.business_date(ctx.property_id)
+    if args.check_in < today:
+        raise OutOfScope(
+            f"PROPOSAL_STALE: the arrival date {args.check_in} is in the past",
+            "That request is out of date now — the team will get back to you with fresh dates.",
+        )
+
+    options = await availability_service.stay_options(
+        ctx.property_id, args.check_in, args.check_out,
+        units=args.units, audience="public",
+    )
+    room = next((o for o in options if o.room_type_id == args.room_type_id), None)
+    if room is None or room.units_left < args.units:
+        left = room.units_left if room else 0
+        raise OutOfScope(
+            f"INVENTORY_CHANGED: {args.units} room(s) were free when this was "
+            f"proposed and {left} are free now",
+            "Those rooms have gone since we spoke — the team will find you an alternative.",
+        )
+
+
 @tool(
     name="get_quote",
     description=(
@@ -60,6 +97,7 @@ class QuoteArgs(BaseModel):
     usage_type="ai.tool_quote",
     result_type="quote",
     creates_result=True,
+    revalidate=_revalidate_quote,
 )
 async def get_quote(args: QuoteArgs, ctx: AgentContext) -> tuple[dict, str]:
     if args.check_out <= args.check_in:
