@@ -1,0 +1,315 @@
+"""
+The agent runtime.
+
+One function does the work — `run_turn` — and its shape is the architecture:
+
+    agent_run                       opened before anything else happens
+      │
+      ├─ model step                 provider asks: speak, or call tools?
+      │    └─ registry.execute()    permission → autonomy → validate → run
+      │         └─ agent_action     written for every call, including refusals
+      │
+      ├─ model step                 the model sees the tool results and continues
+      └─ agent_run finished         status, tokens, latency, and a reply
+
+Three properties are worth stating because they are what make this auditable
+rather than merely logged.
+
+**The run row is opened first.** A crash mid-turn leaves a run marked `running`
+with the actions it managed, which is a diagnosable state. Writing the run at
+the end would lose exactly the turns worth investigating.
+
+**Refusals are recorded.** A tool the agent was not allowed to call produces an
+`agent_actions` row with status `refused` and the reason. A blocked action that
+leaves no trace is indistinguishable from an action nobody attempted, and the
+first question after a bad AI interaction is always "what did it try".
+
+**The model never sees a tool it cannot call.** `registry.available_for` filters
+by grant, so an agent without `get_quote` is not told get_quote exists. Refusal
+is the backstop, not the mechanism.
+"""
+import json
+import logging
+import time
+import uuid
+from datetime import datetime, timezone
+
+from app.config import settings
+from app.db.client import get_db, run_db
+from app.services.ai import prompts, registry, usage as usage_mod
+from app.services.ai.context import AgentContext
+from app.services.ai.errors import AgentError, ProviderError
+from app.services.ai.providers import ModelStep, Provider, for_name
+from app.services.ai.schemas import RunResult, ToolOutcome
+
+logger = logging.getLogger(__name__)
+
+registry.load_all()
+
+
+# ── the run and action rows ──────────────────────────────────────────────────
+
+def _open_run(ctx: AgentContext, trigger: str, summary: str | None) -> str:
+    def _write():
+        row = {
+            "agent_id": ctx.principal.agent_id,
+            "property_id": ctx.property_id,
+            "partner_id": ctx.partner_id,
+            "config_id": ctx.config_id,
+            "config_version": ctx.config_version,
+            "conversation_id": ctx.conversation_id,
+            "member_id": ctx.member_id,
+            "trigger": trigger,
+            "summary": summary,
+            "status": "running",
+            "provider": ctx.provider,
+            "model": ctx.model,
+        }
+        return get_db().table("agent_runs").insert(row).execute().data[0]["id"]
+
+    return _write()
+
+
+def _write_action(ctx: AgentContext, run_id: str, seq: int, outcome: ToolOutcome) -> str | None:
+    """
+    One row per tool call, whatever happened.
+
+    `output` is truncated rather than dropped when a tool returns something
+    large: an availability response over sixty nights is not evidence, but the
+    shape of it is, and a row with no output at all cannot be reviewed.
+    """
+    def _write():
+        payload = outcome.output
+        if payload is not None:
+            encoded = json.dumps(payload, default=str)
+            if len(encoded) > 8000:
+                payload = {"truncated": True, "preview": encoded[:2000]}
+
+        row = {
+            "run_id": run_id,
+            "agent_id": ctx.principal.agent_id,
+            "property_id": ctx.property_id,
+            "partner_id": ctx.partner_id,
+            "seq": seq,
+            "tool": outcome.tool,
+            "input": outcome.input or {},
+            "output": payload,
+            "result_type": outcome.result_type,
+            "result_id": outcome.result_id,
+            "status": outcome.status,
+            "refusal_reason": outcome.refusal_reason,
+            "latency_ms": outcome.latency_ms,
+            "error": outcome.error,
+        }
+        return get_db().table("agent_actions").insert(row).execute().data[0]["id"]
+
+    try:
+        return _write()
+    except Exception:  # noqa: BLE001
+        # A failure to write the audit row must not take the guest's answer with
+        # it. Logged loudly: this is the one thing here that should page someone.
+        logger.exception("could not record agent action %s for run %s", outcome.tool, run_id)
+        return None
+
+
+def _link_result(outcome: ToolOutcome, action_id: str | None) -> None:
+    """
+    Point the created thing back at the action that created it.
+
+    Only tasks carry the column today (`tasks.agent_action_id`, from migration
+    5, given its foreign key in migration 10). It is what closes the loop from a
+    guest's sentence to a job on a board: the ticket knows which AI action
+    raised it, and the action knows which ticket it produced.
+
+    Guarded on `creates_result`, not on `result_type`. `assign_task` reports the
+    same result type as `create_task` without being the ticket's author, and
+    linking on type alone made the ticket point at whichever action touched it
+    last — which is provenance that answers the wrong question.
+    """
+    if not action_id or not outcome.result_id:
+        return
+    spec = registry.REGISTRY.get(outcome.tool)
+    if not spec or not spec.creates_result or spec.result_type != "task":
+        return
+
+    def _write():
+        get_db().table("tasks").update({"agent_action_id": action_id}).eq(
+            "id", outcome.result_id
+        ).execute()
+
+    try:
+        _write()
+    except Exception:  # noqa: BLE001
+        logger.warning("could not link task %s to action %s", outcome.result_id, action_id)
+
+
+def _close_run(run_id: str, fields: dict) -> None:
+    def _write():
+        get_db().table("agent_runs").update(
+            {"finished_at": datetime.now(timezone.utc).isoformat(), **fields}
+        ).eq("id", run_id).execute()
+
+    try:
+        _write()
+    except Exception:  # noqa: BLE001
+        logger.exception("could not close agent run %s", run_id)
+
+
+# ── the turn ─────────────────────────────────────────────────────────────────
+
+async def run_turn(
+    ctx: AgentContext,
+    message: str,
+    *,
+    history: list[dict] | None = None,
+    trigger: str = "message",
+    provider: Provider | None = None,
+    summary: str | None = None,
+) -> RunResult:
+    """
+    One guest turn, from a message to a reply.
+
+    `history` is prior turns in provider shape — the transport owns the thread,
+    because it is the transport that knows which messages were actually
+    delivered. `provider` is injectable so the tests can script the model and
+    then assert on the database rather than on prose.
+    """
+    started = time.monotonic()
+    llm = provider or for_name(ctx.provider)
+    turn_usage = usage_mod.TurnUsage(provider=llm.name, model=ctx.model)
+
+    run_id = await run_db(_open_run, ctx, trigger, summary)
+    ctx.run_id = run_id
+
+    messages: list[dict] = [{"role": "system", "content": prompts.build_system_prompt(ctx)}]
+    messages += history or []
+    messages.append({"role": "user", "content": message})
+
+    tools = registry.describe_for_provider(ctx)
+    outcomes: list[ToolOutcome] = []
+    seq = 0
+    reply: str | None = None
+    handoff = False
+    status = "succeeded"
+    error: str | None = None
+
+    try:
+        for _turn in range(settings.agent_max_tool_turns):
+            step: ModelStep = await llm.step(
+                model=ctx.model, messages=messages, tools=tools, params=ctx.params
+            )
+            turn_usage.add_tokens(step.tokens_in, step.tokens_out)
+
+            if not step.wants_tools:
+                reply = (step.reply or "").strip() or None
+                break
+
+            messages.append(step.raw or {"role": "assistant", "content": None})
+
+            for call in step.tool_calls:
+                outcome = await registry.execute(call.name, call.arguments, ctx)
+                seq += 1
+                outcomes.append(outcome)
+
+                spec = registry.REGISTRY.get(call.name)
+                if spec:
+                    turn_usage.count(spec.usage_type)
+
+                action_id = await run_db(_write_action, ctx, run_id, seq, outcome)
+                await run_db(_link_result, outcome, action_id)
+
+                if outcome.tool == "request_human_handoff" and outcome.ok:
+                    handoff = True
+
+                # What the model is shown. A refusal goes back as text it can
+                # act on, not as an empty result it will retry — that is the
+                # difference between an agent that says "let me get someone"
+                # and one that tries the same forbidden thing four times.
+                content = (
+                    json.dumps(outcome.output, default=str)
+                    if outcome.ok
+                    else json.dumps({"refused": True, "reason": outcome.model_message})
+                )
+                messages.append(llm.tool_result_message(call, content))
+        else:
+            # Ran out of turns without an answer. Rare, and a handoff rather
+            # than a truncated guess.
+            logger.warning("run %s hit the tool-turn ceiling", run_id)
+            handoff = True
+
+        if handoff:
+            status = "escalated"
+        if reply is None and not handoff:
+            reply = None
+            status = "failed"
+            error = "the model produced no reply"
+
+    except ProviderError as exc:
+        # The model is gone. The conversation goes to a human, and the guest is
+        # told something true rather than nothing.
+        logger.warning("provider failed on run %s: %s", run_id, exc.reason)
+        status, error, handoff = "failed", exc.reason, True
+        reply = prompts.handoff_reply(ctx)
+    except AgentError as exc:
+        status, error, handoff = "failed", exc.reason, True
+        reply = exc.guest_message
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("agent run %s failed", run_id)
+        status, error, handoff = "failed", f"{type(exc).__name__}: {exc}", True
+        reply = prompts.handoff_reply(ctx)
+
+    latency = int((time.monotonic() - started) * 1000)
+    turn_usage.count("ai.conversation_turn")
+    usage_mod.record(run_id, turn_usage)
+
+    await run_db(_close_run, run_id, {
+        "status": status,
+        "tokens_in": turn_usage.tokens_in,
+        "tokens_out": turn_usage.tokens_out,
+        "latency_ms": latency,
+        "error": error,
+    })
+
+    # A handoff always leaves the conversation with a human, even when the
+    # handoff came from a crash rather than from the tool. The rule is that an
+    # unattended conversation is never left believing an agent is still on it.
+    if handoff and ctx.conversation_id:
+        await run_db(_ensure_human, ctx)
+
+    return RunResult(
+        run_id=run_id,
+        status=status,
+        reply=reply,
+        actions=outcomes,
+        handoff=handoff,
+        tokens_in=turn_usage.tokens_in,
+        tokens_out=turn_usage.tokens_out,
+        latency_ms=latency,
+        error=error,
+    )
+
+
+def _ensure_human(ctx: AgentContext) -> None:
+    try:
+        get_db().table("conversations").update({"handler": "human"}).eq(
+            "id", ctx.conversation_id
+        ).eq("property_id", ctx.property_id).execute()
+    except Exception:  # noqa: BLE001
+        logger.warning("could not mark conversation %s for a human", ctx.conversation_id)
+
+
+def agent_is_handling(conversation: dict) -> bool:
+    """
+    Whether the runtime may answer at all.
+
+    **Human takeover stops autonomous replies.** A member who takes a
+    conversation over owns it until they explicitly hand it back, and this is
+    the check that makes that true rather than customary. Called by the
+    transport before a run is even opened, so a taken-over conversation costs
+    nothing and leaves no trace.
+    """
+    return (conversation.get("handler") or "ai") == "ai"
+
+
+def new_conversation_id() -> str:
+    return str(uuid.uuid4())

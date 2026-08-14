@@ -45,6 +45,30 @@ class Settings(BaseSettings):
     vertex_fallback_project: Optional[str] = None
     vertex_fallback_service_account_json: Optional[str] = None  # full SA JSON string
 
+    # ── Hotel OS agent runtime (services/ai) ────────────────────────────────
+    # OpenAI, not Vertex. The runtime is provider-agnostic — `providers.py`
+    # dispatches on `agent_configs.provider` — but the hotel agents run on
+    # OpenAI, and the Gemini tiers above stay where they are, serving the
+    # traveller-side pipeline.
+    #
+    # Model ids live here and nowhere else, matching the rule above. `agent` is
+    # the tool-calling loop: a guest turn is a short reasoning step over a
+    # dozen tool schemas, run thousands of times a month, so the cheap tier is
+    # the right default and the expensive one is the exception. `reason` is for
+    # the escalations — a complaint being triaged, an owner asking why revenue
+    # moved — where a wrong answer costs more than the tokens.
+    openai_api_key: Optional[str] = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model_agent: str = "gpt-5-mini"
+    openai_model_reason: str = "gpt-5.1"
+    # Per request, not per turn. A guest waiting on WhatsApp will forgive thirty
+    # seconds; a hung socket holding a worker is a different problem.
+    openai_timeout_seconds: float = 30.0
+    # How many times the model may call tools before the runtime stops it. Six
+    # is generous for "look up the booking, raise a ticket, assign it"; a loop
+    # that needs more is a loop that has stopped making progress.
+    agent_max_tool_turns: int = 6
+
     # Google Maps — Places API for place enrichment (optional but recommended)
     google_maps_api_key: Optional[str] = None
 
