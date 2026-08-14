@@ -344,6 +344,12 @@ def test_metas_error_codes_become_actionable_refusals():
     assert _classify(190, "")[0] == NOT_CONFIGURED
     assert "expired" in _classify(190, "")[1]
 
+    # The one that cost the most to diagnose: a token with the right scope that
+    # is not bound to the WABA. Everything reads, nothing sends.
+    code, advice = _classify(131005, "")
+    assert code == NOT_CONFIGURED
+    assert "API Setup" in advice and "target_ids" in advice
+
 
 def test_an_unmapped_error_code_still_refuses_cleanly():
     from app.services.messaging.channels import PROVIDER_FAILED

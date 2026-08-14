@@ -38,6 +38,12 @@ logger = logging.getLogger(__name__)
 # listed — inventing advice for a code nobody has hit would be worse than the
 # raw number.
 _META_ERRORS: dict[int, tuple[str, str]] = {
+    131005: (NOT_CONFIGURED,
+             " — the token is valid but is not authorised to act on the WABA "
+             "that owns this number. Mint a fresh one from Meta → WhatsApp → "
+             "API Setup (issued already bound to the WABA), or assign the WABA "
+             "to a System User and use its token. `debug_token` showing "
+             "granular_scopes with no target_ids is the tell."),
     131030: (NOT_CONFIGURED,
              " — this number is not on the test app's allowed list. Add it in "
              "Meta → WhatsApp → API Setup → 'To', or move off a test number."),
