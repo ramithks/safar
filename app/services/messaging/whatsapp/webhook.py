@@ -126,6 +126,12 @@ def parse(payload: dict) -> tuple[list[InboundMessage], list[DeliveryUpdate]]:
                 if not external_id:
                     continue
                 errors = raw.get("errors") or []
+                # Meta's own billing dimensions. They appear on the status
+                # callback and nowhere else — not on the send response — so a
+                # parser that drops them leaves the invoice as the only record
+                # of what we were charged for.
+                conversation = raw.get("conversation") or {}
+                pricing = raw.get("pricing") or {}
                 statuses.append(DeliveryUpdate(
                     channel=CHANNEL,
                     external_id=external_id,
@@ -134,6 +140,14 @@ def parse(payload: dict) -> tuple[list[InboundMessage], list[DeliveryUpdate]]:
                     error_detail=(errors[0].get("title") or errors[0].get("message"))
                                  if errors else None,
                     at=_ts(raw.get("timestamp")),
+                    conversation_id_external=conversation.get("id"),
+                    conversation_category=(
+                        (conversation.get("origin") or {}).get("type")
+                        or pricing.get("category")
+                    ),
+                    pricing_model=pricing.get("pricing_model"),
+                    billable=pricing.get("billable"),
+                    recipient_country=raw.get("recipient_id", "")[:2] or None,
                     raw=raw,
                 ))
 

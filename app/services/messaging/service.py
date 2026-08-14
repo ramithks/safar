@@ -534,9 +534,26 @@ def _apply_status(update: DeliveryUpdate) -> dict | None:
     history = list((row.get("metadata") or {}).get("statuses") or [])
     history.append({"status": update.status, "at": (update.at or datetime.now(timezone.utc)).isoformat()})
 
+    metadata = {**(row.get("metadata") or {}), "statuses": history[-10:]}
+
+    # Meta's billing dimensions, kept beside the message they describe. A rate
+    # card will read these; nothing here turns them into money, because nobody
+    # has agreed a price yet and a plausible-looking number now would be a
+    # decision made by accident.
+    billing = {
+        k: v for k, v in {
+            "conversationId": update.conversation_id_external,
+            "category": update.conversation_category,
+            "pricingModel": update.pricing_model,
+            "billable": update.billable,
+        }.items() if v is not None
+    }
+    if billing:
+        metadata["providerBilling"] = {**(metadata.get("providerBilling") or {}), **billing}
+
     patch = {
         "delivery_status": update.status,
-        "metadata": {**(row.get("metadata") or {}), "statuses": history[-10:]},
+        "metadata": metadata,
     }
     if update.status == "failed":
         patch["failure_reason"] = (update.error_detail or "")[:400] or None

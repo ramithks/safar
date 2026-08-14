@@ -201,13 +201,30 @@ class VertexGeminiProvider:
                     payload = {"result": message.get("content")}
                 if not isinstance(payload, dict):
                     payload = {"result": payload}
-                contents.append({
-                    "role": "user",
-                    "parts": [{"functionResponse": {
-                        "name": message.get("name") or "tool",
-                        "response": payload,
-                    }}],
-                })
+
+                part = {"functionResponse": {
+                    "name": message.get("name") or "tool",
+                    "response": payload,
+                }}
+
+                # **Merged into one turn, not one turn each.**
+                #
+                # Gemini requires the number of functionResponse parts to equal
+                # the number of functionCall parts in the turn they answer, and
+                # counts them per *turn*. Emitting a user turn per result made
+                # every multi-tool exchange fail on the second call with
+                # "Please ensure that the number of function response parts is
+                # equal to the number of function call parts" — a 400 the
+                # runtime correctly turned into a handoff, so it looked like an
+                # occasional model outage rather than a protocol mistake.
+                #
+                # It only bites when the model calls several tools at once, which
+                # is exactly the behaviour worth having.
+                if (contents and contents[-1]["role"] == "user"
+                        and all("functionResponse" in p for p in contents[-1]["parts"])):
+                    contents[-1]["parts"].append(part)
+                else:
+                    contents.append({"role": "user", "parts": [part]})
                 continue
 
             if role == "assistant":

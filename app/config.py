@@ -107,6 +107,16 @@ class Settings(BaseSettings):
     # test can shorten it rather than sleep through it.
     whatsapp_service_window_hours: int = 24
 
+    # The controlled smoke test, and only the controlled smoke test.
+    #
+    # Deliberately singular. `scripts/meta_smoke.py` messages exactly this
+    # number and has no way to be handed a list — a smoke test that could
+    # quietly widen into production traffic would be the worst possible way to
+    # discover a mistake. Read through settings like every other credential, so
+    # `.env` is genuinely the one place any of this lives.
+    whatsapp_test_recipient: Optional[str] = None
+    whatsapp_test_phone_number_id: Optional[str] = None
+
     # Run the agent inline in the webhook request instead of handing it to
     # Celery. Development and the E2E suite only: a real deployment must
     # acknowledge Meta quickly and do the model call elsewhere.

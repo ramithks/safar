@@ -17,13 +17,61 @@ import httpx
 
 from app.config import settings
 from app.services.messaging.channels import (
+    NOT_CONFIGURED,
     PROVIDER_FAILED,
     PROVIDER_UNAVAILABLE,
+    TEMPLATE_NOT_APPROVED,
+    WINDOW_CLOSED,
     MessagingError,
     SendResult,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Meta's error codes, translated into ours plus a sentence saying what to do.
+#
+# Written after a real send returned `131030` and the log said nothing except
+# the number. A code alone sends whoever is on call to a search engine; the
+# advice is the difference between a five-minute fix and an afternoon. Only
+# codes we have actually seen or that have an unambiguous operator action are
+# listed — inventing advice for a code nobody has hit would be worse than the
+# raw number.
+_META_ERRORS: dict[int, tuple[str, str]] = {
+    131030: (NOT_CONFIGURED,
+             " — this number is not on the test app's allowed list. Add it in "
+             "Meta → WhatsApp → API Setup → 'To', or move off a test number."),
+    131047: (WINDOW_CLOSED,
+             " — more than 24 hours since the guest wrote. Send an approved "
+             "template instead."),
+    131026: (PROVIDER_FAILED,
+             " — the recipient cannot receive WhatsApp messages on that number."),
+    131051: (PROVIDER_FAILED, " — this message type is not supported here."),
+    132000: (TEMPLATE_NOT_APPROVED,
+             " — the template's parameter count does not match what Meta "
+             "approved. Check `message_templates.parameters`."),
+    132001: (TEMPLATE_NOT_APPROVED,
+             " — no template with that name and language exists on this WABA."),
+    132005: (TEMPLATE_NOT_APPROVED, " — the approved template text has changed."),
+    133010: (NOT_CONFIGURED, " — the phone number is not registered."),
+    190:    (NOT_CONFIGURED,
+             " — the access token has expired or been revoked. Replace "
+             "WHATSAPP_ACCESS_TOKEN in .env."),
+    4:      (PROVIDER_UNAVAILABLE, " — Meta is rate limiting this app."),
+    80007:  (PROVIDER_UNAVAILABLE, " — this WABA has hit its rate limit."),
+}
+
+
+def _classify(code: int | None, detail: str) -> tuple[str, str]:
+    """Meta's code → (our structured code, an operator-facing sentence)."""
+    if code is not None:
+        try:
+            mapped = _META_ERRORS.get(int(code))
+        except (TypeError, ValueError):
+            mapped = None
+        if mapped:
+            return mapped
+    return PROVIDER_FAILED, ""
 
 
 class WhatsAppAdapter:
@@ -55,19 +103,23 @@ class WhatsAppAdapter:
             ) from exc
 
         if resp.status_code >= 400:
-            detail, code = "", None
+            detail, code, subcode = "", None, None
             try:
                 error = (resp.json().get("error") or {})
                 detail = str(error.get("message", ""))[:200]
                 code = error.get("code")
+                subcode = (error.get("error_data") or {}).get("details")
             except Exception:  # noqa: BLE001
                 detail = resp.text[:200]
+
             # 5xx and 429 are worth retrying; a 400 means the message itself is
             # wrong and retrying it produces the same 400 forever.
             retryable = resp.status_code >= 500 or resp.status_code == 429
+            structured, advice = _classify(code, detail)
             raise MessagingError(
-                PROVIDER_FAILED,
-                f"WhatsApp returned {resp.status_code} ({code}): {detail}",
+                structured,
+                f"WhatsApp returned {resp.status_code} ({code}): "
+                f"{subcode or detail}{advice}",
                 retryable=retryable,
             )
 

@@ -244,7 +244,21 @@ async def _post_generate(body: dict, *, model: str, timeout: float) -> dict:
                 await asyncio.sleep(delay)
                 continue
 
-            r.raise_for_status()
+            if r.status_code >= 400:
+                # Vertex explains itself in the body and `raise_for_status`
+                # throws it away. That cost an afternoon: a multi-tool turn was
+                # 400ing with "the number of function response parts must equal
+                # the number of function call parts" and the log said only
+                # "Client error '400 Bad Request'".
+                detail = ""
+                try:
+                    detail = str((r.json().get("error") or {}).get("message", ""))[:300]
+                except Exception:  # noqa: BLE001
+                    detail = r.text[:300]
+                raise httpx.HTTPStatusError(
+                    f"Vertex {r.status_code} for {model}: {detail}",
+                    request=r.request, response=r,
+                )
             break
 
         return r.json()

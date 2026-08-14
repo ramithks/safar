@@ -316,3 +316,133 @@ def test_a_blocked_prompt_is_a_provider_error_not_an_empty_answer():
     with pytest.raises(ProviderError) as caught:
         VertexGeminiProvider._read({"promptFeedback": {"blockReason": "SAFETY"}})
     assert "SAFETY" in str(caught.value)
+
+
+# ── what the real Meta contract taught us ────────────────────────────────────
+#
+# Both of these were written after a real send. The first because a bare `131030`
+# in a log sends whoever is on call to a search engine; the second because Meta's
+# billing dimensions arrive on the status callback and nowhere else, so a parser
+# that drops them leaves the invoice as the only record of what we were charged.
+
+def test_metas_error_codes_become_actionable_refusals():
+    from app.services.messaging.channels import (
+        NOT_CONFIGURED, TEMPLATE_NOT_APPROVED, WINDOW_CLOSED,
+    )
+    from app.services.messaging.whatsapp.adapter import _classify
+
+    # The one a real send actually returned.
+    code, advice = _classify(131030, "Recipient phone number not in allowed list")
+    assert code == NOT_CONFIGURED
+    assert "allowed list" in advice and "API Setup" in advice
+
+    # Meta's own window rule, arriving from the other direction. Our service
+    # refuses first, but a race can still reach this.
+    assert _classify(131047, "")[0] == WINDOW_CLOSED
+    # A template mismatch is a configuration problem, not a transport one.
+    assert _classify(132000, "")[0] == TEMPLATE_NOT_APPROVED
+    assert _classify(190, "")[0] == NOT_CONFIGURED
+    assert "expired" in _classify(190, "")[1]
+
+
+def test_an_unmapped_error_code_still_refuses_cleanly():
+    from app.services.messaging.channels import PROVIDER_FAILED
+    from app.services.messaging.whatsapp.adapter import _classify
+
+    # Inventing advice for a code nobody has hit would be worse than the raw
+    # number, so an unknown code gets the generic classification and no advice.
+    assert _classify(999999, "something new") == (PROVIDER_FAILED, "")
+    assert _classify(None, "no code at all") == (PROVIDER_FAILED, "")
+
+
+def test_metas_billing_dimensions_are_captured_from_a_status_callback():
+    from app.services.messaging.whatsapp import webhook as wa
+
+    _, statuses = wa.parse({
+        "entry": [{"changes": [{"value": {
+            "metadata": {"phone_number_id": "123"},
+            "statuses": [{
+                "id": "wamid.REAL", "status": "delivered", "timestamp": "1770000000",
+                "recipient_id": "919812345678",
+                "conversation": {"id": "conv-abc",
+                                 "origin": {"type": "service"}},
+                "pricing": {"billable": True, "pricing_model": "CBP",
+                            "category": "service"},
+            }],
+        }}]}],
+    })
+    assert len(statuses) == 1
+    update = statuses[0]
+    assert update.status == "delivered"
+    # Meta prices per conversation, not per message, and the category decides
+    # the rate. All of it is needed before a rate card can price anything.
+    assert update.conversation_id_external == "conv-abc"
+    assert update.conversation_category == "service"
+    assert update.pricing_model == "CBP"
+    assert update.billable is True
+
+
+def test_a_status_callback_without_pricing_is_still_parsed():
+    from app.services.messaging.whatsapp import webhook as wa
+
+    # `sent` callbacks carry no pricing block. Requiring one would drop the
+    # first status of every message.
+    _, statuses = wa.parse({
+        "entry": [{"changes": [{"value": {
+            "metadata": {"phone_number_id": "123"},
+            "statuses": [{"id": "wamid.X", "status": "sent", "timestamp": "1770000000"}],
+        }}]}],
+    })
+    assert statuses[0].status == "sent"
+    assert statuses[0].pricing_model is None
+    assert statuses[0].billable is None
+
+
+def test_the_smoke_test_cannot_be_handed_a_list_of_recipients():
+    # The property that matters most about meta_smoke.py: there is exactly one
+    # recipient, it comes from settings, and nothing accepts a collection.
+    import pathlib
+
+    source = (pathlib.Path(__file__).resolve().parent.parent
+              / "scripts" / "meta_smoke.py").read_text()
+    assert "settings.whatsapp_test_recipient" in source
+    for smell in ("for recipient in", "recipients", "sys.argv[1]", "split(',')"):
+        assert smell not in source, f"meta_smoke.py contains {smell!r}"
+
+
+def test_parallel_tool_results_are_merged_into_one_turn():
+    # Gemini counts functionResponse parts per *turn* and requires the count to
+    # match the functionCall turn it answers. One user turn per result made
+    # every multi-tool exchange 400 on the second call — which the runtime
+    # turned into a handoff, so it read as an occasional model outage rather
+    # than a protocol mistake. Found against real Vertex, 3 runs in 40.
+    _, contents = VertexGeminiProvider._to_contents([
+        {"role": "user", "content": "a room tomorrow, and airport pickup?"},
+        {"role": "assistant", "parts": [
+            {"functionCall": {"name": "search_availability", "args": {}}},
+            {"functionCall": {"name": "list_services", "args": {}}},
+        ]},
+        {"role": "tool", "name": "search_availability", "content": '{"anyAvailable": true}'},
+        {"role": "tool", "name": "list_services", "content": '{"services": []}'},
+    ])
+
+    calls = [p for p in contents[1]["parts"] if "functionCall" in p]
+    responses = [p for turn in contents[2:] for p in turn["parts"] if "functionResponse" in p]
+    assert len(calls) == len(responses) == 2
+    # And in one turn, which is the part Gemini actually enforces.
+    assert len(contents) == 3
+    assert [p["functionResponse"]["name"] for p in contents[2]["parts"]] == [
+        "search_availability", "list_services"
+    ]
+
+
+def test_a_new_user_message_after_tool_results_starts_its_own_turn():
+    # The merge must not swallow the next thing the guest says.
+    _, contents = VertexGeminiProvider._to_contents([
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "parts": [{"functionCall": {"name": "get_property", "args": {}}}]},
+        {"role": "tool", "name": "get_property", "content": '{"name": "Casa"}'},
+        {"role": "user", "content": "second"},
+    ])
+    assert len(contents) == 4
+    assert contents[3] == {"role": "user", "parts": [{"text": "second"}]}

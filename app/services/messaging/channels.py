@@ -95,6 +95,21 @@ class DeliveryUpdate:
     at: datetime | None = None
     raw: dict = field(default_factory=dict)
 
+    # What the provider will bill this on.
+    #
+    # Meta prices per *conversation*, not per message, and the category —
+    # service, utility, marketing, authentication — decides the rate. It arrives
+    # on the status callback and nowhere else, so discarding it means the only
+    # record of what we were charged for lives in Meta's invoice.
+    #
+    # Captured now, priced later. Nothing here converts to money: a rate card
+    # will, once somebody has agreed one. See services/ai/usage.py.
+    conversation_id_external: str | None = None
+    conversation_category: str | None = None
+    pricing_model: str | None = None
+    billable: bool | None = None
+    recipient_country: str | None = None
+
 
 @dataclass(frozen=True)
 class SendResult:
