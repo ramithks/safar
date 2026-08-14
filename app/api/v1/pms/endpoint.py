@@ -36,6 +36,9 @@ from app.api.v1.pms.schemas import (
     BillingSummaryOut,
     BookingRequest,
     CheckInRequest,
+    ConsoleActionOut,
+    ConsoleAskOut,
+    ConsoleAskRequest,
     ConversationHandlerRequest,
     ConversationOut,
     FolioEntryOut,
@@ -82,6 +85,7 @@ from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
 from app.services.pms import sync as sync_service
 from app.services.ai import approvals
+from app.services.ai import console as ai_console
 from app.services.ai import model_router
 from app.services.messaging import service as messaging_service
 from app.services.messaging.channels import MessagingError
@@ -408,50 +412,23 @@ async def list_reservations(
     """
     The reservation list, and the three front-desk buckets.
 
-    The status sets come from `services/pms/workspace`, which is also where
-    Today's counts come from — one definition, so the headline number and the
-    list underneath it are the same query with a different projection. They are
-    mirrored again in the PWA's offline cache (src/data/filters.ts), because a
-    list that changes the moment a connection drops leaves the desk with no way
-    to tell which version is right.
+    The buckets, the search and the balance map all come from
+    `services/pms/workspace.list_reservations` — the same function the Front
+    Desk agent's `list_arrivals` calls, and the same status sets Today's counts
+    use. One definition, so the headline number, the list underneath it and
+    whatever the AI reads out are the same query with different projections.
+    They are mirrored again in the PWA's offline cache (src/data/filters.ts),
+    because a list that changes the moment a connection drops leaves the desk
+    with no way to tell which version is right.
     """
-    # The property's date, from services/pms/clock — the same source
-    # `today_stats` uses. Two definitions of "today" is exactly how the count
-    # and the list came to disagree in the first place.
-    today = await clock.abusiness_date_iso(property_id)
-
-    def _read():
-        db = get_db()
-        q = db.table("reservations").select("*").eq("property_id", property_id)
-
-        if bucket == "arrivals":
-            q = q.eq("check_in", today).in_("status", list(workspace_service.ARRIVAL_STATUSES))
-        elif bucket == "departures":
-            q = q.eq("check_out", today).in_("status", list(workspace_service.DEPARTURE_STATUSES))
-        elif bucket == "inhouse":
-            q = q.in_("status", list(workspace_service.IN_HOUSE_STATUSES))
-
-        # Half-open overlap: a stay is in the window if it has not ended before
-        # it and has not started after it.
-        if date_from:
-            q = q.gte("check_out", date_from.isoformat())
-        if date_to:
-            q = q.lte("check_in", date_to.isoformat())
-        if search:
-            escaped = search.replace("%", r"\%").replace(",", " ")
-            q = q.or_(f"guest_name.ilike.%{escaped}%,ref.ilike.%{escaped}%,guest_phone.ilike.%{escaped}%")
-
-        rows = q.order("check_in").limit(limit).execute().data or []
-        # One grouped query for the whole property rather than one per row: the
-        # arrivals list is the screen a receptionist reloads all shift, and
-        # N+1 against the folio is how it gets slow enough to be worked around.
-        balances = {
-            b["reservation_id"]: b["balance_paise"]
-            for b in (db.rpc("folio_balances", {"p_property": property_id}).execute().data or [])
-        }
-        return rows, balances
-
-    rows, balances = await run_db(_read)
+    rows, balances = await workspace_service.list_reservations(
+        property_id,
+        bucket=bucket,
+        search=search,
+        date_from=date_from.isoformat() if date_from else None,
+        date_to=date_to.isoformat() if date_to else None,
+        limit=limit,
+    )
     return [ReservationOut.from_row(r, folio_balance=balances.get(r["id"], 0)) for r in rows]
 
 
@@ -624,33 +601,7 @@ async def list_rooms(
     resolving that in the client would mean shipping the arrivals list to a
     housekeeper who has no business reading it.
     """
-    def _read():
-        db = get_db()
-        rooms = (
-            db.table("rooms")
-            .select("*")
-            .eq("property_id", property_id)
-            .order("number")
-            .execute()
-            .data
-            or []
-        )
-        if not rooms:
-            return [], {}
-        # One query for the whole floor rather than one per room.
-        stays = (
-            db.table("reservations")
-            .select("id,room_id,guest_name,check_out")
-            .eq("property_id", property_id)
-            .eq("status", "checked_in")
-            .not_.is_("room_id", "null")
-            .execute()
-            .data
-            or []
-        )
-        return rooms, {s["room_id"]: s for s in stays}
-
-    rooms, occupants = await run_db(_read)
+    rooms, occupants = await workspace_service.list_rooms(property_id)
     return [RoomOut.from_row(r, occupants.get(r["id"])) for r in rooms]
 
 
@@ -931,7 +882,7 @@ async def list_agents(
             .eq("property_id", property_id).order("agent_type").execute().data or []
         )
         if not agents:
-            return [], {}, {}, {}, {}
+            return [], {}, {}, {}, {}, {}
 
         ids = [a["id"] for a in agents]
         configs = {
@@ -954,20 +905,48 @@ async def list_agents(
             perms.setdefault(p["agent_id"], []).append(p["scope"])
 
         runs: dict[str, dict] = {}
-        for r in (db.table("agent_runs").select("agent_id,started_at")
+        run_ids: dict[str, str] = {}
+        for r in (db.table("agent_runs").select("id,agent_id,started_at,conversation_id")
                   .in_("agent_id", ids).order("started_at", desc=True)
-                  .limit(200).execute().data or []):
-            slot = runs.setdefault(r["agent_id"], {"last": None, "count": 0})
+                  .limit(500).execute().data or []):
+            slot = runs.setdefault(r["agent_id"], {
+                "last": None, "count": 0, "conversations": set(),
+            })
             slot["last"] = slot["last"] or r["started_at"]
             slot["count"] += 1
+            if r.get("conversation_id"):
+                slot["conversations"].add(r["conversation_id"])
+            run_ids[r["id"]] = r["agent_id"]
 
-        return agents, configs, tools, perms, runs
+        # What each agent has cost the hotel, from the ledger's own figure.
+        #
+        # Summed from `usage_events.credits_charged` rather than derived from a
+        # run count times a rate: the two agree today and would stop agreeing
+        # the first time a rate changed mid-month, and the one that is right is
+        # the one the hotel was actually billed.
+        stats: dict[str, dict] = {}
+        for e in (db.table("usage_events").select("agent_id,credits_charged")
+                  .in_("agent_id", ids).limit(2000).execute().data or []):
+            if not e.get("agent_id"):
+                continue
+            slot = stats.setdefault(e["agent_id"], {"credits": 0.0})
+            slot["credits"] += float(e.get("credits_charged") or 0)
 
-    agents, configs, tools, perms, runs = await run_db(_read)
+        for a in (db.table("agent_actions").select("agent_id,status")
+                  .in_("agent_id", ids).limit(2000).execute().data or []):
+            slot = stats.setdefault(a["agent_id"], {"credits": 0.0})
+            slot["actions"] = slot.get("actions", 0) + 1
+            if a["status"] == "awaiting_approval":
+                slot["pending"] = slot.get("pending", 0) + 1
+
+        return agents, configs, tools, perms, runs, stats
+
+    agents, configs, tools, perms, runs, stats = await run_db(_read)
     out = []
     for a in agents:
         config = configs.get(a.get("active_config_id")) or {}
-        stats = runs.get(a["id"]) or {}
+        activity = runs.get(a["id"]) or {}
+        meter = stats.get(a["id"]) or {}
         # The *effective* model, not the configured one. Most properties leave
         # `agent_configs.model` empty and let the router choose by tier, and a
         # screen that showed "—" there would be telling a hotelier their agent
@@ -988,8 +967,12 @@ async def list_agents(
             channels=a.get("channels") or [],
             tools=sorted(tools.get(a["id"], [])),
             permissions=sorted(perms.get(a["id"], [])),
-            lastRunAt=stats.get("last"),
-            runsToday=stats.get("count", 0),
+            lastRunAt=activity.get("last"),
+            runsToday=activity.get("count", 0),
+            creditsCharged=round(meter.get("credits", 0.0)),
+            actionsCount=meter.get("actions", 0),
+            conversationsCount=len(activity.get("conversations") or ()),
+            pendingApprovals=meter.get("pending", 0),
         ))
     return out
 
@@ -1035,6 +1018,67 @@ async def set_agent_autonomy(
     )
 
 
+@router.post("/properties/{property_id}/frontdesk/ask", response_model=ConsoleAskOut)
+@limiter.limit("30/minute")
+async def ask_frontdesk_agent(
+    request: Request,
+    property_id: str,
+    body: ConsoleAskRequest,
+    member=Depends(require_member("frontdesk")),
+):
+    """
+    Ask the Front Desk agent something, and let it act.
+
+    **The authorisation happens here and nowhere else that matters.**
+    `require_member("frontdesk")` resolves the caller against this property from
+    their JWT; everything downstream — the agent context, every tool, every PMS
+    call — is bounded by the `property_id` that check produced. The request body
+    carries a sentence and a task name. It cannot carry a property, a partner, a
+    guest or a reservation, so there is no field in it that a prompt injection
+    could aim at. The model is not the boundary; this dependency is.
+
+    Requires 'frontdesk' rather than merely membership: a housekeeper has no
+    business checking guests in, and the agent must not become a way to do
+    something the person driving it could not do themselves. The agent's own
+    scopes are a separate and narrower set — a manager with every permission
+    still only gets what `agent_permissions` grants.
+    """
+    try:
+        result, conversation = await ai_console.ask(
+            property_id=property_id,
+            member=member,
+            message=body.message,
+            task=body.task,
+        )
+    except ai_console.ConsoleRefused as exc:
+        # 409: the request was well formed and the refusal is a fact about the
+        # thread — a person has it, or no agent is configured. Both are things
+        # the desk needs told, not a server error.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, {"code": exc.code, "detail": exc.detail}
+        ) from exc
+
+    actions = [
+        ConsoleActionOut(
+            tool=a.tool, status=a.status, refusalReason=a.refusal_reason,
+            resultType=a.result_type, resultId=a.result_id, latencyMs=a.latency_ms,
+        )
+        for a in result.actions
+    ]
+    return ConsoleAskOut(
+        runId=result.run_id,
+        conversationId=conversation["id"],
+        status=result.status,
+        reply=result.reply,
+        handoff=result.handoff,
+        actions=actions,
+        pendingApproval=any(a.status == "awaiting_approval" for a in actions),
+        tokensIn=result.tokens_in,
+        tokensOut=result.tokens_out,
+        latencyMs=result.latency_ms,
+    )
+
+
 @router.get("/properties/{property_id}/agent-actions", response_model=list[AgentActionOut])
 @limiter.limit("120/minute")
 async def list_agent_actions(
@@ -1070,9 +1114,22 @@ async def list_agent_actions(
                 .in_("id", sorted(conv_ids)).execute().data or []
             )
         } if conv_ids else {}
-        return rows, runs, convs
 
-    rows, runs, convs = await run_db(_read)
+        # What each action cost, from the ledger rather than from a rate times a
+        # guess. Keyed on `action_id`, which `usage.record_run` sets for the
+        # per-tool events — so a read shows 0 because reads are priced at 0, not
+        # because nobody looked.
+        credits: dict[str, float] = {}
+        if run_ids:
+            for e in (db.table("usage_events").select("action_id,credits_charged")
+                      .in_("run_id", sorted(run_ids)).limit(1000).execute().data or []):
+                if e.get("action_id"):
+                    credits[e["action_id"]] = (
+                        credits.get(e["action_id"], 0.0) + float(e.get("credits_charged") or 0)
+                    )
+        return rows, runs, convs, credits
+
+    rows, runs, convs, credits = await run_db(_read)
     out = []
     for r in rows:
         run = runs.get(r["run_id"]) or {}
@@ -1091,6 +1148,7 @@ async def list_agent_actions(
             resultType=r.get("result_type"), resultId=r.get("result_id"),
             status=r["status"], createdAt=r["created_at"],
             latencyMs=r.get("latency_ms") or 0,
+            creditsCharged=round(credits.get(r["id"], 0.0)),
             guestName=conv.get("guest_name") or conv.get("guest_phone"),
             approvedBy=r.get("approved_by"), approvedAt=r.get("approved_at"),
         ))

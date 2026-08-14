@@ -41,6 +41,8 @@ from datetime import date, timedelta
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from app.config import settings  # noqa: E402
+import e2e_sweep  # noqa: E402
+
 from app.db.client import get_db  # noqa: E402
 from app.services.ai import context as ai_context  # noqa: E402
 from app.services.ai import model_router, registry, runtime  # noqa: E402
@@ -126,6 +128,18 @@ check("and reports what it used",
 
 
 # ── a guest with a stay ──────────────────────────────────────────────────────
+
+# Clear this suite's own fixtures, by the reference prefix it writes.
+# See scripts/e2e_sweep.py for why: five suites leaving a fortnight of test
+# stays on one shared property turned its occupancy into 261%, and pms_e2e
+# failed on a number that was arithmetically correct about a fiction.
+def sweep() -> None:
+    e2e_sweep.announce(
+        'Vertex',
+        e2e_sweep.sweep_reservations(db, [PROPERTY], ['TB-VX', 'TB-VZ']))
+
+
+sweep()
 
 RUN_TAG = uuid.uuid4().hex[:6]
 ci = date.today() + timedelta(days=1)
@@ -455,4 +469,5 @@ check("no private reasoning was stored", no_thoughts[0]["n"] == 0, str(no_though
 print(f"\n{PASS} passed, {FAIL} failed, {SKIP} noted")
 print(f"\nREAL VERTEX TESTED ({settings.hotel_model_conversation}) · REAL DATABASE TESTED "
       "· META NOT INVOLVED")
+sweep()
 sys.exit(1 if FAIL else 0)

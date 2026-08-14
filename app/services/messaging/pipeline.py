@@ -34,6 +34,7 @@ from contextlib import contextmanager
 from app.config import settings
 from app.db.client import get_db, run_db
 from app.services.ai import context as ai_context
+from app.services.ai import routing as ai_routing
 from app.services.ai import runtime
 from app.services.ai.errors import AgentError
 from app.services import billing
@@ -192,6 +193,21 @@ async def process_conversation(conversation_id: str, *, provider=None) -> dict:
         # stops autonomous replies".
         return {"processed": 0, "reason": f"handler is {conversation.get('handler')}"}
 
+    # Which agent, from the channel and the property's own configuration.
+    #
+    # This used to be the literal string "guest", in three places on this path:
+    # the agent type, the actor, and the usage type the credit gate priced. That
+    # was right while one agent existed and would have silently routed a staff
+    # conversation to the Guest agent — guest-scoped, so unable to read the
+    # arrivals list, and billed under the wrong line. See services/ai/routing.
+    routed = await ai_routing.route(conversation)
+    if routed is None:
+        logger.info("no agent configured for %s on property %s",
+                    conversation.get("channel"), conversation["property_id"])
+        await messaging.request_human(conversation["id"], conversation["property_id"])
+        return {"processed": 0, "reason": "no agent for this channel"}
+    agent_type, actor = routed
+
     # The credit gate, and the only one on this path.
     #
     # Checked before the run rather than after it, because a turn that has
@@ -207,7 +223,7 @@ async def process_conversation(conversation_id: str, *, provider=None) -> dict:
     # `billing.allowed()` fails open, so a Supabase outage does not read to a
     # hotelier as being cut off for non-payment.
     decision = await billing.allowed(
-        usage_type=billing.usage_type_for_agent("guest"),
+        usage_type=billing.usage_type_for_agent(agent_type),
         property_id=conversation["property_id"],
     )
     if not decision.allowed:
@@ -236,14 +252,14 @@ async def process_conversation(conversation_id: str, *, provider=None) -> dict:
             ctx = await ai_context.load_context(
                 property_id=conversation["property_id"],
                 partner_id=conversation["partner_id"],
-                agent_type="guest",
+                agent_type=agent_type,
                 conversation_id=conversation["id"],
                 guest_id=conversation.get("guest_id"),
                 guest_name=conversation.get("guest_name"),
                 guest_phone=conversation.get("guest_phone"),
                 reservation_id=conversation.get("reservation_id"),
                 channel=conversation["channel"],
-                actor="guest",
+                actor=actor,
             )
         except AgentError as exc:
             # No agent configured for this property. Not a failure of this

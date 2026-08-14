@@ -39,8 +39,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from app.db.client import get_db, run_db
+from app.services.ai import agents
 from app.services.ai import context as ai_context
-from app.services.ai import registry, usage as usage_mod
+from app.services.ai import registry, runtime, usage as usage_mod
 from app.services.ai.errors import AgentError
 from app.services.ai.schemas import ToolOutcome
 
@@ -153,17 +154,29 @@ async def execute_approved(
             return await refuse("CONVERSATION_CHANGED",
                                 "The conversation this was proposed on no longer exists.")
 
+    # The actor comes from the agent's *type*, not from a constant.
+    #
+    # This was hardcoded to 'guest', which was invisible while the Guest agent
+    # was the only one that could propose anything. It stopped being invisible
+    # the moment a Front Desk check-in reached this function: approving it would
+    # have reloaded the context guest-scoped, and `require_reservation` would
+    # have refused a booking that never belonged to a conversation — a manager
+    # pressing Approve and watching it fail for a reason with no connection to
+    # what they approved.
+    agent_type = _agent_type(action["agent_id"]) or "guest"
+
     try:
         ctx = await ai_context.load_context(
             property_id=property_id,
             partner_id=action["partner_id"],
-            agent_type=_agent_type(action["agent_id"]) or "guest",
+            agent_type=agent_type,
             conversation_id=run.get("conversation_id"),
             guest_id=(conversation or {}).get("guest_id"),
             guest_name=(conversation or {}).get("guest_name"),
             reservation_id=(conversation or {}).get("reservation_id"),
             channel=(conversation or {}).get("channel") or "whatsapp",
-            actor="guest",
+            actor=agents.actor_for(agent_type),
+            member_id=run.get("member_id"),
         )
     except AgentError as exc:
         # Paused, deleted, or its configuration withdrawn. An approval cannot
@@ -189,6 +202,16 @@ async def execute_approved(
         return await refuse(code or "REVALIDATION_FAILED",
                             detail or outcome.refusal_reason or "The tool refused.")
 
+    # Point the created thing back at this action, exactly as a live turn does.
+    #
+    # `runtime.link_result` runs inside `run_turn`, which the approval path never
+    # enters — so without this call the provenance column would be written for
+    # everything the agent does unattended and for nothing it had approved. That
+    # is the wrong way round: a folio charge *always* requires approval, so the
+    # one result type where "which action produced this" matters most would have
+    # been the only one that never recorded it.
+    await run_db(runtime.link_result, outcome, action_id)
+
     await run_db(_settle, action_id, {
         "status": "executed",
         "output": outcome.output,
@@ -209,6 +232,12 @@ async def execute_approved(
             property_id=property_id,
             partner_id=action["partner_id"],
             agent_id=action["agent_id"],
+            # Charged as what the agent *is*. Omitted, this defaulted to
+            # `ai.guest_conversation`, so an approved front desk action billed a
+            # hotel 8 credits under the guest line instead of 6 under
+            # `ai.frontdesk_assist` — a wrong number on an invoice, filed under
+            # the wrong heading.
+            agent_type=agent_type,
             conversation_id=run.get("conversation_id"),
             usage=usage,
             action_ids={spec.usage_type: [action_id]},

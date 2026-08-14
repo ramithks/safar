@@ -288,11 +288,72 @@ def test_every_agent_definition_names_only_registered_tools():
         assert not unknown, f"{agent_type} names tools that do not exist: {unknown}"
 
 
-def test_only_the_guest_agent_is_available():
+def test_only_the_agents_with_a_runtime_behind_them_are_available():
+    """
+    Availability is a claim that something has been built to supervise the
+    agent, not that its definition exists. Sales, Marketing and the Owner
+    Copilot have shapes and no slice; `provisioning.provision` refuses them.
+
+    This list grows one entry per phase, deliberately by hand — an agent that
+    became available because someone flipped a default is an agent nobody
+    decided to ship.
+    """
     from app.services.ai.agents import all_definitions
 
-    available = [t for t, d in all_definitions().items() if d.available]
-    assert available == ["guest"]
+    available = sorted(t for t, d in all_definitions().items() if d.available)
+    assert available == ["frontdesk", "guest"]
+
+
+def test_the_front_desk_agent_is_staff_scoped_and_the_guest_agent_is_not():
+    from app.services.ai.agents import actor_for
+
+    assert actor_for("guest") == "guest"
+    assert actor_for("frontdesk") == "member"
+    assert actor_for("sales") == "member"
+    # No agent type at all falls back to the tighter of the two: a run nobody
+    # classified should be visibly over-restricted, not quietly leaking.
+    assert actor_for(None) == "guest"
+
+
+def test_the_front_desk_agent_cannot_reach_a_guest_or_move_money_outside_a_folio():
+    from app.services.ai.agents import get
+
+    fd = get("frontdesk")
+    # It holds `folio`, deliberately and with the reasoning written down in the
+    # definition — but not the scopes behind refunds, payouts, credit grants,
+    # wallet administration or rate changes.
+    assert "folio" in fd.permissions
+    for scope in ("billing", "payouts", "members", "agents", "reports", "rates"):
+        assert scope not in fd.permissions, scope
+
+    # No way to reach a guest: this agent answers on `internal`, which has no
+    # provider at all.
+    assert fd.channels == ("internal",)
+    for tool in ("send_message", "send_template"):
+        assert tool not in fd.tools, tool
+
+    # And nothing that sells.
+    for tool in ("get_quote", "create_booking", "release_hold"):
+        assert tool not in fd.tools, tool
+
+
+def test_the_front_desk_agents_material_actions_sit_above_its_shipping_autonomy():
+    """
+    The three that change a guest's stay or their bill must come back as
+    approval requests at the level the agent ships at. If a floor ever drops to
+    2, a hotel that changed nothing starts checking guests in unattended.
+    """
+    from app.services.ai.agents import get
+
+    fd = get("frontdesk")
+    assert fd.autonomy_level == 2
+    for tool in ("check_in", "check_out", "post_folio_charge"):
+        assert registry.REGISTRY[tool].autonomy_floor > fd.autonomy_level, tool
+
+    # And the money one cannot be freed by raising the dial.
+    assert registry.REGISTRY["post_folio_charge"].always_requires_approval
+    # It takes no `kind`, so there is no argument to talk into a refund.
+    assert "kind" not in registry.REGISTRY["post_folio_charge"].input_model.model_fields
 
 
 def test_the_owner_copilot_cannot_change_anything():

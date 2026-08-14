@@ -245,6 +245,7 @@ def load_all() -> None:
     from app.services.ai.tools import (  # noqa: F401
         booking,
         communication,
+        frontdesk,
         operations,
         pricing,
         read,

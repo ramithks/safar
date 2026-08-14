@@ -63,27 +63,86 @@ How you write:
 """
 
 
+# The staff-facing half.
+#
+# Not the guest rules with the warmth removed. The two agents face opposite
+# risks and the instructions diverge accordingly.
+#
+# A guest agent's cardinal sin is *saying* something wrong — a price nobody
+# approved, a room that is not free — so its rules are about not answering from
+# memory. A front desk agent's cardinal sin is *doing* something wrong, or
+# reporting that it did: checking somebody into an occupied room, saying a job
+# is assigned when nobody was told, saying a guest is settled when they owe
+# ₹3,264. So these rules are about the gap between an intention and a
+# confirmed result, which is the only gap that matters at a desk.
+#
+# What is still not here: which tools exist, what the autonomy level is, what
+# the agent may not do. Those are rows, checked in Python. A fence described in
+# a prompt is a fence somebody can ask about.
+STAFF_GROUND_RULES = """\
+You assist the staff of one hotel, at the front desk. You are talking to
+colleagues, not to guests.
+
+How you work:
+- Every operational fact comes from a tool. Arrivals, departures, room status,
+  balances, who is in which room, whether a job is done: look them up. The
+  board in your memory is always out of date.
+- Look the booking up before acting on it. find_reservation turns a reference,
+  a name or a phone number into the id every other tool needs.
+- Never say an action happened unless the tool returned success. A check-in that
+  came back as needing approval has not happened; say it is waiting for a
+  manager. A job with no assignee is not assigned. This is the one thing you
+  must not get wrong: at a desk, "done" is acted on immediately.
+- When a tool refuses, relay the reason exactly as it was given. If check-out is
+  refused because ₹3,264 is outstanding, say that figure. Do not soften it, do
+  not work around it, and do not try a different tool to get a different answer.
+- Never compute a balance, an occupancy or a total yourself when a tool reports
+  it. Report the system's number.
+- If you do not know, say so in four words and stop.
+
+How you write:
+- Terse. A line or two. Numbers, room numbers, names, ticket codes.
+- Money in rupees, formatted like ₹4,480 — the tools give you paise, so divide
+  by 100.
+- Lists as lists, one guest per line.
+- No pleasantries, no preamble, no offering to help further.
+"""
+
+
 def build_system_prompt(ctx: AgentContext) -> str:
-    parts = [GROUND_RULES]
+    staff = not ctx.guest_scoped
+    parts = [STAFF_GROUND_RULES if staff else GROUND_RULES]
 
     # Facts about the situation, not rules about it. The model needs to know the
-    # date to read "tomorrow" correctly, and it needs to know whether it is
-    # talking to someone it has a booking for.
+    # date to read "tomorrow" correctly, and it needs to know who it is talking
+    # to — which for a staff agent is a colleague and for a guest agent is
+    # someone who may or may not have a booking.
     situation = [f"Today is {_today(ctx)} at this property."]
-    if ctx.guest_name:
-        situation.append(f"You are speaking to {ctx.guest_name}.")
-    if ctx.reservation_id:
+    if staff:
+        if ctx.member_name:
+            situation.append(f"You are speaking to {ctx.member_name}, who works here.")
+        # Deliberately not "you may see everything at this property". Stating the
+        # boundary invites a conversation about it, and the boundary is not
+        # negotiable in prose — it is `property_id` on every query.
         situation.append(
-            "This conversation is linked to a booking; get_reservation will read it."
-        )
-    elif ctx.guest_id:
-        situation.append(
-            "This guest has stayed before; list_guest_reservations will show their bookings."
+            "Anything you are asked about is about this hotel. There is no other "
+            "property you can see."
         )
     else:
-        situation.append(
-            "You do not know who this is yet. Do not assume they have a booking."
-        )
+        if ctx.guest_name:
+            situation.append(f"You are speaking to {ctx.guest_name}.")
+        if ctx.reservation_id:
+            situation.append(
+                "This conversation is linked to a booking; get_reservation will read it."
+            )
+        elif ctx.guest_id:
+            situation.append(
+                "This guest has stayed before; list_guest_reservations will show their bookings."
+            )
+        else:
+            situation.append(
+                "You do not know who this is yet. Do not assume they have a booking."
+            )
     parts.append("\n".join(situation))
 
     if ctx.system_prompt:

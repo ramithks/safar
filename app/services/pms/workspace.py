@@ -213,6 +213,126 @@ async def list_tasks(property_id: str, limit: int = 200) -> list[dict]:
     return await run_db(_read)
 
 
+async def list_reservations(
+    property_id: str,
+    *,
+    bucket: str | None = None,
+    search: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = 200,
+) -> tuple[list[dict], dict[str, int]]:
+    """
+    The reservation list, the three front-desk buckets, and every folio balance.
+
+    Lifted out of the API endpoint when the Front Desk agent needed the same
+    three buckets. It had to move rather than be copied: `is_arrival` and
+    `ARRIVAL_STATUSES` are already defined once precisely so the Today count and
+    the arrivals list cannot disagree, and a third caller reimplementing the
+    predicate would undo that on the first status somebody forgot.
+
+    Returns the rows and a balance map rather than merging them, because the
+    endpoint and the tool project them differently and neither should have to
+    take the other's shape.
+    """
+    today = await clock.abusiness_date_iso(property_id)
+
+    def _read():
+        db = get_db()
+        q = db.table("reservations").select("*").eq("property_id", property_id)
+
+        if bucket == "arrivals":
+            q = q.eq("check_in", today).in_("status", list(ARRIVAL_STATUSES))
+        elif bucket == "departures":
+            q = q.eq("check_out", today).in_("status", list(DEPARTURE_STATUSES))
+        elif bucket == "inhouse":
+            q = q.in_("status", list(IN_HOUSE_STATUSES))
+
+        # Half-open overlap: a stay is in the window if it has not ended before
+        # it and has not started after it.
+        if date_from:
+            q = q.gte("check_out", date_from)
+        if date_to:
+            q = q.lte("check_in", date_to)
+        if search:
+            escaped = search.replace("%", r"\%").replace(",", " ")
+            q = q.or_(
+                f"guest_name.ilike.%{escaped}%,ref.ilike.%{escaped}%,"
+                f"guest_phone.ilike.%{escaped}%"
+            )
+
+        rows = q.order("check_in").limit(limit).execute().data or []
+        # One grouped query for the whole property rather than one per row: the
+        # arrivals list is the screen a receptionist reloads all shift, and
+        # N+1 against the folio is how it gets slow enough to be worked around.
+        balances = {
+            b["reservation_id"]: b["balance_paise"]
+            for b in (db.rpc("folio_balances", {"p_property": property_id}).execute().data or [])
+        }
+        return rows, balances
+
+    return await run_db(_read)
+
+
+async def list_rooms(property_id: str) -> tuple[list[dict], dict[str, dict]]:
+    """
+    Every room, and whoever is currently in it.
+
+    Read by three callers that want opposite things: housekeeping wants the
+    status board, check-in wants the rooms it may actually assign, and the Front
+    Desk agent wants to answer "is 102 ready". All three need the occupant,
+    because a room can be clean and still unavailable.
+    """
+    def _read():
+        db = get_db()
+        rooms = (
+            db.table("rooms").select("*")
+            .eq("property_id", property_id).order("number").execute().data or []
+        )
+        if not rooms:
+            return [], {}
+        # One query for the whole floor rather than one per room.
+        stays = (
+            db.table("reservations")
+            .select("id,ref,room_id,guest_name,check_in,check_out")
+            .eq("property_id", property_id)
+            .eq("status", "checked_in")
+            .not_.is_("room_id", "null")
+            .execute()
+            .data
+            or []
+        )
+        return rooms, {s["room_id"]: s for s in stays}
+
+    return await run_db(_read)
+
+
+async def find_room(property_id: str, number: str) -> dict | None:
+    """
+    A room by the number a human said, or nothing.
+
+    Case-insensitive and exact — `ilike` without wildcards, so "10" never
+    matches "102". The caller is expected to treat None as a refusal rather than
+    carrying the string forward: a room number that resolves to no room is a
+    room number somebody misheard, and a ticket raised against it is a job
+    nobody can find.
+    """
+    def _read():
+        rows = (
+            get_db().table("rooms")
+            .select("*")
+            .eq("property_id", property_id)
+            .ilike("number", number)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        return rows[0] if rows else None
+
+    return await run_db(_read)
+
+
 async def get_reservation(property_id: str, reservation_id: str) -> tuple[dict, int] | None:
     """The reservation and what is currently on its folio, as one answer."""
     def _read():

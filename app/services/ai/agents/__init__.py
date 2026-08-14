@@ -47,6 +47,34 @@ class AgentDefinition:
     available: bool = False
 
 
+# Which agents talk to guests, and therefore which runs are guest-scoped.
+#
+# `AgentContext.actor` drives `require_reservation` and `require_task`: a
+# guest-scoped run may only read the subject of its own conversation, a
+# staff-scoped run is bounded by the property instead. Getting this wrong in
+# either direction is a real defect — too tight and the Front Desk agent cannot
+# read the arrivals list, too loose and a guest on WhatsApp can ask about
+# somebody else's booking.
+#
+# So it is derived from the agent type in one place rather than passed as an
+# argument at each call site. It was passed as an argument, and
+# `approvals.execute_approved` had it hardcoded to 'guest' — which would have
+# re-imposed guest scoping on a Front Desk action the moment a manager approved
+# one.
+GUEST_FACING = frozenset({"guest"})
+
+
+def actor_for(agent_type: str | None) -> str:
+    """
+    'guest' or 'member', from the agent's type.
+
+    Defaults to 'guest' for an unknown type. The safe default is the tighter
+    one: a new agent nobody has classified yet should be over-restricted and
+    visibly broken, not under-restricted and quietly leaking.
+    """
+    return "guest" if (agent_type or "guest") in GUEST_FACING else "member"
+
+
 def all_definitions() -> dict[str, AgentDefinition]:
     from app.services.ai.agents import frontdesk, guest, marketing, owner, sales
 

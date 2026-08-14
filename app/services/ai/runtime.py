@@ -113,14 +113,26 @@ def _write_action(ctx: AgentContext, run_id: str, seq: int, outcome: ToolOutcome
         return None
 
 
-def _link_result(outcome: ToolOutcome, action_id: str | None) -> None:
+# Which table holds the provenance column, by what the tool says it created.
+#
+# A table per result type rather than a branch: adding the Front Desk agent's
+# folio charge meant one entry here, not another `if` in a function whose whole
+# job is one UPDATE. Result types with no provenance column — a quote, a hold, a
+# room status — are simply absent, and absence means "nothing to stamp".
+_PROVENANCE_TABLES = {
+    "task": "tasks",              # migration 5, FK added in 10
+    "folio_entry": "folio_entries",  # migration 15
+}
+
+
+def link_result(outcome: ToolOutcome, action_id: str | None) -> None:
     """
     Point the created thing back at the action that created it.
 
-    Only tasks carry the column today (`tasks.agent_action_id`, from migration
-    5, given its foreign key in migration 10). It is what closes the loop from a
-    guest's sentence to a job on a board: the ticket knows which AI action
-    raised it, and the action knows which ticket it produced.
+    This is what closes the loop from a sentence somebody typed to a job on a
+    board or a line on a bill: the row knows which AI action produced it, and
+    the action knows which row it produced. An owner reading a ₹1,200 laundry
+    charge six months later can get from the charge to the conversation.
 
     Guarded on `creates_result`, not on `result_type`. `assign_task` reports the
     same result type as `create_task` without being the ticket's author, and
@@ -130,25 +142,29 @@ def _link_result(outcome: ToolOutcome, action_id: str | None) -> None:
     if not action_id or not outcome.result_id:
         return
     spec = registry.REGISTRY.get(outcome.tool)
-    if not spec or not spec.creates_result or spec.result_type != "task":
+    if not spec or not spec.creates_result:
+        return
+    table = _PROVENANCE_TABLES.get(spec.result_type)
+    if not table:
         return
 
     def _write():
-        get_db().table("tasks").update({"agent_action_id": action_id}).eq(
+        get_db().table(table).update({"agent_action_id": action_id}).eq(
             "id", outcome.result_id
         ).execute()
 
     try:
         _write()
     except Exception:  # noqa: BLE001
-        logger.warning("could not link task %s to action %s", outcome.result_id, action_id)
+        logger.warning("could not link %s %s to action %s",
+                       table, outcome.result_id, action_id)
 
 
 def _stamp_message_action(message_id: str, action_id: str) -> None:
     """
     Point an outbound message at the action that sent it.
 
-    The mirror of `_link_result`, and the same ordering problem: the tool
+    The mirror of `link_result`, and the same ordering problem: the tool
     returns before its action row exists, so the stamp has to happen here.
     Together they make the trace run both ways — an auditor reading a message a
     guest received can find the run that decided to send it.
@@ -257,7 +273,7 @@ async def run_turn(
                     turn_usage.count(spec.usage_type)
 
                 action_id = await run_db(_write_action, ctx, run_id, seq, outcome)
-                await run_db(_link_result, outcome, action_id)
+                await run_db(link_result, outcome, action_id)
                 if spec and action_id:
                     action_ids.setdefault(spec.usage_type, []).append(action_id)
                     # The tool needs the action id to stamp on whatever it

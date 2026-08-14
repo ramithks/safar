@@ -85,6 +85,14 @@ _TASKS: dict[str, tuple[str, str]] = {
     "booking":            (CONVERSATION, "a booking against an existing quote"),
     "handoff":            (CONVERSATION, "handing the conversation to a person"),
 
+    # The front desk. Almost all of it is the workhorse: "who is arriving",
+    # "is 102 clean", "check in TB-9F2K" are lookups and one action, however
+    # long the sentence asking for them was. The reasoning tier is reached by
+    # naming a harder task, not by measuring the input — a receptionist who
+    # writes four lines about a group arrival still wants the arrivals list.
+    "frontdesk_operations": (CONVERSATION, "a front desk lookup or action"),
+    "frontdesk_summary":    (CONVERSATION, "the day's board, summarised"),
+
     # Worth the expensive model: money, ambiguity, or several moving parts.
     "complex_negotiation":   (REASONING, "a rate negotiation with money on it"),
     "cancellation_dispute":  (REASONING, "a disputed charge or cancellation fee"),

@@ -682,6 +682,14 @@ class AgentOut(BaseModel):
     permissions: list[str] = []
     lastRunAt: datetime | None = None
     runsToday: int = 0
+    # What this agent has actually consumed and done, over the window
+    # `list_agents` reads. Every one of these is a count of rows, not an
+    # estimate — a screen that shows an agent's credit spend has to be showing
+    # the ledger's figure or it should show nothing at all.
+    creditsCharged: int = 0
+    actionsCount: int = 0
+    conversationsCount: int = 0
+    pendingApprovals: int = 0
 
 
 class AgentActionOut(BaseModel):
@@ -712,6 +720,46 @@ class AgentAutonomyRequest(BaseModel):
 class AgentDecisionRequest(BaseModel):
     decision: str = Field(pattern="^(approved|rejected)$")
     note: str | None = Field(default=None, max_length=300)
+
+
+# ── the staff console ────────────────────────────────────────────────────────
+
+class ConsoleAskRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    # A *capability*, not a model. The router turns it into a tier — see
+    # services/ai/model_router. Constrained to the front desk's own tasks plus
+    # the two reasoning ones it can legitimately need, so a caller cannot route
+    # every question to the expensive tier by typing its name.
+    task: str = Field(
+        default="frontdesk_operations",
+        pattern="^(frontdesk_operations|frontdesk_summary|operational_analysis|multi_reservation)$",
+    )
+
+
+class ConsoleActionOut(BaseModel):
+    """One tool call, as the console shows it back."""
+    tool: str
+    status: str
+    refusalReason: str | None = None
+    resultType: str | None = None
+    resultId: str | None = None
+    latencyMs: int = 0
+
+
+class ConsoleAskOut(BaseModel):
+    runId: str
+    conversationId: str
+    status: str
+    reply: str | None = None
+    handoff: bool = False
+    # Returned rather than left to a second request: the desk needs to see that
+    # a check-in went to the approval queue *in the same breath* as the reply
+    # saying so, and a UI that has to poll for that will show the reply first.
+    actions: list[ConsoleActionOut] = []
+    pendingApproval: bool = False
+    tokensIn: int = 0
+    tokensOut: int = 0
+    latencyMs: int = 0
 
 
 # ── usage ────────────────────────────────────────────────────────────────────
