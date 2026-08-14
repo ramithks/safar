@@ -107,6 +107,24 @@ class Settings(BaseSettings):
     # test can shorten it rather than sleep through it.
     whatsapp_service_window_hours: int = 24
 
+    # ── Instagram ────────────────────────────────────────────────────────────
+    #
+    # Two windows, because Meta gives two. An automated reply gets 24 hours from
+    # the guest's last message, the same as WhatsApp. A conversation a *person*
+    # has taken over gets seven days under Meta's human-agent allowance — which
+    # is why `services/messaging/policy.py` reads the conversation's `handler`
+    # rather than treating this as a constant. Claiming the longer window while
+    # the agent is still driving would be a policy violation wearing a longer
+    # window's clothes.
+    instagram_service_window_hours: int = 24
+    instagram_human_agent_window_hours: int = 168
+
+    instagram_sandbox_ref: str = "sandbox"
+    instagram_verify_token: Optional[str] = None
+    instagram_access_token: Optional[str] = None
+    instagram_app_secret: Optional[str] = None
+    instagram_api_version: str = "v21.0"
+
     # The controlled smoke test, and only the controlled smoke test.
     #
     # Deliberately singular. `scripts/meta_smoke.py` messages exactly this

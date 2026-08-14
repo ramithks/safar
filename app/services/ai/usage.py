@@ -225,6 +225,7 @@ async def record_conversation(
     message_id: str | None = None,
     country: str | None = None,
     pricing_model: str | None = None,
+    usage_type: str | None = None,
 ) -> int:
     """
     One WhatsApp conversation window, as Meta bills it.
@@ -239,7 +240,10 @@ async def record_conversation(
     same window resolves to the same charge. Meta sends the conversation block
     on more than one status update; that is exactly the retry this key absorbs.
     """
-    usage_type = billing.USAGE_BY_WA_CATEGORY.get(category or "")
+    # A channel whose policy names its own conversation type says so directly;
+    # only WhatsApp derives the type from a Meta category, because only WhatsApp
+    # has one.
+    usage_type = usage_type or billing.USAGE_BY_WA_CATEGORY.get(category or "")
     if usage_type is None:
         # A category Meta has added since. Recorded under the cheapest honest
         # type rather than dropped: an unmetered conversation is a hole in the
@@ -248,13 +252,19 @@ async def record_conversation(
         usage_type = "whatsapp.service"
 
     dimension = {"country": country} if country else {}
+    # `provider` is what the cost card resolves on. Instagram carries none: Meta
+    # does not bill us for it, and naming a provider here would make the cost
+    # side look for a rate that must never exist. The event then records
+    # honestly that no rate matched, rather than a zero somebody could mistake
+    # for a checked figure.
+    provider = "meta" if channel == "whatsapp" else None
 
     result = await billing.charge(
         usage_type=usage_type,
         units=1,
         idempotency_key=f"{usage_type}:conv:{external_conversation_id}",
         property_id=property_id,
-        provider="meta",
+        provider=provider,
         dimension=dimension,
         conversation_id=conversation_id,
         message_id=message_id,

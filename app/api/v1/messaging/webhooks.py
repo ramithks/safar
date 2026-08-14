@@ -36,6 +36,9 @@ from app.services.messaging import credentials as creds_module
 from app.services.messaging import pipeline
 from app.services.messaging import service as messaging
 from app.services.messaging.channels import MessagingError
+from app.services.ai import usage as usage_mod
+from app.services.messaging import policy
+from app.services.messaging.instagram import webhook as ig
 from app.services.messaging.whatsapp import webhook as wa
 
 logger = logging.getLogger(__name__)
@@ -103,7 +106,7 @@ async def receive_whatsapp_webhook(request: Request):
     return await handle_payload(payload)
 
 
-async def handle_payload(payload: dict, *, provider=None) -> dict:
+async def handle_payload(payload: dict, *, provider=None, channel: str = "whatsapp") -> dict:
     """
     The part after the signature.
 
@@ -112,18 +115,25 @@ async def handle_payload(payload: dict, *, provider=None) -> dict:
     itself gets its own tests, positive and negative. `provider` rides along for
     the same reason it does in the runtime: the suite scripts the model and
     asserts on the database.
+
+    One function for both channels. The *parsers* differ and the *policies*
+    differ; the order of operations — resolve, persist, acknowledge, dispatch —
+    is the safety property and must not differ, because a second copy of it is a
+    second place for the order to be got wrong.
     """
-    messages, statuses = wa.parse(payload)
+    parser = ig if channel == "instagram" else wa
+    messages, statuses = parser.parse(payload)
     accepted = duplicates = 0
     touched: set[str] = set()
 
     for inbound in messages:
         try:
-            connection = await messaging.resolve_connection(inbound.account_id)
+            connection = await messaging.resolve_connection(inbound.account_id, channel)
         except MessagingError as exc:
-            # A number nobody has connected. Logged and acknowledged: we cannot
-            # say whose guest this is, and a redelivery will not change that.
-            logger.warning("inbound whatsapp for unknown number: %s", exc.detail)
+            # An account nobody has connected. Logged and acknowledged: we
+            # cannot say whose guest this is, and a redelivery will not change
+            # that.
+            logger.warning("inbound %s for unknown account: %s", channel, exc.detail)
             continue
 
         recorded = await messaging.record_inbound(inbound, connection)
@@ -135,6 +145,30 @@ async def handle_payload(payload: dict, *, provider=None) -> dict:
 
         accepted += 1
         touched.add(recorded.conversation["id"])
+
+        # A channel Meta does not bill per conversation gets its conversation
+        # charge opened here, on the message that actually opened the window.
+        # WhatsApp's arrives on the delivery callback instead, where Meta names
+        # the category and the price — see messaging.apply_delivery_status.
+        #
+        # Keyed on the opening message, so a redelivery (handled above) and a
+        # second message inside the same window both resolve to one charge.
+        pol = policy.for_channel(channel)
+        if recorded.opened_window and not pol.bills_per_conversation \
+                and pol.conversation_usage_type:
+            try:
+                await usage_mod.record_conversation(
+                    property_id=recorded.conversation["property_id"],
+                    channel=channel,
+                    category="conversation",
+                    external_conversation_id=inbound.external_id,
+                    conversation_id=recorded.conversation["id"],
+                    message_id=recorded.message["id"],
+                    usage_type=pol.conversation_usage_type,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("could not meter the %s conversation window", channel,
+                               exc_info=True)
 
     for update in statuses:
         await messaging.apply_delivery_status(update)
@@ -150,3 +184,64 @@ async def handle_payload(payload: dict, *, provider=None) -> dict:
         "duplicates": duplicates,
         "statuses": len(statuses),
     }
+
+
+# ── Instagram ───────────────────────────────────────────────────────────────
+#
+# Two routes, the same order of operations, a different parser and a different
+# app secret. Deliberately not folded into the WhatsApp routes with a query
+# parameter: the subscriptions are separate in Meta, the secrets are separate,
+# and a single endpoint verifying against whichever secret happened to work
+# would be an endpoint that verifies nothing.
+
+@router.get("/instagram/webhook")
+@limiter.limit("30/minute")
+async def verify_instagram_webhook(
+    request: Request,
+    hub_mode: str | None = Query(None, alias="hub.mode"),
+    hub_verify_token: str | None = Query(None, alias="hub.verify_token"),
+    hub_challenge: str | None = Query(None, alias="hub.challenge"),
+):
+    """Meta's one-time handshake, echoed as text/plain exactly as sent."""
+    try:
+        challenge = ig.verify_challenge(
+            mode=hub_mode,
+            token=hub_verify_token,
+            challenge=hub_challenge,
+            expected_token=settings.instagram_verify_token,
+        )
+    except ValueError as exc:
+        logger.warning("instagram webhook verification refused: %s", exc)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Verification failed") from exc
+
+    return Response(content=challenge, media_type="text/plain")
+
+
+@router.post("/instagram/webhook")
+@limiter.limit("600/minute")
+async def receive_instagram_webhook(request: Request):
+    """
+    Inbound Instagram messages, echoes and read receipts.
+
+    Signature over the raw bytes, against the *Instagram* app secret. Verified
+    before parsing, for the same reason as WhatsApp: anything that
+    re-serialises the JSON first is checking a different document from the one
+    Meta signed.
+    """
+    body = await request.body()
+
+    if not ig.verify_signature(
+        body=body,
+        header=request.headers.get("X-Hub-Signature-256"),
+        app_secret=creds_module.resolve("default", "instagram").app_secret,
+    ):
+        logger.warning("instagram webhook with a bad or missing signature")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid signature")
+
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        logger.warning("instagram webhook body was not JSON")
+        return {"received": True, "processed": 0}
+
+    return await handle_payload(payload, channel="instagram")

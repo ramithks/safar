@@ -32,11 +32,13 @@ from app.config import settings
 from app.db.client import get_db, run_db
 from app.services import billing
 from app.services.messaging import credentials as creds_module
+from app.services.messaging import policy
 from app.services.messaging import templates as templates_module
 from app.services.messaging.channels import (
     INSUFFICIENT_CREDITS,
     NO_CONNECTION,
     PROVIDER_FAILED,
+    TEMPLATE_NOT_FOUND,
     WINDOW_CLOSED,
     DeliveryUpdate,
     InboundMessage,
@@ -51,6 +53,12 @@ class RecordedInbound:
     conversation: dict
     message: dict
     duplicate: bool
+    # True when this message opened a *new* service window rather than arriving
+    # inside one already open. On WhatsApp nothing needs it — Meta tells us on
+    # the status callback and bills the conversation itself. On Instagram there
+    # is no such callback and no Meta conversation charge, so this is the only
+    # honest moment at which to open one of ours.
+    opened_window: bool = False
 
 
 @dataclass
@@ -63,40 +71,42 @@ class SentMessage:
 
 # ── connections ──────────────────────────────────────────────────────────────
 
-def _resolve_connection(account_id: str) -> dict | None:
-    rows = get_db().rpc(
-        "resolve_whatsapp_property", {"p_phone_number_id": account_id}
-    ).execute().data or []
+def _resolve_connection(account_id: str, channel: str) -> dict | None:
+    pol = policy.for_channel(channel)
+    rows = get_db().rpc(pol.resolver_rpc, {pol.resolver_arg: account_id}).execute().data or []
     if not rows:
         return None
     row = dict(rows[0])
     # The RPC returns the connection's own id under a different name than the
     # table does. Normalised here so callers see one shape.
     row["id"] = row.pop("connection_id")
-    row["phone_number_id"] = account_id
+    row[pol.account_column] = account_id
+    row["channel"] = channel
     return row
 
 
-async def resolve_connection(account_id: str) -> dict:
+async def resolve_connection(account_id: str, channel: str = policy.WHATSAPP) -> dict:
     """
     Which property owns this provider account. The only trusted answer.
 
-    Raises when the number is unknown, which is the correct response to a
-    webhook for a number nobody has connected: we cannot say whose guest that
+    Raises when the account is unknown, which is the correct response to a
+    webhook for an account nobody has connected: we cannot say whose guest that
     is, and guessing would put a stranger's message into a hotel's inbox.
     """
-    row = await run_db(_resolve_connection, account_id)
+    row = await run_db(_resolve_connection, account_id, channel)
     if not row:
         raise MessagingError(
-            NO_CONNECTION, f"no property is connected to WhatsApp number {account_id}"
+            NO_CONNECTION,
+            f"no property is connected to {channel} account {account_id}",
         )
     return row
 
 
-def _connection_for_property(property_id: str) -> dict | None:
+def _connection_for_property(property_id: str, channel: str = policy.WHATSAPP) -> dict | None:
+    pol = policy.for_channel(channel)
     rows = (
         get_db()
-        .table("whatsapp_connections")
+        .table(pol.connections_table)
         .select("*")
         .eq("property_id", property_id)
         .in_("status", ["connected", "pending"])
@@ -105,7 +115,14 @@ def _connection_for_property(property_id: str) -> dict | None:
         .data
         or []
     )
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    row = dict(rows[0])
+    # Carried so the adapter factory does not have to guess which provider a
+    # connection row came from — the two tables have different id columns and a
+    # row that has lost its channel is a row that can be sent to the wrong API.
+    row["channel"] = channel
+    return row
 
 
 # ── conversations ────────────────────────────────────────────────────────────
@@ -214,6 +231,7 @@ def _link_reservation(conversation: dict) -> dict:
 
 def _record_inbound(inbound: InboundMessage, connection: dict) -> RecordedInbound:
     db = get_db()
+    pol = policy.for_channel(inbound.channel)
 
     # Idempotency first, before anything is created. A redelivered webhook must
     # not even create a conversation, because creating one would move
@@ -233,6 +251,7 @@ def _record_inbound(inbound: InboundMessage, connection: dict) -> RecordedInboun
             db.table("conversations").select("*")
             .eq("id", seen[0]["conversation_id"]).limit(1).execute().data[0]
         )
+        # A redelivery never reopens a window and never opens a charge.
         return RecordedInbound(conversation=conversation, message=seen[0], duplicate=True)
 
     conversation = _upsert_conversation(
@@ -242,9 +261,14 @@ def _record_inbound(inbound: InboundMessage, connection: dict) -> RecordedInboun
         external_id=inbound.sender_external_id,
         sender_external_id=inbound.sender_external_id,
         sender_name=inbound.sender_name,
-        account_id=connection.get("phone_number_id") or "",
+        account_id=connection.get(pol.account_column) or "",
     )
     conversation = _link_reservation(conversation)
+
+    # Was a window already open when this arrived? Computed before the update
+    # below overwrites `last_inbound_at`, which is the only moment the answer
+    # exists.
+    opened_window = not window_open(conversation)
 
     sent_at = (inbound.sent_at or datetime.now(timezone.utc)).isoformat()
     message = db.table("conversation_messages").insert({
@@ -276,7 +300,7 @@ def _record_inbound(inbound: InboundMessage, connection: dict) -> RecordedInboun
         "unread_count": (conversation.get("unread_count") or 0) + 1,
     }).eq("id", conversation["id"]).execute()
 
-    db.table("whatsapp_connections").update(
+    db.table(pol.connections_table).update(
         {"last_inbound_at": sent_at}
     ).eq("id", connection["id"]).execute()
 
@@ -284,7 +308,8 @@ def _record_inbound(inbound: InboundMessage, connection: dict) -> RecordedInboun
         db.table("conversations").select("*")
         .eq("id", conversation["id"]).limit(1).execute().data[0]
     )
-    return RecordedInbound(conversation=conversation, message=message, duplicate=False)
+    return RecordedInbound(conversation=conversation, message=message, duplicate=False,
+                           opened_window=opened_window)
 
 
 async def record_inbound(inbound: InboundMessage, connection: dict) -> RecordedInbound:
@@ -302,22 +327,29 @@ def window_open(conversation: dict, *, now: datetime | None = None) -> bool:
     correct, and is why a hotel cannot use this to message people who did not
     contact them.
     """
-    last = conversation.get("last_inbound_at")
-    if not last:
+    closes = window_closes_at(conversation)
+    if closes is None:
         return False
-    if isinstance(last, str):
-        last = datetime.fromisoformat(last.replace("Z", "+00:00"))
-    hours = settings.whatsapp_service_window_hours
-    return (now or datetime.now(timezone.utc)) - last < timedelta(hours=hours)
+    return (now or datetime.now(timezone.utc)) < closes
 
 
 def window_closes_at(conversation: dict) -> datetime | None:
+    """
+    When free-form outbound stops being permitted.
+
+    The number of hours comes from the channel policy, not from here. WhatsApp
+    answers with a constant; Instagram answers 24 hours for the agent and seven
+    days once a person has taken over, which is Meta's human-agent allowance and
+    is keyed on the server's own `handler` column rather than on anything the
+    model can influence.
+    """
     last = conversation.get("last_inbound_at")
     if not last:
         return None
     if isinstance(last, str):
         last = datetime.fromisoformat(last.replace("Z", "+00:00"))
-    return last + timedelta(hours=settings.whatsapp_service_window_hours)
+    hours = policy.for_channel(conversation.get("channel")).window_hours(conversation)
+    return last + timedelta(hours=hours)
 
 
 # ── outbound ─────────────────────────────────────────────────────────────────
@@ -408,28 +440,46 @@ async def send(
     template — the caller has to decide, because a template costs money and says
     something different from what the caller wrote.
     """
-    connection = await run_db(_connection_for_property, conversation["property_id"])
+    channel = conversation.get("channel") or policy.WHATSAPP
+    pol = policy.for_channel(channel)
+
+    connection = await run_db(_connection_for_property, conversation["property_id"], channel)
     if not connection:
         raise MessagingError(
             NO_CONNECTION,
             f"property {conversation['property_id']} has no connected "
-            f"{conversation['channel']} number",
+            f"{channel} account",
         )
 
     template = None
     if purpose:
+        # A channel with no template mechanism refuses by name rather than
+        # falling back to free text. The fallback would look like a success and
+        # would be rejected by Meta outside the window anyway — and inside the
+        # window it would send something other than what the caller asked for.
+        if not pol.supports_templates:
+            raise MessagingError(
+                TEMPLATE_NOT_FOUND,
+                f"{channel} has no approved-template mechanism; "
+                f"a {purpose!r} message must be sent as free text inside the window",
+            )
         template = await templates_module.resolve(
             conversation["property_id"], purpose=purpose, language=language,
-            channel=conversation["channel"],
+            channel=channel,
             allow_test=bool(connection.get("is_sandbox")),
         )
     elif not window_open(conversation):
         closes = window_closes_at(conversation)
+        # The remedy differs by channel, so the message says which one applies.
+        # An agent that reads "send a template" on Instagram will try, and the
+        # refusal it gets back is one turn wasted in front of a guest.
+        remedy = ("an approved template may still be sent" if pol.supports_templates
+                  else "there is no template mechanism on this channel")
         raise MessagingError(
             WINDOW_CLOSED,
-            "the 24-hour service window closed at "
+            f"the {channel} service window closed at "
             + (closes.isoformat() if closes else "an unknown time")
-            + "; free-form messages are not permitted until the guest writes again",
+            + f"; free-form messages are not permitted until the guest writes again — {remedy}",
         )
 
     if body is None and template is None:
