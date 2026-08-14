@@ -566,3 +566,177 @@ class SyncOut(BaseModel):
     # Ids that stopped existing, by entity. The one thing a merge cannot express
     # and a client cannot infer: absence from a filtered list is not deletion.
     deleted: dict[str, list[str]]
+
+
+# ── inbox ────────────────────────────────────────────────────────────────────
+
+class ConversationOut(BaseModel):
+    id: str
+    propertyId: str
+    channel: str
+    guestName: str
+    guestPhone: str | None = None
+    guestHandle: str | None = None
+    lastMessage: str
+    lastMessageAt: datetime
+    # Drives the 24-hour window on the client the same way it does on the
+    # server. Nullable: a conversation nobody has written to has no window at
+    # all, which is different from a window that has closed.
+    lastInboundAt: datetime | None = None
+    lastOutboundAt: datetime | None = None
+    windowOpen: bool = False
+    unread: int = 0
+    handler: str = "ai"
+    aiEnabled: bool = True
+    assigneeName: str | None = None
+    intent: str | None = None
+    reservationId: str | None = None
+    guestId: str | None = None
+
+    @staticmethod
+    def from_row(row: dict, *, window_open: bool = False,
+                 assignee_name: str | None = None) -> "ConversationOut":
+        return ConversationOut(
+            id=row["id"],
+            propertyId=row["property_id"],
+            channel=row["channel"],
+            guestName=row.get("guest_name") or row.get("guest_phone") or "Guest",
+            guestPhone=row.get("guest_phone"),
+            guestHandle=row.get("guest_handle"),
+            lastMessage=row.get("last_message") or "",
+            lastMessageAt=row.get("last_message_at") or row["created_at"],
+            lastInboundAt=row.get("last_inbound_at"),
+            lastOutboundAt=row.get("last_outbound_at"),
+            windowOpen=window_open,
+            unread=row.get("unread_count") or 0,
+            handler=row.get("handler") or "ai",
+            aiEnabled=bool(row.get("ai_enabled", True)),
+            assigneeName=assignee_name,
+            intent=row.get("intent"),
+            reservationId=row.get("reservation_id"),
+            guestId=row.get("guest_id"),
+        )
+
+
+class MessageOut(BaseModel):
+    id: str
+    conversationId: str
+    direction: str
+    author: str
+    authorName: str | None = None
+    body: str
+    messageType: str = "text"
+    sentAt: datetime
+    deliveryStatus: str = "sent"
+    failureReason: str | None = None
+    templateName: str | None = None
+    mediaUrls: list[str] = []
+    # The action that sent it, when an agent did. What lets a receptionist read
+    # a reply and ask what the AI was doing.
+    agentActionId: str | None = None
+
+    @staticmethod
+    def from_row(row: dict) -> "MessageOut":
+        return MessageOut(
+            id=row["id"],
+            conversationId=row["conversation_id"],
+            direction=row["direction"],
+            author=row["author"],
+            authorName=row.get("author_name"),
+            body=row.get("body") or "",
+            messageType=row.get("message_type") or "text",
+            sentAt=row.get("sent_at") or row["created_at"],
+            deliveryStatus=row.get("delivery_status") or "sent",
+            failureReason=row.get("failure_reason"),
+            templateName=row.get("template_name"),
+            mediaUrls=row.get("media_urls") or [],
+            agentActionId=row.get("agent_action_id"),
+        )
+
+
+class SendMessageRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=4000)
+
+
+class ConversationHandlerRequest(BaseModel):
+    # 'human' takes it over; 'ai' hands it back. Deliberately explicit — a
+    # conversation never drifts back to the agent because a human stopped
+    # typing.
+    handler: str = Field(pattern="^(ai|human)$")
+
+
+# ── agents ───────────────────────────────────────────────────────────────────
+
+class AgentOut(BaseModel):
+    id: str
+    propertyId: str
+    agentType: str
+    name: str
+    autonomyLevel: int
+    model: str
+    provider: str
+    isActive: bool
+    status: str
+    channels: list[str] = []
+    tools: list[str] = []
+    permissions: list[str] = []
+    lastRunAt: datetime | None = None
+    runsToday: int = 0
+
+
+class AgentActionOut(BaseModel):
+    id: str
+    agentId: str
+    runId: str
+    conversationId: str | None = None
+    tool: str
+    input: dict = {}
+    output: str = ""
+    refusalReason: str | None = None
+    resultType: str | None = None
+    resultId: str | None = None
+    status: str
+    createdAt: datetime
+    latencyMs: int = 0
+    creditsCharged: int = 0
+    # Enough for a manager to decide without opening the conversation.
+    guestName: str | None = None
+    approvedBy: str | None = None
+    approvedAt: datetime | None = None
+
+
+class AgentAutonomyRequest(BaseModel):
+    autonomyLevel: int = Field(ge=0, le=4)
+
+
+class AgentDecisionRequest(BaseModel):
+    decision: str = Field(pattern="^(approved|rejected)$")
+    note: str | None = Field(default=None, max_length=300)
+
+
+# ── usage ────────────────────────────────────────────────────────────────────
+
+class UsageEventOut(BaseModel):
+    id: str
+    usageType: str
+    quantity: float
+    provider: str | None = None
+    model: str | None = None
+    tokensIn: int | None = None
+    tokensOut: int | None = None
+    conversationId: str | None = None
+    runId: str | None = None
+    createdAt: datetime
+
+
+class UsageMeterOut(BaseModel):
+    """
+    What a hotel is shown. Grouped by what they recognise — AI conversations,
+    WhatsApp messages — never by tokens, which are our cost problem and not
+    something anyone running a hotel should have to reason about.
+    """
+    code: str
+    label: str
+    unit: str
+    used: float
+    billable: bool

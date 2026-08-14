@@ -23,7 +23,11 @@ celery_app = Celery(
     # Task modules the worker must import so their @task functions register. Without
     # this, tasks defined outside celery_app.py (e.g. the recommendation workers) are
     # never discovered and beat's schedule fires into the void.
-    include=["app.workers.reco_tasks", "app.workers.partner_tasks"],
+    include=[
+        "app.workers.reco_tasks",
+        "app.workers.partner_tasks",
+        "app.workers.messaging_tasks",
+    ],
 )
 
 

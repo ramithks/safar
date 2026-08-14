@@ -13,6 +13,7 @@ from app.api.v1.marketplace.endpoint import router as marketplace_router
 from app.api.v1.marketplace.partner_ops import router as marketplace_partner_router
 from app.api.v1.marketplace.payments import router as marketplace_payments_router
 from app.api.v1.pms.endpoint import router as pms_router
+from app.api.v1.messaging.webhooks import router as messaging_webhooks_router
 from app.api.v1.admin.endpoint import router as admin_router
 from app.api.v1.admin.trips import router as admin_trips_router
 from app.api.v1.admin.catalog import router as admin_catalog_router
@@ -44,6 +45,7 @@ router.include_router(marketplace_router)
 router.include_router(marketplace_partner_router)
 router.include_router(marketplace_payments_router)
 router.include_router(pms_router)
+router.include_router(messaging_webhooks_router)
 router.include_router(admin_router)
 router.include_router(admin_trips_router)
 router.include_router(admin_catalog_router)

@@ -99,6 +99,12 @@ def db(monkeypatch) -> FakeDb:
         "app.services.pms.frontdesk",
         "app.services.pms.workspace",
         "app.services.pms.clock",
+        # The handoff tool moves the conversation through the messaging
+        # service now. A module missing from this list does not fail loudly —
+        # it quietly reaches the real database, which is how this fixture stops
+        # being a fixture.
+        "app.services.messaging.service",
+        "app.services.messaging.pipeline",
     ):
         monkeypatch.setattr(f"{module}.get_db", lambda: fake, raising=False)
     return fake
@@ -345,14 +351,22 @@ def test_a_handoff_moves_the_conversation_to_a_human(db):
 
     assert result.handoff is True
     assert result.status == "escalated"
-    assert db.rows("conversations")[0]["handler"] == "human"
+    # 'human_requested', not 'human'. The agent has stopped and nobody has
+    # picked it up — a real state that lasts minutes, and the queue a
+    # receptionist should work first.
+    assert db.rows("conversations")[0]["handler"] == "human_requested"
 
 
 def test_human_takeover_stops_the_agent_answering():
     # The rule, as a column rather than a convention.
     assert runtime.agent_is_handling({"handler": "ai"}) is True
     assert runtime.agent_is_handling({"handler": "human"}) is False
+    # Waiting for a person counts as stopped. The agent must not fill the gap
+    # it just asked somebody to come and fill.
+    assert runtime.agent_is_handling({"handler": "human_requested"}) is False
     assert runtime.agent_is_handling({}) is True
+    # The separate kill switch: off means off, whoever is nominally holding it.
+    assert runtime.agent_is_handling({"handler": "ai", "ai_enabled": False}) is False
 
 
 # ── failure behaviour ────────────────────────────────────────────────────────
@@ -365,7 +379,7 @@ def test_a_dead_model_hands_off_rather_than_inventing(db):
     assert result.handoff is True
     # A guest gets a true sentence, and the conversation is a human's problem.
     assert result.reply and "hotel team" in result.reply
-    assert db.rows("conversations")[0]["handler"] == "human"
+    assert db.rows("conversations")[0]["handler"] == "human_requested"
 
     runs = db.rows("agent_runs")
     assert runs[0]["status"] == "failed"
@@ -400,7 +414,7 @@ def test_a_runaway_loop_is_stopped_and_handed_over(db, monkeypatch):
 
     assert result.handoff is True
     assert len(db.rows("agent_actions")) == 3
-    assert db.rows("conversations")[0]["handler"] == "human"
+    assert db.rows("conversations")[0]["handler"] == "human_requested"
 
 
 # ── what the model is shown ──────────────────────────────────────────────────

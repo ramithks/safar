@@ -586,8 +586,11 @@ result = run(runtime.run_turn(
 ))
 check("the run is marked escalated", result.status == "escalated", result.status)
 handler = sql(f"""select handler from public.conversations where id = '{conversation["id"]}';""")
-check("and the conversation now belongs to a person", handler[0]["handler"] == "human",
-      str(handler))
+# 'human_requested' rather than 'human': the agent has stopped and nobody has
+# picked it up yet. That gap is real, lasts minutes, and is the queue a
+# receptionist should work first — so the inbox has to be able to show it.
+check("and the conversation is waiting for a person",
+      handler[0]["handler"] == "human_requested", str(handler))
 check("which stops the agent answering it",
       runtime.agent_is_handling({"handler": handler[0]["handler"]}) is False)
 
@@ -611,7 +614,7 @@ row = run_row(result.run_id)
 check("the error is on the run", "503" in (row["error"] or ""), str(row.get("error")))
 handler = sql(f"""select handler from public.conversations where id = '{conversation["id"]}';""")
 check("and the conversation went to a human rather than being left with a robot",
-      handler[0]["handler"] == "human", str(handler))
+      handler[0]["handler"] == "human_requested", str(handler))
 sql(f"""update public.conversations set handler = 'ai' where id = '{conversation["id"]}';""")
 
 

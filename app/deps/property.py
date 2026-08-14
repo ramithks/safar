@@ -77,6 +77,21 @@ class Member:
             )
 
 
+def _display_name(db, profile_id: str) -> str | None:
+    """
+    The person's name, from their profile.
+
+    Filled in because several things record *who did this* — a staff reply in
+    the inbox, a task event, a folio line — and every one of them was writing a
+    null. "Somebody changed this" is not an audit trail.
+    """
+    rows = (
+        db.table("profiles").select("full_name")
+        .eq("id", profile_id).limit(1).execute().data or []
+    )
+    return rows[0].get("full_name") if rows else None
+
+
 def _load(property_id: str, profile_id: str) -> Member | None:
     db = get_db()
 
@@ -115,7 +130,7 @@ def _load(property_id: str, profile_id: str) -> Member | None:
             partner_id=partner_id,
             property_id=property_id,
             role=row["role"],
-            display_name=None,
+            display_name=_display_name(db, profile_id),
             extra_perms=frozenset(k for k, v in perms.items() if v is True),
         )
 
@@ -137,7 +152,7 @@ def _load(property_id: str, profile_id: str) -> Member | None:
             partner_id=partner_id,
             property_id=property_id,
             role="owner",
-            display_name=None,
+            display_name=_display_name(db, profile_id),
             extra_perms=frozenset(),
         )
 

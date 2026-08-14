@@ -143,6 +143,23 @@ def _link_result(outcome: ToolOutcome, action_id: str | None) -> None:
         logger.warning("could not link task %s to action %s", outcome.result_id, action_id)
 
 
+def _stamp_message_action(message_id: str, action_id: str) -> None:
+    """
+    Point an outbound message at the action that sent it.
+
+    The mirror of `_link_result`, and the same ordering problem: the tool
+    returns before its action row exists, so the stamp has to happen here.
+    Together they make the trace run both ways — an auditor reading a message a
+    guest received can find the run that decided to send it.
+    """
+    try:
+        get_db().table("conversation_messages").update(
+            {"agent_action_id": action_id}
+        ).eq("id", message_id).execute()
+    except Exception:  # noqa: BLE001
+        logger.warning("could not link message %s to action %s", message_id, action_id)
+
+
 def _close_run(run_id: str, fields: dict) -> None:
     def _write():
         get_db().table("agent_runs").update(
@@ -187,6 +204,9 @@ async def run_turn(
 
     tools = registry.describe_for_provider(ctx)
     outcomes: list[ToolOutcome] = []
+    # usage_type -> the action rows that produced it, so a usage event can point
+    # at the action rather than only at the run.
+    action_ids: dict[str, list[str]] = {}
     seq = 0
     reply: str | None = None
     handoff = False
@@ -217,6 +237,15 @@ async def run_turn(
 
                 action_id = await run_db(_write_action, ctx, run_id, seq, outcome)
                 await run_db(_link_result, outcome, action_id)
+                if spec and action_id:
+                    action_ids.setdefault(spec.usage_type, []).append(action_id)
+                    # The tool needs the action id to stamp on whatever it
+                    # produced — an outbound message has to know which action
+                    # sent it. Only send_message uses this today; passing it
+                    # after the fact is the only order that works, because the
+                    # action row does not exist until the tool has returned.
+                    if outcome.tool == "send_message" and outcome.result_id:
+                        await run_db(_stamp_message_action, outcome.result_id, action_id)
 
                 if outcome.tool == "request_human_handoff" and outcome.ok:
                     handoff = True
@@ -270,6 +299,22 @@ async def run_turn(
         "error": error,
     })
 
+    # Measured, not charged — see services/ai/usage.py. Written after the run is
+    # closed and swallowed on failure: a meter that can take down a guest
+    # conversation is a worse bug than a meter with a gap in it.
+    try:
+        await usage_mod.record_run(
+            run_id=run_id,
+            property_id=ctx.property_id,
+            partner_id=ctx.partner_id,
+            agent_id=ctx.principal.agent_id,
+            conversation_id=ctx.conversation_id,
+            usage=turn_usage,
+            action_ids=action_ids,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("could not record usage for run %s", run_id, exc_info=True)
+
     # A handoff always leaves the conversation with a human, even when the
     # handoff came from a crash rather than from the tool. The rule is that an
     # unattended conversation is never left believing an agent is still on it.
@@ -290,10 +335,19 @@ async def run_turn(
 
 
 def _ensure_human(ctx: AgentContext) -> None:
+    """
+    Stop the agent answering, whatever the reason it stopped.
+
+    'human_requested' rather than 'human': nobody has picked it up. Guarded on
+    the current handler so a crash mid-turn on a conversation a receptionist had
+    *already taken over* does not demote it back to the queue.
+    """
     try:
-        get_db().table("conversations").update({"handler": "human"}).eq(
-            "id", ctx.conversation_id
-        ).eq("property_id", ctx.property_id).execute()
+        get_db().table("conversations").update(
+            {"handler": "human_requested"}
+        ).eq("id", ctx.conversation_id).eq("property_id", ctx.property_id).eq(
+            "handler", "ai"
+        ).execute()
     except Exception:  # noqa: BLE001
         logger.warning("could not mark conversation %s for a human", ctx.conversation_id)
 
@@ -307,8 +361,14 @@ def agent_is_handling(conversation: dict) -> bool:
     the check that makes that true rather than customary. Called by the
     transport before a run is even opened, so a taken-over conversation costs
     nothing and leaves no trace.
+
+    Delegates to `messaging.service.agent_may_answer`, which also honours the
+    per-conversation `ai_enabled` switch — a receptionist can turn the AI off
+    for one difficult guest and have it stay off through every later handover.
     """
-    return (conversation.get("handler") or "ai") == "ai"
+    from app.services.messaging import service as messaging
+
+    return messaging.agent_may_answer(conversation)
 
 
 def new_conversation_id() -> str:

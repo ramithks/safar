@@ -69,6 +69,38 @@ class Settings(BaseSettings):
     # that needs more is a loop that has stopped making progress.
     agent_max_tool_turns: int = 6
 
+    # ── WhatsApp Cloud API ──────────────────────────────────────────────────
+    # Credentials live here and nowhere else. `whatsapp_connections` holds a
+    # `credentials_ref` naming which entry to use, because a token in a database
+    # row is a token in every backup, replica and accidental `select *`.
+    #
+    # `app_secret` verifies Meta's X-Hub-Signature-256 on every inbound webhook;
+    # `access_token` sends. They are separate secrets doing opposite jobs and
+    # are never interchangeable.
+    whatsapp_app_secret: Optional[str] = None
+    whatsapp_access_token: Optional[str] = None
+    # The string Meta echoes during the GET handshake. Ours to choose, and
+    # compared in constant time — see services/messaging/whatsapp/webhook.py.
+    whatsapp_verify_token: Optional[str] = None
+    whatsapp_api_base: str = "https://graph.facebook.com/v21.0"
+    whatsapp_timeout_seconds: float = 15.0
+
+    # Connections whose `credentials_ref` is this one are wired to the
+    # deterministic fake rather than to Meta. Named rather than inferred from a
+    # hostname, so nothing can ship believing it is talking to Meta when it is
+    # not.
+    whatsapp_sandbox_ref: str = "sandbox"
+
+    # Meta permits free-form replies only inside a service window that opens on
+    # each inbound message. 24 hours is Meta's number, not ours; it is here so a
+    # test can shorten it rather than sleep through it.
+    whatsapp_service_window_hours: int = 24
+
+    # Run the agent inline in the webhook request instead of handing it to
+    # Celery. Development and the E2E suite only: a real deployment must
+    # acknowledge Meta quickly and do the model call elsewhere.
+    messaging_inline_processing: bool = False
+
     # Google Maps — Places API for place enrichment (optional but recommended)
     google_maps_api_key: Optional[str] = None
 

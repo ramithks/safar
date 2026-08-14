@@ -21,21 +21,29 @@ marketplace/partner_ops.py.
 # NOTE: deliberately no `from __future__ import annotations` — PEP 563 breaks
 # FastAPI body resolution through slowapi's wrapper. Same note as
 # api/v1/admin/endpoint.py.
+import json
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.api.v1.pms.schemas import (
+    AgentActionOut,
+    AgentAutonomyRequest,
+    AgentDecisionRequest,
+    AgentOut,
     AriEditOut,
     BookingRequest,
     CheckInRequest,
+    ConversationHandlerRequest,
+    ConversationOut,
     FolioEntryOut,
     FolioOut,
     FolioPostRequest,
     InventoryEditRequest,
     InventoryNightOut,
     MeOut,
+    MessageOut,
     NightAuditOut,
     NightAuditRequest,
     NightlyOut,
@@ -50,12 +58,14 @@ from app.api.v1.pms.schemas import (
     RoomOut,
     RoomStatusRequest,
     RoomTypeOut,
+    SendMessageRequest,
     StayOptionOut,
     SyncOut,
     TaskCreateRequest,
     TaskOut,
     TaskStatusRequest,
     TodayStatsOut,
+    UsageMeterOut,
 )
 from app.core.limiter import limiter
 from app.db.client import get_db, run_db
@@ -67,6 +77,8 @@ from app.services.pms import clock
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
 from app.services.pms import sync as sync_service
+from app.services.messaging import service as messaging_service
+from app.services.messaging.channels import MessagingError
 from app.services.pms import workspace as workspace_service
 
 logger = logging.getLogger(__name__)
@@ -689,3 +701,488 @@ async def set_task_status(
 ):
     row = await frontdesk_service.set_task_status(property_id, task_id, body.status, member)
     return TaskOut.from_row(row)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inbox
+#
+# The screens that were on seed data until slice 2. Everything here reads the
+# same `conversations` and `conversation_messages` rows the WhatsApp webhook
+# writes, so a receptionist watching the inbox sees a guest's message arrive and
+# the agent's answer follow it — one thread, not two systems.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/properties/{property_id}/conversations", response_model=list[ConversationOut])
+@limiter.limit("120/minute")
+async def list_conversations(
+    request: Request,
+    property_id: str,
+    status_filter: str | None = Query(None, alias="status"),
+    limit: int = Query(100, ge=1, le=300),
+    member=Depends(require_member("messaging")),
+):
+    def _read():
+        db = get_db()
+        q = (
+            db.table("conversations")
+            .select("*")
+            .eq("property_id", property_id)
+            .order("last_message_at", desc=True)
+            .limit(limit)
+        )
+        if status_filter:
+            q = q.eq("status", status_filter)
+        rows = q.execute().data or []
+
+        # One lookup for every assignee rather than one per row.
+        member_ids = {r["assignee_member"] for r in rows if r.get("assignee_member")}
+        names: dict[str, str] = {}
+        if member_ids:
+            members = (
+                db.table("partner_members").select("id,profile_id")
+                .in_("id", sorted(member_ids)).execute().data or []
+            )
+            profile_ids = {m["profile_id"] for m in members if m.get("profile_id")}
+            profiles = (
+                db.table("profiles").select("id,full_name")
+                .in_("id", sorted(profile_ids)).execute().data or []
+            ) if profile_ids else []
+            by_profile = {p["id"]: p.get("full_name") for p in profiles}
+            names = {m["id"]: by_profile.get(m["profile_id"]) for m in members}
+        return rows, names
+
+    rows, names = await run_db(_read)
+    return [
+        ConversationOut.from_row(
+            r,
+            window_open=messaging_service.window_open(r),
+            assignee_name=names.get(r.get("assignee_member")),
+        )
+        for r in rows
+    ]
+
+
+@router.get(
+    "/properties/{property_id}/conversations/{conversation_id}/messages",
+    response_model=list[MessageOut],
+)
+@limiter.limit("240/minute")
+async def list_messages(
+    request: Request,
+    property_id: str,
+    conversation_id: str,
+    member=Depends(require_member("messaging")),
+):
+    def _read():
+        db = get_db()
+        rows = (
+            db.table("conversation_messages")
+            .select("*")
+            .eq("property_id", property_id)
+            .eq("conversation_id", conversation_id)
+            .order("sent_at")
+            .limit(300)
+            .execute()
+            .data
+            or []
+        )
+        # Opening a thread is reading it. The count is the receptionist's, not
+        # the guest's, so it clears here rather than on a separate call nobody
+        # would remember to make.
+        if rows:
+            db.table("conversations").update({"unread_count": 0}).eq(
+                "id", conversation_id
+            ).eq("property_id", property_id).execute()
+        return rows
+
+    return [MessageOut.from_row(r) for r in await run_db(_read)]
+
+
+@router.post(
+    "/properties/{property_id}/conversations/{conversation_id}/messages",
+    response_model=MessageOut,
+)
+@limiter.limit("60/minute")
+async def send_conversation_message(
+    request: Request,
+    property_id: str,
+    conversation_id: str,
+    body: SendMessageRequest,
+    member=Depends(require_member("messaging")),
+):
+    """
+    A staff reply.
+
+    Goes through the same `messaging.send` the agent uses, so a receptionist
+    typing outside the 24-hour window is refused for exactly the same reason and
+    with exactly the same message. Meta's rule does not care who is typing, and
+    a second code path would be a second chance to forget that.
+
+    **Sending takes the conversation over.** A person typing a reply is a person
+    handling it, and leaving the agent running underneath would let it answer
+    the guest's next message over the top of someone mid-conversation. The
+    explicit Take over button exists for picking a thread up without saying
+    anything yet; this is the same decision made by doing rather than declaring.
+    """
+    conversation = await run_db(_load_conversation, property_id, conversation_id)
+    if not conversation:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")
+
+    try:
+        sent = await messaging_service.send(
+            conversation,
+            body=body.body,
+            author="staff",
+            author_name=member.display_name,
+            author_member=member.member_id,
+        )
+    except MessagingError as exc:
+        # 409 rather than 500: the request was well formed and the refusal is a
+        # fact about the conversation, which is what the desk needs to be told.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": exc.code, "detail": exc.detail},
+        ) from exc
+
+    if (conversation.get("handler") or "ai") != "human":
+        await messaging_service.take_over(conversation_id, property_id, member)
+
+    return MessageOut.from_row(sent.message)
+
+
+@router.post(
+    "/properties/{property_id}/conversations/{conversation_id}/handler",
+    response_model=ConversationOut,
+)
+@limiter.limit("60/minute")
+async def set_conversation_handler(
+    request: Request,
+    property_id: str,
+    conversation_id: str,
+    body: ConversationHandlerRequest,
+    member=Depends(require_member("messaging")),
+):
+    """
+    Take over, or hand back.
+
+    Taking over stops the agent immediately — the pipeline checks `handler`
+    before it opens a run, so nothing in flight can talk over the person who
+    just picked it up. Handing back is deliberately a separate action: a
+    conversation never drifts back to the AI because a human stopped typing.
+    """
+    if body.handler == "human":
+        row = await messaging_service.take_over(conversation_id, property_id, member)
+    else:
+        row = await messaging_service.resume_ai(conversation_id, property_id)
+
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")
+    return ConversationOut.from_row(row, window_open=messaging_service.window_open(row))
+
+
+def _load_conversation(property_id: str, conversation_id: str) -> dict | None:
+    rows = (
+        get_db().table("conversations").select("*")
+        .eq("id", conversation_id).eq("property_id", property_id)
+        .limit(1).execute().data or []
+    )
+    return rows[0] if rows else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Agents, and the approval queue
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/properties/{property_id}/agents", response_model=list[AgentOut])
+@limiter.limit("60/minute")
+async def list_agents(
+    request: Request,
+    property_id: str,
+    member=Depends(require_member()),
+):
+    """
+    Every agent configured for this property.
+
+    Any member may see *that* an agent exists and what it may do — a
+    receptionist working beside it should be able to. The system prompt is not
+    here: reading how the agent was told to behave needs the 'agents'
+    permission, which is enforced by RLS on `agent_configs` and mirrored by
+    simply not selecting it.
+    """
+    def _read():
+        db = get_db()
+        agents = (
+            db.table("agents").select("*")
+            .eq("property_id", property_id).order("agent_type").execute().data or []
+        )
+        if not agents:
+            return [], {}, {}, {}, {}
+
+        ids = [a["id"] for a in agents]
+        configs = {
+            c["id"]: c for c in (
+                db.table("agent_configs").select("id,model,provider,version")
+                .in_("id", [a["active_config_id"] for a in agents if a.get("active_config_id")])
+                .execute().data or []
+            )
+        } if any(a.get("active_config_id") for a in agents) else {}
+
+        tools: dict[str, list[str]] = {}
+        for t in (db.table("agent_tools").select("agent_id,tool_name,enabled")
+                  .in_("agent_id", ids).execute().data or []):
+            if t.get("enabled", True):
+                tools.setdefault(t["agent_id"], []).append(t["tool_name"])
+
+        perms: dict[str, list[str]] = {}
+        for p in (db.table("agent_permissions").select("agent_id,scope")
+                  .in_("agent_id", ids).execute().data or []):
+            perms.setdefault(p["agent_id"], []).append(p["scope"])
+
+        runs: dict[str, dict] = {}
+        for r in (db.table("agent_runs").select("agent_id,started_at")
+                  .in_("agent_id", ids).order("started_at", desc=True)
+                  .limit(200).execute().data or []):
+            slot = runs.setdefault(r["agent_id"], {"last": None, "count": 0})
+            slot["last"] = slot["last"] or r["started_at"]
+            slot["count"] += 1
+
+        return agents, configs, tools, perms, runs
+
+    agents, configs, tools, perms, runs = await run_db(_read)
+    out = []
+    for a in agents:
+        config = configs.get(a.get("active_config_id")) or {}
+        stats = runs.get(a["id"]) or {}
+        out.append(AgentOut(
+            id=a["id"],
+            propertyId=a["property_id"],
+            agentType=a["agent_type"],
+            name=a["name"],
+            autonomyLevel=a["autonomy_level"],
+            model=config.get("model") or "",
+            provider=config.get("provider") or "",
+            isActive=a["status"] == "active",
+            status=a["status"],
+            channels=a.get("channels") or [],
+            tools=sorted(tools.get(a["id"], [])),
+            permissions=sorted(perms.get(a["id"], [])),
+            lastRunAt=stats.get("last"),
+            runsToday=stats.get("count", 0),
+        ))
+    return out
+
+
+@router.patch("/properties/{property_id}/agents/{agent_id}", response_model=AgentOut)
+@limiter.limit("30/minute")
+async def set_agent_autonomy(
+    request: Request,
+    property_id: str,
+    agent_id: str,
+    body: AgentAutonomyRequest,
+    member=Depends(require_member("agents")),
+):
+    """
+    Move the dial.
+
+    The only control a hotel has over what its agent may do unattended, and the
+    reason the tools are granted at full scope and held back by level — see
+    services/ai/agents/guest.py. Requires the 'agents' permission; a receptionist
+    cannot give the AI more authority than they have themselves.
+    """
+    def _write():
+        rows = (
+            get_db().table("agents")
+            .update({"autonomy_level": body.autonomyLevel})
+            .eq("id", agent_id).eq("property_id", property_id)
+            .execute().data
+        )
+        return rows[0] if rows else None
+
+    row = await run_db(_write)
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Agent not found")
+
+    # The agent row alone. The tool and permission lists come from `list_agents`
+    # and the client refetches; duplicating those four queries here to return a
+    # fully-populated object would be a second place they can drift.
+    return AgentOut(
+        id=row["id"], propertyId=row["property_id"], agentType=row["agent_type"],
+        name=row["name"], autonomyLevel=row["autonomy_level"], model="", provider="",
+        isActive=row["status"] == "active", status=row["status"],
+        channels=row.get("channels") or [],
+    )
+
+
+@router.get("/properties/{property_id}/agent-actions", response_model=list[AgentActionOut])
+@limiter.limit("120/minute")
+async def list_agent_actions(
+    request: Request,
+    property_id: str,
+    status_filter: str | None = Query(None, alias="status"),
+    limit: int = Query(60, ge=1, le=200),
+    member=Depends(require_member()),
+):
+    def _read():
+        db = get_db()
+        q = (
+            db.table("agent_actions").select("*")
+            .eq("property_id", property_id)
+            .order("created_at", desc=True).limit(limit)
+        )
+        if status_filter:
+            q = q.eq("status", status_filter)
+        rows = q.execute().data or []
+
+        run_ids = {r["run_id"] for r in rows}
+        runs = {
+            r["id"]: r for r in (
+                db.table("agent_runs").select("id,conversation_id")
+                .in_("id", sorted(run_ids)).execute().data or []
+            )
+        } if run_ids else {}
+
+        conv_ids = {r.get("conversation_id") for r in runs.values() if r.get("conversation_id")}
+        convs = {
+            c["id"]: c for c in (
+                db.table("conversations").select("id,guest_name,guest_phone")
+                .in_("id", sorted(conv_ids)).execute().data or []
+            )
+        } if conv_ids else {}
+        return rows, runs, convs
+
+    rows, runs, convs = await run_db(_read)
+    out = []
+    for r in rows:
+        run = runs.get(r["run_id"]) or {}
+        conv = convs.get(run.get("conversation_id")) or {}
+        # The output is prose for a human to skim, not the raw payload. A
+        # refusal shows its reason, which is the thing a manager reviewing the
+        # queue actually needs.
+        summary = r.get("refusal_reason") or ""
+        if not summary and r.get("output"):
+            summary = json.dumps(r["output"], default=str)[:400]
+        out.append(AgentActionOut(
+            id=r["id"], agentId=r["agent_id"], runId=r["run_id"],
+            conversationId=run.get("conversation_id"),
+            tool=r["tool"], input=r.get("input") or {}, output=summary,
+            refusalReason=r.get("refusal_reason"),
+            resultType=r.get("result_type"), resultId=r.get("result_id"),
+            status=r["status"], createdAt=r["created_at"],
+            latencyMs=r.get("latency_ms") or 0,
+            guestName=conv.get("guest_name") or conv.get("guest_phone"),
+            approvedBy=r.get("approved_by"), approvedAt=r.get("approved_at"),
+        ))
+    return out
+
+
+@router.post(
+    "/properties/{property_id}/agent-actions/{action_id}/decision",
+    response_model=AgentActionOut,
+)
+@limiter.limit("60/minute")
+async def decide_agent_action(
+    request: Request,
+    property_id: str,
+    action_id: str,
+    body: AgentDecisionRequest,
+    member=Depends(require_member("agents")),
+):
+    """
+    Approve or reject a proposed action.
+
+    Recorded server-side with who decided and when — a decision that only
+    existed in a browser is not a decision anyone can audit, and this row is
+    what an owner reads six months later when they ask why a discount went out.
+
+    **Approving records the decision; it does not yet execute the action.**
+    Running an approved quote or booking means replaying a tool call against
+    inventory that has moved since it was proposed, which needs its own
+    re-validation path. Saying so here rather than shipping an Approve button
+    that silently does half of what it says.
+    """
+    def _write():
+        db = get_db()
+        current = (
+            db.table("agent_actions").select("*")
+            .eq("id", action_id).eq("property_id", property_id)
+            .limit(1).execute().data or []
+        )
+        if not current:
+            return None, "not_found"
+        if current[0]["status"] != "awaiting_approval":
+            return current[0], "already_decided"
+
+        rows = db.table("agent_actions").update({
+            "status": body.decision,
+            "approved_by": member.profile_id,
+            "approved_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", action_id).execute().data
+        return (rows[0] if rows else None), None
+
+    row, problem = await run_db(_write)
+    if problem == "not_found" or row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Action not found")
+    if problem == "already_decided":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"This action is already {row['status'].replace('_', ' ')}",
+        )
+
+    return AgentActionOut(
+        id=row["id"], agentId=row["agent_id"], runId=row["run_id"],
+        tool=row["tool"], input=row.get("input") or {},
+        output=row.get("refusal_reason") or "",
+        refusalReason=row.get("refusal_reason"),
+        resultType=row.get("result_type"), resultId=row.get("result_id"),
+        status=row["status"], createdAt=row["created_at"],
+        latencyMs=row.get("latency_ms") or 0,
+        approvedBy=row.get("approved_by"), approvedAt=row.get("approved_at"),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage — measurement, not billing
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/properties/{property_id}/usage", response_model=list[UsageMeterOut])
+@limiter.limit("60/minute")
+async def get_usage_meters(
+    request: Request,
+    property_id: str,
+    days: int = Query(30, ge=1, le=365),
+    member=Depends(require_member("reports")),
+):
+    """
+    What this property has consumed, in units a hotel recognises.
+
+    Grouped by usage type and labelled from `usage_types` — "AI conversation
+    turns", "WhatsApp messages" — never tokens. Tokens are our cost problem, and
+    a hotelier should not have to learn a new unit to read their own bill.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    def _read():
+        db = get_db()
+        events = (
+            db.table("usage_events").select("usage_type,quantity")
+            .eq("property_id", property_id).gte("created_at", since)
+            .limit(5000).execute().data or []
+        )
+        types = {t["code"]: t for t in (db.table("usage_types").select("*").execute().data or [])}
+        return events, types
+
+    events, types = await run_db(_read)
+    totals: dict[str, float] = {}
+    for e in events:
+        totals[e["usage_type"]] = totals.get(e["usage_type"], 0) + float(e["quantity"])
+
+    return [
+        UsageMeterOut(
+            code=code,
+            label=(types.get(code) or {}).get("name") or code,
+            unit=(types.get(code) or {}).get("unit") or "unit",
+            used=used,
+            billable=bool((types.get(code) or {}).get("billable", True)),
+        )
+        for code, used in sorted(totals.items())
+    ]
