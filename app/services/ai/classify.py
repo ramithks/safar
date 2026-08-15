@@ -93,7 +93,12 @@ _CANDIDATES: dict[str, tuple[str, ...]] = {
         "operational_analysis",
     ),
     "marketing": (
-        "guest_conversation",
+        # Campaign planning is a staff conversation about numbers. The reasoning
+        # tier is reached by naming an analysis, not by a long message about a
+        # festival weekend.
+        "marketing_planning",
+        "operational_analysis",
+        "revenue_analysis",
     ),
 }
 

@@ -262,6 +262,7 @@ def load_all() -> None:
         booking,
         communication,
         frontdesk,
+        marketing,
         operations,
         pricing,
         read,

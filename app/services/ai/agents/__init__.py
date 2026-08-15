@@ -75,7 +75,15 @@ class AgentDefinition:
 # The rule this encodes: an agent goes on this list if a stranger can reach it.
 # Not whether it sells, not whether it is new — whether the person on the other
 # end is somebody the hotel has authenticated. Nobody on WhatsApp is.
-GUEST_FACING = frozenset({"guest", "sales", "marketing"})
+#
+# **Marketing was on this list and came off it.** Phase D added it on a
+# prediction — a marketing agent sounded like something that talks to the
+# public. It does not: it answers *staff* on the `internal` console and plans
+# campaigns, and what reaches a guest is a campaign rather than a conversation.
+# Nobody outside the building can reach it, so it is member-scoped, and leaving
+# it guest-scoped would have meant an agent that could not read its own hotel's
+# tickets in order to protect a guest who is never on the other end.
+GUEST_FACING = frozenset({"guest", "sales"})
 
 
 def actor_for(agent_type: str | None) -> str:

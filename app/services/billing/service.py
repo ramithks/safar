@@ -30,6 +30,7 @@ only AI and messaging degrade.
 """
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from app.db.client import get_db, run_db
@@ -50,7 +51,13 @@ USAGE_BY_AGENT = {
     "frontdesk": "ai.frontdesk_assist",
     "owner":     "ai.owner_copilot",
     "sales":     "ai.sales_assist",
-    "marketing": "ai.content_generation",
+    # A *turn*, not the copy. `ai.content_generation` is priced per item at 15
+    # and is charged separately by `propose_campaign_message` — it is what
+    # writing two hundred people's message costs, and it is not what asking
+    # "how many repeat guests do I have" costs. Mapping every marketing turn to
+    # it billed a question that generates nothing at nearly twice the guest
+    # agent's rate.
+    "marketing": "ai.marketing_assist",
 }
 
 # The one agent whose price depends on how hard the turn was.
@@ -422,3 +429,103 @@ async def settle(*, hold_id: str, status: str = "settled") -> dict:
     return await run_db(_rpc, "settle_credit_hold", {
         "p_hold_id": hold_id, "p_status": status,
     }) or {}
+
+
+# ── low balance ─────────────────────────────────────────────────────────────
+#
+# `credit_wallets.low_balance_notified_at` has existed since migration 12 and
+# nothing has ever written it. It could not support "notify once" on its own: a
+# wallet that dips to LOW, is topped up, and dips again should notify twice, and
+# a wallet sitting at LOW through four hundred messages should notify once. A
+# timestamp cannot tell those apart, which is why migration 17 put the tier
+# beside it.
+#
+# The rule is a comparison, not a lock: notify when the current tier is *worse*
+# than the last one notified, and clear the record when the wallet recovers.
+# Concurrent callers converge — two workers both seeing 'critical' both compute
+# "worse than low", and the second write is the same write.
+
+# Worst last. Anything not here — 'ok', 'unknown' — is a recovery.
+_TIER_SEVERITY = {"low": 1, "critical": 2, "empty": 3}
+
+
+@dataclass
+class LowBalanceEvent:
+    """A tier crossing worth telling somebody about. `notify` is false for most."""
+
+    notify: bool
+    tier: str
+    previous: str | None = None
+    available: int = 0
+    billing_account_id: str | None = None
+
+
+def _read_notified(account: str) -> dict | None:
+    rows = (
+        get_db().table("credit_wallets")
+        .select("id,low_balance_tier,low_balance_notified_at,balance_credits")
+        .eq("billing_account_id", account).limit(1).execute().data or []
+    )
+    return rows[0] if rows else None
+
+
+def _write_notified(wallet_id: str, patch: dict) -> None:
+    get_db().table("credit_wallets").update(patch).eq("id", wallet_id).execute()
+
+
+async def check_low_balance(billing_account_id: str) -> LowBalanceEvent:
+    """
+    Decide whether this wallet has just crossed into a worse tier.
+
+    Returns `notify=True` at most once per crossing. The caller does the telling
+    — this function only owns the idempotency, because "have we already said
+    this" is a question about state and not about notification channels.
+
+    Swallows its own failures into `notify=False`. A wallet read that fails must
+    never be the reason a campaign stops or a message is not sent; the worst
+    outcome of getting this wrong is a hotel not being warned, and the worst
+    outcome of raising is a hotel not being served.
+    """
+    try:
+        state = await wallet_state(billing_account_id)
+        wallet = await run_db(_read_notified, billing_account_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not evaluate low balance for %s", billing_account_id,
+                       exc_info=True)
+        return LowBalanceEvent(notify=False, tier="unknown")
+
+    if not wallet or not state.get("exists"):
+        return LowBalanceEvent(notify=False, tier="unknown")
+
+    tier = str(state.get("tier") or "ok")
+    previous = wallet.get("low_balance_tier")
+    available = int(state.get("available") or 0)
+    severity = _TIER_SEVERITY.get(tier, 0)
+    previous_severity = _TIER_SEVERITY.get(previous or "", 0)
+
+    if severity == 0:
+        # Recovered. Clearing the record is what makes the *next* dip notify
+        # again — without it a hotel is warned once, ever.
+        if previous is not None:
+            await run_db(_write_notified, wallet["id"], {
+                "low_balance_tier": None, "low_balance_notified_at": None,
+            })
+        return LowBalanceEvent(notify=False, tier=tier, previous=previous,
+                               available=available,
+                               billing_account_id=billing_account_id)
+
+    if severity <= previous_severity:
+        # Still low, or improved without recovering. Already said.
+        return LowBalanceEvent(notify=False, tier=tier, previous=previous,
+                               available=available,
+                               billing_account_id=billing_account_id)
+
+    await run_db(_write_notified, wallet["id"], {
+        "low_balance_tier": tier,
+        "low_balance_notified_at": datetime.now(timezone.utc).isoformat(),
+    })
+    logger.info("billing account %s crossed into %s (available %s)",
+                billing_account_id, tier, available)
+    return LowBalanceEvent(notify=True, tier=tier, previous=previous,
+                           available=available,
+                           billing_account_id=billing_account_id)

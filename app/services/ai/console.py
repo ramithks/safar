@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 
 from app.db.client import get_db, run_db
 from app.services.ai import context as ai_context
+from app.services.ai import agents as agents_module
 from app.services.ai import routing, runtime
 from app.services.ai.schemas import RunResult
 from app.services.messaging import service as messaging
@@ -64,15 +65,22 @@ DEFAULT_TASK = "frontdesk_operations"
 HISTORY_TURNS = 6
 
 
-def _external_id(member) -> str:
+def _external_id(member, agent_type: str) -> str:
     """
-    One internal thread per person per property.
+    One internal thread per person per agent per property.
 
     Keyed on the profile rather than the membership: `member_id` is null for an
     owner who has no `partner_members` row, and an owner asking the front desk
     agent a question is the most likely person to be in that state.
+
+    The agent type joined it when a second agent arrived on `internal`. One
+    thread per person was right while the front desk was alone there; with
+    marketing beside it, a receptionist's arrivals questions and a manager's
+    campaign planning would have interleaved in one history and each agent would
+    have been handed the other's context as if it were its own.
     """
-    return f"staff:{member.profile_id}"
+    return f"staff:{member.profile_id}" if agent_type == "frontdesk" else \
+        f"staff:{member.profile_id}:{agent_type}"
 
 
 def _find_or_open(property_id: str, partner_id: str, external_id: str,
@@ -185,6 +193,7 @@ async def ask(
     member,
     message: str,
     task: str | None = None,
+    agent_type: str | None = None,
     provider=None,
     classifier=None,
 ) -> tuple[RunResult, dict]:
@@ -198,9 +207,21 @@ async def ask(
     `provider` is injectable so the E2E suite can script the model and then
     assert on the database rather than on prose. Everything else is real.
     """
+    # Which agent, and it is the caller's choice rather than the channel's.
+    #
+    # `internal` used to mean "the front desk agent", because it was the only
+    # one there. Two agents share it now, and `routing._PRIORITY` would always
+    # hand an internal thread to the front desk — leaving the marketing agent
+    # configured, active and unreachable.
+    #
+    # So the console takes an agent type. That is the honest model for a staff
+    # surface: which agent you are talking to is a screen somebody opened, not a
+    # property of the transport. Routing still decides when nobody says, which
+    # keeps every existing caller working unchanged.
+    resolved = agent_type
     conversation = await run_db(
         _find_or_open, property_id, member.partner_id,
-        _external_id(member), member.display_name,
+        _external_id(member, resolved or "frontdesk"), member.display_name,
     )
 
     # Persisted before the run, for the same reason the WhatsApp webhook
@@ -223,19 +244,24 @@ async def ask(
             conversation,
         )
 
-    routed = await routing.route(conversation)
-    if routed is None:
-        raise ConsoleRefused(
-            "NO_AGENT",
-            "No agent is configured for the staff console at this property.",
-            conversation,
-        )
-    agent_type, actor = routed
+    if resolved is None:
+        routed = await routing.route(conversation)
+        if routed is None:
+            raise ConsoleRefused(
+                "NO_AGENT",
+                "No agent is configured for the staff console at this property.",
+                conversation,
+            )
+        resolved, actor = routed
+    else:
+        # The actor still comes from `agents.actor_for`, never from a literal —
+        # naming the agent must not also be a way to name its scope.
+        actor = agents_module.actor_for(resolved)
 
     ctx = await ai_context.load_context(
         property_id=property_id,
         partner_id=member.partner_id,
-        agent_type=agent_type,
+        agent_type=resolved,
         conversation_id=conversation["id"],
         channel=CHANNEL,
         # The two that make this a staff run. `actor` comes from the agent's

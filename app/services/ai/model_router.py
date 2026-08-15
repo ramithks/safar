@@ -93,6 +93,12 @@ _TASKS: dict[str, tuple[str, str]] = {
     "frontdesk_operations": (CONVERSATION, "a front desk lookup or action"),
     "frontdesk_summary":    (CONVERSATION, "the day's board, summarised"),
 
+    # Marketing. Planning a campaign and writing its copy are both the
+    # workhorse's job: the audience arithmetic happens in Postgres and the copy
+    # is three sentences about a hotel. Only an analysis of *why* a campaign
+    # performed reaches the reasoning tier, and that is named separately.
+    "marketing_planning":   (CONVERSATION, "proposing or drafting a campaign"),
+
     # Worth the expensive model: money, ambiguity, or several moving parts.
     "complex_negotiation":   (REASONING, "a rate negotiation with money on it"),
     "cancellation_dispute":  (REASONING, "a disputed charge or cancellation fee"),

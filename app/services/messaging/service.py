@@ -148,6 +148,42 @@ def _upsert_conversation(
     if existing:
         return existing[0]
 
+    # Adopt a thread we started ourselves.
+    #
+    # `conversations_identity_idx` is keyed on `external_id`, which only exists
+    # once the guest has written — so a conversation opened by an outbound
+    # campaign has none, and this guest's first reply would have created a
+    # *second* row. That is not cosmetic: the reply would be "STOP", and it
+    # would land on a thread with no history while the campaign thread sat
+    # beside it looking unanswered.
+    #
+    # Matched on the address rather than on the guest record, because the
+    # address is what both rows are certain to share.
+    if sender_external_id:
+        address_column = "guest_phone" if channel == policy.WHATSAPP else "guest_handle"
+        orphan = (
+            db.table("conversations")
+            .select("*")
+            .eq("property_id", property_id)
+            .eq("channel", channel)
+            .eq(address_column, sender_external_id)
+            .is_("external_id", "null")
+            .order("created_at")
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if orphan:
+            adopted = (
+                db.table("conversations")
+                .update({"external_id": external_id, "channel_account_id": account_id})
+                .eq("id", orphan[0]["id"])
+                .execute()
+                .data
+            )
+            return adopted[0] if adopted else orphan[0]
+
     # A returning guest is matched on the phone number the property already has
     # for them. Scoped to the property — the same number at two hotels is two
     # guest records, and joining them would be a cross-property leak dressed up
@@ -183,6 +219,77 @@ def _upsert_conversation(
         "status": "open",
     }
     return db.table("conversations").insert(row).execute().data[0]
+
+
+def _conversation_for_guest(property_id: str, channel: str, guest: dict) -> dict | None:
+    """
+    The thread to write to when *we* are starting the conversation.
+
+    Every conversation this codebase has created until now began with an inbound
+    message, so `_upsert_conversation` keys on the provider's thread id. A
+    campaign has no such id — nobody has written — so this is the other door,
+    and it is deliberately narrow: it takes a guest row that a segment query
+    already returned, never an address from a caller.
+
+    **Instagram cannot use it to start anything.** There is no way to open an
+    Instagram thread from a handle; Meta only lets you reply into one the person
+    opened. So on Instagram this returns an existing conversation or None, and
+    the recipient is skipped as NO_CONTACT. Returning a fresh row there would be
+    manufacturing a thread that can never be delivered into.
+    """
+    db = get_db()
+    address = guest.get("phone") if channel == policy.WHATSAPP else None
+    address_column = "guest_phone" if channel == policy.WHATSAPP else "guest_handle"
+
+    query = (
+        db.table("conversations").select("*")
+        .eq("property_id", property_id).eq("channel", channel)
+        .eq("guest_id", guest["id"])
+        .order("last_message_at", desc=True).limit(1)
+    )
+    found = query.execute().data or []
+    if found:
+        return found[0]
+
+    if address:
+        by_address = (
+            db.table("conversations").select("*")
+            .eq("property_id", property_id).eq("channel", channel)
+            .eq(address_column, address).limit(1).execute().data or []
+        )
+        if by_address:
+            return by_address[0]
+
+    if not address:
+        return None
+
+    prop = (
+        db.table("properties").select("partner_id")
+        .eq("id", property_id).limit(1).execute().data or []
+    )
+    if not prop:
+        return None
+
+    return db.table("conversations").insert({
+        "property_id": property_id,
+        "partner_id": prop[0]["partner_id"],
+        "channel": channel,
+        # No external_id: the provider has not given us a thread id because
+        # there is no thread yet. `_upsert_conversation` adopts this row when
+        # the guest replies — see the comment there.
+        "external_id": None,
+        "guest_phone": address if channel == policy.WHATSAPP else None,
+        "guest_handle": address if channel != policy.WHATSAPP else None,
+        "guest_name": guest.get("name"),
+        "guest_id": guest["id"],
+        "handler": "ai",
+        "status": "open",
+    }).execute().data[0]
+
+
+async def conversation_for_guest(property_id: str, channel: str, guest: dict) -> dict | None:
+    """See `_conversation_for_guest`. None means this guest is unreachable here."""
+    return await run_db(_conversation_for_guest, property_id, channel, guest)
 
 
 def _link_reservation(conversation: dict) -> dict:
@@ -313,7 +420,38 @@ def _record_inbound(inbound: InboundMessage, connection: dict) -> RecordedInboun
 
 
 async def record_inbound(inbound: InboundMessage, connection: dict) -> RecordedInbound:
-    return await run_db(_record_inbound, inbound, connection)
+    recorded = await run_db(_record_inbound, inbound, connection)
+
+    # Opting out happens here, and it is the earliest honest place.
+    #
+    # This is the one function every inbound message on every channel passes
+    # through — the mirror of `send()` on the way out — so a stop request is
+    # acted on before the pipeline is dispatched, before an agent run is opened,
+    # before a model reads a word of it, and regardless of whether a human has
+    # taken the conversation over or the AI is switched off for this thread.
+    #
+    # Putting it in a tool would have made the model the thing that noticed,
+    # which is exactly the arrangement §14 of the brief forbids: an opt-out that
+    # depends on a model behaving is not an opt-out.
+    #
+    # A duplicate delivery re-applies it, which is harmless — `opt_out` is a
+    # write of the same three values — and is better than the alternative of a
+    # redelivered STOP being ignored because the first copy was lost.
+    if not recorded.duplicate or inbound.body:
+        try:
+            from app.services.marketing import consent as consent_module
+
+            await consent_module.apply_inbound(recorded.conversation, inbound.body)
+        except Exception:  # noqa: BLE001
+            # Logged loudly and swallowed. A consent write that failed must not
+            # discard the guest's message — but it is the one failure here that
+            # somebody has to see, because the guest believes they have stopped.
+            logger.exception(
+                "could not apply an opt-out from message %s on conversation %s",
+                recorded.message.get("id"), recorded.conversation.get("id"),
+            )
+
+    return recorded
 
 
 # ── the window ───────────────────────────────────────────────────────────────

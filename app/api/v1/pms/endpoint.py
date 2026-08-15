@@ -37,6 +37,7 @@ from app.api.v1.pms.schemas import (
     BookingRequest,
     CheckInRequest,
     ConsoleActionOut,
+    CampaignOut,
     ConsoleAskOut,
     ConsoleAskRequest,
     ConversationHandlerRequest,
@@ -1082,6 +1083,183 @@ async def ask_frontdesk_agent(
         tokensOut=result.tokens_out,
         latencyMs=result.latency_ms,
     )
+
+
+@router.post("/properties/{property_id}/marketing/ask", response_model=ConsoleAskOut)
+@limiter.limit("30/minute")
+async def ask_marketing_agent(
+    request: Request,
+    property_id: str,
+    body: ConsoleAskRequest,
+    member=Depends(require_member("marketing")),
+):
+    """
+    Ask the Marketing agent to plan something.
+
+    The same console, the same runtime and the same conversation model as the
+    front desk — what differs is one argument. Two agents share the `internal`
+    channel now, and channel routing puts the front desk first, so the caller
+    names which one it wants. That is the honest model for a staff surface:
+    which agent you are talking to is a screen somebody opened.
+
+    `require_member("marketing")` rather than mere membership. A receptionist
+    has no business planning campaigns to the guest list, and the agent must not
+    become a way to do something the person driving it could not do themselves.
+    Nothing is sent from here either way: `execute_campaign` always requires a
+    separate approval, which is the 'agents' permission and a different person's
+    decision.
+    """
+    try:
+        result, conversation = await ai_console.ask(
+            property_id=property_id,
+            member=member,
+            message=body.message,
+            task=body.task,
+            agent_type="marketing",
+        )
+    except ai_console.ConsoleRefused as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, {"code": exc.code, "detail": exc.detail}
+        ) from exc
+
+    actions = [
+        ConsoleActionOut(
+            tool=a.tool, status=a.status, refusalReason=a.refusal_reason,
+            resultType=a.result_type, resultId=a.result_id, latencyMs=a.latency_ms,
+        )
+        for a in result.actions
+    ]
+    return ConsoleAskOut(
+        runId=result.run_id,
+        conversationId=conversation["id"],
+        status=result.status,
+        reply=result.reply,
+        handoff=result.handoff,
+        actions=actions,
+        pendingApproval=any(a.status == "awaiting_approval" for a in actions),
+        tokensIn=result.tokens_in,
+        tokensOut=result.tokens_out,
+        latencyMs=result.latency_ms,
+    )
+
+
+@router.get("/properties/{property_id}/campaigns", response_model=list[CampaignOut])
+@limiter.limit("120/minute")
+async def list_campaigns(
+    request: Request,
+    property_id: str,
+    limit: int = Query(40, ge=1, le=200),
+    member=Depends(require_member("marketing")),
+):
+    """
+    Every campaign at this property, with the counts a screen needs.
+
+    The counts come from `campaign_recipients` rather than from columns on the
+    campaign — one place, computed the same way the run computes it, so a screen
+    and a worker can never disagree about how many people were reached.
+    """
+    def _read():
+        db = get_db()
+        campaigns = (
+            db.table("marketing_campaigns").select("*")
+            .eq("property_id", property_id)
+            .order("created_at", desc=True).limit(limit).execute().data or []
+        )
+        if not campaigns:
+            return [], {}, {}
+
+        ids = [c["id"] for c in campaigns]
+        counts: dict[str, dict] = {}
+        for row in (db.table("campaign_recipients").select("campaign_id,status,reason")
+                    .in_("campaign_id", ids).limit(5000).execute().data or []):
+            slot = counts.setdefault(row["campaign_id"], {"reasons": {}})
+            slot[row["status"]] = slot.get(row["status"], 0) + 1
+            if row.get("reason"):
+                slot["reasons"][row["reason"]] = slot["reasons"].get(row["reason"], 0) + 1
+
+        # What each campaign has cost the hotel, from the ledger's own figure —
+        # the same argument as the per-agent credits on /agents: a count times a
+        # rate stops being right the first time a rate changes mid-month.
+        spend: dict[str, dict] = {}
+        for e in (db.table("usage_events")
+                  .select("external_ref,credits_charged,provider_cost_inr_micros")
+                  .eq("usage_type", "marketing.campaign_send")
+                  .in_("external_ref", ids).limit(5000).execute().data or []):
+            slot = spend.setdefault(e["external_ref"], {"credits": 0.0, "cost": 0})
+            slot["credits"] += float(e.get("credits_charged") or 0)
+            slot["cost"] += int(e.get("provider_cost_inr_micros") or 0)
+
+        return campaigns, counts, spend
+
+    campaigns, counts, spend = await run_db(_read)
+    out = []
+    for c in campaigns:
+        n = counts.get(c["id"]) or {}
+        money = spend.get(c["id"]) or {}
+        out.append(CampaignOut(
+            id=c["id"],
+            name=c["name"],
+            campaignType=c["campaign_type"],
+            channel=c["channel"],
+            status=c["status"],
+            offer=c.get("offer") or {},
+            body=c.get("body"),
+            templatePurpose=c.get("template_purpose"),
+            version=c["version"],
+            createdBy=c["created_by"],
+            approvedBy=c.get("approved_by"),
+            approvedAt=c.get("approved_at"),
+            scheduledAt=c.get("scheduled_at"),
+            startedAt=c.get("started_at"),
+            completedAt=c.get("completed_at"),
+            cancelledAt=c.get("cancelled_at"),
+            outcomeReason=c.get("outcome_reason"),
+            audienceSize=sum(v for k, v in n.items() if k != "reasons"),
+            sent=n.get("sent", 0),
+            skipped=n.get("skipped", 0),
+            failed=n.get("failed", 0),
+            blocked=n.get("blocked", 0),
+            pending=n.get("pending", 0),
+            skippedBy=n.get("reasons") or {},
+            optedOut=(n.get("reasons") or {}).get("MARKETING_OPT_OUT", 0),
+            creditsCharged=money.get("credits"),
+            providerCostMicros=money.get("cost"),
+            createdAt=c["created_at"],
+        ))
+    return out
+
+
+@router.post("/properties/{property_id}/campaigns/{campaign_id}/cancel",
+             response_model=CampaignOut)
+@limiter.limit("30/minute")
+async def cancel_campaign_endpoint(
+    request: Request,
+    property_id: str,
+    campaign_id: str,
+    member=Depends(require_member("marketing")),
+):
+    """
+    Stop a campaign, including one that is part-way through.
+
+    The running worker reloads the campaign before every recipient, so this
+    takes effect within one message rather than at the end of the batch. It
+    cannot un-send what has already gone, and the response says how many that
+    was.
+    """
+    from app.services.marketing import campaigns as campaign_module
+
+    try:
+        await campaign_module.cancel(campaign_id, property_id, f"cancelled by {member.display_name}")
+    except campaign_module.CampaignRefused as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, {"code": exc.code, "detail": exc.detail}
+        ) from exc
+
+    campaigns = await list_campaigns(request, property_id, limit=200, member=member)
+    for c in campaigns:
+        if str(c.id) == str(campaign_id):
+            return c
+    raise HTTPException(status.HTTP_404_NOT_FOUND, "Campaign not found")
 
 
 @router.get("/properties/{property_id}/agent-actions", response_model=list[AgentActionOut])

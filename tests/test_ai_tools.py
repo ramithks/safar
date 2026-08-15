@@ -291,8 +291,8 @@ def test_every_agent_definition_names_only_registered_tools():
 def test_only_the_agents_with_a_runtime_behind_them_are_available():
     """
     Availability is a claim that something has been built to supervise the
-    agent, not that its definition exists. Marketing and the Owner Copilot have
-    shapes and no slice; `provisioning.provision` refuses them.
+    agent, not that its definition exists. The Owner Copilot has a shape and no
+    slice; `provisioning.provision` refuses it.
 
     This list grows one entry per phase, deliberately by hand — an agent that
     became available because someone flipped a default is an agent nobody
@@ -301,7 +301,7 @@ def test_only_the_agents_with_a_runtime_behind_them_are_available():
     from app.services.ai.agents import all_definitions
 
     available = sorted(t for t, d in all_definitions().items() if d.available)
-    assert available == ["frontdesk", "guest", "sales"]
+    assert available == ["frontdesk", "guest", "marketing", "sales"]
 
 
 def test_an_agent_a_stranger_can_reach_is_guest_scoped():
@@ -323,10 +323,15 @@ def test_an_agent_a_stranger_can_reach_is_guest_scoped():
     # Reachable by anyone with the hotel's number.
     assert actor_for("guest") == "guest"
     assert actor_for("sales") == "guest"
-    assert actor_for("marketing") == "guest"
 
-    # Reachable only by somebody `require_member` authenticated.
+    # Reachable only by somebody `require_member` authenticated. Marketing is
+    # here and not above: Phase D put it on the guest-facing list on a guess
+    # about what a marketing agent talks to, and Phase E built it — it answers
+    # staff on the `internal` console and plans campaigns. What reaches a guest
+    # is a campaign, which is not a conversation, so nobody outside the building
+    # can reach this agent at all.
     assert actor_for("frontdesk") == "member"
+    assert actor_for("marketing") == "member"
     assert actor_for("owner") == "member"
 
     # No agent type at all falls back to the tighter of the two: a run nobody

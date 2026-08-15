@@ -38,6 +38,11 @@ ROLE_PERMS: dict[str, set[str]] = {
     "manager": {
         "rates", "billing", "members", "agents", "reports",
         "frontdesk", "folio", "housekeeping", "tasks", "messaging",
+        # Writing to people who did not write to you. Deliberately not given to
+        # receptionists or concierges alongside 'messaging': answering a guest
+        # and campaigning four hundred past guests are different acts with
+        # different risks, and the second one is a manager's.
+        "marketing",
     },
     "accounts": {"billing", "payouts", "reports", "folio", "tasks"},
     "receptionist": {"frontdesk", "folio", "housekeeping", "tasks", "messaging"},

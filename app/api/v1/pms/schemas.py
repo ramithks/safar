@@ -768,6 +768,54 @@ class ConsoleAskOut(BaseModel):
     latencyMs: int = 0
 
 
+# ── marketing campaigns ──────────────────────────────────────────────────────
+
+class CampaignOut(BaseModel):
+    """
+    One campaign, with the numbers a screen shows.
+
+    The counts are every terminal state a recipient can reach, plus the
+    breakdown of *why* people were skipped. That last field is the one that
+    matters: a campaign reporting "83 sent" out of an audience of 127 has to be
+    able to name the other 44, or the first question anybody asks has no answer.
+    """
+    id: str
+    name: str
+    campaignType: str
+    channel: str
+    status: str
+    offer: dict = {}
+    body: str | None = None
+    templatePurpose: str | None = None
+    version: int = 1
+    createdBy: str
+    approvedBy: str | None = None
+    approvedAt: datetime | None = None
+    scheduledAt: datetime | None = None
+    startedAt: datetime | None = None
+    completedAt: datetime | None = None
+    cancelledAt: datetime | None = None
+    outcomeReason: str | None = None
+
+    audienceSize: int = 0
+    sent: int = 0
+    skipped: int = 0
+    failed: int = 0
+    blocked: int = 0
+    pending: int = 0
+    # reason -> count, from campaign_recipients.reason.
+    skippedBy: dict[str, int] = {}
+    # Pulled out of skippedBy because it is the number a hotelier watches, and a
+    # figure buried in a dict is a figure nobody watches.
+    optedOut: int = 0
+
+    # From the ledger, not from a count times a rate. None when nothing has been
+    # charged yet, which the screen renders as "—" rather than as zero.
+    creditsCharged: float | None = None
+    providerCostMicros: int | None = None
+    createdAt: datetime
+
+
 # ── usage ────────────────────────────────────────────────────────────────────
 
 class UsageEventOut(BaseModel):

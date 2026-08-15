@@ -79,7 +79,11 @@ def run(coro):
     ("frontdesk", "ai.frontdesk_assist"),
     ("owner",     "ai.owner_copilot"),
     ("sales",     "ai.sales_assist"),
-    ("marketing", "ai.content_generation"),
+    # A *turn*, not the copy. `ai.content_generation` is per item at 15 and is
+    # charged by `propose_campaign_message`; charging it for "how many repeat
+    # guests do I have" billed a question that generates nothing at nearly twice
+    # the guest agent's rate.
+    ("marketing", "ai.marketing_assist"),
 ])
 def test_each_agent_is_charged_as_what_it_is(agent_type, expected):
     assert billing.usage_type_for_agent(agent_type) == expected
