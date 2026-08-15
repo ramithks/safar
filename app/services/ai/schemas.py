@@ -47,6 +47,28 @@ class ToolSpec:
 
     fn: Callable[..., Awaitable[Any]]
 
+    # Whether what it writes is a *suggestion for a person* rather than a change
+    # to the hotel.
+    #
+    # The autonomy ladder reads 0 read-only · 1 propose · 2 safe operational
+    # actions, and the invariant `tests/test_ai_tools.py` enforces is that a
+    # mutating tool sits at floor 2 or above — otherwise level 1 would be able
+    # to change things and the rung would mean nothing.
+    #
+    # The Owner Copilot's `create_revenue_recommendation` broke that rule while
+    # being exactly what level 1 is *for*. It writes a row and an owner notices
+    # it, so calling it non-mutating would be a lie; but it changes no rate, no
+    # allocation, no stay and no money, and putting it at floor 2 would have
+    # meant either raising that agent to a level whose name promises operational
+    # actions it must never have, or queueing every written suggestion for a
+    # human to approve before another human reads it.
+    #
+    # So the distinction is declared rather than argued. A proposal may run at
+    # level 1 and at no lower level; everything else that mutates still needs 2.
+    # The exception is a field somebody sets deliberately, which means it is a
+    # list a reviewer can read — not a comment explaining why a rule has a hole.
+    proposal: bool = False
+
     # What the action produced, for `agent_actions.result_type`.
     result_type: str = "none"
 
@@ -97,14 +119,47 @@ class ToolSpec:
     revalidate: Callable[..., Awaitable[None]] | None = None
 
     def json_schema(self) -> dict:
-        """The argument schema, in the shape a provider expects."""
+        """
+        The argument schema, in the shape a provider expects.
+
+        Providers reject `$defs`-heavy schemas inconsistently, so nested models
+        are **inlined** rather than referenced. This used to be `pop("$defs")`
+        and nothing else, which was correct only for as long as no tool had a
+        nested argument — the first one that did shipped
+        `items: {"$ref": "#/$defs/…"}` pointing at a definition that had just
+        been deleted. Gemini was shown an array of nothing, sent an array of
+        strings, and the tool rejected them. Nothing failed loudly; the agent
+        simply could not use one of its tools, and only a live run found it.
+
+        So the refs are resolved instead of orphaned, and an unresolvable one
+        raises at registration time rather than at a hotelier's screen.
+        """
         schema = self.input_model.model_json_schema()
-        # Providers reject `$defs`-heavy schemas inconsistently and none of our
-        # tools need nesting, so this is flattened at the edge rather than
-        # tolerated.
-        schema.pop("$defs", None)
+        defs = schema.pop("$defs", {}) or {}
         schema.pop("title", None)
-        return schema
+
+        def inline(node, depth: int = 0):
+            if depth > 8:
+                # A model that references itself. Not something any tool here
+                # needs, and an infinite expansion is worse than a refusal.
+                raise RuntimeError(f"{self.name}: argument schema nests too deeply")
+            if isinstance(node, list):
+                return [inline(v, depth + 1) for v in node]
+            if not isinstance(node, dict):
+                return node
+            ref = node.get("$ref")
+            if isinstance(ref, str):
+                name = ref.rsplit("/", 1)[-1]
+                if name not in defs:
+                    raise RuntimeError(
+                        f"{self.name}: argument schema references {ref} and "
+                        f"nothing defines it"
+                    )
+                merged = {k: v for k, v in node.items() if k != "$ref"}
+                return inline({**defs[name], **merged}, depth + 1)
+            return {k: inline(v, depth + 1) for k, v in node.items()}
+
+        return inline(schema)
 
 
 @dataclass

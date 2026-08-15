@@ -15,6 +15,7 @@ import pytest
 
 from app.api.v1.marketplace import payments
 from app.services import marketplace_bookings as mb
+from app.services import partner_terms
 from app.services import plan_coupons
 from tests.test_marketplace_hardening import FakeDB, run
 
@@ -32,6 +33,12 @@ def wired(monkeypatch):
         monkeypatch.setattr(plan_coupons, "get_db", lambda: db)
         monkeypatch.setattr(payments, "get_db", lambda: db)
         monkeypatch.setattr(mb, "get_db", lambda: db)
+        # `settle_authenticated_mandate` learned to read the partner's terms
+        # after this fixture was written, and `partner_terms` reaches for its
+        # own client. Unpatched, the ordinary-charge test left the fake and hit
+        # the real database — which is what a 204 from postgrest in a unit test
+        # means every time.
+        monkeypatch.setattr(partner_terms, "get_db", lambda: db)
         return db
 
     return _install
@@ -64,6 +71,9 @@ def _db(*, redemptions=None, pending=COUPON, kind="free_months", value=6):
             ],
             "platform_coupon_redemptions": redemptions or [],
             "partner_payments": [],
+            # No row: `partner_terms.resolve` falls back to `default_terms()`,
+            # which carries the ordinary ₹499 fee this test is about.
+            "partner_terms": [],
         },
         unique={"partner_payments": ["razorpay_payment_id"]},
     )

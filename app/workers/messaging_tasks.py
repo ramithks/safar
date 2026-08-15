@@ -20,6 +20,27 @@ from app.workers.celery_app import celery_app
 logger = logging.getLogger(__name__)
 
 
+# How long a task waits for a busy conversation before giving up, and how.
+#
+# **This has to exceed `pipeline.LOCK_TTL_SECONDS`, and it did not.** The task
+# was declared `max_retries=3` and the busy branch asked for `max_retries=10`;
+# Celery checks the *decorator's* number, so the real budget was three attempts
+# three seconds apart — nine seconds — against a lock a holder may legitimately
+# keep for ninety while it answers up to eight messages with a real model.
+#
+# The consequence was a guest message dropped in silence: the waiting task
+# exhausted its retries, `MaxRetriesExceededError` was then caught by
+# `autoretry_for=(Exception,)` and retried into the same wall, and the message
+# stayed `agent_run_id is null` with nobody coming back. It showed up as
+# `celery_ordering_e2e` reporting "1 left" and "2 runs for 3 messages" and was
+# filed for weeks as an unexplained flake.
+#
+# 24 × 5s = 120s, comfortably past the 90s TTL: if the holder is alive we wait
+# it out, and if it died the lock expires and we take it.
+BUSY_RETRY_SECONDS = 5
+BUSY_MAX_RETRIES = 24
+
+
 @celery_app.task(
     name="travbuddy.messaging.process_conversation",
     bind=True,
@@ -29,7 +50,9 @@ logger = logging.getLogger(__name__)
     autoretry_for=(Exception,),
     retry_backoff=5,
     retry_backoff_max=120,
-    max_retries=3,
+    # Must cover the busy-lock wait above, because Celery enforces this number
+    # rather than the one passed to `self.retry()`.
+    max_retries=BUSY_MAX_RETRIES,
     acks_late=True,
 )
 def process_conversation_task(self, conversation_id: str) -> dict:
@@ -47,7 +70,46 @@ def process_conversation_task(self, conversation_id: str) -> dict:
             # retry is the belt to that pair of braces, and it is what covers
             # the case where the holder finishes in the gap between its last
             # query and releasing the lock.
-            logger.debug("conversation %s is busy, retrying shortly", conversation_id)
-            raise self.retry(countdown=3, max_retries=10)
+            if self.request.retries < BUSY_MAX_RETRIES:
+                logger.debug("conversation %s is busy, retrying shortly", conversation_id)
+                raise self.retry(countdown=BUSY_RETRY_SECONDS,
+                                 max_retries=BUSY_MAX_RETRIES)
+
+            # Two minutes of a conversation held by somebody else is not a busy
+            # hotel, it is something stuck. The guest gets a person rather than
+            # silence — the same degradation every other dead end on this path
+            # takes — and it is logged at error because nothing should reach it.
+            logger.error(
+                "conversation %s was locked for %ss; handing it to a human",
+                conversation_id, BUSY_MAX_RETRIES * BUSY_RETRY_SECONDS,
+            )
+            asyncio.run(_hand_to_human(conversation_id))
+            return {"processed": 0, "reason": "conversation locked too long"}
 
         return asyncio.run(process_conversation(conversation_id))
+
+
+async def _hand_to_human(conversation_id: str) -> None:
+    """
+    Give up on answering, visibly.
+
+    An unanswered guest must always end up in front of a person. Failing to
+    acquire the lock for two minutes is the one path here that produces no run,
+    no action and no reply, so it is the one that most needs to leave a trace.
+    """
+    from app.db.client import get_db, run_db
+    from app.services.messaging import service as messaging
+
+    def _property_of():
+        rows = (
+            get_db().table("conversations").select("property_id")
+            .eq("id", conversation_id).limit(1).execute().data or []
+        )
+        return rows[0]["property_id"] if rows else None
+
+    try:
+        property_id = await run_db(_property_of)
+        if property_id:
+            await messaging.request_human(conversation_id, property_id)
+    except Exception:  # noqa: BLE001 — a failed handoff must not mask the cause
+        logger.exception("could not hand conversation %s to a human", conversation_id)

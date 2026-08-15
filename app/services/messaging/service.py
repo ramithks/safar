@@ -481,12 +481,20 @@ def window_closes_at(conversation: dict) -> datetime | None:
     is keyed on the server's own `handler` column rather than on anything the
     model can influence.
     """
+    channel = conversation.get("channel")
+    # A channel with no window has no closing time, and that is an answer rather
+    # than an error. The staff console is the case: no provider, no Meta, no
+    # 24-hour rule. `policy.for_channel` still raises for a channel nobody has
+    # configured, which is the distinction worth keeping.
+    if not policy.has_window(channel):
+        return None
+
     last = conversation.get("last_inbound_at")
     if not last:
         return None
     if isinstance(last, str):
         last = datetime.fromisoformat(last.replace("Z", "+00:00"))
-    hours = policy.for_channel(conversation.get("channel")).window_hours(conversation)
+    hours = policy.for_channel(channel).window_hours(conversation)
     return last + timedelta(hours=hours)
 
 

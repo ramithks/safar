@@ -25,13 +25,14 @@ import json
 import logging
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 
 from app.api.v1.pms.schemas import (
     AgentActionOut,
     AgentAutonomyRequest,
     AgentDecisionRequest,
     AgentOut,
+    AnalyticsReportOut,
     AriEditOut,
     BillingSummaryOut,
     BookingRequest,
@@ -42,7 +43,33 @@ from app.api.v1.pms.schemas import (
     ConsoleAskRequest,
     ConversationHandlerRequest,
     ConversationOut,
+    DailyPointOut,
+    GuestOut,
     FolioEntryOut,
+    MarginRowOut,
+    MemberOut,
+    ServiceOut,
+    ServiceUpsertRequest,
+    GuestRegistrationOut,
+    PublicStayOut,
+    WebCheckInRequest,
+    CreditOrderOut,
+    CreditOrderRequest,
+    CreditPurchaseOut,
+    PaymentOrderOut,
+    PublicAvailabilityOut,
+    PublicBookingOut,
+    PublicConfirmRequest,
+    PublicOrderOut,
+    PublicOrderRequest,
+    PublicQuoteOut,
+    PublicQuoteRequest,
+    PublicRoomOptionOut,
+    PublicServiceOut,
+    PublicSiteOut,
+    QuotedAddonOut,
+    WebsiteConfigOut,
+    WebsiteUpdateRequest,
     FolioOut,
     FolioPostRequest,
     InventoryEditRequest,
@@ -52,6 +79,9 @@ from app.api.v1.pms.schemas import (
     NightAuditOut,
     NightAuditRequest,
     NightlyOut,
+    OwnerAskOut,
+    OwnerAskRequest,
+    OwnerOverviewOut,
     PropertyOut,
     QuoteOut,
     QuoteRequest,
@@ -59,6 +89,8 @@ from app.api.v1.pms.schemas import (
     RateNightOut,
     RatePlanOptionOut,
     RatePlanOut,
+    RecommendationOut,
+    RecommendationStatusRequest,
     ReservationOut,
     RoomOut,
     RoomStatusRequest,
@@ -77,15 +109,20 @@ from app.api.v1.pms.schemas import (
 from app.core.limiter import limiter
 from app.db.client import get_db, run_db
 from app.deps.auth import require_user
-from app.deps.property import require_member
+from app.deps.property import ROLE_PERMS, require_member
 from app.services import billing
 from app.services.pms import ari as ari_service
 from app.services.pms import availability as availability_service
 from app.services.pms import clock
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
+from app.services.pms import payments as payments_service
+from app.services.pms import public_booking
 from app.services.pms import sync as sync_service
+from app.services.pms import website as website_service
+from app.services import razorpay
 from app.services.ai import approvals
+from app.services.ai.errors import AgentError
 from app.services.ai import console as ai_console
 from app.services.ai import model_router
 from app.services.messaging import service as messaging_service
@@ -94,6 +131,18 @@ from app.services.pms import workspace as workspace_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/pms", tags=["pms"])
+
+# What one credit is worth in subscription revenue, in paise.
+# ₹2,499/month against a 3,000-credit grant — the anchoring stated in
+# migration 13. Named here so the margin route is the only place that
+# prices a credit, and never the client.
+CREDIT_VALUE_PAISE = 83
+
+# What a hotel pays for one credit, in paise. ₹1.00 — above the ₹0.83 a
+# credit is worth inside a subscription, because a top-up is bought outside
+# an allowance somebody has already paid for. The one place this conversion
+# happens; a rupee amount never arrives from a client.
+CREDIT_PRICE_PAISE = 100
 
 
 # ── workspace ────────────────────────────────────────────────────────────────
@@ -1638,3 +1687,1512 @@ def _as_float(value) -> float | None:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+# ── owner copilot and analytics ──────────────────────────────────────────────
+#
+# Two surfaces, and the order matters: the **structured** endpoints come first
+# and the AI sits on top of them. `/analytics/*` answers without a model at all,
+# so the Reports page and the owner's dashboard keep working when Vertex is
+# down, when the wallet is empty, and when a hotel has turned its agents off.
+# `/owner/ask` adds prose and recommendations to numbers that were already
+# there. Building it the other way round — a screen whose only source is an
+# agent's answer — is how analytics become an AI outage.
+
+def _period_args(period: str, date_from: date | None, date_to: date | None):
+    """Turn the query string into what `analytics` accepts, or 400."""
+    from app.services.pms import analytics
+
+    if period not in analytics.PERIOD_KEYS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Unknown period '{period}'. One of: {', '.join(analytics.PERIOD_KEYS)}.",
+        )
+    if period == "custom" and not (date_from and date_to):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "A custom period needs both 'from' and 'to'.",
+        )
+    return period, date_from, date_to
+
+
+async def _report_or_400(property_id: str, period: str,
+                         date_from: date | None, date_to: date | None) -> dict:
+    from app.services.pms import analytics
+
+    key, start, end = _period_args(period, date_from, date_to)
+    try:
+        return await analytics.report(property_id, key=key, date_from=start, date_to=end)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+
+@router.get("/properties/{property_id}/analytics", response_model=AnalyticsReportOut)
+@limiter.limit("60/minute")
+async def get_analytics(
+    request: Request,
+    property_id: str,
+    period: str = Query("today"),
+    date_from: date | None = Query(None, alias="from"),
+    date_to: date | None = Query(None, alias="to"),
+    member=Depends(require_member("reports")),
+):
+    """
+    The property's own figures for a period, with the comparable period beside
+    them.
+
+    `require_member("reports")` and nothing else decides who may read this. A
+    receptionist cannot, an accounts user can, and a property id that is not
+    theirs 404s in the dependency before this body runs — which is why no query
+    parameter here names a property, a partner or an account.
+
+    No model is involved. Every number comes from `services/pms/analytics`, the
+    same function `/today` calls, so this endpoint and the Today screen cannot
+    report different revenue for the same day.
+    """
+    return await _report_or_400(property_id, period, date_from, date_to)
+
+
+@router.get("/properties/{property_id}/analytics/series", response_model=list[DailyPointOut])
+@limiter.limit("60/minute")
+async def get_analytics_series(
+    request: Request,
+    property_id: str,
+    days: int = Query(30, ge=1, le=365),
+    member=Depends(require_member("reports")),
+):
+    """Occupancy, ADR and RevPAR per night, ending on the property's today."""
+    from app.services.pms import analytics
+
+    return await analytics.day_series(property_id, days)
+
+
+@router.get("/properties/{property_id}/recommendations",
+            response_model=list[RecommendationOut])
+@limiter.limit("60/minute")
+async def list_recommendations(
+    request: Request,
+    property_id: str,
+    status_filter: str | None = Query(None, alias="status"),
+    limit: int = Query(40, ge=1, le=200),
+    member=Depends(require_member("reports")),
+):
+    from app.services.pms import recommendations as recs
+
+    if status_filter and status_filter not in recs.STATUSES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            f"Unknown status. One of: {', '.join(recs.STATUSES)}.")
+    rows = await recs.list_for(property_id, status=status_filter, limit=limit)
+    return [recs.project(r) for r in rows]
+
+
+@router.post("/properties/{property_id}/recommendations/{recommendation_id}/status",
+             response_model=RecommendationOut)
+@limiter.limit("30/minute")
+async def set_recommendation_status(
+    request: Request,
+    property_id: str,
+    recommendation_id: str,
+    body: RecommendationStatusRequest,
+    member=Depends(require_member("reports")),
+):
+    """
+    Mark a recommendation reviewed, dismissed or actioned.
+
+    **'actioned' means a person says they did it.** Nothing here changes a rate,
+    an allocation or a stop-sell, and no worker reads these rows looking for
+    work. When an execution path exists it will run through the same approval
+    and revalidation the other agents' writes already use; this endpoint will
+    still only be moving a label.
+    """
+    from app.services.pms import recommendations as recs
+
+    row = await recs.set_status(property_id, recommendation_id, body.status,
+                                profile_id=member.profile_id)
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Recommendation not found")
+    return recs.project(row)
+
+
+@router.get("/properties/{property_id}/owner/overview", response_model=OwnerOverviewOut)
+@limiter.limit("60/minute")
+async def get_owner_overview(
+    request: Request,
+    property_id: str,
+    period: str = Query("last_7"),
+    date_from: date | None = Query(None, alias="from"),
+    date_to: date | None = Query(None, alias="to"),
+    member=Depends(require_member("reports")),
+):
+    """
+    Everything the owner's screen shows before anybody asks a question.
+
+    Today and a chosen period, because they answer different questions — "how is
+    tonight" and "how is the business" — and an owner opening the app wants both
+    without picking one first.
+    """
+    from app.services.pms import clock
+    from app.services.pms import recommendations as recs
+
+    today_report = await _report_or_400(property_id, "today", None, None)
+    period_report = await _report_or_400(property_id, period, date_from, date_to)
+    rows = await recs.list_for(property_id, limit=20)
+
+    def _name():
+        found = (
+            get_db().table("properties").select("name")
+            .eq("id", property_id).limit(1).execute().data or []
+        )
+        return found[0]["name"] if found else None
+
+    return OwnerOverviewOut(
+        propertyId=property_id,
+        propertyName=await run_db(_name),
+        businessDate=await clock.abusiness_date_iso(property_id),
+        timezone=await clock.atimezone_for(property_id),
+        currency=today_report["currency"],
+        today=today_report,
+        period=period_report,
+        recommendations=[recs.project(r) for r in rows],
+    )
+
+
+def _run_credits(run_id: str) -> int:
+    """What one run cost the hotel, from the ledger's own figure."""
+    rows = (
+        get_db().table("usage_events").select("credits_charged")
+        .eq("run_id", run_id).limit(50).execute().data or []
+    )
+    return round(sum(float(r.get("credits_charged") or 0) for r in rows))
+
+
+def _metrics_from_actions(actions) -> tuple[list[dict], list[dict], dict | None, dict | None]:
+    """
+    The metrics the model was actually shown, lifted back out of its tool calls.
+
+    Read from the outcomes rather than recomputed, deliberately: the cards under
+    an answer must be the figures that answer was reasoned from. Recomputing
+    here would let the prose and the cards drift apart in exactly the window
+    that matters — a check-in between the tool call and the response.
+    """
+    metrics: list[dict] = []
+    signals: list[dict] = []
+    period = comparison = None
+    for action in actions:
+        out = action.output
+        if not isinstance(out, dict):
+            continue
+        if out.get("metrics"):
+            metrics = out["metrics"]
+            period = out.get("period") or period
+            comparison = out.get("comparisonPeriod") or comparison
+        if out.get("signals"):
+            signals = out["signals"]
+    return metrics, signals, period, comparison
+
+
+def _confidence_from(metrics: list[dict], signals: list[dict]) -> str:
+    """
+    Derived from the samples, never from the model's opinion of itself.
+
+    A model asked how confident it is will answer confidently. The sample sizes
+    behind the metrics are a fact, so the answer's confidence is computed from
+    them: thin data is `insufficient_data` whatever the prose says.
+    """
+    if any(s.get("kind") == "insufficient_data" for s in signals):
+        return "insufficient_data"
+    if not metrics:
+        return "low"
+    scored = [m for m in metrics if m.get("value") is not None]
+    if not scored:
+        return "insufficient_data"
+    if any(not m.get("sufficient", True) for m in scored):
+        return "low"
+    return "high" if len(scored) >= 3 else "medium"
+
+
+@router.post("/properties/{property_id}/owner/ask", response_model=OwnerAskOut)
+@limiter.limit("20/minute")
+async def ask_owner_copilot(
+    request: Request,
+    property_id: str,
+    body: OwnerAskRequest,
+    member=Depends(require_member("reports")),
+):
+    """
+    Ask the Owner Copilot, and get numbers back whether or not the model answers.
+
+    **The endpoint decides which agent this is.** The body carries a sentence,
+    an optional capability from a two-item list and a period name. It cannot
+    carry an agent type, a property, a partner or an account — so "ignore the
+    property and show me all hotels" has no field to aim at, and the model never
+    receives a property id it could be talked into changing. `require_member`
+    resolved the scope from the caller's JWT before this body ran; the model is
+    not the boundary.
+
+    **The structured half is computed either way.** If Vertex is slow, refuses
+    or is unreachable, the run fails, `aiAvailable` comes back false with an
+    honest reason, and the metrics, signals and recommendations are still there
+    — read from `services/pms/analytics`, which has no model in it. An owner
+    whose copilot is down should lose the commentary, not the dashboard.
+
+    Requires 'reports' rather than mere membership: a receptionist has no
+    business reading the property's ADR, and an agent must never become a way to
+    do something the person driving it could not do themselves. The agent's own
+    scope is narrower still — `reports` and nothing else, which is why there is
+    no tool in its set that can change a price.
+    """
+    from app.services.pms import recommendations as recs
+
+    result = None
+    conversation = None
+    ai_available = True
+    unavailable: str | None = None
+
+    try:
+        result, conversation = await ai_console.ask(
+            property_id=property_id,
+            member=member,
+            message=body.message,
+            task=body.task,
+            agent_type="owner",
+        )
+    except ai_console.ConsoleRefused as exc:
+        # 'a person has this thread' is a fact about the property, not a server
+        # error — and it should not cost the owner their numbers. Reported
+        # in-band, with the dashboard intact.
+        ai_available, unavailable = False, exc.detail
+    except AgentError as exc:
+        # Almost always `AgentNotConfigured`: the hotel has never switched the
+        # copilot on. Reported as what it is rather than swept into the generic
+        # branch below — "the copilot is unavailable right now" tells a hotelier
+        # their system is broken when the truth is that nobody has enabled a
+        # feature, and those two sentences send them to very different places.
+        logger.info("owner copilot not available for %s: %s", property_id, exc.reason)
+        ai_available = False
+        unavailable = exc.reason
+    except Exception:  # noqa: BLE001 — the boundary is the point
+        logger.exception("owner copilot failed for property %s", property_id)
+        ai_available = False
+        unavailable = "The copilot is unavailable right now. The figures below are live."
+
+    metrics = signals = []
+    period = comparison = None
+    actions: list[ConsoleActionOut] = []
+    created: list[dict] = []
+
+    if result is not None:
+        metrics, signals, period, comparison = _metrics_from_actions(result.actions)
+        actions = [
+            ConsoleActionOut(
+                tool=a.tool, status=a.status, refusalReason=a.refusal_reason,
+                resultType=a.result_type, resultId=a.result_id, latencyMs=a.latency_ms,
+            )
+            for a in result.actions
+        ]
+        ids = [a.result_id for a in result.actions
+               if a.result_type == "recommendation" and a.result_id and a.ok]
+        if ids:
+            def _read_created():
+                return (
+                    get_db().table("revenue_recommendations").select("*")
+                    .in_("id", ids).execute().data or []
+                )
+            created = await run_db(_read_created)
+        if result.status == "failed":
+            ai_available = False
+            unavailable = (
+                "The copilot could not complete that. The figures below are live."
+            )
+
+    # The fallback, and the reason this endpoint is worth having over the
+    # console: an answer with no tool call behind it — because the model failed,
+    # or because it replied from the conversation without looking — still comes
+    # back with the property's real numbers rather than an empty card.
+    if not metrics:
+        report = await _report_or_400(property_id, body.period, None, None)
+        metrics, signals = report["metrics"], report["signals"]
+        period, comparison = report["period"], report["comparisonPeriod"]
+        currency = report["currency"]
+    else:
+        currency = next((m.get("currency") for m in metrics if m.get("currency")), "INR")
+
+    if period is None:
+        report = await _report_or_400(property_id, body.period, None, None)
+        period, comparison = report["period"], report["comparisonPeriod"]
+
+    return OwnerAskOut(
+        runId=result.run_id if result else None,
+        conversationId=conversation["id"] if conversation else None,
+        status=result.status if result else "unavailable",
+        summary=result.reply if result else None,
+        aiAvailable=ai_available,
+        aiUnavailableReason=unavailable,
+        period=period,
+        comparisonPeriod=comparison,
+        currency=currency or "INR",
+        metrics=metrics,
+        signals=signals,
+        recommendations=[recs.project(r) for r in created],
+        evidence=actions,
+        confidence=_confidence_from(metrics, signals),
+        creditsCharged=await run_db(_run_credits, result.run_id) if result else 0,
+        tokensIn=result.tokens_in if result else 0,
+        tokensOut=result.tokens_out if result else 0,
+        latencyMs=result.latency_ms if result else 0,
+    )
+
+
+# ── guests, services, members, margin ────────────────────────────────────────
+#
+# The four reads the PWA had no route for. Nothing new is being modelled here:
+# every table, its RLS and its write path have existed since M1, and these are
+# the queries the screens were always going to make.
+
+@router.get("/properties/{property_id}/guests", response_model=list[GuestOut])
+@limiter.limit("120/minute")
+async def list_guests(
+    request: Request,
+    property_id: str,
+    search: str | None = Query(None, max_length=80),
+    limit: int = Query(200, ge=1, le=500),
+    member=Depends(require_member("frontdesk")),
+):
+    """
+    The hotel's guest list.
+
+    `require_member("frontdesk")` rather than bare membership: a guest list is
+    names, phone numbers and stay history, and a housekeeper has no reason to
+    hold it. Accounts does not either — they read folios, not people.
+
+    Search escapes `%` and `_` before it reaches `ilike`, for the same reason
+    `plan_coupons` does: a Postgres wildcard typed into a search box should
+    match a literal wildcard, not every guest in the building.
+    """
+    def _read():
+        q = (
+            get_db().table("guests")
+            .select("id,property_id,name,phone,email,city,stays_count,"
+                    "total_spend_paise,last_stay_at,vip,notes,marketing_opt_in")
+            .eq("property_id", property_id)
+        )
+        if search:
+            escaped = search.replace("%", r"\%").replace("_", r"\_").replace(",", " ")
+            q = q.or_(f"name.ilike.%{escaped}%,phone.ilike.%{escaped}%,"
+                      f"email.ilike.%{escaped}%")
+        return q.order("last_stay_at", desc=True).limit(limit).execute().data or []
+
+    return [GuestOut.from_row(r) for r in await run_db(_read)]
+
+
+@router.get("/properties/{property_id}/services", response_model=list[ServiceOut])
+@limiter.limit("120/minute")
+async def list_services(
+    request: Request,
+    property_id: str,
+    include_inactive: bool = Query(False),
+    member=Depends(require_member()),
+):
+    """
+    The paid extras this hotel sells.
+
+    Any member may read them — a receptionist quoting a transfer needs the
+    price, and the Guest agent already reads the same rows through
+    `list_services`. Editing is a different permission; see below.
+
+    Inactive services are excluded by default and available on request: the
+    desk should not be able to sell something the hotel retired, but the
+    settings screen has to show it in order to bring it back.
+    """
+    def _read():
+        q = (
+            get_db().table("services")
+            .select("*").eq("property_id", property_id)
+        )
+        if not include_inactive:
+            q = q.eq("is_active", True)
+        return q.order("sort_order").limit(200).execute().data or []
+
+    return [ServiceOut.from_row(r) for r in await run_db(_read)]
+
+
+@router.post("/properties/{property_id}/services", response_model=ServiceOut)
+@limiter.limit("60/minute")
+async def upsert_service(
+    request: Request,
+    property_id: str,
+    body: ServiceUpsertRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    Create or amend one service.
+
+    `require_member("rates")` because this sets a price. A receptionist may sell
+    a transfer and may not decide what it costs — the same line the rate
+    calendar draws, and the same one the Sales agent's discount ceiling sits
+    behind.
+
+    The property comes from the path and is checked by the dependency; `id`
+    from the body is scoped to it on update, so a service id belonging to
+    another hotel updates nothing rather than being moved.
+    """
+    payload = {
+        "property_id": property_id,
+        "partner_id": member.partner_id,
+        "name": body.name,
+        "description": body.description or None,
+        "price_paise": body.pricePaise,
+        "category": body.category,
+        "is_active": body.isActive,
+        "daily_capacity": body.dailyCapacity,
+        "lead_time_hours": body.leadTimeHours,
+    }
+
+    def _write():
+        db = get_db()
+        if body.id:
+            rows = (
+                db.table("services").update(payload)
+                .eq("id", body.id).eq("property_id", property_id)
+                .execute().data
+            )
+            return rows[0] if rows else None
+        return db.table("services").insert(payload).execute().data[0]
+
+    row = await run_db(_write)
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Service not found")
+    return ServiceOut.from_row(row)
+
+
+@router.get("/properties/{property_id}/members", response_model=list[MemberOut])
+@limiter.limit("60/minute")
+async def list_members(
+    request: Request,
+    property_id: str,
+    member=Depends(require_member("members")),
+):
+    """
+    Who works here, and what each of them may do.
+
+    Scoped to the property's partner and filtered by `property_ids`, so a
+    manager of one hotel in a group does not get the group's staff list. The
+    permission set is flattened from `ROLE_PERMS` plus per-member grants — the
+    same derivation `/me` does, in the same place, rather than a second table
+    the screen would have to interpret.
+    """
+    def _read():
+        db = get_db()
+        rows = (
+            db.table("partner_members")
+            .select("id,profile_id,role,property_ids,permissions,status")
+            .eq("partner_id", member.partner_id)
+            .order("role")
+            .limit(200).execute().data or []
+        )
+        rows = [
+            r for r in rows
+            if not (r.get("property_ids") or []) or property_id in r["property_ids"]
+        ]
+        if not rows:
+            return []
+        profiles = {
+            p["id"]: p for p in
+            (db.table("profiles").select("id,email,full_name")
+             .in_("id", [r["profile_id"] for r in rows]).execute().data or [])
+        }
+        return [(r, profiles.get(r["profile_id"], {})) for r in rows]
+
+    out = []
+    for row, profile in await run_db(_read):
+        extra = {k for k, v in (row.get("permissions") or {}).items() if v is True}
+        perms = ROLE_PERMS.get(row["role"], set()) | extra
+        out.append(MemberOut(
+            id=row["id"],
+            name=profile.get("full_name") or profile.get("email") or "Member",
+            email=profile.get("email") or "",
+            role=row["role"],
+            propertyIds=row.get("property_ids") or [],
+            status=row.get("status") or "active",
+            # An owner's '*' is expanded to nothing useful for a screen, so it
+            # is passed through as the single token it is.
+            permissions=sorted(perms),
+        ))
+    return out
+
+
+@router.get("/properties/{property_id}/margin", response_model=list[MarginRowOut])
+@limiter.limit("30/minute")
+async def get_margin_rows(
+    request: Request,
+    property_id: str,
+    days: int = Query(30, ge=1, le=365),
+    member=Depends(require_member("billing")),
+):
+    """
+    What each property cost us against what it paid — the internal margin view.
+
+    **This is the one route in the PMS that returns provider cost.** Migration
+    12 revokes `usage_events.provider_cost_inr_micros` from browser roles precisely so
+    this number cannot be read from the client; it is served here, behind
+    `require_member("billing")`, through the service-role client.
+
+    Computed from `usage_events` rather than from `billing_period_summary`,
+    deliberately: the summary is a materialised period and this screen is asked
+    "how are we doing right now". The definitions are the same — credits
+    charged is the revenue side, `cost_inr_micros` is the cost side, and neither
+    is derived from the other.
+
+    Scoped to the caller's partner. A margin screen that showed every hotel on
+    the platform would be an operator tool wearing a hotelier's login.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    def _read():
+        db = get_db()
+        properties = (
+            db.table("properties").select("id,name,city")
+            .eq("partner_id", member.partner_id).execute().data or []
+        )
+        if not properties:
+            return []
+        ids = [p["id"] for p in properties]
+        events = (
+            db.table("usage_events")
+            .select("property_id,usage_type,credits_charged,provider_cost_inr_micros")
+            .in_("property_id", ids)
+            .gte("created_at", since)
+            .limit(20000).execute().data or []
+        )
+        return properties, events
+
+    loaded = await run_db(_read)
+    if not loaded:
+        return []
+    properties, events = loaded
+
+    totals: dict[str, dict] = {}
+    for e in events:
+        slot = totals.setdefault(e["property_id"], {"credits": 0.0, "cost": 0, "by_type": {}})
+        credits = float(e.get("credits_charged") or 0)
+        slot["credits"] += credits
+        slot["cost"] += int(e.get("provider_cost_inr_micros") or 0)
+        slot["by_type"][e["usage_type"]] = slot["by_type"].get(e["usage_type"], 0.0) + credits
+
+    out = []
+    for p in properties:
+        t = totals.get(p["id"], {"credits": 0.0, "cost": 0, "by_type": {}})
+        # One credit is worth roughly ₹0.83 of subscription revenue — the
+        # anchoring in migration 13. Stated once, here, rather than in the
+        # client: a browser that prices a credit is a browser that can disagree
+        # with the invoice.
+        revenue_paise = round(t["credits"] * CREDIT_VALUE_PAISE)
+        cost_paise = round(t["cost"] / 10_000)  # 1e-6 INR → paise
+        top = max(t["by_type"].items(), key=lambda kv: kv[1], default=("", 0))[0]
+        out.append(MarginRowOut(
+            propertyId=p["id"],
+            propertyName=p["name"],
+            city=p.get("city") or "",
+            plan="",
+            usageCredits=round(t["credits"]),
+            providerCostInrMicros=t["cost"],
+            revenuePaise=revenue_paise,
+            marginPaise=revenue_paise - cost_paise,
+            topUsageType=top,
+        ))
+    return sorted(out, key=lambda r: -r.usageCredits)
+
+
+# ── web check-in — the only unauthenticated routes in this file ──────────────
+#
+# Everything above resolves a member from a JWT before the handler runs. These
+# three do not, because the person using them is a guest on their own phone who
+# has never had an account and never will.
+#
+# **The booking reference is the credential.** That is a weaker control than a
+# token and it is the one the product has, so the design compensates rather than
+# pretends: the read is masked to what a guest needs to recognise their own
+# booking, the write cannot reach anything but its own reservation, the rate
+# limit is tight enough that guessing `TB-` plus six characters is not
+# practical, and a wrong reference is answered identically to a right one that
+# has been cancelled — 404, with no hint about which.
+
+def _mask_phone(phone: str | None) -> str:
+    """Last four digits. Enough to recognise, useless if leaked."""
+    digits = "".join(c for c in (phone or "") if c.isdigit())
+    return f"••••{digits[-4:]}" if len(digits) >= 4 else ""
+
+
+def _load_public_stay(ref: str) -> dict | None:
+    """
+    One reservation by reference, with the names a guest would recognise.
+
+    Reads through the service-role client because the caller has no identity to
+    check RLS against — which is exactly why nothing here is selected that a
+    guest should not see. The projection *is* the access control.
+    """
+    db = get_db()
+    rows = (
+        db.table("reservations")
+        .select("id,ref,property_id,partner_id,guest_name,guest_phone,check_in,"
+                "check_out,nights,units,adults,children,total_paise,paid_paise,"
+                "status,room_type_id,rate_plan_id")
+        .ilike("ref", ref.strip())
+        .limit(1).execute().data or []
+    )
+    if not rows:
+        return None
+    stay = rows[0]
+
+    prop = (
+        db.table("properties")
+        .select("name,city,check_in_time,check_out_time")
+        .eq("id", stay["property_id"]).limit(1).execute().data or [{}]
+    )[0]
+    room_type = (
+        db.table("room_types").select("name")
+        .eq("id", stay["room_type_id"]).limit(1).execute().data or [{}]
+    )[0]
+    rate_plan = (
+        db.table("rate_plans").select("name,inclusions")
+        .eq("id", stay["rate_plan_id"]).limit(1).execute().data or [{}]
+    )[0]
+    balance = db.rpc("folio_balance", {"p_reservation": stay["id"]}).execute().data
+    registration = (
+        db.table("guest_registrations").select("*")
+        .eq("reservation_id", stay["id"]).limit(1).execute().data or []
+    )
+    return {
+        "stay": stay, "property": prop, "room_type": room_type,
+        "rate_plan": rate_plan, "balance": int(balance or 0),
+        "registration": registration[0] if registration else None,
+    }
+
+
+@router.get("/public/stays/{ref}", response_model=PublicStayOut)
+@limiter.limit("10/minute")
+async def get_public_stay(request: Request, ref: str):
+    """
+    A guest's own booking, by the reference on their confirmation.
+
+    No authentication, so the rate limit is the control that matters: ten
+    attempts a minute against a six-character reference space is not a
+    practical enumeration, and a real guest never needs an eleventh.
+
+    A cancelled stay 404s alongside a reference that never existed. Telling a
+    stranger "that booking exists but is cancelled" is a free bit of information
+    about somebody else's travel.
+    """
+    loaded = await run_db(_load_public_stay, ref)
+    if not loaded or loaded["stay"]["status"] in ("cancelled", "no_show"):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that booking.")
+
+    stay = loaded["stay"]
+    return PublicStayOut(
+        ref=stay["ref"],
+        propertyName=loaded["property"].get("name") or "",
+        propertyCity=loaded["property"].get("city") or "",
+        checkInTime=str(loaded["property"].get("check_in_time") or "")[:5],
+        checkOutTime=str(loaded["property"].get("check_out_time") or "")[:5],
+        guestName=stay.get("guest_name") or "Guest",
+        guestPhoneMasked=_mask_phone(stay.get("guest_phone")),
+        checkIn=stay["check_in"], checkOut=stay["check_out"],
+        nights=stay["nights"], units=stay["units"],
+        adults=stay.get("adults") or 0, children=stay.get("children") or 0,
+        roomTypeName=loaded["room_type"].get("name") or "",
+        ratePlanName=loaded["rate_plan"].get("name") or "",
+        inclusions=loaded["rate_plan"].get("inclusions") or [],
+        totalPaise=stay.get("total_paise") or 0,
+        paidPaise=stay.get("paid_paise") or 0,
+        balancePaise=loaded["balance"],
+        status=stay["status"],
+        registration=(GuestRegistrationOut.from_row(loaded["registration"])
+                      if loaded["registration"] else None),
+    )
+
+
+@router.post("/public/stays/{ref}/check-in", response_model=GuestRegistrationOut)
+@limiter.limit("6/minute")
+async def submit_web_check_in(request: Request, ref: str, body: WebCheckInRequest):
+    """
+    File a registration against one booking, before arrival.
+
+    **This does not check anybody in.** It records what the guest told us; the
+    desk still runs `check_in`, which is where a room is assigned, the folio is
+    opened and the stay's status moves. Conflating the two would let a stranger
+    with a reference mark a room occupied.
+
+    The reservation comes from the reference in the path and from nothing in the
+    body — there is no `reservationId` field for a caller to point somewhere
+    else. Re-submitting amends the guest's own row rather than creating a
+    second, which is what correcting a typo means.
+    """
+    loaded = await run_db(_load_public_stay, ref)
+    if not loaded or loaded["stay"]["status"] in ("cancelled", "no_show"):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that booking.")
+
+    stay = loaded["stay"]
+    if stay["status"] == "checked_out":
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "This stay has already ended.")
+
+    # The last four characters, and the rest is discarded here — before it
+    # reaches the database, so there is no window in which it exists at rest.
+    digits = "".join(c for c in body.idNumber if c.isalnum())
+    payload = {
+        "reservation_id": stay["id"],
+        "property_id": stay["property_id"],
+        "partner_id": stay["partner_id"],
+        "full_name": body.fullName.strip(),
+        "email": body.email.strip() or None,
+        "phone": body.phone.strip() or None,
+        "address": body.address.strip() or None,
+        "city": body.city.strip() or None,
+        "country": body.country.strip() or None,
+        "id_type": body.idType,
+        "id_last4": digits[-4:] if digits else None,
+        "travelling_with": body.travellingWith,
+        "estimated_arrival": body.estimatedArrival,
+        "special_requests": (body.specialRequests or "").strip() or None,
+        "source": "web",
+    }
+
+    def _write():
+        return (
+            get_db().table("guest_registrations")
+            .upsert(payload, on_conflict="reservation_id")
+            .execute().data[0]
+        )
+
+    return GuestRegistrationOut.from_row(await run_db(_write))
+
+
+@router.get("/properties/{property_id}/reservations/{reservation_id}/registration",
+            response_model=GuestRegistrationOut)
+@limiter.limit("120/minute")
+async def get_registration(
+    request: Request,
+    property_id: str,
+    reservation_id: str,
+    member=Depends(require_member("frontdesk")),
+):
+    """
+    What the guest filled in, for the desk that is about to meet them.
+
+    Authenticated and property-scoped, unlike the two above. Even here it is
+    `id_last4` and nothing more — the full document was never received, so there
+    is no version of this route that could return it.
+    """
+    def _read():
+        rows = (
+            get_db().table("guest_registrations").select("*")
+            .eq("reservation_id", reservation_id)
+            .eq("property_id", property_id)
+            .limit(1).execute().data or []
+        )
+        return rows[0] if rows else None
+
+    row = await run_db(_read)
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            "This guest has not checked in online.")
+    return GuestRegistrationOut.from_row(row)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# M5 — the public booking loop
+#
+#     /stay/[slug] ──► availability ──► quote ──► order ──► Razorpay
+#                                                             │
+#                            reservation ◄── confirm ◄────────┤
+#                                        ◄── webhook ◄────────┘
+#
+# **Every one of these composes the services the front desk already uses.**
+# Availability is `availability.stay_options`, the price is
+# `booking.create_quote`, the reservation is `booking.create_reservation` —
+# which already validates the quote, enforces its expiry, converts the hold and
+# refuses a second submission. Nothing in this section prices a stay, counts a
+# room or decrements inventory, and if it ever appears to, that is a bug.
+#
+# What this section owns is the boundary: resolving a slug instead of an id,
+# refusing anything the browser tried to decide, and making the four possible
+# orderings of "browser returns" and "webhook fires" converge on one booking.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _room_option(option, units: int) -> PublicRoomOptionOut:
+    """
+    One room type as the public sees it.
+
+    Rate plans that are closed or violate the minimum stay are dropped rather
+    than shown greyed out: a guest cannot act on them, and a price they are not
+    allowed to take is a price they will ask about.
+    """
+    return PublicRoomOptionOut(
+        roomTypeId=option.room_type_id,
+        name=option.room_type_name,
+        code=option.room_type_code,
+        maxOccupancy=option.max_occupancy,
+        unitsLeft=option.units_left,
+        ratePlans=[
+            RatePlanOptionOut(
+                ratePlanId=p.rate_plan_id, code=p.code, name=p.name,
+                mealPlan=p.meal_plan, audience="public", refundable=p.refundable,
+                inclusions=p.inclusions, totalPaise=p.total_paise,
+                perNightPaise=p.per_night_paise,
+                minStayViolation=p.min_stay_violation, closed=p.closed,
+            )
+            for p in option.rate_plans
+            if not p.closed and p.min_stay_violation is None
+        ],
+    )
+
+
+@router.get("/public/hotels/{slug}", response_model=PublicSiteOut)
+@limiter.limit("60/minute")
+async def get_public_hotel(request: Request, slug: str):
+    """
+    A published hotel's page.
+
+    The content is the website's *published* snapshot, never its draft — a
+    hotelier mid-edit is not publishing. The rooms and services come from the
+    live PMS, so a new room type or a price change appears here with nothing to
+    re-publish; the website holds no inventory of its own.
+    """
+    prop = await public_booking.resolve_published(slug)
+
+    def _read():
+        db = get_db()
+        types = (
+            db.table("room_types")
+            .select("id,code,name,description,max_occupancy,bed_type,amenities")
+            .eq("property_id", prop.id).eq("is_active", True)
+            .order("sort_order").execute().data or []
+        )
+        services = (
+            db.table("services")
+            .select("id,name,description,category,price_paise,lead_time_hours,daily_capacity")
+            .eq("property_id", prop.id).eq("is_active", True)
+            .order("sort_order").limit(50).execute().data or []
+        )
+        return types, services
+
+    types, services = await run_db(_read)
+    return PublicSiteOut(
+        slug=prop.slug, name=prop.name, city=prop.city, template=prop.template,
+        currency=prop.currency, timezone=prop.timezone,
+        checkInTime=prop.check_in_time, checkOutTime=prop.check_out_time,
+        policies=prop.policies, content=prop.website,
+        services=[
+            PublicServiceOut(
+                id=s["id"], name=s["name"], description=s.get("description") or "",
+                category=s["category"], pricePaise=s["price_paise"],
+                leadTimeHours=s.get("lead_time_hours") or 0,
+                dailyCapacity=s.get("daily_capacity"),
+            ) for s in services
+        ],
+        roomTypes=[
+            PublicRoomOptionOut(
+                roomTypeId=t["id"], name=t["name"], code=t["code"],
+                description=t.get("description"),
+                maxOccupancy=t.get("max_occupancy") or 2,
+                bedType=t.get("bed_type"), amenities=t.get("amenities") or [],
+                # Nothing is claimed about availability here. This is the
+                # brochure; the number comes from /availability with dates.
+                unitsLeft=0,
+            ) for t in types
+        ],
+    )
+
+
+@router.get("/public/hotels/{slug}/availability", response_model=PublicAvailabilityOut)
+@limiter.limit("30/minute")
+async def get_public_availability(
+    request: Request,
+    slug: str,
+    check_in: date = Query(alias="from"),
+    check_out: date = Query(alias="to"),
+    units: int = Query(1, ge=1, le=5),
+    adults: int = Query(2, ge=1, le=20),
+    children: int = Query(0, ge=0, le=10),
+):
+    """
+    Live availability, from the same function the front desk calls.
+
+    `audience="public"` is the load-bearing argument: it is what stops a
+    stranger being shown — or later quoted — the B2B contracted rate. The
+    endpoint knows who is asking; the service does the filtering.
+    """
+    prop = await public_booking.resolve_published(slug)
+    public_booking.validate_stay_dates(prop, check_in, check_out)
+
+    options = await availability_service.stay_options(
+        prop.id, check_in, check_out, units=units, audience="public",
+    )
+    rooms = [
+        _room_option(o, units) for o in options
+        if o.units_left >= units and o.max_occupancy >= adults + children
+    ]
+    rooms = [r for r in rooms if r.ratePlans]
+
+    return PublicAvailabilityOut(
+        checkIn=check_in, checkOut=check_out,
+        nights=(check_out - check_in).days, units=units,
+        currency=prop.currency, rooms=rooms, soldOut=not rooms,
+    )
+
+
+@router.post("/public/hotels/{slug}/quote", response_model=PublicQuoteOut)
+@limiter.limit("20/minute")
+async def create_public_quote(request: Request, slug: str, body: PublicQuoteRequest):
+    """
+    Price a stay and hold the rooms.
+
+    `booking.create_quote` does all of it — the GST slab per night, the
+    discount clamp, the token rule from `properties.settings`, the hold, the
+    expiry. This endpoint supplies `audience="public"`, which is what makes a
+    rate plan id the guest was never offered unusable even if they guess one.
+    """
+    prop = await public_booking.resolve_published(slug)
+    public_booking.validate_stay_dates(prop, body.checkIn, body.checkOut)
+
+    quote = await booking_service.create_quote(
+        property_id=prop.id,
+        rate_plan_id=body.ratePlanId,
+        check_in=body.checkIn, check_out=body.checkOut,
+        units=body.units, adults=body.adults, children=body.children,
+        # No discount from a public caller. Negotiation is the Sales agent's,
+        # behind an authenticated surface with a ceiling on it.
+        requested_discount_pct=0,
+        issued_by="booking_engine",
+        audience="public",
+    )
+
+    def _names():
+        db = get_db()
+        rt = (db.table("room_types").select("name")
+              .eq("id", quote.room_type_id).limit(1).execute().data or [{}])[0]
+        rp = (db.table("rate_plans").select("name,inclusions")
+              .eq("id", quote.rate_plan_id).limit(1).execute().data or [{}])[0]
+        return rt, rp
+
+    room_type, rate_plan = await run_db(_names)
+    priced = quote.priced
+    return PublicQuoteOut(
+        quoteId=quote.id,
+        checkIn=quote.check_in, checkOut=quote.check_out,
+        nights=(quote.check_out - quote.check_in).days,
+        units=priced.units,
+        roomTypeName=room_type.get("name") or "",
+        ratePlanName=rate_plan.get("name") or "",
+        inclusions=rate_plan.get("inclusions") or [],
+        grossPaise=priced.gross_paise, discountPaise=priced.discount_paise,
+        taxPaise=priced.tax_paise, totalPaise=priced.total_paise,
+        tokenPaise=priced.token_paise, balancePaise=priced.balance_paise,
+        expiresAt=quote.expires_at, currency=prop.currency,
+    )
+
+
+def _quote_row(quote_id: str, property_id: str) -> dict | None:
+    rows = (
+        get_db().table("quotes").select("*")
+        .eq("id", quote_id).eq("property_id", property_id)
+        .limit(1).execute().data or []
+    )
+    return rows[0] if rows else None
+
+
+@router.post("/public/hotels/{slug}/quotes/{quote_id}/order", response_model=PublicOrderOut)
+@limiter.limit("15/minute")
+async def create_public_order(
+    request: Request, slug: str, quote_id: str, body: PublicOrderRequest,
+):
+    """
+    Turn a held quote into a Razorpay order.
+
+    **The amount is computed here and never received.** It is the quote's own
+    token plus server-priced add-ons; the request carries a service id and a
+    quantity and nothing else that touches money. A browser that posts a price
+    is posting a field no model on this route has.
+
+    The order row is written *before* the id reaches the browser, because the
+    webhook can fire while Checkout is still opening and a webhook that finds no
+    order has nothing to settle. The guest's details and their add-ons are
+    stored on it for the same reason: the webhook has no browser to ask.
+    """
+    prop = await public_booking.resolve_published(slug)
+    quote = await run_db(_quote_row, quote_id, prop.id)
+    if not quote:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "That price is no longer available.")
+    if quote["status"] != "active":
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "This price has already been used. Please search again.")
+    if datetime.fromisoformat(str(quote["expires_at"]).replace("Z", "+00:00")) \
+            < datetime.now(timezone.utc):
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "This price has expired. Please search again.")
+
+    addons = await public_booking.price_addons(
+        prop.id, [a.model_dump() for a in body.addons],
+        check_in=date.fromisoformat(str(quote["check_in"])),
+        check_out=date.fromisoformat(str(quote["check_out"])),
+        timezone_name=prop.timezone,
+    )
+    addons_total = sum(a.total_paise for a in addons)
+    amount = public_booking.checkout_amount_paise(
+        quote["total_paise"], quote["token_paise"], addons_total,
+    )
+    if amount < 100:
+        # Razorpay refuses anything under a rupee. A property on pay-at-hotel
+        # with no extras has nothing to charge, and saying so is better than
+        # inventing a one-rupee order.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This stay does not require an online payment. Please contact the hotel.",
+        )
+
+    if not razorpay.configured():
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "Online payment is unavailable right now.")
+
+    rzp = await razorpay.create_order(
+        amount_paise=amount,
+        receipt=f"stay-{quote_id[:8]}",
+        notes={"quote": quote_id, "property": prop.slug},
+    )
+
+    order = await payments_service.create(
+        razorpay_order_id=rzp["id"], purpose="booking",
+        partner_id=prop.partner_id, property_id=prop.id,
+        quote_id=quote_id, amount_paise=amount,
+        guest_details=body.guest.model_dump(),
+        addons=[a.as_dict() for a in addons],
+        attribution={"source": body.source} if body.source else {},
+    )
+
+    return PublicOrderOut(
+        orderId=order["id"], razorpayOrderId=rzp["id"],
+        keyId=razorpay.public_key_id() or "",
+        amountPaise=amount, quoteId=quote_id,
+        addons=[a.as_dict() for a in addons],
+        roomTokenPaise=min(quote["token_paise"], quote["total_paise"]),
+        addonsTotalPaise=addons_total,
+        balanceDuePaise=max(0, quote["total_paise"] - quote["token_paise"]),
+        hotelName=prop.name, guestName=body.guest.fullName,
+        guestEmail=body.guest.email, guestPhone=body.guest.phone,
+    )
+
+
+async def _fulfil_booking(order: dict) -> dict:
+    """
+    Create the reservation an order paid for. Called once per order, ever.
+
+    The caller has already won `payments.claim`, so this runs for exactly one of
+    the browser callback and the webhook. If it raises, the order is released
+    back to 'created' and Razorpay's next webhook retry picks it up — a guest
+    who has paid must never be left without a booking because a room sold in the
+    seconds between.
+    """
+    guest = order.get("guest_details") or {}
+    reservation = await booking_service.create_reservation(
+        property_id=order["property_id"],
+        quote_id=order["quote_id"],
+        guest_name=guest.get("fullName") or "Guest",
+        guest_phone=guest.get("phone"),
+        guest_email=guest.get("email"),
+        source="travbuddy" if (order.get("attribution") or {}).get("source") == "travbuddy"
+               else "direct",
+        # What was actually paid now. The rest is balance due on the folio,
+        # which is what a folio is for.
+        token_paise=order["amount_paise"],
+        payment_method="gateway",
+        notes=guest.get("notes"),
+        created_by="booking_engine",
+        member_id=None, member_name=None,
+    )
+    await public_booking.attach_addons(reservation, order.get("addons") or [])
+    await payments_service.record_result(order["id"], reservation_id=reservation["id"])
+    return reservation
+
+
+async def _public_booking_out(reservation: dict, hotel_name: str) -> PublicBookingOut:
+    def _read():
+        db = get_db()
+        rt = (db.table("room_types").select("name")
+              .eq("id", reservation["room_type_id"]).limit(1).execute().data or [{}])[0]
+        balance = db.rpc("folio_balance",
+                         {"p_reservation": reservation["id"]}).execute().data
+        return rt, int(balance or 0)
+
+    room_type, balance = await run_db(_read)
+    addons = await public_booking.list_for_reservation(reservation["id"])
+    return PublicBookingOut(
+        ref=reservation["ref"], status=reservation["status"], hotelName=hotel_name,
+        checkIn=reservation["check_in"], checkOut=reservation["check_out"],
+        nights=reservation["nights"], units=reservation["units"],
+        roomTypeName=room_type.get("name") or "",
+        guestName=reservation.get("guest_name") or "Guest",
+        totalPaise=reservation.get("total_paise") or 0,
+        paidPaise=reservation.get("paid_paise") or 0,
+        balancePaise=balance,
+        addons=[
+            QuotedAddonOut(
+                serviceId=a["service_id"], name=a["name"], quantity=a["quantity"],
+                unitPricePaise=a["unit_price_paise"], totalPaise=a["total_paise"],
+                serviceDate=a.get("service_date"),
+            ) for a in addons
+        ],
+        checkInUrl=f"/checkin/{reservation['ref']}",
+    )
+
+
+@router.post("/public/hotels/{slug}/confirm", response_model=PublicBookingOut)
+@limiter.limit("15/minute")
+async def confirm_public_booking(
+    request: Request, slug: str, body: PublicConfirmRequest,
+):
+    """
+    The browser returning from Checkout. The fast path, not the reliable one.
+
+    **Payment success is never inferred from the browser.** The signature is an
+    HMAC over `order_id|payment_id` with our secret, so a client cannot forge
+    one — and even so, this route does not decide anything the webhook could not
+    decide alone. If the webhook won the race this returns the booking it made;
+    if the browser wins, the webhook later finds `reservation_id` set and does
+    nothing.
+    """
+    prop = await public_booking.resolve_published(slug)
+
+    if not razorpay.verify_payment_signature(
+        body.razorpayOrderId, body.razorpayPaymentId, body.razorpaySignature
+    ):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "That payment could not be verified.")
+
+    order = await payments_service.get(body.razorpayOrderId)
+    if not order or order["purpose"] != "booking" or order["property_id"] != prop.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that payment.")
+
+    settlement = await payments_service.claim(body.razorpayOrderId, body.razorpayPaymentId)
+    if settlement.won:
+        try:
+            reservation = await _fulfil_booking(settlement.order)
+        except HTTPException:
+            await payments_service.release(settlement.order["id"], "fulfilment failed")
+            raise
+        except Exception as exc:  # noqa: BLE001
+            await payments_service.release(settlement.order["id"], str(exc)[:200])
+            logger.exception("could not fulfil paid order %s", body.razorpayOrderId)
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Your payment went through and we could not finish the booking. "
+                "The hotel has been notified.",
+            ) from exc
+        return await _public_booking_out(reservation, prop.name)
+
+    # Somebody else settled it — almost always the webhook, arriving first.
+    existing = settlement.order
+    if existing.get("reservation_id"):
+        def _read():
+            rows = (get_db().table("reservations").select("*")
+                    .eq("id", existing["reservation_id"]).limit(1).execute().data or [])
+            return rows[0] if rows else None
+        reservation = await run_db(_read)
+        if reservation:
+            return await _public_booking_out(reservation, prop.name)
+
+    # Claimed but not yet fulfilled: the other caller is mid-flight. Asking the
+    # browser to wait is honest — the alternative is a second reservation.
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        "This payment is still being confirmed. Please refresh in a moment.",
+    )
+
+
+@router.post("/public/razorpay/webhook")
+async def public_razorpay_webhook(
+    request: Request,
+    x_razorpay_signature: str = Header(default=None),
+):
+    """
+    Razorpay's server-to-server callback. The reliable path.
+
+    Deliberately not origin-guarded and not authenticated: Razorpay is not a
+    browser. The HMAC over the **raw** body is the whole authentication story,
+    which is why the body is read as bytes before anything parses it —
+    re-serialising the JSON changes the bytes and the signature never matches.
+
+    Always 200 once the signature is good. A non-2xx makes Razorpay retry, and
+    retrying something that already succeeded is noise; the one case that
+    deliberately *does* fail is a fulfilment error, because there a retry is
+    exactly what we want.
+    """
+    if not razorpay.webhook_configured():
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Webhook not configured.")
+
+    raw = await request.body()
+    if not razorpay.verify_webhook_signature(raw, x_razorpay_signature):
+        logger.warning("[pms webhook] bad signature")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Bad signature.")
+
+    try:
+        event = json.loads(raw or b"{}")
+    except ValueError:
+        return {"ok": True, "ignored": "unparseable"}
+
+    name = event.get("event") or ""
+    payload = event.get("payload") or {}
+    payment = (payload.get("payment") or {}).get("entity") or {}
+    order_id = payment.get("order_id") or (
+        (payload.get("order") or {}).get("entity") or {}
+    ).get("id")
+
+    if not order_id:
+        return {"ok": True, "ignored": "no order id"}
+
+    order = await payments_service.get(order_id)
+    if not order:
+        # Not ours — the marketplace webhook handles its own orders.
+        return {"ok": True, "ignored": "unknown order"}
+
+    if name in ("payment.failed",):
+        await payments_service.mark(order_id, "failed", payment.get("error_description"))
+        return {"ok": True, "handled": "failed"}
+
+    if name not in ("payment.captured", "order.paid"):
+        return {"ok": True, "ignored": name}
+
+    payment_id = payment.get("id")
+    if not payment_id:
+        return {"ok": True, "ignored": "no payment id"}
+
+    settlement = await payments_service.claim(order_id, payment_id)
+    if not settlement.won:
+        # The browser got here first, or this is a duplicate delivery. Either
+        # way there is nothing to do — and saying so is the whole point.
+        return {"ok": True, "handled": "already settled"}
+
+    try:
+        if settlement.order["purpose"] == "booking":
+            await _fulfil_booking(settlement.order)
+        else:
+            await _fulfil_credits(settlement.order)
+    except Exception as exc:  # noqa: BLE001
+        await payments_service.release(settlement.order["id"], str(exc)[:200])
+        logger.exception("webhook could not fulfil order %s", order_id)
+        # The one deliberate non-2xx: Razorpay retries for 24 hours, and a
+        # retry is exactly the recovery this needs.
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            "Could not fulfil the order.") from exc
+
+    return {"ok": True, "handled": settlement.order["purpose"]}
+
+
+# ── M5.6 — buying credits ────────────────────────────────────────────────────
+#
+# The ledger has been built and tested since migration 12; this is only the
+# commerce. A purchase creates a `purchased` bucket through `grant_credits()`
+# and touches nothing else — `charge_usage` is unchanged, no wallet balance is
+# written directly, and the idempotency key is the Razorpay order id, so a
+# webhook delivered three times grants once.
+
+async def _fulfil_credits(order: dict) -> dict:
+    """
+    Grant the credits an order paid for. Called once per order, ever.
+
+    `billing.grant()` is the only writer, and its key is derived from the
+    Razorpay order — not from the clock, not from a uuid. That is what makes
+    this safe to call from both the browser callback and a retried webhook.
+    """
+    key = f"credit-purchase:{order['razorpay_order_id']}"
+    result = await billing.grant(
+        billing_account_id=order["billing_account_id"],
+        kind="purchased",
+        credits=int(order["credits"]),
+        idempotency_key=key,
+        source_type="purchase",
+        actor_type="user",
+        metadata={
+            "razorpayOrderId": order["razorpay_order_id"],
+            "razorpayPaymentId": order.get("razorpay_payment_id"),
+            "amountPaise": order["amount_paise"],
+        },
+    )
+    await payments_service.record_result(order["id"], ledger_key=key)
+    return result
+
+
+@router.post("/properties/{property_id}/credits/order", response_model=CreditOrderOut)
+@limiter.limit("10/minute")
+async def create_credit_order(
+    request: Request,
+    property_id: str,
+    body: CreditOrderRequest,
+    member=Depends(require_member("billing")),
+):
+    """
+    Start a credit top-up.
+
+    The client asks for a number of credits; **the server decides what they
+    cost**. `CREDIT_PRICE_PAISE` is the one place that conversion happens, and a
+    rupee amount in the request body would be a field this model does not have.
+    """
+    account = await billing.account_for_property(property_id)
+    if not account:
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "This property has no billing account.")
+    if not razorpay.configured():
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "Payments are unavailable right now.")
+
+    amount = body.credits * CREDIT_PRICE_PAISE
+    rzp = await razorpay.create_order(
+        amount_paise=amount,
+        receipt=f"credits-{property_id[:8]}",
+        notes={"credits": str(body.credits), "property": property_id},
+    )
+    order = await payments_service.create(
+        razorpay_order_id=rzp["id"], purpose="credits",
+        partner_id=member.partner_id, property_id=property_id,
+        billing_account_id=account, credits=body.credits, amount_paise=amount,
+    )
+    return CreditOrderOut(
+        orderId=order["id"], razorpayOrderId=rzp["id"],
+        keyId=razorpay.public_key_id() or "",
+        credits=body.credits, amountPaise=amount,
+    )
+
+
+@router.post("/properties/{property_id}/credits/verify", response_model=CreditPurchaseOut)
+@limiter.limit("20/minute")
+async def verify_credit_purchase(
+    request: Request,
+    property_id: str,
+    body: PublicConfirmRequest,
+    member=Depends(require_member("billing")),
+):
+    """
+    The browser returning from a credit top-up.
+
+    Same convergence as a booking: the signature is checked, the claim decides
+    who acts, and the webhook is the reliable path behind it. A duplicate call
+    reports the wallet rather than granting again.
+    """
+    if not razorpay.verify_payment_signature(
+        body.razorpayOrderId, body.razorpayPaymentId, body.razorpaySignature
+    ):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "That payment could not be verified.")
+
+    order = await payments_service.get(body.razorpayOrderId)
+    if not order or order["purpose"] != "credits" or order["property_id"] != property_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that payment.")
+
+    settlement = await payments_service.claim(body.razorpayOrderId, body.razorpayPaymentId)
+    if settlement.won:
+        try:
+            result = await _fulfil_credits(settlement.order)
+        except Exception as exc:  # noqa: BLE001
+            await payments_service.release(settlement.order["id"], str(exc)[:200])
+            logger.exception("could not grant credits for %s", body.razorpayOrderId)
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                "Your payment went through and the credits have not "
+                                "landed yet. They will shortly.") from exc
+        state = await billing.wallet_state(order["billing_account_id"])
+        return CreditPurchaseOut(
+            status="granted", credits=int(order["credits"]),
+            creditsGranted=int(order["credits"]),
+            balanceAfter=int(state.get("balance") or 0),
+        )
+
+    state = await billing.wallet_state(order["billing_account_id"])
+    return CreditPurchaseOut(
+        status="already_granted", credits=int(order["credits"]),
+        creditsGranted=0, balanceAfter=int(state.get("balance") or 0),
+        alreadyProcessed=True,
+    )
+
+
+@router.get("/properties/{property_id}/payments", response_model=list[PaymentOrderOut])
+@limiter.limit("60/minute")
+async def list_payment_orders(
+    request: Request,
+    property_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    member=Depends(require_member("billing")),
+):
+    """Every order this property has started, paid or otherwise."""
+    rows = await payments_service.history(property_id, limit)
+    return [
+        PaymentOrderOut(
+            id=r["id"], razorpayOrderId=r["razorpay_order_id"], purpose=r["purpose"],
+            amountPaise=r["amount_paise"], credits=r.get("credits"),
+            status=r["status"], reservationId=r.get("reservation_id"),
+            createdAt=r["created_at"], paidAt=r.get("paid_at"),
+            failureReason=r.get("failure_reason"),
+        ) for r in rows
+    ]
+
+
+# ── M5.4 — the website builder's own API ─────────────────────────────────────
+
+@router.get("/properties/{property_id}/website", response_model=WebsiteConfigOut)
+@limiter.limit("120/minute")
+async def get_website(
+    request: Request, property_id: str, member=Depends(require_member("rates")),
+):
+    """
+    The builder's view: the **draft**, always.
+
+    'rates' rather than a new scope. Publishing a website is a commercial act
+    about how a hotel sells itself, and the permission that already governs what
+    it sells for is the right one — a receptionist does not get to rewrite the
+    hotel's home page.
+    """
+    row = await website_service.get_config(property_id)
+    return website_service.project(row)
+
+
+@router.patch("/properties/{property_id}/website", response_model=WebsiteConfigOut)
+@limiter.limit("120/minute")
+async def update_website(
+    request: Request,
+    property_id: str,
+    body: WebsiteUpdateRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    Save the draft. **Never the published copy.**
+
+    `website.save_draft` writes one column and cannot reach the other, which is
+    the whole reason draft and published are separate: a hotelier typing a new
+    headline must not change the page a guest is reading.
+    """
+    row = await website_service.save_draft(
+        property_id,
+        template=body.template,
+        draft=body.model_dump(exclude_none=True, exclude={"template"}),
+    )
+    return website_service.project(row)
+
+
+@router.post("/properties/{property_id}/website/publish", response_model=WebsiteConfigOut)
+@limiter.limit("30/minute")
+async def publish_website(
+    request: Request, property_id: str, member=Depends(require_member("rates")),
+):
+    """Copy the draft to published, and make `/stay/[slug]` answer."""
+    row = await website_service.publish(property_id, member.profile_id)
+    return website_service.project(row)
+
+
+@router.post("/properties/{property_id}/website/unpublish", response_model=WebsiteConfigOut)
+@limiter.limit("30/minute")
+async def unpublish_website(
+    request: Request, property_id: str, member=Depends(require_member("rates")),
+):
+    """
+    Take the site down. The content is kept.
+
+    Unpublishing is not deleting: a hotel that goes quiet for a season should
+    not have to rebuild its page to come back.
+    """
+    row = await website_service.unpublish(property_id)
+    return website_service.project(row)

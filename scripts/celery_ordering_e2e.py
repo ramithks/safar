@@ -196,10 +196,14 @@ for conv in convs:
     check(f"{conv['guest_name']}: runs are serial, never overlapping",
           not overlapped, f"{len(overlapped)} overlapping pair(s)")
 
+    # Ordered the same way the drain orders, and for the same reason: `sent_at`
+    # is Meta's second-granularity timestamp and three messages sent inside four
+    # seconds routinely tie. Asserting on a tied sort was this suite reporting
+    # its own non-determinism as a product failure.
     answered = (db.table("conversation_messages")
-                .select("body,agent_run_id,sent_at")
+                .select("body,agent_run_id,sent_at,created_at")
                 .eq("conversation_id", conv["id"]).eq("direction", "inbound")
-                .order("sent_at").execute().data or [])
+                .order("sent_at").order("created_at").execute().data or [])
     order = [m["body"] for m in answered]
     check(f"{conv['guest_name']}: answered in the order they were said",
           order == MESSAGES, str(order))

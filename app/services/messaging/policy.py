@@ -39,6 +39,9 @@ from app.config import settings
 
 WHATSAPP = "whatsapp"
 INSTAGRAM = "instagram"
+# The staff console. A channel with no provider and nothing to send to —
+# see WINDOWLESS below for why it is named here but has no policy row.
+INTERNAL = "internal"
 
 
 @dataclass(frozen=True)
@@ -122,6 +125,32 @@ _POLICIES = {
         window_hours=_instagram_window,
     ),
 }
+
+
+# Channels that carry no window, as opposed to channels nobody has configured.
+#
+# The difference matters and is the reason this is a set rather than a policy
+# row. `internal` is the staff console: no provider, no Meta, no 24-hour rule,
+# nothing that leaves the process. Giving it a `ChannelPolicy` would mean a fake
+# connection row and a window that is always open — a provider abstraction
+# pretending to carry something that never travels, which `services/ai/console`
+# refused to build for exactly this reason.
+#
+# But `for_channel` raising for it was wrong too. `list_conversations` calls
+# `window_open()` on every row in the inbox, so one staff-console thread made
+# the whole Inbox screen 500 with `no messaging policy for channel 'internal'`.
+# The caller was asking a reasonable question — "is the window open" — about a
+# channel whose honest answer is "there is no window", and got an exception.
+#
+# So the two cases are now distinguishable: a channel in here has no window and
+# says so; a channel in neither place is one nobody has thought about, and that
+# still raises.
+WINDOWLESS = frozenset({INTERNAL})
+
+
+def has_window(channel: str | None) -> bool:
+    """Whether free-form outbound on this channel is time-limited at all."""
+    return (channel or WHATSAPP) not in WINDOWLESS
 
 
 def for_channel(channel: str | None) -> ChannelPolicy:

@@ -94,6 +94,19 @@ def _pending(conversation_id: str) -> list[dict]:
     granularity: two messages from the same guest inside one second left the
     second one permanently unanswered. Timestamps are a proxy for "has this been
     handled"; the column is the thing itself.
+
+    **`created_at` breaks the tie, and that is not decoration.** `sent_at`
+    carries Meta's timestamp, which is second-granularity, so a guest firing off
+    two messages inside one second produces two rows that sort equally — and
+    `order("sent_at")` alone then drains them in whatever order PostgREST
+    happens to return. That is the exact property this whole locking design
+    exists to guarantee: "let me check" answered after "yes we have a room"
+    reads to the guest as the hotel talking over itself.
+
+    It was found as an intermittent `celery_ordering_e2e` failure that had been
+    filed as unexplained for weeks — 17 of 59 recorded test batches contained a
+    tie. `created_at` is `now()` at insert, microsecond precision, and the
+    webhook persists in the order it read them.
     """
     return (
         get_db()
@@ -103,6 +116,7 @@ def _pending(conversation_id: str) -> list[dict]:
         .eq("direction", "inbound")
         .is_("agent_run_id", "null")
         .order("sent_at")
+        .order("created_at")
         .limit(MAX_DRAIN)
         .execute()
         .data

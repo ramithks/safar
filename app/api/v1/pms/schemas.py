@@ -898,3 +898,639 @@ class BillingSummaryOut(BaseModel):
     balance: int = 0
     available: int = 0
     groups: list[UsageGroupOut] = []
+
+
+# ── owner analytics ──────────────────────────────────────────────────────────
+#
+# These mirror `services/pms/analytics` field for field rather than reshaping
+# it. The whole point of that module is that there is one definition of
+# occupancy in the system; a response model that renamed or recomputed anything
+# would be the second one.
+
+class PeriodOut(BaseModel):
+    """A stretch of the property's own calendar. Both ends inclusive."""
+    key: str
+    label: str
+    # `from` is a Python keyword, so the field is declared under an alias and
+    # populated by it. The wire name is what the PWA reads.
+    from_: str = Field(alias="from")
+    to: str
+    days: int
+    timezone: str
+
+    model_config = {"populate_by_name": True}
+
+
+class MetricOut(BaseModel):
+    """
+    One number and everything needed to read it.
+
+    `change` is in the metric's own unit — percentage *points* for a percentage,
+    paise for money. `changePct` is the relative move and is null wherever
+    reporting it would be a different claim from the one the numbers support.
+    Both are sent, so no client has to decide which applies.
+    """
+    key: str
+    label: str
+    # `int | float`, in that order, so paise stay integers on the wire. Pydantic's
+    # smart union keeps the exact type; a bare `float` would render every rupee
+    # amount with a decimal point it does not have.
+    value: int | float | None = None
+    unit: str
+    currency: str | None = None
+    previous: int | float | None = None
+    change: float | None = None
+    changePct: float | None = None
+    basis: str
+    sample: int = 0
+    # False when the metric rests on fewer observations than this property's
+    # threshold. A client showing a value with this false must say so; an agent
+    # must refuse to recommend from it.
+    sufficient: bool = True
+
+
+class SignalOut(BaseModel):
+    """A deterministic observation. No model produced this."""
+    kind: str
+    severity: str
+    headline: str
+    metric: str
+    observed: int | float | None = None
+    comparison: int | float | None = None
+    threshold: float
+    unit: str
+    detail: str = ""
+    subject: dict | None = None
+
+
+class AnalyticsReportOut(BaseModel):
+    propertyId: str
+    period: PeriodOut
+    comparisonPeriod: PeriodOut | None = None
+    currency: str
+    metrics: list[MetricOut] = []
+    # roomTypes · ratePlans · sources · services · daily. Left as a dict because
+    # each cut has its own shape and the client renders them independently;
+    # five near-identical models would be five places to keep in step.
+    breakdowns: dict = {}
+    signals: list[SignalOut] = []
+    generatedAt: datetime
+
+
+class DailyPointOut(BaseModel):
+    date: str
+    roomsSold: int
+    roomsAvailable: int
+    occupancyPct: float
+    adrPaise: int
+    revparPaise: int
+    revenuePaise: int
+
+
+class RecommendationOut(BaseModel):
+    """
+    One recommendation, with the argument that produced it.
+
+    `evidence` carries the server's own figures at the moment the advice was
+    given — not the model's copy of them. There is no `apply` on this object
+    because there is nothing to apply it with.
+    """
+    id: str
+    propertyId: str
+    type: str
+    status: str
+    title: str
+    rationale: str
+    confidence: str
+    expectedImpact: str | None = None
+    risk: str | None = None
+    suggestedAction: str | None = None
+    evidence: list[dict] = []
+    period: dict = {}
+    subject: dict = {}
+    createdBy: str | None = None
+    createdAt: datetime | None = None
+    reviewedAt: datetime | None = None
+    agentActionId: str | None = None
+
+
+class RecommendationStatusRequest(BaseModel):
+    status: Literal["open", "reviewed", "dismissed", "actioned"]
+
+
+class OwnerAskRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    # The owner's own capabilities and nothing else. A caller cannot name
+    # `complex_negotiation` to route an owner question somewhere it does not
+    # belong — and cannot name an agent at all: which agent answers is decided
+    # by the endpoint, not by the body.
+    task: str | None = Field(
+        default=None,
+        pattern="^(revenue_analysis|operational_analysis)$",
+    )
+    # Which period the structured half of the answer covers. The model may look
+    # at others; this is what the cards render.
+    period: str = Field(default="today")
+
+
+class OwnerAskOut(BaseModel):
+    """
+    A structured answer, not a paragraph to be parsed.
+
+    `summary` is the model's prose. Everything below it is server-computed and
+    survives the model being unavailable — which is the point: `aiAvailable`
+    false with a full `metrics` array is an honest state, and a Reports page
+    built on this keeps working when Vertex does not.
+    """
+    runId: str | None = None
+    conversationId: str | None = None
+    status: str
+    summary: str | None = None
+    aiAvailable: bool = True
+    # Present when the model could not answer. A sentence for a person, not a
+    # stack trace.
+    aiUnavailableReason: str | None = None
+
+    period: PeriodOut
+    comparisonPeriod: PeriodOut | None = None
+    currency: str = "INR"
+    metrics: list[MetricOut] = []
+    signals: list[SignalOut] = []
+    recommendations: list[RecommendationOut] = []
+    # Which tools ran, so an owner can see what the answer was built from.
+    evidence: list[ConsoleActionOut] = []
+    # high · medium · low · insufficient_data. Derived from the samples the
+    # metrics rest on, never from the model's own opinion of itself.
+    confidence: str = "medium"
+    creditsCharged: int = 0
+    tokensIn: int = 0
+    tokensOut: int = 0
+    latencyMs: int = 0
+
+
+class OwnerOverviewOut(BaseModel):
+    """What the /owner screen renders before anybody types anything."""
+    propertyId: str
+    propertyName: str | None = None
+    businessDate: str
+    timezone: str
+    currency: str = "INR"
+    today: AnalyticsReportOut
+    period: AnalyticsReportOut
+    recommendations: list[RecommendationOut] = []
+
+
+# ── guests, services, members, margin ────────────────────────────────────────
+#
+# Four screens that shipped reading seed data because the routes behind them did
+# not exist. The tables, their RLS and every write path have been real since M1;
+# only the read was missing, which is the worst shape for a gap to have — the
+# Guests page rendered invented people in the same typeface as real ones.
+
+class GuestOut(BaseModel):
+    id: str
+    propertyId: str
+    name: str
+    phone: str = ""
+    email: str | None = None
+    city: str | None = None
+    stays: int = 0
+    lastStayAt: date | None = None
+    totalSpendPaise: int = 0
+    notes: str | None = None
+    vip: bool = False
+    # Whether this guest may be sent a campaign. Read-only here: consent is
+    # changed by the guest saying STOP, never by a screen.
+    marketingOptIn: bool = False
+
+    @classmethod
+    def from_row(cls, r: dict) -> "GuestOut":
+        return cls(
+            id=r["id"],
+            propertyId=r["property_id"],
+            name=r.get("name") or "Guest",
+            phone=r.get("phone") or "",
+            email=r.get("email"),
+            city=r.get("city"),
+            stays=int(r.get("stays_count") or 0),
+            lastStayAt=r.get("last_stay_at"),
+            totalSpendPaise=int(r.get("total_spend_paise") or 0),
+            notes=r.get("notes"),
+            vip=bool(r.get("vip")),
+            marketingOptIn=bool(r.get("marketing_opt_in")),
+        )
+
+
+class ServiceOut(BaseModel):
+    id: str
+    propertyId: str
+    name: str
+    description: str = ""
+    pricePaise: int
+    category: str
+    isActive: bool = True
+    dailyCapacity: int | None = None
+    leadTimeHours: int = 0
+
+    @classmethod
+    def from_row(cls, r: dict) -> "ServiceOut":
+        return cls(
+            id=r["id"],
+            propertyId=r["property_id"],
+            name=r["name"],
+            description=r.get("description") or "",
+            pricePaise=int(r.get("price_paise") or 0),
+            category=r.get("category") or "other",
+            isActive=bool(r.get("is_active", True)),
+            dailyCapacity=r.get("daily_capacity"),
+            leadTimeHours=int(r.get("lead_time_hours") or 0),
+        )
+
+
+class ServiceUpsertRequest(BaseModel):
+    id: str | None = None
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=1000)
+    # Paise, and an integer. A price that has been through a float has already
+    # lost the argument with an accountant.
+    pricePaise: int = Field(ge=0)
+    category: Literal["transfer", "food", "wellness", "activity", "room", "other"]
+    isActive: bool = True
+    dailyCapacity: int | None = Field(default=None, ge=0)
+    leadTimeHours: int = Field(default=0, ge=0, le=720)
+
+
+class MemberOut(BaseModel):
+    id: str
+    name: str
+    email: str
+    role: str
+    propertyIds: list[str] = []
+    status: str = "active"
+    # The flattened permission set, so the screen can show what a role actually
+    # allows. Not a security boundary — `require_member` re-derives it server
+    # side on every route, exactly as `/me` does.
+    permissions: list[str] = []
+
+
+class MarginRowOut(BaseModel):
+    """
+    Internal only. Carries provider cost, which is the margin.
+
+    `require_member("billing")` gates the route and the service-role client does
+    the read, because `usage_events.provider_cost_inr_micros` is revoked from browser
+    roles by design — see migration 12. A hotel must never receive this shape.
+    """
+    propertyId: str
+    propertyName: str
+    city: str = ""
+    plan: str = ""
+    usageCredits: int = 0
+    providerCostInrMicros: int = 0
+    revenuePaise: int = 0
+    marginPaise: int = 0
+    topUsageType: str = ""
+
+
+# ── web check-in ─────────────────────────────────────────────────────────────
+#
+# The only shapes in this file a stranger can reach. Everything here is either
+# masked on the way out or write-only on the way in.
+
+class PublicStayOut(BaseModel):
+    """
+    A stay, as the person holding its reference may see it.
+
+    **Masked deliberately.** The booking reference is the whole credential, so
+    what it unlocks has to be worth less than the reference is hard to guess:
+    enough for a guest to recognise their own booking, not enough to be worth
+    guessing at. No email, no full phone, no guest id, no room number, no folio
+    detail beyond the balance they will be asked for.
+    """
+    ref: str
+    propertyName: str
+    propertyCity: str
+    checkInTime: str
+    checkOutTime: str
+    guestName: str
+    # Last four digits only. Enough to recognise, useless if leaked.
+    guestPhoneMasked: str
+    checkIn: date
+    checkOut: date
+    nights: int
+    units: int
+    adults: int
+    children: int
+    roomTypeName: str
+    ratePlanName: str
+    inclusions: list[str] = []
+    totalPaise: int
+    paidPaise: int
+    balancePaise: int
+    status: str
+    registration: "GuestRegistrationOut | None" = None
+
+
+class GuestRegistrationOut(BaseModel):
+    reservationId: str
+    fullName: str
+    email: str = ""
+    phone: str = ""
+    address: str = ""
+    city: str = ""
+    country: str = ""
+    idType: str | None = None
+    # Never the whole document. The rest is not stored — see migration 19.
+    idLast4: str = ""
+    travellingWith: int = 0
+    estimatedArrival: str | None = None
+    specialRequests: str | None = None
+    submittedAt: datetime
+
+    @classmethod
+    def from_row(cls, r: dict) -> "GuestRegistrationOut":
+        arrival = r.get("estimated_arrival")
+        return cls(
+            reservationId=r["reservation_id"],
+            fullName=r.get("full_name") or "",
+            email=r.get("email") or "",
+            phone=r.get("phone") or "",
+            address=r.get("address") or "",
+            city=r.get("city") or "",
+            country=r.get("country") or "",
+            idType=r.get("id_type"),
+            idLast4=r.get("id_last4") or "",
+            travellingWith=int(r.get("travelling_with") or 0),
+            estimatedArrival=str(arrival)[:5] if arrival else None,
+            specialRequests=r.get("special_requests"),
+            submittedAt=r["submitted_at"],
+        )
+
+
+class WebCheckInRequest(BaseModel):
+    """
+    What a guest fills in on their phone.
+
+    `idNumber` is **write-only and mostly discarded**: the server keeps its last
+    four characters and never stores the rest. It is accepted at all so the form
+    can look like the form a hotelier expects, and so a guest who has typed
+    their passport number is not asked to retype only part of it.
+    """
+    fullName: str = Field(min_length=2, max_length=120)
+    email: str = Field(default="", max_length=200)
+    phone: str = Field(default="", max_length=32)
+    address: str = Field(default="", max_length=300)
+    city: str = Field(default="", max_length=120)
+    country: str = Field(default="", max_length=120)
+    idType: Literal["passport", "aadhaar", "driving_licence",
+                    "voter_id", "pan", "other"] | None = None
+    idNumber: str = Field(default="", max_length=64)
+    travellingWith: int = Field(default=0, ge=0, le=30)
+    # 'HH:MM'. Refused rather than coerced: a malformed arrival time silently
+    # dropped is a guest the desk is not expecting.
+    estimatedArrival: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+    specialRequests: str | None = Field(default=None, max_length=500)
+
+
+# ── M5: public booking, website, credit purchase ─────────────────────────────
+
+class PublicRoomOptionOut(BaseModel):
+    """One room type a guest may book, with the rate plans they may see."""
+    roomTypeId: str
+    name: str
+    code: str
+    description: str | None = None
+    maxOccupancy: int
+    bedType: str | None = None
+    amenities: list[str] = []
+    unitsLeft: int
+    ratePlans: list[RatePlanOptionOut] = []
+
+
+class PublicAvailabilityOut(BaseModel):
+    checkIn: date
+    checkOut: date
+    nights: int
+    units: int
+    currency: str = "INR"
+    rooms: list[PublicRoomOptionOut] = []
+    # Said plainly rather than left as an empty list. "Nothing is free" and "we
+    # could not read availability" look identical to a guest otherwise.
+    soldOut: bool = False
+
+
+class PublicServiceOut(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+    category: str
+    pricePaise: int
+    leadTimeHours: int = 0
+    dailyCapacity: int | None = None
+
+
+class PublicSiteOut(BaseModel):
+    """The published site, plus the facts a template needs about the hotel."""
+    slug: str
+    name: str
+    city: str | None = None
+    template: str
+    currency: str = "INR"
+    timezone: str
+    checkInTime: str = ""
+    checkOutTime: str = ""
+    policies: dict = {}
+    content: dict = {}
+    services: list[PublicServiceOut] = []
+    roomTypes: list[PublicRoomOptionOut] = []
+
+
+class PublicQuoteRequest(BaseModel):
+    checkIn: date
+    checkOut: date
+    ratePlanId: str
+    units: int = Field(default=1, ge=1, le=5)
+    adults: int = Field(default=2, ge=1, le=20)
+    children: int = Field(default=0, ge=0, le=10)
+
+
+class QuotedAddonOut(BaseModel):
+    serviceId: str
+    name: str
+    quantity: int
+    unitPricePaise: int
+    totalPaise: int
+    serviceDate: date | None = None
+
+
+class PublicQuoteOut(BaseModel):
+    """
+    A priced stay, held.
+
+    Every figure is the server's. There is no field here a client may send back
+    changed and have honoured — the confirm step reads the quote row, not this
+    response.
+    """
+    quoteId: str
+    checkIn: date
+    checkOut: date
+    nights: int
+    units: int
+    roomTypeName: str
+    ratePlanName: str
+    inclusions: list[str] = []
+    grossPaise: int
+    discountPaise: int
+    taxPaise: int
+    totalPaise: int
+    tokenPaise: int
+    balancePaise: int
+    # When the hold lets go. Shown, because a guest who wanders off and comes
+    # back to a dead quote deserves to have been told.
+    expiresAt: datetime
+    currency: str = "INR"
+
+
+class PublicAddonSelection(BaseModel):
+    serviceId: str
+    quantity: int = Field(default=1, ge=1, le=50)
+    serviceDate: date | None = None
+    # Deliberately no price field. If one is sent it is not read — see
+    # `public_booking.price_addons`.
+
+
+class PublicGuestDetails(BaseModel):
+    fullName: str = Field(min_length=2, max_length=120)
+    email: str = Field(min_length=3, max_length=200)
+    phone: str = Field(min_length=6, max_length=32)
+    notes: str | None = Field(default=None, max_length=500)
+
+
+class PublicOrderRequest(BaseModel):
+    guest: PublicGuestDetails
+    addons: list[PublicAddonSelection] = Field(default_factory=list, max_length=10)
+    # Where the booking came from, when the link carried it. Recorded, never
+    # trusted for anything priced.
+    source: str | None = Field(default=None, max_length=40)
+
+
+class PublicOrderOut(BaseModel):
+    """What Checkout needs, and nothing that would let a client decide a price."""
+    orderId: str
+    razorpayOrderId: str
+    keyId: str
+    amountPaise: int
+    currency: str = "INR"
+    quoteId: str
+    addons: list[QuotedAddonOut] = []
+    # The room's token plus the extras, broken out so the summary can show why
+    # the number is what it is.
+    roomTokenPaise: int
+    addonsTotalPaise: int
+    balanceDuePaise: int
+    hotelName: str
+    guestName: str
+    guestEmail: str
+    guestPhone: str
+
+
+class PublicConfirmRequest(BaseModel):
+    razorpayOrderId: str
+    razorpayPaymentId: str
+    razorpaySignature: str
+
+
+class PublicBookingOut(BaseModel):
+    """
+    A confirmed booking, as a stranger may see it.
+
+    The reference is the credential for web check-in, so it is here. No
+    reservation id, no property id, no guest id — see `/public/stays/{ref}`,
+    which makes the same argument at more length.
+    """
+    ref: str
+    status: str
+    hotelName: str
+    checkIn: date
+    checkOut: date
+    nights: int
+    units: int
+    roomTypeName: str
+    guestName: str
+    totalPaise: int
+    paidPaise: int
+    balancePaise: int
+    addons: list[QuotedAddonOut] = []
+    checkInUrl: str
+    currency: str = "INR"
+
+
+class WebsiteConfigOut(BaseModel):
+    propertyId: str
+    template: str
+    status: str
+    travbuddyPath: str = ""
+    domain: str | None = None
+    headline: str = ""
+    tagline: str = ""
+    about: str = ""
+    accentColor: str = "#0F766E"
+    heroImageUrl: str | None = None
+    gallery: list[str] = []
+    amenities: list[str] = []
+    contactPhone: str | None = None
+    contactEmail: str | None = None
+    sections: list[dict] = []
+    publishedAt: datetime | None = None
+    hasUnpublishedChanges: bool = False
+
+
+class WebsiteUpdateRequest(BaseModel):
+    template: str | None = None
+    headline: str | None = Field(default=None, max_length=200)
+    tagline: str | None = Field(default=None, max_length=300)
+    about: str | None = Field(default=None, max_length=2000)
+    accentColor: str | None = Field(default=None, max_length=32)
+    heroImageUrl: str | None = Field(default=None, max_length=500)
+    gallery: list[str] | None = None
+    amenities: list[str] | None = None
+    contactPhone: str | None = Field(default=None, max_length=32)
+    contactEmail: str | None = Field(default=None, max_length=200)
+    sections: list[dict] | None = None
+
+
+class CreditOrderRequest(BaseModel):
+    # A bundle, not a rupee amount. The client picks how many credits; the
+    # server decides what they cost — the same reason no other request model
+    # here carries a price.
+    credits: int = Field(ge=100, le=200_000)
+
+
+class CreditOrderOut(BaseModel):
+    orderId: str
+    razorpayOrderId: str
+    keyId: str
+    credits: int
+    amountPaise: int
+    currency: str = "INR"
+
+
+class CreditPurchaseOut(BaseModel):
+    status: str
+    credits: int = 0
+    creditsGranted: int = 0
+    balanceAfter: int | None = None
+    alreadyProcessed: bool = False
+
+
+class PaymentOrderOut(BaseModel):
+    id: str
+    razorpayOrderId: str
+    purpose: str
+    amountPaise: int
+    credits: int | None = None
+    status: str
+    reservationId: str | None = None
+    createdAt: datetime
+    paidAt: datetime | None = None
+    failureReason: str | None = None

@@ -363,9 +363,19 @@ async def today_stats(property_id: str) -> dict:
 
     "Today" is the property's, not the server's — a desk in Goa opening the
     screen at 00:15 is looking at the day that has just started.
+
+    **The money comes from `pms.analytics`, not from here.** It used to be
+    computed inline as `round((gross − discount) / nights) × units`, and
+    `gross_paise` is already Σ(tariff × units) — so every multi-room booking
+    reported its revenue once per room it contained, and ADR with it. One
+    definition of room revenue now serves this screen, the Reports page and the
+    Owner Copilot, which is the only arrangement in which they cannot disagree.
     """
+    from app.services.pms import analytics  # local: analytics imports this module
+
     today = await clock.abusiness_date(property_id)
     today_s = today.isoformat()
+    money = await analytics.day_money(property_id, today)
 
     def _read():
         db = get_db()
@@ -407,18 +417,13 @@ async def today_stats(property_id: str) -> dict:
 
     stays, room_types, open_tasks, unread = await run_db(_read)
 
-    # Occupying today: half-open, so a stay checking out this morning has
-    # already released the room for tonight.
-    occupying = [s for s in stays if s["check_in"] <= today_s < s["check_out"]]
-
-    rooms_sold = sum(s["units"] for s in occupying)
-    rooms_available = sum(rt["total_units"] for rt in room_types)
-
-    room_revenue = sum(
-        round((s["gross_paise"] - s["discount_paise"]) / s["nights"]) * s["units"]
-        for s in occupying
-        if s["nights"]
-    )
+    # Occupancy and money for tonight, from the one place that computes them.
+    # Half-open, so a stay checking out this morning has already released the
+    # room — the rule lives in `analytics`, applied identically for one day and
+    # for ninety.
+    rooms_sold = money["roomsSold"]
+    rooms_available = money["roomsAvailable"] or sum(rt["total_units"] for rt in room_types)
+    room_revenue = money["roomRevenuePaise"]
 
     # Same predicate the arrivals *list* is built from, so the number on Today
     # and the rows behind it cannot disagree.

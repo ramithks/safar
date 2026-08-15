@@ -40,10 +40,16 @@ def mock_frames(tmp_path):
 @pytest.fixture
 def mock_vision_results(mock_frames):
     results = []
+    # 'gemini' and 'unknown' are the only two detection sources there are —
+    # `LocationSegment.detection_source` is a Literal over exactly those, and
+    # `vision_client` sets 'gemini' on a hit. The old 'landmark_recognition' and
+    # 'web_detection' are Google Vision vocabulary from before the pipeline
+    # moved to Gemini; a fixture still using them builds a VisionResult the
+    # response model refuses, which is a stale test rather than a real defect.
     locations = [
-        ("Eiffel Tower", 48.8584, 2.2945, "landmark_recognition", 0.95),
-        ("Louvre Museum", 48.8606, 2.3376, "landmark_recognition", 0.88),
-        ("Arc de Triomphe", 48.8738, 2.2950, "web_detection", 0.72),
+        ("Eiffel Tower", 48.8584, 2.2945, "gemini", 0.95),
+        ("Louvre Museum", 48.8606, 2.3376, "gemini", 0.88),
+        ("Arc de Triomphe", 48.8738, 2.2950, "unknown", 0.72),
     ]
     for frame, (name, lat, lng, source, conf) in zip(mock_frames, locations):
         vr = VisionResult(frame=frame)
@@ -72,11 +78,21 @@ class TestFullPipeline:
             for i in range(3)
         ]
 
-        mock_place = PlaceDetail(
-            place_id="ChIJtest",
-            name="Eiffel Tower",
-            coordinates=Coordinates(lat=48.8584, lng=2.2945),
-            types=["tourist_attraction"],
+        # `enrich_with_places` returns `EnrichmentResult`, not a bare
+        # `PlaceDetail` — it gained a `suggestions` list when the pipeline
+        # started offering alternatives for a place it could not corroborate.
+        # The orchestrator reads `.primary` to decide whether the landmark was
+        # verified, so a mock returning the inner object skips the branch under
+        # test and fails on the attribute.
+        from app.pipeline.places_client import EnrichmentResult
+
+        mock_place = EnrichmentResult(
+            primary=PlaceDetail(
+                place_id="ChIJtest",
+                name="Eiffel Tower",
+                coordinates=Coordinates(lat=48.8584, lng=2.2945),
+                types=["tourist_attraction"],
+            )
         )
 
         with (
@@ -89,12 +105,12 @@ class TestFullPipeline:
             patch("app.pipeline.orchestrator.extract_frames", return_value=mock_frames),
             patch("app.pipeline.orchestrator.deduplicate_frames", return_value=mock_frames),
             patch("app.pipeline.orchestrator.analyze_frames", return_value=mock_vision_results),
-            patch("app.pipeline.orchestrator.enrich_with_places", return_value=[
+            patch("app.pipeline.places_client.enrich_with_places", return_value=[
                 (vr, mock_place) for vr in mock_vision_results
             ]),
             patch("app.pipeline.orchestrator._cleanup"),
         ):
-            result = asyncio.get_event_loop().run_until_complete(
+            result = asyncio.run(
                 run_pipeline(
                     job_id="test_job_001",
                     reel_url="https://www.instagram.com/reels/test/",
@@ -115,7 +131,7 @@ class TestFullPipeline:
             side_effect=DownloadError("private account", retryable=False),
         ):
             with patch("app.pipeline.orchestrator._cleanup"):
-                result = asyncio.get_event_loop().run_until_complete(
+                result = asyncio.run(
                     run_pipeline(
                         job_id="test_job_002",
                         reel_url="https://www.instagram.com/reels/private/",
@@ -158,7 +174,7 @@ class TestFullPipeline:
             patch("app.pipeline.orchestrator.analyze_frames", return_value=low_conf_results),
             patch("app.pipeline.orchestrator._cleanup"),
         ):
-            result = asyncio.get_event_loop().run_until_complete(
+            result = asyncio.run(
                 run_pipeline(
                     job_id="test_job_003",
                     reel_url="https://www.instagram.com/reels/indoor/",

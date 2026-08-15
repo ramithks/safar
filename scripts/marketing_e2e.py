@@ -745,14 +745,27 @@ _opted_out_during = {"done": False}
 
 async def _send_text_and_opt_out(self, *, to, body, client_reference):
     """
-    Opt the last guest out part-way through the run.
+    Opt the last guest out part-way through the run, before their own turn.
 
     A test hook on the *fake provider*, not on production code: the campaign
     loop cannot be told when to be interrupted, so the interruption has to come
     from the one place a real one would — the outside world, while a message is
     in flight.
+
+    **`to != VICTIM['phone']` is load-bearing, and its absence was a coin flip.**
+    The hook used to fire on the first send whatever it was. When the recipient
+    order happened to put the victim first, the opt-out landed *during their own
+    send* — after their revalidation had already passed — so they were messaged
+    and the assertion failed. That is correct behaviour, not a defect: a guest
+    who opts out after their message has left cannot be un-sent, and no design
+    could promise otherwise.
+
+    So the interruption is now placed where the property actually holds: before
+    the victim's turn, which is what "revalidated at the moment before their
+    message leaves" means. The assertion is unchanged and is now testing
+    something the system genuinely guarantees.
     """
-    if not _opted_out_during["done"]:
+    if not _opted_out_during["done"] and to != VICTIM["phone"]:
         _opted_out_during["done"] = True
         await consent_module.opt_out(PROPERTY, VICTIM["id"])
     return await _original_send_text(self, to=to, body=body,

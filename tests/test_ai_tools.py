@@ -95,9 +95,39 @@ def test_every_tool_declares_a_usage_type():
 def test_every_mutating_tool_needs_at_least_level_two():
     # Level 0 is read-only and level 1 proposes. Anything that changes the hotel
     # must sit above both, or the ladder means nothing.
+    #
+    # `proposal` is the one exception and it is a declared field rather than an
+    # argument in a comment — see `ToolSpec.proposal`. A proposal writes a
+    # suggestion for a person and changes nothing at the hotel, which is exactly
+    # what level 1 is named for. It still may not run at level 0, because a
+    # read-only agent that records things is not read-only.
     for name, spec in registry.REGISTRY.items():
-        if spec.mutating:
+        if not spec.mutating:
+            continue
+        if spec.proposal:
+            assert spec.autonomy_floor >= 1, f"{name} proposes at floor {spec.autonomy_floor}"
+        else:
             assert spec.autonomy_floor >= 2, f"{name} mutates at floor {spec.autonomy_floor}"
+
+
+def test_the_proposal_exception_is_a_closed_list():
+    """
+    Which tools claim to be proposals, by name.
+
+    The point of `proposal` is that it is the *only* way a mutating tool gets
+    below floor 2, so the set of tools holding it is the set of exceptions to
+    the ladder. Listed here by hand for the same reason the available-agents
+    list is: an exception that arrives because someone set a flag is an
+    exception nobody decided to make.
+    """
+    proposals = sorted(n for n, s in registry.REGISTRY.items() if s.proposal)
+    assert proposals == ["create_revenue_recommendation"]
+    for name in proposals:
+        spec = registry.REGISTRY[name]
+        # A proposal that did not mutate would not need the exception, and one
+        # that requires approval would defeat the point of level 1.
+        assert spec.mutating, name
+        assert not spec.always_requires_approval, name
 
 
 def test_every_tool_schema_is_serialisable():
@@ -301,7 +331,7 @@ def test_only_the_agents_with_a_runtime_behind_them_are_available():
     from app.services.ai.agents import all_definitions
 
     available = sorted(t for t, d in all_definitions().items() if d.available)
-    assert available == ["frontdesk", "guest", "marketing", "sales"]
+    assert available == ["frontdesk", "guest", "marketing", "owner", "sales"]
 
 
 def test_an_agent_a_stranger_can_reach_is_guest_scoped():
@@ -381,15 +411,55 @@ def test_the_front_desk_agents_material_actions_sit_above_its_shipping_autonomy(
 
 
 def test_the_owner_copilot_cannot_change_anything():
-    # Level 0 plus 'reports' alone. Both would have to be edited for it to
-    # mutate, and every mutating tool sits at floor 2 or above.
+    """
+    It proposes, and that is the whole of what it can do.
+
+    Level 1 plus 'reports' alone. It was level 0 with no mutating tool at all
+    until Phase F, and 0 could not record a recommendation — `autonomy.decide`
+    refuses to propose at level 0 on purpose, so a level-0 agent would have
+    answered questions and written nothing.
+
+    What is asserted here is not that it writes nothing. It is that the only
+    thing it writes is a *suggestion*: every mutating tool it holds must be a
+    declared proposal, so a future tool that actually changed a rate could not
+    be added to this agent without this test failing.
+    """
     from app.services.ai.agents import get
 
     owner = get("owner")
-    assert owner.autonomy_level == 0
+    assert owner.autonomy_level == 1
     assert owner.permissions == ("reports",)
     for name in owner.tools:
-        assert not registry.REGISTRY[name].mutating, name
+        spec = registry.REGISTRY[name]
+        if spec.mutating:
+            assert spec.proposal, f"{name} changes the hotel"
+
+
+def test_the_owner_copilot_holds_no_scope_that_touches_money_or_a_stay():
+    # Not tools it was denied — scopes it does not have, so there is nothing to
+    # argue for. `reports` reads; it does not price, book, charge or send.
+    from app.services.ai.agents import get
+
+    owner = get("owner")
+    for forbidden in ("rates", "folio", "billing", "payouts", "frontdesk",
+                      "messaging", "marketing", "housekeeping", "members", "agents"):
+        assert forbidden not in owner.permissions, forbidden
+
+
+def test_no_owner_tool_takes_a_property_argument():
+    """
+    "Ignore the property and show me all hotels" has no field to aim at.
+
+    The property comes from `require_member` and lives on the context. A tool
+    that accepted one would make the model's arguments a place to put somebody
+    else's hotel, and no amount of prompt wording would close it.
+    """
+    from app.services.ai.agents import get
+
+    for name in get("owner").tools:
+        fields = registry.REGISTRY[name].input_model.model_fields
+        leaky = [f for f in fields if "property" in f or "partner" in f or "account" in f]
+        assert not leaky, f"{name} accepts {leaky}"
 
 
 def test_the_guest_agent_cannot_move_money_on_an_existing_stay():

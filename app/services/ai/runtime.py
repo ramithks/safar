@@ -129,6 +129,7 @@ _PROVENANCE_TABLES = {
     "folio_entry": "folio_entries",  # migration 15
     "quote": "quotes",               # migration 16
     "reservation": "reservations",   # migration 16
+    "recommendation": "revenue_recommendations",  # migration 18
 }
 
 
