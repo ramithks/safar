@@ -101,6 +101,43 @@ sql(f"""update public.inventory_holds set expires_at = now() - interval '1 minut
         where property_id = '{PROP}' and status = 'active';""")
 sql("select public.expire_holds();")
 
+
+# ── this suite's own stays, given back ───────────────────────────────────────
+#
+# This is the suite that *discovered* the contamination — it computed 261%
+# occupancy off a property five other suites had been leaving stays on — and it
+# was also quietly contributing to it. Every run books a real room and never
+# gave it back.
+#
+# It cannot sweep by reference prefix like the others do, because it creates its
+# bookings through the API and the server allocates the ref: a pms_e2e stay is
+# `TB-` + six characters, indistinguishable from a real one. So it sweeps by the
+# two guest names it invents, which are unambiguously fixtures and unambiguously
+# nobody's booking.
+#
+# Before and after, for the reason every other suite does it before and after: a
+# run that dies halfway leaves its stays behind, and the next run should not
+# inherit them. The cascade takes `reservation_nights` and `folio_entries` with
+# it and nulls `tasks.room_id`, so nothing is orphaned.
+FIXTURE_GUESTS = ("Nisha Kapoor", "Stale Quote", "No Such Quote",
+                  "Double Submit", "Will Be Deleted")
+
+
+def sweep_fixtures(label: str) -> None:
+    names = ", ".join(f"'{n}'" for n in FIXTURE_GUESTS)
+    gone = sql(f"""with doomed as (
+                     delete from public.reservations
+                      where property_id = '{PROP}' and guest_name in ({names})
+                      returning 1)
+                   select count(*) as n from doomed;""")
+    n = int((gone[0] or {}).get("n") or 0) if gone else 0
+    if n:
+        print(f"  · swept {n} stays left by {label} pms_e2e runs")
+
+
+sweep_fixtures("previous")
+print(f"\n── pms · property {PROP[:8]}… · nights {ci} → {co} · fixtures {FIXTURE_GUESTS[0]} ──")
+
 print("\n── availability ──")
 st, avail = http(f"{API}/properties/{PROP}/availability?checkIn={ci}&checkOut={co}&units=1", headers=reception)
 check("200 for a member", st == 200, f"{st} {avail}")
@@ -675,5 +712,6 @@ check("another partner's staff cannot sync this property", st == 404, f"got {st}
 st, _ = http(f"{API}/properties/{PROP}/sync")
 check("and an unauthenticated sync is 401, not 422", st == 401, f"got {st}")
 
+sweep_fixtures("this suite's")
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

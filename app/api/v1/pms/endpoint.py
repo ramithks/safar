@@ -1033,9 +1033,14 @@ async def ask_frontdesk_agent(
     `require_member("frontdesk")` resolves the caller against this property from
     their JWT; everything downstream — the agent context, every tool, every PMS
     call — is bounded by the `property_id` that check produced. The request body
-    carries a sentence and a task name. It cannot carry a property, a partner, a
-    guest or a reservation, so there is no field in it that a prompt injection
-    could aim at. The model is not the boundary; this dependency is.
+    carries a sentence and, optionally, a task name from a fixed list. It cannot
+    carry a property, a partner, a guest or a reservation, so there is no field
+    in it that a prompt injection could aim at. The model is not the boundary;
+    this dependency is.
+
+    An absent task is classified rather than defaulted — see
+    `services/ai/classify`. That classifier is given no tools and never the
+    property id, so the worst a message can talk it into is the wrong model.
 
     Requires 'frontdesk' rather than merely membership: a housekeeper has no
     business checking guests in, and the agent must not become a way to do

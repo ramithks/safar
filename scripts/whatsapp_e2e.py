@@ -46,7 +46,7 @@ os.environ.setdefault("WHATSAPP_APP_SECRET", "whatsapp-e2e-app-secret")
 os.environ.setdefault("WHATSAPP_VERIFY_TOKEN", "whatsapp-e2e-verify-token")
 
 from app.config import settings  # noqa: E402
-import e2e_sweep  # noqa: E402
+import e2e_fixture  # noqa: E402
 
 from app.db.client import get_db  # noqa: E402
 from app.services.ai import registry  # noqa: E402
@@ -105,17 +105,15 @@ def sql(query: str):
 
 # ── a guest with a phone nobody has used before ──────────────────────────────
 
-# Clear this suite's own fixtures, by the reference prefix it writes.
-# See scripts/e2e_sweep.py for why: five suites leaving a fortnight of test
-# stays on one shared property turned its occupancy into 261%, and pms_e2e
-# failed on a number that was arithmetically correct about a fiction.
-def sweep() -> None:
-    e2e_sweep.announce(
-        'WhatsApp',
-        e2e_sweep.sweep_reservations(db, [PROPERTY, OTHER_PROPERTY], ['TB-WA', 'TB-ZZ']))
-
-
-sweep()
+# What this suite owns, and gives back. See scripts/e2e_fixture.py.
+FIXTURE = e2e_fixture.Fixture(
+    label="WhatsApp",
+    property_id=PROPERTY,
+    partner_id=PARTNER,
+    prefixes=("TB-WA", "TB-ZZ"),
+    also_sweep=(OTHER_PROPERTY,),
+)
+FIXTURE.open()
 
 RUN_TAG = uuid.uuid4().hex[:8]
 GUEST_PHONE = f"9199{RUN_TAG[:8]}"
@@ -880,5 +878,5 @@ check("no credential column exists on the connection table at all",
 
 print(f"\n{PASS} passed, {FAIL} failed")
 print("\nREAL DATABASE TESTED · FAKE META TESTED · REAL META NOT TESTED (no credentials)")
-sweep()
+FIXTURE.close()
 sys.exit(1 if FAIL else 0)

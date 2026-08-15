@@ -225,7 +225,14 @@ async def execute_approved(
     # Metered like any other action. It happened, a guest is affected by it, and
     # it consumed the same service a live turn would have.
     try:
-        usage = usage_mod.TurnUsage(provider=ctx.provider, model=ctx.model)
+        # The tier comes off the run that proposed this, not from a fresh
+        # routing decision. Approving a negotiation an hour later does not make
+        # it an ordinary enquiry, and re-deriving the tier here would price the
+        # same piece of work differently depending on how long a manager took to
+        # look at their phone.
+        usage = usage_mod.TurnUsage(
+            provider=ctx.provider, model=ctx.model, tier=run.get("model_tier") or "",
+        )
         usage.count(spec.usage_type)
         await usage_mod.record_run(
             run_id=action["run_id"],

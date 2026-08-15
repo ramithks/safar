@@ -10,7 +10,9 @@ record all happen, and a second entrance would be a way to skip all five.
       ├─ resolve the tool          unknown name → refused, told to the model
       ├─ permissions.check()       grant + scope
       ├─ validate arguments        pydantic, the same schema the model was shown
+      ├─ precheck()                the property's own rules, before anything queues
       ├─ autonomy.decide()         execute · approve · refuse
+      ├─ revalidate()              approval path only: is it still true?
       ├─ run the function          which does the work and nothing else
       └─ return a ToolOutcome      which the caller writes to agent_actions
 
@@ -53,6 +55,7 @@ def tool(
     creates_result: bool = False,
     always_requires_approval: bool = False,
     scoped_to_conversation: bool = False,
+    precheck: Callable | None = None,
     revalidate: Callable | None = None,
 ) -> Callable:
     """
@@ -80,6 +83,7 @@ def tool(
             creates_result=creates_result,
             always_requires_approval=always_requires_approval,
             scoped_to_conversation=scoped_to_conversation,
+            precheck=precheck,
             revalidate=revalidate,
         )
         return fn
@@ -137,9 +141,10 @@ async def execute(
 
     `approved=True` means a human with the 'agents' permission has stood in for
     the autonomy level on this specific action. It skips **only** the autonomy
-    gate. Permission, grant, argument validation and the tool's own
-    revalidation all still run — a manager can lend their judgement, not their
-    access, and cannot approve a tool the agent was never granted.
+    gate. Permission, grant, argument validation, the property's own business
+    rules and the tool's revalidation all still run — a manager can lend their
+    judgement, not their access, and cannot approve a tool the agent was never
+    granted or a price the property never authorised.
     """
     started = time.monotonic()
 
@@ -177,6 +182,17 @@ async def execute(
             f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()[:4]
         )
         return refusal(ToolInputInvalid(f"{spec.name} arguments rejected — {detail}"))
+
+    # Business validation, before the autonomy gate and therefore before
+    # `approved` can matter. A discount above what the property authorises is
+    # not something a manager should be offered the chance to approve — it is
+    # something the agent must be told it cannot ask for, while the guest is
+    # still in the conversation.
+    if spec.precheck is not None:
+        try:
+            await spec.precheck(args, ctx)
+        except AgentError as exc:
+            return refusal(exc)
 
     verdict = autonomy.EXECUTE if approved else autonomy.decide(spec, ctx)
     if verdict == autonomy.REFUSE:
@@ -249,4 +265,5 @@ def load_all() -> None:
         operations,
         pricing,
         read,
+        sales,
     )

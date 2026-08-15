@@ -28,13 +28,13 @@ from datetime import date, datetime, timedelta, timezone
 from fastapi import HTTPException, status
 
 from app.db.client import get_db, run_db
+from app.services.pms import negotiation
 from app.services.pms.availability import nightly_for_plan
 from app.services.pms.pricing import (
     NightlyRate,
     PricedStay,
     nights_between,
     price_stay,
-    resolve_property_limits,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,6 +99,8 @@ async def create_quote(
     issued_by: str = "employee",
     issued_by_member: str | None = None,
     conversation_id: str | None = None,
+    authorised_discount_pct: int | None = None,
+    audience: str | None = None,
 ) -> QuoteResult:
     """
     Price a stay, hold the stock, and record the quote.
@@ -107,6 +109,28 @@ async def create_quote(
     server-side, which is what makes it safe for an AI agent to negotiate: the
     worst outcome is the floor, and the guest is never shown a number the
     property did not authorise.
+
+    `authorised_discount_pct` raises that floor for one quote, and is how a
+    manager's approval reaches the price. It does not remove the clamp — the
+    ceiling becomes `properties.settings.max_approved_discount_pct`, which is
+    still the property's number and still enforced here. So an approval row
+    carrying 90 produces a quote at the property's approval ceiling, not at 90.
+    That second clamp is not redundancy for its own sake: the first layer is an
+    argument on a row somebody pressed Approve on, and this is the layer that
+    does not depend on them having read it.
+
+    `audience` is who is being quoted, and it mirrors `stay_options(audience=…)`
+    exactly: the caller knows who is asking and the service enforces it. `None`
+    means "any", which is right for the front desk — it books on behalf of
+    travel agents and must be able to quote their rate.
+
+    **It was not here, and its absence was a real hole.** `stay_options` has
+    filtered by audience since it was written, so a guest was never *shown* a
+    b2b rate plan — but nothing stopped one being *priced* if its id arrived from
+    somewhere else. The whole argument for the tool layer is that a model
+    guessing a UUID is not the thing standing between a guest and an agent rate.
+    Found by `scripts/sales_e2e.py` calling `get_quote` with the b2b plan id
+    directly, which is what a prompt injection would do if it could read one.
     """
     nights = nights_between(check_in, check_out)
     if nights <= 0:
@@ -119,6 +143,12 @@ async def create_quote(
     prop, plan = await run_db(_load_context, property_id, rate_plan_id)
     if not prop or not plan or plan["property_id"] != property_id or not plan["is_active"]:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Rate plan not found")
+    if audience is not None and plan["audience"] != audience:
+        # 404 rather than 403, deliberately, and the same answer the caller gets
+        # for a plan id that never existed. "That rate exists but is not for you"
+        # tells a guest there is a cheaper price and invites them to go looking
+        # for its id.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Rate plan not found")
     if prop["status"] != "active":
         raise HTTPException(status.HTTP_409_CONFLICT, "This property is not taking bookings")
 
@@ -128,7 +158,12 @@ async def create_quote(
     if nightly is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "These dates are closed on this rate plan")
 
-    max_discount, token_pct = resolve_property_limits(prop.get("settings"))
+    policy = negotiation.resolve(prop.get("settings"))
+    max_discount = policy.ceiling_for(approved=authorised_discount_pct is not None)
+    if authorised_discount_pct is not None:
+        max_discount = min(max_discount, max(int(authorised_discount_pct), 0))
+    token_pct = policy.token_pct
+
     priced = price_stay(
         [NightlyRate(date=d, price_paise=p) for d, p in nightly],
         units=units,

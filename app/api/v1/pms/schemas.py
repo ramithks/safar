@@ -730,8 +730,14 @@ class ConsoleAskRequest(BaseModel):
     # services/ai/model_router. Constrained to the front desk's own tasks plus
     # the two reasoning ones it can legitimately need, so a caller cannot route
     # every question to the expensive tier by typing its name.
-    task: str = Field(
-        default="frontdesk_operations",
+    #
+    # **Null is the normal case.** A receptionist should not have to pick a
+    # capability from a dropdown to get the right model, so an absent task hands
+    # the decision to `services/ai/classify` — one call on the cheapest tier
+    # there is, with no tools, choosing from the front desk's own list. An
+    # explicit task still wins: a caller that knows should not be second-guessed.
+    task: str | None = Field(
+        default=None,
         pattern="^(frontdesk_operations|frontdesk_summary|operational_analysis|multi_reservation)$",
     )
 

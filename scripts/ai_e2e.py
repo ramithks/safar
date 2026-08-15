@@ -38,7 +38,7 @@ from datetime import date, timedelta
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from app.config import settings  # noqa: E402
-import e2e_sweep  # noqa: E402
+import e2e_fixture  # noqa: E402
 
 from app.db.client import get_db  # noqa: E402
 from app.services.ai import context as ai_context  # noqa: E402
@@ -112,17 +112,18 @@ db.table("conversations").update({"handler": "ai"}).eq("property_id", PROPERTY).
 
 # ── a conversation and a stay for it to be about ─────────────────────────────
 
-# Clear this suite's own fixtures, by the reference prefix it writes.
-# See scripts/e2e_sweep.py for why: five suites leaving a fortnight of test
-# stays on one shared property turned its occupancy into 261%, and pms_e2e
-# failed on a number that was arithmetically correct about a fiction.
-def sweep() -> None:
-    e2e_sweep.announce(
-        'agent runtime',
-        e2e_sweep.sweep_reservations(db, [PROPERTY, OTHER_PROPERTY], ['TB-AI', 'TB-XX']))
-
-
-sweep()
+# What this suite owns, and gives back. See scripts/e2e_fixture.py — it prints
+# the property, the billing account and the wallet it is about to spend, raises
+# the wallet to a floor so a previous suite's spend cannot pause this one, and
+# sweeps its own stays before and after.
+FIXTURE = e2e_fixture.Fixture(
+    label="agent runtime",
+    property_id=PROPERTY,
+    partner_id=PARTNER,
+    prefixes=("TB-AI", "TB-XX"),
+    also_sweep=(OTHER_PROPERTY,),
+)
+FIXTURE.open()
 
 RUN_TAG = uuid.uuid4().hex[:6]
 ci = date.today() + timedelta(days=1)
@@ -795,5 +796,5 @@ check("a booking against a quote that does not exist is refused",
       f"{missing_quote.code} {missing_quote.detail}")
 
 print(f"\n{PASS} passed, {FAIL} failed")
-sweep()
+FIXTURE.close()
 sys.exit(1 if FAIL else 0)

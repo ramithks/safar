@@ -127,6 +127,12 @@ async def get_quote(args: QuoteArgs, ctx: AgentContext) -> tuple[dict, str]:
             discount_reason="negotiation" if requested else None,
             issued_by=ACTOR_QUOTE,
             conversation_id=ctx.conversation_id,
+            # The same 'public' that `search_availability` and
+            # `get_stay_options` pass. Those filter what the guest is *shown*;
+            # this decides what may be *priced*, and the two have to agree or
+            # the filter is decoration — a rate plan id is a uuid, and a uuid
+            # from the b2b tier would otherwise quote a guest the agent rate.
+            audience="public",
         )
     except Exception as exc:  # noqa: BLE001
         # Never fall back to an estimate. A pricing service that is down means

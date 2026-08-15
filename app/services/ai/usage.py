@@ -57,6 +57,11 @@ class TurnUsage:
 
     provider: str = ""
     model: str = ""
+    # The capability tier the router chose: 'conversation' | 'reasoning' |
+    # 'classify'. Carried because for one agent it changes the *price* — a sales
+    # turn on the reasoning tier is a negotiation and is charged as one — and
+    # deriving it back from a model id would break the day a tier moves.
+    tier: str = ""
     tokens_in: int = 0
     tokens_out: int = 0
     # Reasoning tokens, where the provider reports them separately. Billed, and
@@ -114,7 +119,7 @@ async def record_run(
     answered — plus one non-billable row per tool call. The token counts ride on
     the turn, because that is where the provider cost actually lands.
     """
-    turn_type = billing.usage_type_for_agent(agent_type)
+    turn_type = billing.usage_type_for_agent(agent_type, tier=usage.tier or None)
 
     unit_detail = {
         "tokens_in": usage.tokens_in,
@@ -139,6 +144,7 @@ async def record_run(
             "models": usage.models or ([usage.model] if usage.model else []),
             "latencyMs": latency_ms,
             "agentType": agent_type,
+            "tier": usage.tier or None,
         },
     )
     written = 1 if result.recorded else 0

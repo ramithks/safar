@@ -43,13 +43,18 @@ logger = logging.getLogger(__name__)
 
 CHANNEL = "internal"
 
-# What the router is asked for on a front desk turn.
+# What the router is asked for on a front desk turn when nobody says.
 #
 # A capability, not a model — see services/ai/model_router. The caller may name
 # a harder task (`operational_analysis`, `multi_reservation`) and get the
 # reasoning tier; nothing here infers difficulty from how much somebody typed,
 # because a receptionist writing three lines about a group arrival wants the
 # same lookup as one writing four words.
+#
+# `task=None` hands the decision to `services/ai/classify` instead, which is the
+# API's default: a receptionist should not have to pick a capability from a
+# dropdown to get the right model. An explicit task still wins, because a caller
+# that knows should not be second-guessed by a cheap model.
 DEFAULT_TASK = "frontdesk_operations"
 
 # How much of the thread the model is given. Shorter than a guest conversation's
@@ -179,8 +184,9 @@ async def ask(
     property_id: str,
     member,
     message: str,
-    task: str = DEFAULT_TASK,
+    task: str | None = None,
     provider=None,
+    classifier=None,
 ) -> tuple[RunResult, dict]:
     """
     One front desk turn. Returns the run and the conversation it happened on.
@@ -248,6 +254,7 @@ async def ask(
         provider=provider,
         summary=message[:120],
         task=task,
+        classifier=classifier,
     )
 
     # Stamp the question with the run that answered it, so an unanswered message

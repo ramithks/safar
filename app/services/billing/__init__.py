@@ -2,6 +2,7 @@
 from app.services.billing.service import (  # noqa: F401
     CRITICAL_PURPOSES,
     USAGE_BY_AGENT,
+    USAGE_BY_AGENT_TIER,
     USAGE_BY_WA_CATEGORY,
     ChargeResult,
     Decision,

@@ -49,8 +49,25 @@ USAGE_BY_AGENT = {
     "guest":     "ai.guest_conversation",
     "frontdesk": "ai.frontdesk_assist",
     "owner":     "ai.owner_copilot",
-    "sales":     "ai.negotiation",
+    "sales":     "ai.sales_assist",
     "marketing": "ai.content_generation",
+}
+
+# The one agent whose price depends on how hard the turn was.
+#
+# `ai.negotiation` is 20 credits and its rate-card description says exactly what
+# it is for: "one turn on the reasoning tier where a price is being argued".
+# Mapping every sales turn to it would have charged a hotel 20 credits for "do
+# you have a room on Friday" — two and a half times what the guest agent charges
+# for the same sentence, on the agent most likely to be asked it.
+#
+# So the tier decides, and the tier is the router's own decision recorded on
+# `agent_runs.model_tier`. A hotel that queries its bill can join the charge back
+# to the run and see why. No other agent varies: a front desk lookup and a front
+# desk analysis are the same product to the hotel, and only this one has a
+# separately priced hard case that was already on the card.
+USAGE_BY_AGENT_TIER = {
+    ("sales", "reasoning"): "ai.negotiation",
 }
 
 # Meta bills per conversation, by category, and tells us the category on the
@@ -77,8 +94,20 @@ CRITICAL_PURPOSES = {
 }
 
 
-def usage_type_for_agent(agent_type: str | None) -> str:
-    return USAGE_BY_AGENT.get(agent_type or "", "ai.guest_conversation")
+def usage_type_for_agent(agent_type: str | None, tier: str | None = None) -> str:
+    """
+    What one turn of this agent is sold as.
+
+    `tier` is optional and usually absent: the pre-run credit gate consults this
+    before anything has been routed, so it prices the ordinary case. That is the
+    right way round — a gate that assumed the expensive type would pause an
+    agent that had the credits for the turn it was about to take. The ledger,
+    which runs after and knows the tier, records what actually happened.
+    """
+    base = USAGE_BY_AGENT.get(agent_type or "", "ai.guest_conversation")
+    if tier:
+        return USAGE_BY_AGENT_TIER.get((agent_type or "", tier), base)
+    return base
 
 
 def is_critical(purpose: str | None) -> bool:

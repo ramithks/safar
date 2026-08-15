@@ -46,7 +46,7 @@ from datetime import date, timedelta
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-import e2e_sweep  # noqa: E402
+import e2e_fixture  # noqa: E402
 
 from app.db.client import get_db  # noqa: E402
 from app.deps.property import Member  # noqa: E402
@@ -138,62 +138,35 @@ db.table("conversations").update({"handler": "ai", "ai_enabled": True}).eq(
 ).eq("channel", "internal").execute()
 
 
-def top_up_wallet() -> None:
-    """
-    Leave the shared wallet with room for the next suite.
-
-    Found by running this: forty front desk turns at 6 credits each drove the
-    test property's balance to −459, past its 500 overdraft. `usage_allowed()`
-    then correctly paused the *Guest* agent, and `whatsapp_e2e.py` failed with
-    "a reply was stored: 0" — a green pipeline reported as broken because a
-    different suite had spent the money.
-
-    The metering was right and the gate was right. What was wrong is that four
-    suites share one wallet and none of them said so. Topping up before the run
-    keeps the gates independent, which is the only way a failure in one of them
-    means anything.
-
-    Idempotent on the day, so re-running the suite does not mint credits
-    forever — that would hide a genuine runaway charge behind a test fixture.
-    """
-    from app.services import billing as billing_mod
-
-    account = run(billing_mod.account_for_property(PROPERTY))
-    if not account:
-        return
-    state = run(billing_mod.wallet_state(account))
-    if state.get("available", 0) >= 2000:
-        return
-    run(billing_mod.grant(
-        billing_account_id=account, kind="adjustment", credits=5000,
-        idempotency_key=f"e2e-topup:{PROPERTY}:{date.today().isoformat()}",
-        source_type="test", actor_type="admin",
-        metadata={"reason": "frontdesk_e2e keeps the shared gates independent"},
-    ))
-    print(f"  · wallet topped up: {state.get('available')} → "
-          f"{run(billing_mod.wallet_state(account)).get('available')}")
-
-
-# ── clear what previous runs left behind ─────────────────────────────────────
+# What this suite owns, and gives back.
 #
-# This suite creates rooms, and that is new: every other suite creates
-# reservations and conversations, which nothing counts absolutely. Rooms are
-# counted — `pms_e2e` asserts on the size of the floor, and `today_stats`
-# divides by it. Four rooms per run turned that hotel's occupancy into 380% and
-# its floor into 72 rooms, and `pms_e2e` failed on two assertions that were
-# perfectly correct about a property this suite had been quietly inflating.
+# The wallet floor and the stay sweep are `e2e_fixture`'s now — every suite does
+# the same two things and doing them five different ways was how they diverged.
+# See scripts/e2e_fixture.py for the two failures that produced it.
+FIXTURE = e2e_fixture.Fixture(
+    label="front desk",
+    property_id=PROPERTY,
+    partner_id=PARTNER,
+    prefixes=("TB-FA", "TB-FD", "TB-FX", "TB-FS", "TB-FG", "TB-R1", "TB-R2"),
+    also_sweep=(OTHER_PROPERTY,),
+)
+
+
+# ── rooms, which only this suite creates ─────────────────────────────────────
 #
-# So the fixtures are named, and named fixtures are removable. Done at the
-# *start* rather than only at the end, because a run that dies halfway leaves
-# its rooms behind and the next run should not inherit them.
+# Every other suite creates reservations and conversations, which nothing counts
+# absolutely. Rooms are counted — `pms_e2e` asserts on the size of the floor, and
+# `today_stats` divides by it. Four rooms per run turned that hotel's occupancy
+# into 380% and its floor into 72 rooms, and `pms_e2e` failed on two assertions
+# that were perfectly correct about a property this suite had been inflating.
+#
+# So this stays here rather than moving into the shared fixture: it is a sweep
+# only one suite needs, and a generic room sweep would be a loaded gun pointed
+# at whichever suite next created one.
 #
 # `rooms.id` is referenced by `reservations.room_id` and `tasks.room_id`, both
 # `on delete set null`, so this cannot orphan a stay or a ticket.
-def sweep_previous_runs() -> None:
-    stays = e2e_sweep.sweep_reservations(
-        db, [PROPERTY, OTHER_PROPERTY], ["TB-FA", "TB-FD", "TB-FX", "TB-FS", "TB-FG",
-                                         "TB-R1", "TB-R2"])
-
+def sweep_rooms() -> int:
     rooms = (
         db.table("rooms").select("id,number")
         .in_("property_id", [PROPERTY, OTHER_PROPERTY])
@@ -210,12 +183,13 @@ def sweep_previous_runs() -> None:
     ]
     for r in doomed:
         db.table("rooms").delete().eq("id", r["id"]).execute()
+    return len(doomed)
 
-    e2e_sweep.announce("front desk", stays, len(doomed))
 
-
-top_up_wallet()
-sweep_previous_runs()
+FIXTURE.open()
+_swept_rooms = sweep_rooms()
+if _swept_rooms:
+    print(f"   swept            {_swept_rooms} rooms left by a previous run\n")
 
 RUN_TAG = uuid.uuid4().hex[:6]
 TODAY = clock.business_date_iso(PROPERTY)
@@ -1425,7 +1399,8 @@ else:
 set_autonomy(2)
 # And leave the hotel as it was found, so the next gate is measuring the
 # product rather than this suite's leftovers.
-sweep_previous_runs()
+sweep_rooms()
+FIXTURE.close()
 print(f"\n╔═ {PASS} passed, {FAIL} failed")
 print("╚═")
 sys.exit(1 if FAIL else 0)

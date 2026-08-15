@@ -78,11 +78,38 @@ def run(coro):
     ("guest",     "ai.guest_conversation"),
     ("frontdesk", "ai.frontdesk_assist"),
     ("owner",     "ai.owner_copilot"),
-    ("sales",     "ai.negotiation"),
+    ("sales",     "ai.sales_assist"),
     ("marketing", "ai.content_generation"),
 ])
 def test_each_agent_is_charged_as_what_it_is(agent_type, expected):
     assert billing.usage_type_for_agent(agent_type) == expected
+
+
+# ── the one agent whose price depends on how hard the turn was ──────────────
+#
+# `ai.negotiation` is 20 credits and the rate card describes it as a reasoning-
+# tier turn where a price is being argued. Charging every sales turn at it would
+# bill 20 credits for "do you have a room on Friday" — two and a half times the
+# guest agent's price for the same sentence.
+
+def test_a_sales_turn_on_the_reasoning_tier_is_a_negotiation():
+    assert billing.usage_type_for_agent("sales", tier="reasoning") == "ai.negotiation"
+    assert billing.usage_type_for_agent("sales", tier="conversation") == "ai.sales_assist"
+
+
+def test_no_other_agent_is_repriced_by_its_tier():
+    # A front desk lookup and a front desk analysis are the same product to the
+    # hotel. Only sales has a separately priced hard case already on the card.
+    for agent_type in ("guest", "frontdesk", "owner", "marketing"):
+        base = billing.usage_type_for_agent(agent_type)
+        assert billing.usage_type_for_agent(agent_type, tier="reasoning") == base
+
+
+def test_the_credit_gate_prices_the_ordinary_case():
+    # Consulted before anything is routed. A gate that assumed the expensive
+    # type would pause an agent that had the credits for the turn it was about
+    # to take.
+    assert billing.usage_type_for_agent("sales") == "ai.sales_assist"
 
 
 def test_an_unknown_agent_falls_back_to_the_cheapest_conversational_type():

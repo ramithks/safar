@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 
 from app.config import settings
 from app.db.client import get_db, run_db
-from app.services.ai import model_router, prompts, registry, usage as usage_mod
+from app.services.ai import classify, model_router, prompts, registry, usage as usage_mod
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import AgentError, ProviderError
 from app.services.ai.providers import ModelStep, Provider, for_name
@@ -50,7 +50,7 @@ registry.load_all()
 # ── the run and action rows ──────────────────────────────────────────────────
 
 def _open_run(ctx: AgentContext, trigger: str, summary: str | None,
-              provider: str, model: str) -> str:
+              provider: str, model: str, task: str, tier: str) -> str:
     def _write():
         row = {
             "agent_id": ctx.principal.agent_id,
@@ -65,6 +65,11 @@ def _open_run(ctx: AgentContext, trigger: str, summary: str | None,
             "status": "running",
             "provider": provider,
             "model": model,
+            # The routing decision, kept. It is what explains a turn that ran on
+            # Pro and, for the sales agent, a turn that was billed at 20 credits
+            # rather than 8 — see migration 16.
+            "task": task,
+            "model_tier": tier,
         }
         return get_db().table("agent_runs").insert(row).execute().data[0]["id"]
 
@@ -120,8 +125,10 @@ def _write_action(ctx: AgentContext, run_id: str, seq: int, outcome: ToolOutcome
 # job is one UPDATE. Result types with no provenance column — a quote, a hold, a
 # room status — are simply absent, and absence means "nothing to stamp".
 _PROVENANCE_TABLES = {
-    "task": "tasks",              # migration 5, FK added in 10
+    "task": "tasks",                 # migration 5, FK added in 10
     "folio_entry": "folio_entries",  # migration 15
+    "quote": "quotes",               # migration 16
+    "reservation": "reservations",   # migration 16
 }
 
 
@@ -199,7 +206,8 @@ async def run_turn(
     trigger: str = "message",
     provider: Provider | None = None,
     summary: str | None = None,
-    task: str = "guest_conversation",
+    task: str | None = None,
+    classifier=None,
 ) -> RunResult:
     """
     One guest turn, from a message to a reply.
@@ -212,9 +220,25 @@ async def run_turn(
     `task` is a *capability*, not a model. `model_router` turns it into a model,
     a thinking budget and a token ceiling, so no model id appears in this file
     — see services/ai/model_router.py for why that indirection earns its keep.
+
+    **`task=None` means "work it out".** A caller that already knows the
+    capability — the staff console, where a receptionist picked one — passes it.
+    A caller that does not, which is every inbound message, leaves it and the
+    classifier decides on the cheapest tier there is. That used to be a constant,
+    with the consequence that the router's whole escalation table was
+    unreachable in production: every guest turn in the system was routed as
+    `guest_conversation` whatever it said.
     """
     started = time.monotonic()
     llm = provider or for_name(ctx.provider)
+
+    # Before the run is opened, because the run row records what was decided.
+    routed = None
+    if task is None:
+        routed = await (classifier or classify.for_provider(provider)).classify(
+            agent_type=ctx.principal.agent_type, message=message, history=history,
+        )
+        task = routed.task
 
     # `agent_configs.model` is the exception, not the rule. Empty means "let the
     # router decide", which is what almost every property wants — a model id
@@ -229,9 +253,19 @@ async def run_turn(
         "max_output_tokens": ctx.params.get("max_output_tokens", choice.max_output_tokens),
         "thinking_budget": ctx.params.get("thinking_budget", choice.thinking_budget),
     }
-    turn_usage = usage_mod.TurnUsage(provider=llm.name, model=choice.model)
+    turn_usage = usage_mod.TurnUsage(provider=llm.name, model=choice.model, tier=choice.tier)
 
-    run_id = await run_db(_open_run, ctx, trigger, summary, llm.name, choice.model)
+    # The classification's own tokens. Counted on this turn rather than billed
+    # separately: `ai.classification` is priced at zero on purpose — routing a
+    # message well is plumbing, and charging for plumbing teaches the runtime to
+    # skip it — but the tokens were spent and the margin report should see them.
+    if routed is not None and routed.source == "model":
+        turn_usage.add_tokens(routed.tokens_in, routed.tokens_out)
+        turn_usage.used_model(routed.model)
+        turn_usage.count("ai.classification")
+
+    run_id = await run_db(_open_run, ctx, trigger, summary, llm.name, choice.model,
+                          task, choice.tier)
     ctx.run_id = run_id
 
     messages: list[dict] = [{"role": "system", "content": prompts.build_system_prompt(ctx)}]

@@ -61,7 +61,21 @@ class AgentDefinition:
 # `approvals.execute_approved` had it hardcoded to 'guest' — which would have
 # re-imposed guest scoping on a Front Desk action the moment a manager approved
 # one.
-GUEST_FACING = frozenset({"guest"})
+# **Sales is on this list and it was not.** The set was written when the Guest
+# agent was the only one that ever met a member of the public, and "guest" read
+# as the name of the audience rather than as one entry in a list. Activating the
+# Sales agent made that wrong: it answers strangers on WhatsApp and Instagram,
+# and `actor_for('sales')` was returning 'member' — so a person who had never
+# stayed at the hotel would have had a run whose `require_task` was bounded by
+# the property rather than by their own conversation.
+#
+# Caught by `scripts/sales_e2e.py` asserting on the routing tuple rather than on
+# the agent type alone, which is why the two are returned together.
+#
+# The rule this encodes: an agent goes on this list if a stranger can reach it.
+# Not whether it sells, not whether it is new — whether the person on the other
+# end is somebody the hotel has authenticated. Nobody on WhatsApp is.
+GUEST_FACING = frozenset({"guest", "sales", "marketing"})
 
 
 def actor_for(agent_type: str | None) -> str:

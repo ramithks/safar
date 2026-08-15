@@ -67,6 +67,23 @@ class ToolSpec:
     # conversation before anything is returned.
     scoped_to_conversation: bool = False
 
+    # Business validation, run *before* the autonomy gate on every path.
+    #
+    # `revalidate` below asks "is this still true?" and only runs on the approval
+    # path. This asks "was this ever allowed?" and runs on both, which is the
+    # difference that matters: a request outside the property's rules must be
+    # refused, not queued for a human who can only refuse it again five minutes
+    # later while a guest is told their discount is being considered.
+    #
+    # It is also where the rule "approval skips the autonomy gate and nothing
+    # else" stops being a convention. Sitting above the gate rather than inside
+    # the tool body means `approved=True` cannot route around it — the only line
+    # `approved` changes is the verdict, and this has already run by then.
+    #
+    # Raises `AgentError` to refuse. Absent means the arguments' validity is
+    # fully expressed by the pydantic model, which is true of most tools.
+    precheck: Callable[..., Awaitable[None]] | None = None
+
     # Checked again just before an *approved* proposal executes.
     #
     # A proposal and its approval are separated by however long a manager takes

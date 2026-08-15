@@ -175,13 +175,18 @@ def _agent_text(message: dict) -> str:
     )
 
 
-async def process_conversation(conversation_id: str, *, provider=None) -> dict:
+async def process_conversation(conversation_id: str, *, provider=None, classifier=None) -> dict:
     """
     Answer everything outstanding on one conversation.
 
     Safe to call more than once: a second call with nothing pending does
     nothing, which is what makes it safe to fire from both a webhook and a
     retry.
+
+    `classifier` decides which capability each message is routed as, and
+    therefore which model tier answers it. Left alone it follows the provider:
+    a real run classifies on the cheap tier, a scripted one does not classify at
+    all. See services/ai/classify.for_provider.
     """
     conversation = await run_db(_conversation, conversation_id)
     if not conversation:
@@ -276,6 +281,7 @@ async def process_conversation(conversation_id: str, *, provider=None) -> dict:
             history=history,
             trigger="webhook",
             provider=provider,
+            classifier=classifier,
             summary=(message.get("body") or message.get("message_type") or "")[:120],
         )
         # Stamped before anything else can fail. A crash after the run but
@@ -329,7 +335,7 @@ async def _deliver(conversation: dict, result) -> None:
         await messaging.request_human(conversation["id"], conversation["property_id"])
 
 
-async def dispatch(conversation_id: str, *, provider=None) -> None:
+async def dispatch(conversation_id: str, *, provider=None, classifier=None) -> None:
     """
     Hand the conversation to a worker, or do it here.
 
@@ -346,7 +352,7 @@ async def dispatch(conversation_id: str, *, provider=None) -> None:
     `RuntimeError`, not a shortcut.
     """
     if settings.messaging_inline_processing:
-        await process_conversation(conversation_id, provider=provider)
+        await process_conversation(conversation_id, provider=provider, classifier=classifier)
         return
 
     try:

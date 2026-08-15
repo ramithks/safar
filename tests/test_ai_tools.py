@@ -291,8 +291,8 @@ def test_every_agent_definition_names_only_registered_tools():
 def test_only_the_agents_with_a_runtime_behind_them_are_available():
     """
     Availability is a claim that something has been built to supervise the
-    agent, not that its definition exists. Sales, Marketing and the Owner
-    Copilot have shapes and no slice; `provisioning.provision` refuses them.
+    agent, not that its definition exists. Marketing and the Owner Copilot have
+    shapes and no slice; `provisioning.provision` refuses them.
 
     This list grows one entry per phase, deliberately by hand — an agent that
     became available because someone flipped a default is an agent nobody
@@ -301,15 +301,34 @@ def test_only_the_agents_with_a_runtime_behind_them_are_available():
     from app.services.ai.agents import all_definitions
 
     available = sorted(t for t, d in all_definitions().items() if d.available)
-    assert available == ["frontdesk", "guest"]
+    assert available == ["frontdesk", "guest", "sales"]
 
 
-def test_the_front_desk_agent_is_staff_scoped_and_the_guest_agent_is_not():
+def test_an_agent_a_stranger_can_reach_is_guest_scoped():
+    """
+    The rule is *who is on the other end*, not what the agent does.
+
+    This test asserted `actor_for("sales") == "member"` and was wrong in the
+    dangerous direction — it encoded the same assumption that made
+    `GUEST_FACING` a set containing only "guest". The Sales agent answers
+    strangers on WhatsApp and Instagram; scoping its runs by property rather
+    than by conversation would have let somebody who has never stayed at the
+    hotel ask `get_task_status` about any ticket in the building.
+
+    Caught by `scripts/sales_e2e.py`, which asserts on the routing *tuple* —
+    agent type and actor together — rather than on the agent type alone.
+    """
     from app.services.ai.agents import actor_for
 
+    # Reachable by anyone with the hotel's number.
     assert actor_for("guest") == "guest"
+    assert actor_for("sales") == "guest"
+    assert actor_for("marketing") == "guest"
+
+    # Reachable only by somebody `require_member` authenticated.
     assert actor_for("frontdesk") == "member"
-    assert actor_for("sales") == "member"
+    assert actor_for("owner") == "member"
+
     # No agent type at all falls back to the tighter of the two: a run nobody
     # classified should be visibly over-restricted, not quietly leaking.
     assert actor_for(None) == "guest"

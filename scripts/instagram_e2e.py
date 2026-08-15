@@ -48,6 +48,8 @@ os.environ.setdefault("MESSAGING_INLINE_PROCESSING", "true")
 os.environ.setdefault("INSTAGRAM_APP_SECRET", "instagram-e2e-app-secret")
 os.environ.setdefault("INSTAGRAM_VERIFY_TOKEN", "instagram-e2e-verify-token")
 
+import e2e_fixture  # noqa: E402
+
 from app.config import settings  # noqa: E402
 from app.db.client import get_db  # noqa: E402
 from app.services.ai import registry  # noqa: E402
@@ -67,6 +69,20 @@ OTHER_IG_ACCOUNT = "17841400000000002"
 
 registry.load_all()
 db = get_db()
+
+# What this suite owns. It creates no reservations — Instagram enquiries are
+# conversations, not bookings — so there is nothing to sweep, but it does spend
+# credits on every agent turn, and the wallet it spends them from is shared with
+# three other suites. `open()` states which one and raises it to a floor first.
+# See scripts/e2e_fixture.py for the run where not doing that made a green
+# pipeline report as broken.
+FIXTURE = e2e_fixture.Fixture(
+    label="Instagram",
+    property_id=PROPERTY,
+    partner_id=PARTNER,
+    prefixes=(),
+)
+FIXTURE.open()
 
 PASS = FAIL = 0
 
@@ -585,4 +601,5 @@ print(f"  {state}")
 print(f"\n{PASS} passed, {FAIL} failed")
 print("REAL DATABASE TESTED · FAKE INSTAGRAM TESTED · "
       "REAL INSTAGRAM NOT TESTED (no Meta credentials)")
+FIXTURE.close()
 sys.exit(1 if FAIL else 0)
