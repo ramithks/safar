@@ -23,6 +23,7 @@ from app.services.ai.errors import OutOfScope, ToolUnavailable
 from app.services.ai.registry import tool
 from app.services.ai.tools import ACTOR_RESERVATION
 from app.services.pms import booking as booking_service
+from app.services.pms import creators as creators_service
 
 
 class BookingArgs(BaseModel):
@@ -154,6 +155,15 @@ async def create_booking(args: BookingArgs, ctx: AgentContext) -> tuple[dict, st
             f"booking failed: {type(exc).__name__}: {exc}",
             "I couldn't complete that booking — putting you through to the team now.",
         ) from exc
+
+    # Who sent this guest, decided by the server from the touch chain. The model
+    # is not consulted and could not be: it has no way to name a creator, and
+    # `resolve` reads the conversation id off the run's own context rather than
+    # off anything the model produced. An AI that could assign attribution would
+    # be an AI that could assign money.
+    await creators_service.resolve(
+        reservation["id"], conversation_id=ctx.conversation_id
+    )
 
     return (
         {

@@ -43,8 +43,18 @@ from app.api.v1.pms.schemas import (
     BillingSummaryOut,
     BookingRequest,
     CheckInRequest,
+    AttributionTouchOut,
+    CampaignStatusRequest,
     ConsoleActionOut,
     CampaignOut,
+    CreatorCampaignCreateRequest,
+    CreatorCampaignOut,
+    CreatorPayoutOut,
+    PayoutApprovalOut,
+    PayoutApprovalRequest,
+    PayoutEventOut,
+    PublicAttributionOut,
+    PublicAttributionRequest,
     ConsoleAskOut,
     ConsoleAskRequest,
     ConversationHandlerRequest,
@@ -122,6 +132,7 @@ from app.services.pms import ari as ari_service
 from app.services.pms import availability as availability_service
 from app.services.pms import b2b as b2b_service
 from app.services.pms import clock
+from app.services.pms import creators as creators_service
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
 from app.services.pms import payments as payments_service
@@ -523,6 +534,12 @@ async def create_reservation(
         member_id=member.member_id,
         member_name=member.display_name,
     )
+    # A desk booking can still be a creator's: the guest clicked a reel, then
+    # rang the hotel. The chain is searched by the thread this reservation is
+    # already linked to and by the guest's phone — never by anything the desk
+    # typed, because "which creator gets paid" is not a field a receptionist
+    # should be able to fill in.
+    await creators_service.resolve_for_reservation(row)
     return ReservationOut.from_row(row)
 
 
@@ -574,6 +591,11 @@ async def check_out(
     member=Depends(require_member("frontdesk")),
 ):
     row = await frontdesk_service.check_out(property_id, reservation_id, member)
+    # A finished, settled stay is the moment a creator's commission becomes
+    # payable. Almost every call finds no payout at all, which is the point:
+    # the check is cheap and the alternative is a nightly job that has to
+    # rediscover which stays moved.
+    await creators_service.recalculate_for_reservation(reservation_id)
     return ReservationOut.from_row(row)
 
 
@@ -622,6 +644,12 @@ async def post_folio(
         idempotency_key=body.idempotencyKey,
         member=member,
     )
+    # A payment or a refund moves `paid_paise`, and a stay that is not paid in
+    # full is not one a creator is owed for. Recomputed here rather than read
+    # lazily so the owner's screen and the approval agree at the moment of
+    # approval, not merely eventually.
+    if body.kind in ("payment", "refund"):
+        await creators_service.recalculate_for_reservation(reservation_id)
     return FolioEntryOut.from_row(row)
 
 
@@ -2784,7 +2812,10 @@ async def create_public_order(
         quote_id=quote_id, amount_paise=amount,
         guest_details=body.guest.model_dump(),
         addons=[a.as_dict() for a in addons],
-        attribution={"source": body.source} if body.source else {},
+        attribution={
+            **({"source": body.source} if body.source else {}),
+            **({"visitorRef": body.visitorRef} if body.visitorRef else {}),
+        },
     )
 
     return PublicOrderOut(
@@ -2829,6 +2860,16 @@ async def _fulfil_booking(order: dict) -> dict:
     )
     await public_booking.attach_addons(reservation, order.get("addons") or [])
     await payments_service.record_result(order["id"], reservation_id=reservation["id"])
+
+    # Who, if anyone, sent this guest. Best-effort and after the fact on
+    # purpose: the booking is paid for and must exist whether or not a
+    # commission can be worked out, and `resolve` swallows its own failures for
+    # exactly that reason. It is also idempotent on the reservation, so the
+    # browser callback and the webhook racing here cannot pay twice.
+    await creators_service.resolve(
+        reservation["id"],
+        visitor_ref=(order.get("attribution") or {}).get("visitorRef"),
+    )
     return reservation
 
 
@@ -3444,3 +3485,310 @@ async def create_agency_booking(
 async def list_agency_bookings(request: Request, agency=Depends(require_agency)):
     """Everything this agency has booked, newest first, across every contract."""
     return [ReservationOut.from_row(row) for row in await b2b_service.list_bookings(agency)]
+
+
+# ── M6b: the creator programme ───────────────────────────────────────────────
+#
+#   public ──► POST /public/hotels/{slug}/attribution   record the click
+#
+#   staff  ──► GET  /properties/{id}/creator-campaigns
+#          ──► GET  .../creator-campaigns/{cid}/touches   the evidence chain
+#          ──► GET  .../creator-campaigns/{cid}/payouts   and what it is worth
+#          ──► POST .../creator-campaigns/{cid}/status
+#          ──► POST .../creator-campaigns/{cid}/approve
+#
+# The two permissions are deliberately different. Reading and running a campaign
+# is `marketing`, which a manager holds. **Approving money is `payouts`**, which
+# by default only an owner and an accounts clerk hold — a manager can run the
+# programme all day and cannot sign off a rupee of it. That separation is the
+# whole reason the approval step exists.
+#
+# Not one of these routes accepts an amount, a room-night count, a commission or
+# a creator id. There is nothing on the wire that could move money: the figures
+# come out of `creator_payout_recalc`, from the reservation.
+
+
+@router.post("/public/hotels/{slug}/attribution", response_model=PublicAttributionOut)
+@limiter.limit("30/minute")
+async def record_public_attribution(
+    request: Request, slug: str, body: PublicAttributionRequest,
+):
+    """
+    A guest arrived on a creator's link.
+
+    The only write an unauthenticated caller can cause on this path, and it is
+    deliberately almost inert: it records that a code was opened, and returns a
+    ref the browser will hand back later. It cannot create a booking, cannot see
+    a price and cannot name a creator — the code resolves server-side or it
+    resolves to nothing.
+
+    **A refusal is a 200.** A campaign the hotel paused last week must still
+    render its own hotel page, so `attributed=false` is the answer rather than a
+    404 the front end would have to special-case. The visitor ref comes back
+    either way, because the next click on a *live* link needs to be the same
+    visitor.
+    """
+    # Resolving the hotel first is what scopes this: a code belonging to another
+    # property is simply not this page's, and the 404 for an unpublished slug
+    # arrives before any campaign is looked at.
+    prop = await public_booking.resolve_published(slug)
+
+    touch = await creators_service.record_touch(
+        body.code,
+        source="website",
+        visitor_ref=body.visitorRef,
+        metadata={"slug": prop.slug},
+    )
+    if not touch.ok:
+        return PublicAttributionOut(
+            attributed=False,
+            visitorRef=body.visitorRef or creators_service.new_visitor_ref(),
+        )
+    return PublicAttributionOut(
+        attributed=True,
+        visitorRef=touch.visitor_ref or "",
+        creatorName=touch.creator_name,
+        creatorHandle=touch.creator_handle,
+        campaignName=touch.campaign_name,
+        guestDiscountPct=touch.guest_discount_pct,
+        touchRef=touch.touch_ref,
+    )
+
+
+def _campaign_out(p) -> CreatorCampaignOut:
+    return CreatorCampaignOut(
+        id=p.id,
+        campaignId=p.campaign_id,
+        campaignName=p.campaign_name,
+        propertyId=p.property_id,
+        creatorId=p.creator_id,
+        creatorName=p.creator_name,
+        creatorHandle=p.creator_handle,
+        platform=p.platform if p.platform in
+            ("instagram", "youtube", "blog", "other") else "other",
+        followers=p.followers,
+        code=p.code,
+        status=p.status,
+        startDate=p.start_date,
+        endDate=p.end_date,
+        guestDiscountPct=p.guest_discount_pct,
+        commissionPct=p.commission_pct,
+        attributionWindowDays=p.attribution_window_days,
+        minNights=p.min_nights,
+        clicks=p.clicks,
+        conversations=p.conversations,
+        bookings=p.bookings,
+        roomNights=p.room_nights,
+        revenuePaise=p.revenue_paise,
+        payoutPaise=p.payout_paise,
+        approvedPaise=p.approved_paise,
+        payoutStatus=p.payout_status,
+    )
+
+
+@router.get("/properties/{property_id}/creator-campaigns",
+            response_model=list[CreatorCampaignOut])
+@limiter.limit("120/minute")
+async def list_creator_campaigns(
+    request: Request, property_id: str, member=Depends(require_member("marketing")),
+):
+    """Every creator this hotel works with, newest first, with the numbers rolled up."""
+    return [_campaign_out(p) for p in await creators_service.list_participations(property_id)]
+
+
+@router.get("/properties/{property_id}/creator-campaigns/{campaign_id}/touches",
+            response_model=list[AttributionTouchOut])
+@limiter.limit("120/minute")
+async def list_attribution_touches(
+    request: Request, property_id: str, campaign_id: str,
+    member=Depends(require_member("marketing")),
+):
+    """
+    The evidence chain for one creator, newest first.
+
+    This is the screen that answers "why did we pay this". The booking touch
+    carries the reservation reference and what the stay was worth, so the trail
+    reads as a sequence of facts rather than a list of uuids.
+    """
+    await creators_service.require_participation(campaign_id, property_id)
+    out: list[AttributionTouchOut] = []
+    for touch in await creators_service.list_touches(campaign_id):
+        reservation = touch.get("reservation") or {}
+        out.append(AttributionTouchOut(
+            id=touch["id"],
+            campaignId=campaign_id,
+            kind=touch["kind"],
+            source=touch.get("source") or "other",
+            at=touch["occurred_at"],
+            expiresAt=touch["expires_at"],
+            city=touch.get("city"),
+            touchRef=touch.get("touch_ref"),
+            conversationId=touch.get("conversation_id"),
+            reservationId=touch.get("reservation_id"),
+            reservationRef=reservation.get("ref"),
+            nights=reservation.get("nights"),
+            valuePaise=reservation.get("total_paise"),
+        ))
+    return out
+
+
+@router.get("/properties/{property_id}/creator-campaigns/{campaign_id}/payouts",
+            response_model=list[CreatorPayoutOut])
+@limiter.limit("120/minute")
+async def list_creator_payouts(
+    request: Request, property_id: str, campaign_id: str,
+    member=Depends(require_member("marketing")),
+):
+    """
+    What this creator is owed, booking by booking, and why.
+
+    Readable on `marketing` rather than `payouts` on purpose: a manager running
+    the programme needs to see what it is costing. Approving is the narrower
+    permission, and it is a different route.
+    """
+    await creators_service.require_participation(campaign_id, property_id)
+    out: list[CreatorPayoutOut] = []
+    for payout in await creators_service.list_payouts(campaign_id):
+        reservation = payout.get("reservation") or {}
+        out.append(CreatorPayoutOut(
+            id=payout["id"],
+            campaignId=campaign_id,
+            reservationId=payout["reservation_id"],
+            reservationRef=reservation.get("ref") or "",
+            guestName=reservation.get("guest_name") or "",
+            checkIn=reservation.get("check_in"),
+            checkOut=reservation.get("check_out"),
+            source=reservation.get("source") or "direct",
+            reservationStatus=reservation.get("status") or "",
+            status=payout["status"],
+            eligible=bool(payout.get("eligible")),
+            ineligibleReason=payout.get("ineligible_reason"),
+            roomNights=int(payout.get("room_nights") or 0),
+            netRevenuePaise=int(payout.get("net_revenue_paise") or 0),
+            commissionPct=float(payout.get("commission_pct") or 0),
+            termsVersion=int(payout.get("terms_version") or 1),
+            amountPaise=int(payout.get("amount_paise") or 0),
+            approvedByName=payout.get("approved_by_name"),
+            approvedAt=payout.get("approved_at"),
+            events=[
+                PayoutEventOut(
+                    fromStatus=e["from_status"], toStatus=e["to_status"],
+                    actorName=e["actor_name"],
+                    amountPaise=int(e.get("amount_paise") or 0),
+                    note=e.get("note"), at=e["at"],
+                ) for e in payout.get("events") or []
+            ],
+        ))
+    return out
+
+
+@router.post("/properties/{property_id}/creator-campaigns/{campaign_id}/status",
+             response_model=CreatorCampaignOut)
+@limiter.limit("60/minute")
+async def set_creator_campaign_status(
+    request: Request, property_id: str, campaign_id: str,
+    body: CampaignStatusRequest, member=Depends(require_member("marketing")),
+):
+    """
+    Pause, resume or end one creator's participation.
+
+    The client sends a word, not a state machine: which transitions are legal is
+    decided in `creators.set_status` and, for the campaign itself, by a trigger
+    in migration 23. A client that could set an arbitrary status could restart
+    an ended campaign, which would make the touches already recorded under it
+    ambiguous about which run they belonged to.
+    """
+    await creators_service.set_status(campaign_id, property_id, body.status)
+    for p in await creators_service.list_participations(property_id):
+        if p.id == campaign_id:
+            return _campaign_out(p)
+    raise HTTPException(status.HTTP_404_NOT_FOUND, "Campaign not found")
+
+
+@router.post("/properties/{property_id}/creator-campaigns/{campaign_id}/approve",
+             response_model=PayoutApprovalOut)
+@limiter.limit("30/minute")
+async def approve_creator_payout(
+    request: Request, property_id: str, campaign_id: str,
+    body: PayoutApprovalRequest | None = None,
+    member=Depends(require_member("payouts")),
+):
+    """
+    Approve everything currently payable for this creator.
+
+    **`payouts`, not `marketing`.** A manager runs the programme; an owner or an
+    accounts clerk signs off what it costs. That is the separation the approval
+    step exists for, and it is the reason this route does not simply live behind
+    the same permission as the screen it is on.
+
+    The amount is not in the request and cannot be. Two people pressing approve
+    at the same moment serialise on the participation's row lock and the second
+    approves nothing, which is reported as `approved: 0` rather than as an
+    error — pressing it twice is not a mistake, it is a person checking.
+    """
+    verdict = await creators_service.approve(
+        campaign_id, property_id,
+        profile_id=member.profile_id,
+        member_id=member.member_id,
+        name=member.display_name or "Owner",
+        note=(body.note if body else None),
+    )
+    return PayoutApprovalOut(
+        approved=int(verdict.get("approved") or 0),
+        amountPaise=int(verdict.get("amountPaise") or 0),
+    )
+
+
+@router.post("/properties/{property_id}/creator-campaigns",
+             response_model=CreatorCampaignOut, status_code=status.HTTP_201_CREATED)
+@limiter.limit("30/minute")
+async def create_creator_campaign(
+    request: Request, property_id: str, body: CreatorCampaignCreateRequest,
+    member=Depends(require_member("marketing")),
+):
+    """
+    Put a creator on a campaign.
+
+    The campaign is created as a **draft** and the creator as **invited**, which
+    is not a formality: nothing records a touch until somebody presses go live.
+    A hotel typing in a partnership it is still negotiating has not started
+    crediting clicks to it.
+
+    A creator already on the platform is joined rather than duplicated — one
+    handle on one platform is one person, and two rows for the same person is
+    how one booking becomes two payouts.
+    """
+    if not body.campaignId:
+        if not (body.campaignName and body.startDate and body.endDate):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "A new campaign needs a name and the dates it runs between.",
+            )
+        if body.endDate < body.startDate:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "A campaign cannot end before it starts."
+            )
+
+    participation = await creators_service.create(
+        property_id, member.partner_id, member.member_id,
+        {
+            "creator_name": body.creatorName,
+            "creator_handle": body.creatorHandle,
+            "platform": body.platform,
+            "followers": body.followers,
+            "city": body.city,
+            "campaign_id": body.campaignId,
+            "campaign_name": body.campaignName,
+            "start_date": body.startDate,
+            "end_date": body.endDate,
+            "commission_pct": body.commissionPct,
+            "guest_discount_pct": body.guestDiscountPct,
+            "attribution_window_days": body.attributionWindowDays,
+            "min_nights": body.minNights,
+        },
+    )
+    for p in await creators_service.list_participations(property_id):
+        if p.id == participation["id"]:
+            return _campaign_out(p)
+    raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        "The campaign was created but could not be read back")

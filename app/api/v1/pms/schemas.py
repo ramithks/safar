@@ -1417,6 +1417,11 @@ class PublicOrderRequest(BaseModel):
     # Where the booking came from, when the link carried it. Recorded, never
     # trusted for anything priced.
     source: str | None = Field(default=None, max_length=40)
+    # The ref this browser was given when it followed a creator's link, possibly
+    # weeks ago. It names a row the server wrote, not a creator — resolution
+    # happens in `creator_resolve_attribution`, which reads the chain and
+    # ignores anything the client thinks it knows.
+    visitorRef: str | None = Field(default=None, max_length=64)
 
 
 class PublicOrderOut(BaseModel):
@@ -1616,3 +1621,182 @@ class AgencyBookingRequest(BaseModel):
     guestPhone: str | None = None
     guestEmail: str | None = None
     notes: str | None = Field(default=None, max_length=500)
+
+
+# ── M6b: the creator programme ───────────────────────────────────────────────
+#
+# One card per *participation* — a creator in a campaign — because that is the
+# unit a hotel acts on: they pause @maya, not "the August programme". The
+# campaign's own name and terms ride along, and `status` is the effective one
+# (see `_effective_status` in services/pms/creators.py).
+#
+# Every money field here is derived server-side and none of them is accepted on
+# any request. `CampaignStatusRequest` and `PayoutApprovalRequest` carry no
+# amount, no room-night count and no creator — there is nothing on the wire that
+# could move a rupee.
+
+
+class CreatorCampaignOut(BaseModel):
+    id: str
+    campaignId: str
+    campaignName: str
+    propertyId: str
+
+    creatorId: str
+    creatorName: str
+    creatorHandle: str
+    platform: Literal["instagram", "youtube", "blog", "other"]
+    followers: int
+
+    # The only identifier that ever leaves the building. No creator, campaign or
+    # property uuid appears in a public link.
+    code: str
+    status: Literal["draft", "live", "paused", "ended"]
+    startDate: date
+    endDate: date
+
+    guestDiscountPct: float
+    commissionPct: float
+    attributionWindowDays: int
+    minNights: int
+
+    clicks: int
+    conversations: int
+    bookings: int
+    roomNights: int
+    revenuePaise: int
+    # What is waiting for somebody to press approve, and what already has been.
+    payoutPaise: int
+    approvedPaise: int
+    payoutStatus: Literal["accruing", "pending_approval", "approved", "paid"]
+
+
+class AttributionTouchOut(BaseModel):
+    """
+    One link in the chain, as an owner reads it.
+
+    `reservationRef` and `valuePaise` are filled in on the booking touch, which
+    is what turns a list of clicks into an answer to "why did we pay this".
+    """
+
+    id: str
+    campaignId: str
+    kind: Literal["click", "conversation", "quote", "booking"]
+    source: Literal["website", "whatsapp", "instagram", "direct", "other"]
+    at: datetime
+    expiresAt: datetime
+    city: str | None = None
+    touchRef: str | None = None
+    conversationId: str | None = None
+    reservationId: str | None = None
+    reservationRef: str | None = None
+    nights: int | None = None
+    valuePaise: int | None = None
+
+
+class PayoutEventOut(BaseModel):
+    fromStatus: str
+    toStatus: str
+    actorName: str
+    amountPaise: int
+    note: str | None = None
+    at: datetime
+
+
+class CreatorPayoutOut(BaseModel):
+    id: str
+    campaignId: str
+    reservationId: str
+    reservationRef: str
+    guestName: str
+    checkIn: date
+    checkOut: date
+    source: str
+    reservationStatus: str
+
+    status: Literal["accruing", "pending_approval", "approved", "rejected", "paid"]
+    eligible: bool
+    # Why not, in a sentence a hotel can read back to a creator.
+    ineligibleReason: str | None = None
+
+    roomNights: int
+    netRevenuePaise: int
+    # Snapshotted at attribution. September's renegotiation does not restate
+    # August — see creator_payouts in migration 23.
+    commissionPct: float
+    termsVersion: int
+    amountPaise: int
+
+    approvedByName: str | None = None
+    approvedAt: datetime | None = None
+    events: list[PayoutEventOut] = []
+
+
+class CampaignStatusRequest(BaseModel):
+    # 'draft' is deliberately absent: a campaign cannot be un-launched, and
+    # offering it would offer to make touches already recorded ambiguous.
+    status: Literal["live", "paused", "ended"]
+
+
+class PayoutApprovalRequest(BaseModel):
+    note: str | None = Field(default=None, max_length=300)
+
+
+class PayoutApprovalOut(BaseModel):
+    approved: int
+    amountPaise: int
+
+
+class PublicAttributionRequest(BaseModel):
+    code: str = Field(min_length=3, max_length=24)
+    # Returned by a previous call and sent back by the browser. It is a handle
+    # on a row the server wrote, not a claim about which creator is owed money.
+    visitorRef: str | None = Field(default=None, max_length=64)
+
+
+class PublicAttributionOut(BaseModel):
+    """
+    What a guest's browser is told after following a creator's link.
+
+    `attributed=False` is a normal answer, not an error: a campaign the hotel
+    paused last week still shows the hotel, it just no longer credits anyone.
+    """
+
+    attributed: bool
+    visitorRef: str
+    creatorName: str | None = None
+    creatorHandle: str | None = None
+    campaignName: str | None = None
+    guestDiscountPct: float = 0
+    # Goes into the prefilled text of the hotel's WhatsApp link, so the chain
+    # survives the channel change without asking the guest for anything.
+    touchRef: str | None = None
+
+
+class CreatorCampaignCreateRequest(BaseModel):
+    """
+    Add a creator to a campaign, making both if they are new.
+
+    There is no `code` field and there never will be: the public code is
+    generated server-side. A hotel that could choose one could choose one
+    already live at another property, and the unique index would turn a typo
+    into a 500 on a screen with nowhere to go.
+
+    `campaignId` is how a second creator joins an existing programme. Omitted,
+    the campaign fields below are required and a new one is created as a draft.
+    """
+
+    creatorName: str = Field(min_length=1, max_length=80)
+    creatorHandle: str = Field(min_length=2, max_length=60)
+    platform: Literal["instagram", "youtube", "blog", "other"] = "instagram"
+    followers: int = Field(default=0, ge=0, le=1_000_000_000)
+    city: str | None = Field(default=None, max_length=80)
+
+    campaignId: str | None = None
+    campaignName: str | None = Field(default=None, max_length=120)
+    startDate: date | None = None
+    endDate: date | None = None
+    commissionPct: float = Field(default=10, ge=0, le=50)
+    guestDiscountPct: float = Field(default=0, ge=0, le=50)
+    attributionWindowDays: int = Field(default=30, ge=1, le=180)
+    minNights: int = Field(default=1, ge=1, le=30)

@@ -451,6 +451,36 @@ async def record_inbound(inbound: InboundMessage, connection: dict) -> RecordedI
                 recorded.message.get("id"), recorded.conversation.get("id"),
             )
 
+    # Creator attribution across a channel change.
+    #
+    # A guest who followed a creator's link is given a WhatsApp button whose
+    # prefilled text carries `CR-7X2K9M` — a token this server minted. When the
+    # message arrives we read our own token back out of it and bind the thread
+    # to the chain, which is what makes PRD §16's common path work: click a
+    # reel, message the hotel a fortnight later, book, and the creator is still
+    # paid. The guest is asked for nothing and no number is stored early.
+    #
+    # Every inbound message on every channel passes through here, and almost
+    # every one of them costs a single regex that matches nothing. Failures are
+    # swallowed for the same reason the consent write's are not: an opt-out that
+    # was lost is a guest still being messaged, while a commission that was lost
+    # is a row a hotel can fix — and neither is worth discarding the message
+    # itself over.
+    if not recorded.duplicate and inbound.body:
+        try:
+            from app.services.pms import creators as creators_service
+
+            await creators_service.bind_conversation(
+                recorded.conversation["property_id"],
+                recorded.conversation["id"],
+                inbound.body,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "could not bind creator attribution on conversation %s",
+                recorded.conversation.get("id"), exc_info=True,
+            )
+
     return recorded
 
 
