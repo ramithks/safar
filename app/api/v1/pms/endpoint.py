@@ -1592,7 +1592,10 @@ async def get_billing_summary(
     AI reply is taken in the pipeline, against the same wallet, before a run
     opens.
     """
-    account = await billing.account_for_property(property_id)
+    # Resolved together, because a cached account whose wallet is missing is a
+    # stale cache rather than an empty hotel — see `wallet_for_property`. This
+    # screen showed a zero balance beside a full wallet until it did.
+    account, state = await billing.wallet_for_property(property_id)
     if not account:
         return BillingSummaryOut(tier="unknown")
 
@@ -1611,7 +1614,6 @@ async def get_billing_summary(
         return (sub[0] if sub else None), types
 
     subscription, types = await run_db(_read)
-    state = await billing.wallet_state(account)
 
     period_start = _as_date(subscription and subscription.get("current_period_start"))
     period_end = _as_date(subscription and subscription.get("current_period_end"))

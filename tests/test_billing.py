@@ -427,3 +427,99 @@ def test_the_pms_never_imports_billing():
         or "services.billing" in path.read_text()
     ]
     assert offenders == [], f"the PMS reached for the wallet in {offenders}"
+
+
+# ── which account a property pays from ───────────────────────────────────────
+#
+# Resolved through a cache, because the charge path is on a guest's critical
+# path and this value changes approximately never. "Approximately never" is
+# where the bug was: the cache used to last the process lifetime, so a property
+# whose billing account had been replaced kept reading the old one — the usage
+# screen showed "0 credits, tier unknown" beside a wallet that was full, and
+# nothing short of a restart fixed it.
+#
+# Two mechanisms now bound that, and both are tested: the entry expires, and a
+# wallet lookup that comes back empty is treated as proof the cache is wrong
+# rather than as proof the hotel is broke.
+
+
+class _Lookup:
+    """Stands in for the property → account read, counting how often it runs."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.calls = 0
+
+    async def __call__(self, fn, *args):
+        self.calls += 1
+        return self.answers[min(self.calls - 1, len(self.answers) - 1)]
+
+
+def test_account_is_cached_between_calls(monkeypatch):
+    billing.forget_account("prop-1")
+    lookup = _Lookup("acct-a")
+    monkeypatch.setattr(billing.service, "run_db", lookup)
+
+    first = asyncio.run(billing.account_for_property("prop-1"))
+    second = asyncio.run(billing.account_for_property("prop-1"))
+
+    assert (first, second) == ("acct-a", "acct-a")
+    assert lookup.calls == 1, "the second call should not have hit the database"
+
+
+def test_a_stale_account_expires(monkeypatch):
+    """The backstop. Whatever else goes wrong, the cache is wrong for a bounded time."""
+    billing.forget_account("prop-2")
+    lookup = _Lookup("acct-old", "acct-new")
+    monkeypatch.setattr(billing.service, "run_db", lookup)
+    monkeypatch.setattr(billing.service, "_ACCOUNT_CACHE_TTL_SECONDS", 0.0)
+
+    assert asyncio.run(billing.account_for_property("prop-2")) == "acct-old"
+    assert asyncio.run(billing.account_for_property("prop-2")) == "acct-new"
+    assert lookup.calls == 2
+
+
+def test_a_missing_wallet_is_read_as_a_stale_cache(monkeypatch):
+    """
+    The fast path, and the one that actually mattered.
+
+    A cached account whose wallet does not exist is not a hotel with an empty
+    wallet — a wallet row is created with the account and never removed while it
+    lives. So `wallet_for_property` drops the cached answer and resolves once
+    more, rather than reporting a zero it has no business believing.
+    """
+    billing.forget_account("prop-3")
+    lookup = _Lookup("acct-gone", "acct-live")
+    monkeypatch.setattr(billing.service, "run_db", lookup)
+
+    states = {
+        "acct-gone": {"exists": False, "balance": 0, "available": 0, "tier": "unknown"},
+        "acct-live": {"exists": True, "balance": 2400, "available": 2400, "tier": "ok"},
+    }
+
+    async def _state(account):
+        return states[account]
+
+    monkeypatch.setattr(billing.service, "wallet_state", _state)
+
+    account, state = asyncio.run(billing.wallet_for_property("prop-3"))
+
+    assert account == "acct-live"
+    assert state["available"] == 2400, "the full wallet, not the stale zero"
+
+
+def test_a_genuinely_empty_wallet_is_still_reported(monkeypatch):
+    """The other side of it: self-healing must not turn a real zero into a retry loop."""
+    billing.forget_account("prop-4")
+    lookup = _Lookup("acct-real")
+    monkeypatch.setattr(billing.service, "run_db", lookup)
+
+    async def _state(account):
+        return {"exists": True, "balance": 0, "available": 0, "tier": "empty"}
+
+    monkeypatch.setattr(billing.service, "wallet_state", _state)
+
+    account, state = asyncio.run(billing.wallet_for_property("prop-4"))
+    assert account == "acct-real"
+    assert state["tier"] == "empty"
+    assert lookup.calls == 1, "an existing wallet is believed the first time"

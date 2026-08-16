@@ -315,6 +315,45 @@ FIXTURE = e2e_fixture.Fixture(
     credit_floor=3000,
 )
 FIXTURE.open()
+
+
+def _deflate_runaway_wallet(ceiling: int = 200_000) -> None:
+    """
+    Bring an inflated wallet back to something a test can drain.
+
+    Section 16 proves a campaign that cannot be paid for does not start, and it
+    sets that up by draining the wallet. A wallet with fourteen billion credits
+    in it cannot be drained — the scenario silently stops being reachable, and
+    the suite goes on reporting green on a case it is no longer exercising.
+    That happened, for the reason described beside the recovery grant below.
+
+    So the fixture checks its own preconditions. Buckets are expired through
+    `expire_credit_buckets()` rather than written down by hand: it is the
+    mechanism a month's end uses, it goes through the ledger, and the balance is
+    still explicable afterwards.
+    """
+    state = run(billing_mod.wallet_state(ACCOUNT))
+    balance = num(state.get("balance"))
+    if balance <= ceiling:
+        return
+    print(f"   wallet was {balance:,.0f} credits — expiring buckets back to a testable size")
+    sql(f"""update public.credit_buckets
+               set expires_at = now() - interval '1 day'
+             where wallet_id in (select id from public.credit_wallets
+                                  where billing_account_id = '{ACCOUNT}');
+           select public.expire_credit_buckets();
+           update public.subscriptions set current_period_start = now()
+            where billing_account_id = '{ACCOUNT}' and status in ('trialing', 'active');""")
+    # A fresh key, not `Fixture._top_up()`: that one is idempotent on the day so
+    # a second call after the drain mints nothing, and the suite would run the
+    # rest of its scenarios against an overdrawn wallet.
+    run(billing_mod.grant(
+        billing_account_id=ACCOUNT, kind="adjustment", credits=8000,
+        idempotency_key=f"e2e-deflate:{PROPERTY}:{uuid.uuid4().hex[:10]}",
+        source_type="test", actor_type="admin",
+    ))
+    print(f"   refilled to {num(run(billing_mod.wallet_state(ACCOUNT)).get('available')):,.0f}")
+
 reset_fixtures()
 bootstrap_inventory()
 FakeWhatsAppAdapter.reset()
@@ -335,6 +374,7 @@ check("which is not the one every other suite spends from",
       "a campaign spends per recipient; a shared wallet would make another suite fail")
 
 ACCOUNT = run(billing_mod.account_for_property(PROPERTY))
+_deflate_runaway_wallet()
 check("and a wallet behind it", bool(ACCOUNT))
 
 
@@ -1088,20 +1128,25 @@ check("the tier and the time are both recorded",
       isinstance(wallet_row, list) and wallet_row[0]["stamped"]
       and wallet_row[0]["low_balance_tier"] == first_notice.tier, str(wallet_row))
 
-# Sized against the period, not a constant.
+# Roll the period, then top up a fixed amount.
 #
-# `wallet_state` computes the tier as available ÷ credits granted this period,
-# and every run of this suite grants more — so a fixed 6,000 top-up recovered
-# the wallet on the first run and stopped being enough by the fourth, as
-# `period_granted` climbed past 39,000. The suite then failed on a tier it could
-# no longer reach, which is a fixture that decays rather than a bug.
-state = run(billing_mod.wallet_state(ACCOUNT))
-period = num(state.get("period_granted"))
-available = num(state.get("available"))
-# Solve (available + x) / (period + x) >= 0.30 for x.
-needed = max(int((0.30 * period - available) / 0.70) + 1000, 6000)
+# This block used to solve `(available + x) / (period + x) >= 0.30` for x, to
+# survive the fact that `period_granted` grows with every run of this suite.
+# That formula compounds: granting x raises the denominator, so the next run has
+# to grant about 43% more than this one did, forever. It did exactly that —
+# 6.9 billion, then 9.9 billion, then 14.1 billion credits — until the wallet
+# was so large that section 16 could no longer drain it and the "cannot afford
+# a campaign" scenario stopped being reachable at all. A fixture that inflates
+# what it is measuring is worse than one that decays, because it goes on
+# passing.
+#
+# The denominator is "buckets granted since `current_period_start`", so the
+# honest reset is the one a real month does: move the period on. After that a
+# constant top-up is correct and stays correct.
+sql(f"""update public.subscriptions set current_period_start = now()
+         where billing_account_id = '{ACCOUNT}' and status in ('trialing', 'active');""")
 run(billing_mod.grant(
-    billing_account_id=ACCOUNT, kind="adjustment", credits=needed,
+    billing_account_id=ACCOUNT, kind="adjustment", credits=6000,
     idempotency_key=f"e2e-recover:{PROPERTY}:{RUN_TAG}",
     source_type="test", actor_type="admin",
 ))

@@ -29,6 +29,7 @@ folios, invoicing, check-in/out, housekeeping and tasks are the subscription;
 only AI and messaging degrade.
 """
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -160,11 +161,31 @@ class Decision:
 # ── account resolution ───────────────────────────────────────────────────────
 #
 # A property's billing account changes approximately never — it is set by a
-# trigger when the property is created — so it is cached for the process
-# lifetime. The charge path is on a guest's critical path and a round trip to
-# resolve a constant is a round trip nobody needs.
+# trigger when the property is created — so it is cached. The charge path is on
+# a guest's critical path and a round trip to resolve a near-constant is a round
+# trip nobody needs.
+#
+# **"Approximately never" is not never, and the cache used to last the process
+# lifetime.** That was found in the pilot rehearsal: a property whose billing
+# account had been replaced kept reading the old one, so the hotel's usage
+# screen showed a zero balance and an unknown tier while its actual wallet was
+# full. In production the same staleness would outlive an account closure or a
+# group restructuring for as long as the process ran, and the charge path would
+# be pointing at an account that no longer exists.
+#
+# So the cache has a ceiling on how wrong it can be. Five minutes is far shorter
+# than the interval at which this value genuinely changes and far longer than
+# the burst of calls a single guest conversation makes, which is the traffic the
+# cache exists for.
 
+_ACCOUNT_CACHE_TTL_SECONDS = 300.0
+
+# Two dicts rather than one of tuples, so the cached value stays a plain account
+# id: this is a private structure, but it is one several tests reach into, and a
+# changed representation would have made them fail for a reason unrelated to
+# what they assert.
 _account_cache: dict[str, str] = {}
+_account_cached_at: dict[str, float] = {}
 
 
 def _lookup_account(property_id: str) -> str | None:
@@ -184,17 +205,62 @@ async def account_for_property(property_id: str) -> str | None:
     if not property_id:
         return None
     cached = _account_cache.get(property_id)
-    if cached:
-        return cached
+    if cached is not None:
+        # An entry with no timestamp was put here directly rather than resolved
+        # — a test, or a caller reaching in. Stamp it now rather than trusting
+        # it forever: there is no path that should be permanently exempt from
+        # the ceiling.
+        cached_at = _account_cached_at.setdefault(property_id, time.monotonic())
+        if time.monotonic() - cached_at < _ACCOUNT_CACHE_TTL_SECONDS:
+            return cached
+        forget_account(property_id)
+
     account = await run_db(_lookup_account, property_id)
     if account:
         _account_cache[property_id] = account
+        _account_cached_at[property_id] = time.monotonic()
     return account
 
 
 def forget_account(property_id: str) -> None:
-    """For tests, and for the day a property is moved between accounts."""
+    """
+    Drop a cached resolution now rather than waiting for it to expire.
+
+    Called by the provisioning path when a property is attached to a different
+    account, by `wallet_for_property` when the cache is caught being wrong, and
+    by tests. The TTL is the backstop; this is the fast path.
+    """
     _account_cache.pop(property_id, None)
+    _account_cached_at.pop(property_id, None)
+
+
+async def wallet_for_property(property_id: str) -> tuple[str | None, dict]:
+    """
+    A property's account **and** its wallet, resolved together and self-healing.
+
+    The pair matters. `account_for_property` answers from a cache, and a cache
+    can be wrong; the wallet lookup is the cheapest possible proof of whether it
+    is. A cached account whose wallet does not exist is not a hotel with an
+    empty wallet — it is a stale answer — so this drops it and resolves once
+    more before believing the zero.
+
+    Without this the failure is quiet and expensive: the usage screen reads
+    "0 credits, tier unknown" beside a wallet that is full, and nobody can tell
+    from the screen which of the two is lying.
+    """
+    account = await account_for_property(property_id)
+    if not account:
+        return None, {}
+
+    state = await wallet_state(account)
+    if state.get("exists"):
+        return account, state
+
+    forget_account(property_id)
+    fresh = await account_for_property(property_id)
+    if not fresh or fresh == account:
+        return fresh, state
+    return fresh, await wallet_state(fresh)
 
 
 # ── charging ────────────────────────────────────────────────────────────────

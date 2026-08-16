@@ -18,5 +18,6 @@ from app.services.billing.service import (  # noqa: F401
     reverse,
     settle,
     usage_type_for_agent,
+    wallet_for_property,
     wallet_state,
 )
