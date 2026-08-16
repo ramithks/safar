@@ -293,11 +293,16 @@ class NightAuditOut(BaseModel):
 
 
 class FolioPostRequest(BaseModel):
-    kind: str
+    # Both closed, and both mirroring the check constraints on `folio_entries`.
+    # They were plain strings, which meant a value outside the enumeration
+    # reached Postgres and came back as a 500 — a receptionist told "an
+    # unexpected error occurred" for a typo in a payment method. A Literal turns
+    # the same mistake into a 422 that names the field and lists what it accepts.
+    kind: Literal["room", "addon", "tax", "payment", "refund", "adjustment"]
     description: str = Field(min_length=1, max_length=200)
     # Always positive. The sign is decided server-side by `kind`.
     amountPaise: int = Field(gt=0)
-    method: str | None = None
+    method: Literal["cash", "card", "upi", "bank", "gateway"] | None = None
     # Client-generated. What makes an offline replay a no-op instead of a second
     # charge on a guest's account.
     idempotencyKey: str = Field(min_length=8, max_length=100)
@@ -1534,3 +1539,80 @@ class PaymentOrderOut(BaseModel):
     createdAt: datetime
     paidAt: datetime | None = None
     failureReason: str | None = None
+
+
+# ── M6: the B2B agent portal ─────────────────────────────────────────────────
+#
+# Three of the four shapes below exist because an agency is a principal that is
+# not staff: it has a contract rather than a role, a credit line rather than a
+# till, and a list of hotels it may sell rather than a property it works at.
+#
+# The fourth — `AgencyQuoteRequest` — exists for what it *omits*. There is no
+# `discountPct` on it, and that is the decision: an agency's rate is already the
+# negotiated one. A portal that could ask for a further discount would be a
+# second negotiation channel with nobody in it, running against the same floor
+# the Sales agent is clamped to but with no conversation anyone could review.
+
+
+class AgencyContractOut(BaseModel):
+    id: str
+    code: str
+    companyName: str
+    contactName: str | None = None
+    city: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    commissionPct: float
+    creditLimitPaise: int
+    # Derived, never stored: unsettled bookings plus live quotes. See
+    # b2b_committed_paise() in migration 22.
+    committedPaise: int
+    availablePaise: int
+    status: str
+    partnerId: str
+    propertyIds: list[str] = []
+
+
+class AgencyMeOut(BaseModel):
+    profileId: str
+    fullName: str | None = None
+    email: str | None = None
+    contracts: list[AgencyContractOut]
+
+
+class AgencyPropertyOut(BaseModel):
+    id: str
+    name: str
+    city: str | None = None
+    currency: str = "INR"
+    checkInTime: str | None = None
+    checkOutTime: str | None = None
+    # Which contract covers this hotel. The portal reads the credit line from
+    # here rather than assuming an agency has only one.
+    agencyId: str
+
+
+class AgencyQuoteRequest(BaseModel):
+    ratePlanId: str
+    checkIn: date
+    checkOut: date
+    units: int = Field(default=1, ge=1, le=20)
+    adults: int = Field(default=2, ge=0, le=40)
+    children: int = Field(default=0, ge=0, le=20)
+
+
+class AgencyQuoteOut(QuoteOut):
+    """A quote with the state of the line it was just committed against."""
+
+    agencyId: str
+    committedPaise: int
+    creditLimitPaise: int
+    availablePaise: int
+
+
+class AgencyBookingRequest(BaseModel):
+    quoteId: str
+    guestName: str = Field(min_length=1, max_length=120)
+    guestPhone: str | None = None
+    guestEmail: str | None = None
+    notes: str | None = Field(default=None, max_length=500)

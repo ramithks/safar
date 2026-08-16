@@ -28,6 +28,12 @@ from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 
 from app.api.v1.pms.schemas import (
+    AgencyBookingRequest,
+    AgencyContractOut,
+    AgencyMeOut,
+    AgencyPropertyOut,
+    AgencyQuoteOut,
+    AgencyQuoteRequest,
     AgentActionOut,
     AgentAutonomyRequest,
     AgentDecisionRequest,
@@ -109,10 +115,12 @@ from app.api.v1.pms.schemas import (
 from app.core.limiter import limiter
 from app.db.client import get_db, run_db
 from app.deps.auth import require_user
+from app.deps.b2b import require_agency
 from app.deps.property import ROLE_PERMS, require_member
 from app.services import billing
 from app.services.pms import ari as ari_service
 from app.services.pms import availability as availability_service
+from app.services.pms import b2b as b2b_service
 from app.services.pms import clock
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
@@ -204,6 +212,41 @@ async def list_tasks(request: Request, property_id: str, member=Depends(require_
 
 # ── availability ─────────────────────────────────────────────────────────────
 
+def _stay_option_out(option) -> StayOptionOut:
+    """
+    One room type, priced, on the wire.
+
+    Shared by the staff route and the agent portal because they return the same
+    thing — the difference between them is which audience's plans the service
+    was asked for, and that decision is made before this is reached. Two copies
+    of this projection is how one of them ends up omitting a field the other
+    added.
+    """
+    return StayOptionOut(
+        roomTypeId=option.room_type_id,
+        roomTypeCode=option.room_type_code,
+        roomTypeName=option.room_type_name,
+        unitsLeft=option.units_left,
+        maxOccupancy=option.max_occupancy,
+        ratePlans=[
+            RatePlanOptionOut(
+                ratePlanId=p.rate_plan_id,
+                code=p.code,
+                name=p.name,
+                mealPlan=p.meal_plan,
+                audience=p.audience,
+                refundable=p.refundable,
+                inclusions=p.inclusions,
+                totalPaise=p.total_paise,
+                perNightPaise=p.per_night_paise,
+                minStayViolation=p.min_stay_violation,
+                closed=p.closed,
+            )
+            for p in option.rate_plans
+        ],
+    )
+
+
 @router.get("/properties/{property_id}/availability", response_model=list[StayOptionOut])
 @limiter.limit("120/minute")
 async def get_availability(
@@ -226,32 +269,7 @@ async def get_availability(
     options = await availability_service.stay_options(
         property_id, check_in, check_out, units=units, audience=audience
     )
-    return [
-        StayOptionOut(
-            roomTypeId=o.room_type_id,
-            roomTypeCode=o.room_type_code,
-            roomTypeName=o.room_type_name,
-            unitsLeft=o.units_left,
-            maxOccupancy=o.max_occupancy,
-            ratePlans=[
-                RatePlanOptionOut(
-                    ratePlanId=p.rate_plan_id,
-                    code=p.code,
-                    name=p.name,
-                    mealPlan=p.meal_plan,
-                    audience=p.audience,
-                    refundable=p.refundable,
-                    inclusions=p.inclusions,
-                    totalPaise=p.total_paise,
-                    perNightPaise=p.per_night_paise,
-                    minStayViolation=p.min_stay_violation,
-                    closed=p.closed,
-                )
-                for p in o.rate_plans
-            ],
-        )
-        for o in options
-    ]
+    return [_stay_option_out(o) for o in options]
 
 
 # ── sync ─────────────────────────────────────────────────────────────────────
@@ -3196,3 +3214,233 @@ async def unpublish_website(
     """
     row = await website_service.unpublish(property_id)
     return website_service.project(row)
+
+
+# ── M6: the B2B agent portal ─────────────────────────────────────────────────
+#
+#   /b2b ──► /agency/me                                who am I, and my line
+#        ──► /agency/properties                        what I may sell
+#        ──► /agency/properties/{id}/availability      the same ARI calendar
+#        ──► /agency/properties/{id}/quotes            price it, hold it, commit
+#        ──► /agency/properties/{id}/bookings          quote → reservation
+#        ──► /agency/bookings                          what I have sold
+#
+# Every one of these resolves the agency from the JWT through `require_agency`,
+# and the property id in the path against the contract through
+# `b2b.contract_for`. No route accepts an agency id — the parallel of no PMS
+# route accepting a partner id, and for the same reason.
+#
+# Not one of them prices anything. `stay_options` and `create_quote` are the
+# same functions the front desk calls; the only difference is that `audience` is
+# fixed to 'b2b' here by the server rather than being a query parameter.
+
+@router.get("/agency/me", response_model=AgencyMeOut)
+@limiter.limit("120/minute")
+async def get_agency_me(request: Request, agency=Depends(require_agency)):
+    """
+    The signed-in agency and the state of every credit line it holds.
+
+    An agency with contracts at two hotel groups gets two, because it negotiated
+    twice. The portal shows the one covering whichever hotel is on screen.
+    """
+    contracts = []
+    for contract in agency.contracts:
+        committed = await b2b_service.committed_paise(contract.id)
+        contracts.append(AgencyContractOut(
+            id=contract.id,
+            code=contract.code,
+            companyName=contract.company_name,
+            contactName=contract.contact_name,
+            city=contract.city,
+            phone=contract.phone,
+            email=contract.email,
+            commissionPct=contract.commission_pct,
+            creditLimitPaise=contract.credit_limit_paise,
+            committedPaise=committed,
+            availablePaise=max(contract.credit_limit_paise - committed, 0),
+            status=contract.status,
+            partnerId=contract.partner_id,
+            propertyIds=list(contract.property_ids),
+        ))
+    return AgencyMeOut(
+        profileId=agency.profile_id,
+        fullName=agency.full_name,
+        email=agency.email,
+        contracts=contracts,
+    )
+
+
+@router.get("/agency/properties", response_model=list[AgencyPropertyOut])
+@limiter.limit("120/minute")
+async def list_agency_properties(request: Request, agency=Depends(require_agency)):
+    """The hotels this agency may sell, each carrying the contract that covers it."""
+    return [
+        AgencyPropertyOut(
+            id=row["id"],
+            name=row["name"],
+            city=row.get("city"),
+            currency=row.get("currency") or "INR",
+            checkInTime=str(row.get("check_in_time") or "")[:5] or None,
+            checkOutTime=str(row.get("check_out_time") or "")[:5] or None,
+            agencyId=row["agency_id"],
+        )
+        for row in await b2b_service.sellable_properties(agency)
+    ]
+
+
+@router.get("/agency/properties/{property_id}/availability",
+            response_model=list[StayOptionOut])
+@limiter.limit("120/minute")
+async def get_agency_availability(
+    request: Request,
+    property_id: str,
+    check_in: date = Query(..., alias="checkIn"),
+    check_out: date = Query(..., alias="checkOut"),
+    units: int = Query(1, ge=1, le=20),
+    agency=Depends(require_agency),
+):
+    """
+    What this hotel can sell these dates, on the plans this agency may see.
+
+    `audience='b2b'` is passed here and cannot be overridden by the caller —
+    unlike the staff route, which honours a query parameter because the front
+    desk legitimately books on behalf of agencies and must be able to see both.
+    An agency has no such reason, and a portal that could ask for `audience=None`
+    would be a portal that could read the hotel's public rate card.
+    """
+    await b2b_service.contract_for(agency, property_id)
+    options = await availability_service.stay_options(
+        property_id, check_in, check_out, units=units, audience="b2b"
+    )
+    return [_stay_option_out(o) for o in options]
+
+
+@router.post("/agency/properties/{property_id}/quotes", response_model=AgencyQuoteOut)
+@limiter.limit("60/minute")
+async def create_agency_quote(
+    request: Request,
+    property_id: str,
+    body: AgencyQuoteRequest,
+    agency=Depends(require_agency),
+):
+    """
+    Price a stay, hold the stock, and take the credit.
+
+    **The credit is committed here, not at booking.** A quote holds a room for
+    fifteen minutes; from this moment it holds the money for the same fifteen
+    minutes, and both are released by the same expiry. That is what makes the
+    limit hold under two simultaneous bookings — `b2b_commit_credit` tags the
+    quote inside a lock on the agency's row, so the second one counts the first.
+    Checking at booking time instead would leave a fifteen-minute window in
+    which two agents at the same agency are both told yes.
+
+    A refusal releases the hold rather than leaving a room off sale for a
+    booking everybody already knows is not happening.
+    """
+    contract = await b2b_service.contract_for(agency, property_id)
+    contract.require_active()
+
+    result = await booking_service.create_quote(
+        property_id=property_id,
+        rate_plan_id=body.ratePlanId,
+        check_in=body.checkIn,
+        check_out=body.checkOut,
+        units=body.units,
+        adults=body.adults,
+        children=body.children,
+        issued_by="agent_portal",
+        # The clamp that matters. A b2b plan id is the only thing this path can
+        # price, so an agency that guessed a public rate plan's uuid gets the
+        # same 404 as one that invented it.
+        audience="b2b",
+    )
+
+    try:
+        verdict = await b2b_service.commit_credit(contract.id, result.id)
+    except HTTPException:
+        await booking_service.abandon_quote(result.id, result.hold_id)
+        raise
+
+    committed = int(verdict.get("committedPaise") or 0)
+    limit = int(verdict.get("creditLimitPaise") or 0)
+    return AgencyQuoteOut(
+        id=result.id,
+        holdId=result.hold_id,
+        propertyId=property_id,
+        roomTypeId=result.room_type_id,
+        ratePlanId=result.rate_plan_id,
+        checkIn=result.check_in,
+        checkOut=result.check_out,
+        units=result.priced.units,
+        adults=result.adults,
+        children=result.children,
+        nightly=[NightlyOut(date=n.date, pricePaise=n.price_paise) for n in result.priced.nightly],
+        grossPaise=result.priced.gross_paise,
+        discountPaise=result.priced.discount_paise,
+        taxPaise=result.priced.tax_paise,
+        totalPaise=result.priced.total_paise,
+        # An agency settles on invoice, so nothing is collected now and the
+        # property's token rule does not apply to it. The whole total is the
+        # balance, and it sits on the folio until the hotel bills it.
+        tokenPaise=0,
+        balancePaise=result.priced.total_paise,
+        issuedBy="agent_portal",
+        expiresAt=result.expires_at,
+        agencyId=contract.id,
+        committedPaise=committed,
+        creditLimitPaise=limit,
+        availablePaise=max(limit - committed, 0),
+    )
+
+
+@router.post("/agency/properties/{property_id}/bookings", response_model=ReservationOut)
+@limiter.limit("60/minute")
+async def create_agency_booking(
+    request: Request,
+    property_id: str,
+    body: AgencyBookingRequest,
+    agency=Depends(require_agency),
+):
+    """
+    Turn a committed quote into a booking.
+
+    The agency is read off the quote by `create_reservation` and is never sent
+    in the request, so the only stay that can reach a credit line is one
+    `b2b_commit_credit` already checked the limit for. The check below is the
+    matching half: a quote committed to *another* agency is not bookable here,
+    even though both are valid quotes on the same hotel.
+
+    Nothing is collected. An agency pays on invoice, which means the entire
+    total sits on the folio as a balance — and that balance is exactly what
+    `b2b_committed_paise` reads, so the desk posting a payment against it is the
+    whole of settlement.
+    """
+    contract = await b2b_service.contract_for(agency, property_id)
+    contract.require_active()
+
+    quote = await run_db(_quote_row, body.quoteId, property_id)
+    if not quote or quote.get("b2b_agent_id") != contract.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Quote not found")
+
+    row = await booking_service.create_reservation(
+        property_id=property_id,
+        quote_id=body.quoteId,
+        guest_name=body.guestName.strip(),
+        guest_phone=(body.guestPhone or "").strip() or None,
+        guest_email=(body.guestEmail or "").strip() or None,
+        source="b2b",
+        token_paise=0,
+        payment_method=None,
+        notes=(body.notes or "").strip() or None,
+        created_by="b2b",
+        member_id=None,
+        member_name=contract.company_name,
+    )
+    return ReservationOut.from_row(row)
+
+
+@router.get("/agency/bookings", response_model=list[ReservationOut])
+@limiter.limit("120/minute")
+async def list_agency_bookings(request: Request, agency=Depends(require_agency)):
+    """Everything this agency has booked, newest first, across every contract."""
+    return [ReservationOut.from_row(row) for row in await b2b_service.list_bookings(agency)]

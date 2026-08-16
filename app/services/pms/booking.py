@@ -47,6 +47,17 @@ HOLD_TTL_SECONDS = 15 * 60
 # a web check-in form by someone who has just got off a flight.
 _REF_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
+# `quotes.issued_by` and `inventory_holds.source` enumerate the same actors
+# under two spellings. Mapping them here rather than collapsing everything that
+# is not the AI to 'employee' matters because the hold column exists to answer
+# "who took this room off sale" — and a room held by the booking engine that
+# reads as held by the front desk is the one question it cannot answer.
+_HOLD_SOURCE = {
+    "ai": "ai",
+    "booking_engine": "booking_engine",
+    "agent_portal": "b2b",
+}
+
 
 def _new_ref() -> str:
     return "TB-" + "".join(random.choices(_REF_ALPHABET, k=6))
@@ -192,7 +203,7 @@ async def create_quote(
                 "p_units": units,
                 "p_ttl_seconds": HOLD_TTL_SECONDS,
                 "p_rate_plan": rate_plan_id,
-                "p_source": "ai" if issued_by == "ai" else "employee",
+                "p_source": _HOLD_SOURCE.get(issued_by, "employee"),
                 "p_conversation": conversation_id,
             },
         ).execute().data
@@ -272,6 +283,32 @@ async def create_quote(
         adults=adults,
         children=children,
     )
+
+
+def _release(hold_id: str) -> None:
+    get_db().rpc("release_hold", {"p_hold": hold_id}).execute()
+
+
+async def abandon_quote(quote_id: str, hold_id: str | None) -> None:
+    """
+    Give back a quote that will never be booked, and the room it was holding.
+
+    Used where a caller has priced a stay and *then* found a reason to refuse it
+    — the agent portal's credit check is the first such caller. Leaving the hold
+    to expire on its own would be correct and would also take a room off sale
+    for fifteen minutes for a booking everybody already knows is not happening.
+
+    Deliberately silent about a hold that no longer exists, for the same reason
+    `release_hold` is: cleanup after a refusal must never be the thing that
+    fails.
+    """
+    if hold_id:
+        await run_db(_release, hold_id)
+
+    def _mark():
+        get_db().table("quotes").update({"status": "superseded"}).eq("id", quote_id).execute()
+
+    await run_db(_mark)
 
 
 def _payment_status(paid: int, total: int) -> str:
@@ -386,6 +423,13 @@ async def create_reservation(
                             "tax_paise": q["tax_paise"],
                             "total_paise": q["total_paise"],
                             "paid_paise": paid,
+                            # Read off the quote, never off the request. There
+                            # is no `agencyId` parameter anywhere on the booking
+                            # path, so the only way a stay can be billed to a
+                            # credit line is if `b2b_commit_credit` put the
+                            # agency on the quote — which it only does under the
+                            # agency's own row lock, having checked the limit.
+                            "b2b_agent_id": q.get("b2b_agent_id"),
                             "source": source,
                             "status": "confirmed",
                             "payment_status": _payment_status(paid, q["total_paise"]),
