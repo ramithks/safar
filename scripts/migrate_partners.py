@@ -152,6 +152,31 @@ def q(value) -> str:
 
 # ── what the marketplace knows ───────────────────────────────────────────────
 
+def ineligible_partners() -> list[dict]:
+    """
+    Active partners this migration will not move, and why.
+
+    Reported rather than omitted. A partner who never appears in the output is
+    indistinguishable from one that was fine, and "we migrated everybody" is a
+    claim somebody will make on the strength of a report that quietly listed
+    four of eighteen.
+    """
+    return read_production("""
+        select p.slug, p.brand_name, p.city, p.stay_plan_status,
+               pr.email as owner_email,
+               (select count(*) from public.partner_listings l
+                 where l.partner_id = p.id) as listings,
+               (select count(*) from public.partner_listings l
+                 where l.partner_id = p.id and l.kind = 'hotel') as hotel_listings
+          from public.partners p
+          left join public.profiles pr on pr.id = p.owner_id
+         where p.status = 'active'
+           and p.stay_plan_status <> 'active'
+           and not exists (select 1 from public.partner_listings l
+                            where l.partner_id = p.id and l.kind = 'hotel')
+         order by p.brand_name""")
+
+
 def eligible_partners(slug: str | None) -> list[dict]:
     """
     Partners worth moving: one with a hotel listing, or a live stay plan.
@@ -749,6 +774,21 @@ def main() -> int:
         rooms = plan_room_types(listing, listing_rooms(listing["id"]) if listing else [])
         plan = migrate(partner, listing, rooms, apply=args.apply)
         verdicts[describe(plan, apply=args.apply)] += 1
+
+    # Everybody else, named. See `ineligible_partners`.
+    if not args.slug:
+        rest = ineligible_partners()
+        if rest:
+            print(f"\n  ── not migrated ({len(rest)}) " + "─" * 30)
+            for row in rest:
+                why = ("no hotel listing" if not row["hotel_listings"]
+                       else "no active stay plan")
+                if not row["listings"]:
+                    why = "no listings at all — never finished signing up"
+                if not row.get("owner_email"):
+                    why += ", and no owner email"
+                print(f"     {row['brand_name'][:34]:<34} NEEDS_REVIEW — {why}")
+                verdicts[REVIEW] += 1
 
     print("\n══ " + " · ".join(f"{n} {word.lower()}" for word, n in verdicts.items() if n)
           + " ══")

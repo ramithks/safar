@@ -778,7 +778,26 @@ check("the audience was materialised before anything was sent",
 # The guest who will opt out mid-run. Chosen *after* the audience was built, so
 # they are already a pending recipient — which is exactly the situation the
 # per-recipient revalidation exists for.
-VICTIM = LATE[-1]
+#
+# Read out of the order the executor will actually use, and never the first
+# entry. `_pending` sorts by `created_at`, and `prepare()` inserts every
+# recipient in one batch — so the timestamps tie and the order among them is
+# whatever Postgres returns. Picking a guest by hand made this a coin flip: when
+# the victim happened to come first, the hook below could not fire before their
+# own send, they were messaged, and the suite failed on its second run for a
+# reason that had nothing to do with the product. Taking the last of the real
+# order removes the guess.
+_race_order = (db.table("campaign_recipients")
+               .select("guest_id").eq("campaign_id", RACE_CAMPAIGN)
+               .eq("status", "pending").order("created_at").limit(1000)
+               .execute().data or [])
+_victim_row = _race_order[-1] if len(_race_order) > 1 else None
+check("the audience has room for somebody to opt out mid-run",
+      _victim_row is not None, f"{len(_race_order)} pending recipient(s)")
+# The phone comes from the guest row: `campaign_recipients` carries only the
+# guest id, and the hook below compares against the number the adapter is given.
+VICTIM = (next((g for g in LATE if g["id"] == _victim_row["guest_id"]), LATE[-1])
+          if _victim_row else LATE[-1])
 _original_send_text = FakeWhatsAppAdapter.send_text
 _opted_out_during = {"done": False}
 

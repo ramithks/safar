@@ -97,19 +97,38 @@ if settings.request_timeout_seconds and settings.request_timeout_seconds > 0:
 _origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
 _is_production = settings.app_env.lower().startswith("prod")
 
-if not _origins:
-    if _is_production:
-        raise RuntimeError(
-            "ALLOWED_ORIGINS is empty and APP_ENV is production. Refusing to "
-            "start with a wildcard CORS policy — set it to the exact origins, "
-            "e.g. https://partner.travbuddy.in,https://travbuddy.in"
-        )
-    _origins = ["*"]
-elif _is_production and "*" in _origins:
+# The origins this API is actually for. Used as the production default when
+# nothing is configured, so a deploy that forgets the variable comes up
+# *narrow* rather than either wide open or dead.
+#
+# Failing closed by raising was the first version of this, and it was wrong for
+# an API that also serves the marketplace: a redeploy with the variable unset
+# would have taken travbuddy.in down to fix a header. Refusing an explicit
+# wildcard is still worth doing — that is somebody choosing to be open — but
+# forgetting to set a value should not be an outage.
+_PRODUCTION_DEFAULT = [
+    "https://partner.travbuddy.in",
+    "https://travbuddy.in",
+    "https://www.travbuddy.in",
+]
+
+if _is_production and "*" in _origins:
     raise RuntimeError(
         "ALLOWED_ORIGINS contains '*' and APP_ENV is production. Name the "
-        "origins explicitly; a wildcard here lets any site call this API."
+        "origins explicitly; a wildcard here lets any site on the internet make "
+        "credentialed calls to a hotel's API."
     )
+
+if not _origins:
+    if _is_production:
+        _origins = list(_PRODUCTION_DEFAULT)
+        logger.warning(
+            "ALLOWED_ORIGINS is unset in production — defaulting to %s. Set it "
+            "explicitly; this default is a safety net, not configuration.",
+            ", ".join(_origins),
+        )
+    else:
+        _origins = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
