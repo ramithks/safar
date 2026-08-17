@@ -51,7 +51,8 @@ def sweep_reservations(db, property_ids: list[str], prefixes: list[str]) -> int:
     doomed: list[dict] = []
     for prefix in prefixes:
         doomed += (
-            db.table("reservations").select("id,ref")
+            db.table("reservations").select(
+                "id,ref,room_type_id,check_in,check_out,units")
             .in_("property_id", property_ids)
             .like("ref", f"{prefix}%")
             .limit(500).execute().data or []
@@ -60,6 +61,28 @@ def sweep_reservations(db, property_ids: list[str], prefixes: list[str]) -> int:
     gone = 0
     for row in doomed:
         try:
+            # Return the stock *before* the row goes, because afterwards there
+            # is nothing left to compute the release from.
+            #
+            # `room_inventory.units_booked` is owned by the RPCs — confirm adds
+            # to it, `release_booking` subtracts — and a delete goes past both.
+            # No trigger catches it, because the product has no path that
+            # deletes a reservation; only these suites do. So the counter went
+            # one way only, and after enough runs a night that nobody had
+            # booked reported itself full. That is how b2b_e2e came to pass on a
+            # fresh property and fail on replay.
+            #
+            # Released first and deleted second, rather than the other way
+            # round: a crash in between leaves stock that reads as sold, which
+            # a later sweep can still fix. The opposite order leaves a night
+            # oversold with no record of why.
+            if row.get("room_type_id") and row.get("check_in") and row.get("check_out"):
+                db.rpc("release_booking", {
+                    "p_room_type": row["room_type_id"],
+                    "p_check_in": row["check_in"],
+                    "p_check_out": row["check_out"],
+                    "p_units": row.get("units") or 1,
+                }).execute()
             db.table("reservations").delete().eq("id", row["id"]).execute()
             gone += 1
         except Exception:  # noqa: BLE001

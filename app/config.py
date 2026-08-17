@@ -45,6 +45,20 @@ class Settings(BaseSettings):
     vertex_fallback_project: Optional[str] = None
     vertex_fallback_service_account_json: Optional[str] = None  # full SA JSON string
 
+    # ── Hotel OS ─────────────────────────────────────────────────────────────
+    #
+    # Whether this process serves the hotel OS at all — `/api/v1/pms/*` and the
+    # messaging webhooks. **Off by default, and the default is the whole point.**
+    #
+    # The hotel OS is a different Supabase project to the marketplace
+    # (`rdlozqvuywtgsodunait` against `uabxtdhxbamuhthxnhid`) and `get_db()`
+    # builds one client from one `SUPABASE_URL`. A marketplace deployment with
+    # these routes mounted answers 500 to every one of them, because the tables
+    # are not there — so StayOS is its own deployment of this codebase with
+    # `.env.hotelos`, and the marketplace stays correct without anybody having
+    # to remember to switch something off.
+    enable_hotel_os: bool = False
+
     # ── Hotel OS agent runtime (services/ai) ────────────────────────────────
     # Gemini on Vertex, through the same `services/vertex.py` the traveller-side
     # pipeline uses — same project, same credentials, same region rotation, same

@@ -1,4 +1,7 @@
+import logging
+
 from fastapi import APIRouter
+from app.config import settings
 from app.api.v1.plan_trip.endpoint import router as plan_trip_router
 from app.api.v1.groups.endpoint import router as groups_router
 from app.api.v1.trips.endpoint import router as trips_router
@@ -26,6 +29,8 @@ from app.api.v1.images import router as images_router
 from app.api.v1.health import router as health_router
 from app.api.v1.metrics import router as metrics_router
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/v1")
 
 router.include_router(health_router, tags=["health"])
@@ -44,8 +49,39 @@ router.include_router(hotels_router)
 router.include_router(marketplace_router)
 router.include_router(marketplace_partner_router)
 router.include_router(marketplace_payments_router)
-router.include_router(pms_router)
-router.include_router(messaging_webhooks_router)
+# ── the hotel OS, mounted only where its database is ─────────────────────────
+#
+# **These routes need a different Supabase project to every route above them.**
+# The marketplace lives in `uabxtdhxbamuhthxnhid`; the hotel OS lives in
+# `rdlozqvuywtgsodunait`, and `get_db()` builds one client from one
+# `SUPABASE_URL`. A process configured for the marketplace has no `properties`,
+# no `reservations` and no `hotel_websites` table, so every one of these routes
+# answers a 500 from PostgREST — including the public ones a guest can reach
+# without a login.
+#
+# That is exactly what happened when StayOS first reached production:
+# `/api/v1/pms/public/hotels/{slug}` returned INTERNAL_SERVER_ERROR to anybody
+# who asked, because the routes shipped with the marketplace image while the
+# schema they read did not. Mounting them behind the flag turns that into an
+# honest 404 — this deployment does not serve the hotel OS — and costs the
+# marketplace nothing.
+#
+# StayOS therefore runs as its own deployment of this same codebase with
+# `.env.hotelos`, which sets `ENABLE_HOTEL_OS=true` along with the project it
+# points at. Default off, so the marketplace is correct with no environment
+# change at all; a StayOS deployment that forgets the flag fails as a clean 404
+# on every PMS route, which is diagnosable, rather than as a 500 storm.
+if settings.enable_hotel_os:
+    router.include_router(pms_router)
+    router.include_router(messaging_webhooks_router)
+    logger.info("Hotel OS routes mounted (ENABLE_HOTEL_OS=true, db=%s)",
+                settings.supabase_url)
+else:
+    logger.info(
+        "Hotel OS routes NOT mounted — set ENABLE_HOTEL_OS=true on a deployment "
+        "whose SUPABASE_URL is the hotel-OS project."
+    )
+
 router.include_router(admin_router)
 router.include_router(admin_trips_router)
 router.include_router(admin_catalog_router)

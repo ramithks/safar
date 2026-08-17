@@ -132,15 +132,48 @@ def committed(agency=AGENCY) -> int:
 
 def sweep():
     """
-    Give the property back.
+    Give the property back — the rooms as well as the rows.
 
     By `b2b_agent_id`, not by a ref prefix. Every reservation this suite writes
     carries the seeded agency and nothing else on Casa Mandala does, so this is
     strictly more precise than `TB-B2…` would be — and unlike a prefix it cannot
     be defeated by a booking whose ref the suite never got to rewrite because it
     died between the insert and the update.
+
+    **Deleting a reservation does not return its stock.** `room_inventory
+    .units_booked` is owned by the RPCs — `confirm_booking` adds to it,
+    `release_booking` subtracts — and a `delete from reservations` goes past
+    both. There is no trigger to catch it because the product has no path that
+    deletes a reservation at all; only this suite does.
+
+    So the counter only ever went up. Casa Mandala's deluxe rooms reached 16
+    booked out of 16 on the two nights this suite always asks for (today + 200),
+    against zero surviving reservations, and section 5 started failing with "no
+    longer available in the number of rooms requested" — on a night nobody had
+    booked. It passed on a fresh property and failed on replay, which is the
+    shape of every idempotency bug in this directory.
+
+    The release is computed from the reservations about to go, per night, and
+    floored at zero. It runs in the same statement batch as the delete so a
+    crash between them cannot leave the stock released and the stay standing.
     """
     sql(f"""
+-- Return the stock first: once the rows are gone there is nothing left to
+-- compute the release from.
+update public.room_inventory ri
+   set units_booked = greatest(ri.units_booked - claimed.units, 0),
+       updated_at   = now()
+  from (
+    select r.room_type_id, night::date as date, sum(r.units)::int as units
+      from public.reservations r
+      cross join lateral generate_series(
+        r.check_in, r.check_out - 1, interval '1 day') as night
+     where r.b2b_agent_id = '{AGENCY}'
+     group by r.room_type_id, night::date
+  ) as claimed
+ where ri.room_type_id = claimed.room_type_id
+   and ri.date         = claimed.date;
+
 delete from public.reservations where b2b_agent_id = '{AGENCY}';
 delete from public.quotes
  where property_id = '{PROP}' and issued_by = 'agent_portal';
