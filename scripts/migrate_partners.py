@@ -201,6 +201,26 @@ def best_listing(partner_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
+def marketplace_history(partner_id: str) -> dict:
+    """
+    What the partner already has on the marketplace, counted and left alone.
+
+    Reported rather than migrated. A marketplace booking is a consumer-side
+    record with its own payment, commission and payout attached; copying it into
+    the PMS would create a second copy of a financial fact and no way to say
+    which is authoritative. The marketplace stays the system of record for
+    everything it has already sold.
+    """
+    rows = read_production(f"""
+        select (select count(*) from public.bookings b
+                 where b.partner_id = {q(partner_id)}) as bookings,
+               (select count(*) from public.bookings b
+                 where b.partner_id = {q(partner_id)} and b.status = 'paid') as paid,
+               (select count(*) from public.partner_listings l
+                 where l.partner_id = {q(partner_id)}) as listings""")
+    return rows[0] if rows else {"bookings": 0, "paid": 0, "listings": 0}
+
+
 def listing_rooms(listing_id: str) -> list[dict]:
     """
     The hotel's rooms, from `listing_room_types` rather than from
@@ -467,6 +487,9 @@ def migrate(partner: dict, listing: dict | None, room_types: list[dict],
         "city": (listing or {}).get("city") or partner.get("city"),
         "slug": slugify((listing or {}).get("slug") or partner["slug"]),
         "listing_price": (listing or {}).get("price_from"),
+        "listing_id": (listing or {}).get("id"),
+        "listing_status": (listing or {}).get("status"),
+        "history": marketplace_history(partner["id"]),
         "rooms": room_types,
         "units": sum(r["units"] for r in room_types),
         "free_until": free_until,
@@ -493,11 +516,22 @@ on conflict (id) do update
 
 insert into public.properties
   (id, partner_id, slug, name, city, timezone, status, currency, tax_inclusive,
-   check_in_time, check_out_time)
+   check_in_time, check_out_time, marketplace_listing_id)
 values ({q(property_id)}, {q(partner['id'])}, {q(plan['slug'])}, {q(plan['hotel'])},
-        {q(plan['city'])}, 'Asia/Kolkata', 'active', 'INR', false, '14:00', '11:00')
+        {q(plan['city'])}, 'Asia/Kolkata', 'active', 'INR', false, '14:00', '11:00',
+        {q((listing or {}).get('id'))})
 on conflict (id) do update
-   set name = excluded.name, city = excluded.city, status = 'active';""")
+   set name = excluded.name, city = excluded.city, status = 'active',
+       marketplace_listing_id = excluded.marketplace_listing_id;
+
+-- The owner is a member of their own hotel, not merely the partner's owner_id.
+-- `require_member` falls back to ownership, so this is belt and braces — but
+-- the members screen reads this table, and a hotel whose owner is absent from
+-- its own staff list reads as a bug to the person looking at it.
+insert into public.partner_members
+  (partner_id, profile_id, role, status, accepted_at)
+values ({q(partner['id'])}, {q(profile_id)}, 'owner', 'active', now())
+on conflict do nothing;""")
 
     # Room types and one public rate plan each. `on conflict (code)` per
     # property, so a re-run corrects a price rather than adding a second
@@ -550,6 +584,21 @@ select {q(account_id)}, sp.id, {q(property_id)}, 'active', {q(today)}, {q(free_u
                     where s.billing_account_id = {q(account_id)}
                       and s.status in ('trialing', 'active'));""")
 
+        # The entitlement, which is not the subscription. `subscriptions` is the
+        # billing record and a promotional year written there is
+        # indistinguishable from a paid one later; this row says what was given
+        # and why. Unique on (partner_id, source), so a second run grants
+        # nothing further — see migration 25.
+        write_hotel_os(f"""
+insert into public.partner_transitions
+  (partner_id, property_id, billing_account_id, source, reason,
+   starts_at, ends_at, marketplace_partner_id, marketplace_listing_id)
+values ({q(partner['id'])}, {q(property_id)}, {q(account_id)}, 'partner_migration',
+        'Partner migration — 1 year free',
+        {q(today)}, {q(free_until)}, {q(partner['id'])},
+        {q((listing or {}).get('id'))})
+on conflict (partner_id, source) do nothing;""")
+
         from app.services import billing
         import asyncio
         asyncio.run(billing.grant(
@@ -571,35 +620,86 @@ RESOLUTION_LABEL = {
     NEEDS_REVIEW: "needs_review",
 }
 
+READY, WARNING, REVIEW, SKIPPED = "READY", "WARNING", "NEEDS_REVIEW", "SKIPPED"
 
-def describe(plan: dict, *, apply: bool) -> None:
+
+def verdict_for(plan: dict) -> tuple[str, list[str]]:
     """
-    Where every price came from, room by room.
+    One word for the partner, and the reasons behind it.
+
+    Every partner gets one. A record that produced no output at all is the
+    failure mode this exists to prevent — "it didn't appear in the report" is
+    indistinguishable from "it was fine" when somebody is reading three hundred
+    lines looking for what to fix.
+    """
+    warnings: list[str] = []
+
+    if plan.get("skipped"):
+        return SKIPPED, [plan["skipped"]]
+
+    unpriced = [r for r in plan["rooms"] if not r["sellable"]]
+    if not plan["rooms"]:
+        warnings.append("no active room types on the marketplace listing — "
+                        "the hotel is created with nothing to sell")
+    if unpriced:
+        warnings.append(f"{len(unpriced)} room(s) have no resolvable price and "
+                        f"arrive switched off")
+    if plan.get("listing_status") and plan["listing_status"] != "published":
+        warnings.append(f"built from a {plan['listing_status']} listing, not a "
+                        f"published one")
+    for room in plan["rooms"]:
+        for note in room["notes"]:
+            warnings.append(f"{room['name']}: {note}")
+
+    if unpriced:
+        return REVIEW, warnings
+    if warnings:
+        return WARNING, warnings
+    return READY, warnings
+
+
+def describe(plan: dict, *, apply: bool) -> str:
+    """
+    Where every price came from, room by room, and what state the hotel is in.
 
     The point of this output is that somebody can audit it before it becomes
     money. A total is not auditable; "₹3,600, inherited from the listing price,
     because the marketplace already charges that per room per night" is.
+
+    Returns the verdict so the caller can count them.
     """
+    verdict, warnings = verdict_for(plan)
+
     if plan.get("skipped"):
-        print(f"  ─ {plan['slug']}: skipped — {plan['skipped']}")
-        return
+        print(f"\n  ── {plan.get('slug', 'unknown')} " + "─" * 40)
+        print(f"     Status                SKIPPED — {plan['skipped']}")
+        return verdict
 
     print(f"\n  ── {plan['brand']} " + "─" * max(4, 56 - len(plan["brand"])))
+    print(f"     Partner ID            {plan['partner_id']}")
     print(f"     Hotel                 {plan['hotel']}")
     print(f"     City                  {plan['city'] or 'unknown'}")
+    print(f"     Owner                 {plan['email']}"
+          + (f"  ({plan['name']})" if plan.get("name") else ""))
     print(f"     Listing price         "
           + (f"₹{plan['listing_price']:,}/night" if plan.get("listing_price")
              else "not set"))
-    print(f"     Owner                 {plan['email']}"
-          + (f"  ({plan['name']})" if plan.get("name") else ""))
+    print(f"     Marketplace listing   "
+          + (f"CONNECTED  {plan['listing_id']}  ({plan['listing_status']})"
+             if plan.get("listing_id") else "NONE"))
     print(f"     Booking page          partner.travbuddy.in/stay/{plan['slug']}")
 
+    history = plan.get("history") or {}
+    print(f"     Marketplace history   {history.get('listings', 0)} listing(s), "
+          f"{history.get('bookings', 0)} booking(s) — left in place, not copied")
+
     if not plan["rooms"]:
-        print("\n     No active room types on the marketplace listing.")
+        print("\n     Rooms                 none active on the listing")
     for room in plan["rooms"]:
         ready = room["sellable"]
         print(f"\n     Room                  {room['name']}")
-        print(f"       room-specific price {room['source'] if room['resolution'] == EXPLICIT else 'missing'}")
+        print(f"       source price        "
+              f"{room['source'] if room['resolution'] == EXPLICIT else 'missing'}")
         print(f"       resolved price      "
               + (f"₹{to_rupees(room['paise']):,}/night" if ready else "—"))
         print(f"       resolution          {RESOLUTION_LABEL[room['resolution']]}")
@@ -608,18 +708,22 @@ def describe(plan: dict, *, apply: bool) -> None:
         for note in room["notes"]:
             print(f"       ⚠ rejected          {note}")
 
-    unpriced = [r for r in plan["rooms"] if not r["sellable"]]
-    if unpriced:
-        print(f"\n     ⚠ {len(unpriced)} room(s) reach the hotel OS switched off. They cannot be")
-        print("       sold until somebody prices them on the calendar screen.")
-    print(f"\n     Free until            {plan['free_until']}  "
-          f"({plan['credits']:,} AI credits)")
+    print(f"\n     Rooms                 {len(plan['rooms'])}")
+    print(f"     Rates                 {sum(1 for r in plan['rooms'] if r['sellable'])} sellable")
+    print(f"     StayOS billing        {'CREATED' if apply else 'would be created'}")
+    print(f"     Free entitlement      {plan['free_until'].replace(year=plan['free_until'].year - 1)}"
+          f" → {plan['free_until']}  ({plan['credits']:,} AI credits)")
+    print(f"     Warnings              " + (warnings[0] if warnings else "None"))
+    for extra in warnings[1:]:
+        print(f"                           {extra}")
+    print(f"     STATUS                {verdict}")
 
     if apply:
         made = plan.get("account_created")
         print(f"     Account               {'created' if made else 'already existed'}")
         if plan.get("invite"):
             print(f"     Invite                {plan['invite']}")
+    return verdict
 
 
 def main() -> int:
@@ -639,16 +743,15 @@ def main() -> int:
         return 1
     print(f"  eligible  {len(partners)} partner(s)")
 
-    done, skipped = 0, 0
+    verdicts = {READY: 0, WARNING: 0, REVIEW: 0, SKIPPED: 0}
     for partner in partners:
         listing = best_listing(partner["id"])
         rooms = plan_room_types(listing, listing_rooms(listing["id"]) if listing else [])
         plan = migrate(partner, listing, rooms, apply=args.apply)
-        describe(plan, apply=args.apply)
-        skipped += 1 if plan.get("skipped") else 0
-        done += 0 if plan.get("skipped") else 1
+        verdicts[describe(plan, apply=args.apply)] += 1
 
-    print(f"\n══ {done} migrated, {skipped} skipped ══")
+    print("\n══ " + " · ".join(f"{n} {word.lower()}" for word, n in verdicts.items() if n)
+          + " ══")
     if not args.apply:
         print("\nDRY RUN — nothing was written. Re-run with --apply to create these.\n")
     else:

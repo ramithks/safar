@@ -84,9 +84,33 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 if settings.request_timeout_seconds and settings.request_timeout_seconds > 0:
     app.add_middleware(TimeoutMiddleware, timeout_seconds=settings.request_timeout_seconds)
 
-# CORS — driven by ALLOWED_ORIGINS (comma-separated, or "*"). Mobile clients
-# don't enforce CORS, but a tightened list protects the browser docs/dashboards.
-_origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()] or ["*"]
+# CORS — driven by ALLOWED_ORIGINS (comma-separated). Mobile clients don't
+# enforce CORS, but the PMS is a browser app on a different origin to this API,
+# so for StayOS this list is the difference between the front desk working and
+# every request failing a preflight.
+#
+# **The empty-list fallback is `*` only outside production.** It exists so a
+# fresh checkout runs without configuration; shipping it would let any page on
+# the internet make credentialed calls to a hotel's API. In production an empty
+# list is a misconfiguration worth failing loudly on, at boot, rather than
+# discovering as a security finding later.
+_origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
+_is_production = settings.app_env.lower().startswith("prod")
+
+if not _origins:
+    if _is_production:
+        raise RuntimeError(
+            "ALLOWED_ORIGINS is empty and APP_ENV is production. Refusing to "
+            "start with a wildcard CORS policy — set it to the exact origins, "
+            "e.g. https://partner.travbuddy.in,https://travbuddy.in"
+        )
+    _origins = ["*"]
+elif _is_production and "*" in _origins:
+    raise RuntimeError(
+        "ALLOWED_ORIGINS contains '*' and APP_ENV is production. Name the "
+        "origins explicitly; a wildcard here lets any site call this API."
+    )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,

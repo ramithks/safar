@@ -1615,6 +1615,16 @@ async def get_billing_summary(
 
     subscription, types = await run_db(_read)
 
+    # A promotional period, read through the one function that decides whether a
+    # hotel is inside one — see `active_transition` in migration 25. Kept out of
+    # `subscriptions` on purpose: that table is the billing record, and a free
+    # year written there is indistinguishable from a paid one later.
+    def _transition():
+        return get_db().rpc("active_transition",
+                            {"p_property": property_id}).execute().data
+
+    transition = await run_db(_transition) or {}
+
     period_start = _as_date(subscription and subscription.get("current_period_start"))
     period_end = _as_date(subscription and subscription.get("current_period_end"))
     plan = ((subscription or {}).get("subscription_plans") or {})
@@ -1657,8 +1667,11 @@ async def get_billing_summary(
 
     return BillingSummaryOut(
         plan=plan.get("name") or plan.get("code"),
-        period_start=period_start,
-        period_end=period_end,
+        periodStart=period_start,
+        periodEnd=period_end,
+        freeUntil=_as_date(transition.get("endsAt")) if transition else None,
+        freeReason=transition.get("reason") if transition else None,
+        freeDaysLeft=transition.get("daysLeft") if transition else None,
         tier=str(state.get("tier") or "unknown"),
         balance=int(state.get("balance") or 0),
         available=int(state.get("available") or 0),

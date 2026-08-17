@@ -895,14 +895,26 @@ class UsageEventOut(BaseModel):
 
 class BillingSummaryOut(BaseModel):
     plan: str | None = None
-    period_start: date | None = None
-    period_end: date | None = None
+    # camelCase like every other field in this file. These two were snake_case
+    # and the PWA has been reading `periodStart`/`periodEnd` — so the usage
+    # screen's "billing period ends" has been rendering an empty date since the
+    # endpoint was written. Renamed rather than patched at the client, because
+    # the convention stated at the top of this file is the one worth keeping.
+    periodStart: date | None = None
+    periodEnd: date | None = None
     # ok · low · critical · empty. Drives the banner and nothing else; the
     # numbers behind it are only surfaced in the purchase flow and the export.
     tier: str = "unknown"
     balance: int = 0
     available: int = 0
     groups: list[UsageGroupOut] = []
+    # A free period this hotel is inside, if any — a migrated partner's
+    # transition year, for instance. Present so the usage screen can say why
+    # nothing is being charged instead of showing a plan and leaving the
+    # hotelier to wonder when the bill starts.
+    freeUntil: date | None = None
+    freeReason: str | None = None
+    freeDaysLeft: int | None = None
 
 
 # ── owner analytics ──────────────────────────────────────────────────────────
