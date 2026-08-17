@@ -174,7 +174,24 @@ class Settings(BaseSettings):
     places_cache_dir: str = "/tmp/travbuddy/places_cache"
     places_cache_ttl_seconds: int = 604800  # 7 days
 
-    # Job queue
+    # Job queue — and the Celery broker, and the rate limiter's storage, and
+    # the messaging pipeline's lock. One URL behind all of them.
+    #
+    # **The localhost default is a development convenience and is always wrong
+    # in a container.** Nothing listens on localhost inside one, so it produces
+    # `Error 111 connecting to localhost:6379` — which reads like Redis is down
+    # rather than like the variable was never set. Worse than the noise is the
+    # silence: this is also `broker=` in `workers/celery_app.py`, so a worker
+    # that starts on the default connects to nothing and every messaging and
+    # marketing task simply never runs, with no error anywhere.
+    #
+    # `app/main.py` therefore logs an error at boot if production is still
+    # holding this default. See `redis_target()` for the redacted form used in
+    # logs and health output.
+    # The two deployments share a Redis server and must not share a namespace:
+    # the marketplace is on database 0, StayOS on 1. That is belt to the queue
+    # routing's braces (`workers/celery_app.py`) — routing is what stops a task
+    # crossing over; separate databases keep result keys and locks apart too.
     redis_url: str = "redis://localhost:6379/0"
 
     # GCP Cloud Storage — videos and frames
@@ -277,3 +294,42 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def redis_target(url: str | None = None) -> str:
+    """
+    The Redis this process is pointed at, safe to log.
+
+    Scheme, host, port and database number only — a Redis URL carries its
+    password inline (`redis://:secret@host:6379/0`) and this string goes into
+    logs and into the health endpoint's error text, both of which get pasted
+    into chats and issue trackers.
+
+    Exists because the failure it describes is otherwise unreadable. An unset
+    `REDIS_URL` leaves the localhost default in place, and the resulting
+    `Error 111 connecting to localhost:6379` reads like Redis is down rather
+    than like a variable was never set — which is what it actually means in a
+    container, where nothing listens on localhost.
+    """
+    from urllib.parse import urlsplit
+
+    raw = url if url is not None else settings.redis_url
+    try:
+        parts = urlsplit(raw)
+        host = parts.hostname or "?"
+        port = f":{parts.port}" if parts.port else ""
+        db = parts.path or ""
+        return f"{parts.scheme}://{host}{port}{db}"
+    except Exception:  # noqa: BLE001 — a log line must never raise
+        return "<unparseable REDIS_URL>"
+
+
+def redis_is_unconfigured() -> bool:
+    """
+    True when `REDIS_URL` was never set and the development default survived.
+
+    Compared against the field's own default rather than a repeated literal, so
+    the two cannot drift apart.
+    """
+    default = Settings.model_fields["redis_url"].default
+    return settings.redis_url == default

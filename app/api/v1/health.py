@@ -35,13 +35,30 @@ async def _check_supabase() -> str:
 
 
 def _check_redis() -> str:
+    """
+    Ping Redis, and on failure say *which* Redis.
+
+    The bare error was `Error 111 connecting to localhost:6379. Connection
+    refused.`, which reads like Redis is down. In a container it means
+    `REDIS_URL` was never set and the development default survived — a
+    configuration problem wearing an outage's clothes. The two need telling
+    apart from the response alone, because that response is usually all anyone
+    pastes.
+
+    Credentials are stripped: a Redis URL carries its password inline and this
+    string ends up in chats and issue trackers. See `config.redis_target`.
+    """
+    from app.config import redis_is_unconfigured, redis_target
+
     try:
         from app.workers.job_store import _get_redis
-        r = _get_redis()
-        r.ping()
+        _get_redis().ping()
         return "ok"
     except Exception as e:
-        return f"error: {e}"
+        if redis_is_unconfigured():
+            return (f"error: REDIS_URL is not set, so this fell back to "
+                    f"{redis_target()} — {e}")
+        return f"error: connecting to {redis_target()} — {e}"
 
 
 def _check_vision_api() -> str:

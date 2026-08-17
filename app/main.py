@@ -57,6 +57,34 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Places API client init failed (non-fatal): {e}")
 
+    # Redis, said out loud at boot.
+    #
+    # It is the Celery broker as well as the job store, the rate limiter's
+    # storage and the messaging pipeline's lock, and only one of those
+    # complains when it is wrong. A worker started against an unreachable
+    # broker consumes nothing and reports nothing: guest replies and campaigns
+    # stop happening, silently. Naming the target here means the answer is in
+    # the first ten lines of the log rather than in a health check somebody has
+    # to think to call.
+    #
+    # Only production earns an error. On a laptop the same default is usually
+    # right — Redis really is on localhost — and a red line for a working setup
+    # teaches people to skim past red lines.
+    from app.config import redis_is_unconfigured, redis_target
+
+    if not redis_is_unconfigured():
+        logger.info("Redis: %s", redis_target())
+    elif settings.app_env.lower().startswith("prod"):
+        logger.error(
+            "REDIS_URL is not set — falling back to %s. In a container nothing "
+            "listens there, so the job store, the rate limiter and the Celery "
+            "broker are all pointed at nothing. Set REDIS_URL.",
+            redis_target(),
+        )
+    else:
+        logger.info("Redis: %s (REDIS_URL unset, using the default)",
+                    redis_target())
+
     logger.info(f"TravBuddy backend started (env={settings.app_env})")
     yield
     logger.info("TravBuddy backend shutting down")

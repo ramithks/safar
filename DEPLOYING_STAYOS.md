@@ -30,13 +30,19 @@ StayOS token no matter what else is set.
 
 ## Environment
 
-Start from the marketplace service's variables — they are the proven production
-set — then apply the table below. **`GOOGLE_SERVICE_ACCOUNT_JSON`,
-`GOOGLE_MAPS_API_KEY`, `GCP_*`, `GCS_BUCKET_NAME`, `SENTRY_DSN` and the
-`RAZORPAY_*` trio are copied unchanged**: they are not database-scoped, and
-Vertex, Maps and Razorpay-test are the same accounts for both products.
+**`.env.stayos.coolify` is the answer.** It sits beside this file, gitignored,
+holding all 24 variables with production values already filled in — paste it
+into Coolify's environment editor whole. Regenerate it if a secret rotates.
 
-### Changed
+It has been booted with **nothing else present**: `.env` moved aside so no value
+could be inherited from a file that will not exist in the container, and
+`stayos_backend_check.py` scored **20/20** against it. That is what proves the
+list is complete rather than merely plausible.
+
+The rest of this section is what is in that file and why, for when it needs
+changing.
+
+### Changed from the marketplace service
 
 | Variable | Value | |
 | --- | --- | --- |
@@ -68,11 +74,37 @@ Vertex, Maps and Razorpay-test are the same accounts for both products.
 | Variable | Why |
 | --- | --- |
 | `SUPABASE_JWT_SECRET` | The marketplace's HS256 secret. StayOS tokens are ES256 and verify through JWKS. Copying it means an HS256 token would be checked against the wrong key; leaving it unset makes `app/deps/auth.py` refuse one loudly. |
+| `GOOGLE_MAPS_API_KEY` | The Places client init is wrapped in a try/except and logs "non-fatal" on failure, and no PMS route touches it. A secret a service does not use should not be on it. |
+| `GCS_BUCKET_NAME`, `INSTAGRAM_PROXY_URL` | The reels pipeline and its scraper — marketplace only. `INSTAGRAM_PROXY_URL` is not the Instagram inbox; that is `INSTAGRAM_ACCESS_TOKEN`. |
 | `WHATSAPP_TEST_RECIPIENT`, `WHATSAPP_TEST_PHONE_NUMBER_ID` | Only `scripts/meta_smoke.py` reads them, and it sends a real message. |
 
 > ⚠ Do not paste `.env.hotelos` into Coolify. It is a **development** file:
 > `APP_ENV=development`, `EXPOSE_API_DOCS=true`, and an `ALLOWED_ORIGINS` that
 > includes four localhost ports. Every one of those is wrong in production.
+
+### The other direction: five variables the test suites own
+
+Not a deployment concern — a warning against "tidying" the two files into one.
+These five must **never** be exported in a shell that runs the E2E suites:
+
+```
+MESSAGING_INLINE_PROCESSING   WHATSAPP_APP_SECRET   WHATSAPP_VERIFY_TOKEN
+INSTAGRAM_APP_SECRET          INSTAGRAM_VERIFY_TOKEN
+```
+
+Fourteen suites open with `os.environ.setdefault(...)` on them, which does
+nothing when the variable already exists. Adding them to `.env.hotelos` cost
+five gates at once — whatsapp, instagram, marketing, creator, pilot and
+partner_migration — because each suite then signed its webhooks with the test
+secret while the app verified with the real one, and the agent never replied
+because inline processing was off. All six failures looked like product bugs.
+
+The asymmetry that makes this easy to get wrong: the same names inside the
+`.env` **file** are harmless. Pydantic reads that file without populating
+`os.environ`, so `setdefault` still wins. Only *exporting* breaks it, which is
+exactly what `set -a; . ./.env.hotelos` does.
+
+Production sets all five, where no suite runs.
 
 ### Meta credentials
 
@@ -90,6 +122,53 @@ https://stayos-backend.travbuddy.in/api/v1/messaging/instagram/webhook
 
 Both answer the `GET` verification handshake and take the `POST` deliveries, and
 both verify `X-Hub-Signature-256` against `*_APP_SECRET` before reading a body.
+
+## Redis
+
+**`REDIS_URL` must be set. There is no safe default.**
+
+One URL is the Celery broker, the job store, the rate limiter's storage and the
+messaging pipeline's lock. Unset, it falls back to `redis://localhost:6379/0`,
+and nothing listens on localhost inside a container — which is how the first
+StayOS deploy came up reporting
+
+```
+"redis": "error: Error 111 connecting to localhost:6379. Connection refused."
+```
+
+That reads like Redis is down. It meant the variable was never set. The health
+check now says which of the two it is, and `app/main.py` logs the target at
+boot, both with credentials stripped.
+
+The health check is the lucky part. The same URL is `broker=` in
+`workers/celery_app.py`, and a worker pointed at an unreachable broker consumes
+nothing and complains about nothing — guest replies and campaigns would simply
+stop, silently. Read the boot log:
+
+```
+Redis: redis://redis:6379/1              ← configured
+REDIS_URL is not set — falling back to…  ← not
+```
+
+### The value
+
+```
+REDIS_URL=redis://redis:6379/1
+```
+
+**Database 1**, where the marketplace uses 0. Queue routing is what actually
+keeps tasks apart; separate databases keep result keys and locks apart too.
+
+`redis` is a Docker-network hostname, so it only resolves if this service is in
+the **same Coolify project** as the Redis container. If it is not, the error
+names the host instead of the variable:
+
+| What the health check says | What it means |
+| --- | --- |
+| `REDIS_URL is not set, so this fell back to redis://localhost:6379/0` | the variable is missing |
+| `connecting to redis://redis:6379/1 — … nodename nor servname provided` | set, but the hostname does not resolve from this container — move the service into the Redis resource's project, or use an address that does |
+| `connecting to redis://redis:6379/1 — … Connection refused` | host resolves, nothing listening on that port |
+| `ok` | done |
 
 ## Celery
 

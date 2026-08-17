@@ -499,7 +499,19 @@ def migrate(partner: dict, listing: dict | None, room_types: list[dict],
         return {"slug": partner["slug"], "skipped": "no email to create an account with"}
 
     property_id = str(uuid.uuid5(uuid.UUID(partner["id"]), "property"))
-    today = date.today()
+
+    # **UTC, not the operator's laptop.** `starts_at` is compared against
+    # Postgres `now()` by `active_transition()`, and `date.today()` is local.
+    # Run this from India after 18:30 IST and the local date is already
+    # tomorrow while `now()` is still today in UTC — so the row lands with
+    # `starts_at` in the *future* and the hotel is not inside its own free
+    # period until UTC midnight. Up to five and a half hours in which a
+    # partner who was just given a free year reads as chargeable.
+    #
+    # Found by `partner_migration_e2e` at 00:56 IST; it had passed all day.
+    # A date this side of the boundary has to be the same date the database
+    # will compare it to, so it is taken from the same clock.
+    today = datetime.now(timezone.utc).date()
     free_until = today + timedelta(days=365)
 
     plan = {
