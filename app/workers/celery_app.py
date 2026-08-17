@@ -59,6 +59,36 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,           # one task at a time per worker process
     worker_concurrency=settings.celery_worker_concurrency,  # cap concurrent workers (rate-limit protection)
     result_expires=86400,                   # results kept for 24 hours
+    # ── which worker may run which task ──────────────────────────────────────
+    #
+    # This codebase is deployed **twice**: once against the marketplace Supabase
+    # project and once against the hotel OS's. One `SUPABASE_URL` per process,
+    # so a task executed by the wrong deployment reads the wrong database.
+    #
+    # Both deployments enqueue through Celery, and without routing every task
+    # lands on the one default queue that both workers consume. Whichever worker
+    # grabs it first runs it: a guest's WhatsApp reply picked up by the
+    # marketplace worker looks for `conversations` in a project that has never
+    # had that table, and fails in a service nobody was looking at. Sharing one
+    # Redis makes that certain rather than likely — and the StayOS service is
+    # meant to be configured by copying the marketplace's environment, `REDIS_URL`
+    # included.
+    #
+    # **Only the hotel-OS tasks are routed.** Everything else keeps landing on
+    # the default `celery` queue, because the marketplace worker is already
+    # running in production with no `-Q` and would stop consuming anything the
+    # moment its tasks moved. Renaming its queue to be symmetrical would be a
+    # tidier diagram and an outage.
+    #
+    # The StayOS worker therefore starts with `-Q hotelos`, and the marketplace
+    # worker's command does not change. Beat belongs to the marketplace
+    # deployment: every scheduled entry below is a marketplace task, and
+    # `revert_intro_commission` runs hourly and *writes* to `partners` — a table
+    # that also exists, meaning something quite different, in the hotel OS.
+    task_routes={
+        "travbuddy.messaging.*": {"queue": "hotelos"},
+        "travbuddy.marketing.*": {"queue": "hotelos"},
+    },
     # Recommendation-engine nightly/weekly maintenance (docs/recommendation_engine.md
     # Part 9.3 / 14.3). Defined here — not in reco_tasks — so `celery beat` sees the
     # schedule from conf regardless of task-module import order. Task functions are

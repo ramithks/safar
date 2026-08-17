@@ -1,33 +1,34 @@
 import logging
 
 from fastapi import APIRouter
-from app.config import settings
-from app.api.v1.plan_trip.endpoint import router as plan_trip_router
-from app.api.v1.groups.endpoint import router as groups_router
-from app.api.v1.trips.endpoint import router as trips_router
-from app.api.v1.search.endpoint import router as search_router
-from app.api.v1.recommend.endpoint import router as recommend_router
+
+from app.api.v1.admin.catalog import router as admin_catalog_router
+from app.api.v1.admin.endpoint import router as admin_router
+from app.api.v1.admin.trips import router as admin_trips_router
 from app.api.v1.autocomplete.endpoint import router as autocomplete_router
-from app.api.v1.onboarding.endpoint import router as onboarding_router
 from app.api.v1.discover.endpoint import router as discover_router
+from app.api.v1.groups.endpoint import router as groups_router
+from app.api.v1.health import router as health_router
 from app.api.v1.hostels.endpoint import router as hostels_router
 from app.api.v1.hotels.endpoint import router as hotels_router
+from app.api.v1.images import router as images_router
 from app.api.v1.marketplace.endpoint import router as marketplace_router
 from app.api.v1.marketplace.partner_ops import router as marketplace_partner_router
 from app.api.v1.marketplace.payments import router as marketplace_payments_router
-from app.api.v1.pms.endpoint import router as pms_router
 from app.api.v1.messaging.webhooks import router as messaging_webhooks_router
-from app.api.v1.admin.endpoint import router as admin_router
-from app.api.v1.admin.trips import router as admin_trips_router
-from app.api.v1.admin.catalog import router as admin_catalog_router
-from app.api.v1.referral.endpoint import router as referral_router
-from app.api.v1.users.endpoint import router as users_router
-from app.api.v1.reels.endpoint import router as reels_router
-from app.api.v1.reels.analyze import router as reels_analyze_router
-from app.api.v1.reels.jobs import router as reels_jobs_router
-from app.api.v1.images import router as images_router
-from app.api.v1.health import router as health_router
 from app.api.v1.metrics import router as metrics_router
+from app.api.v1.onboarding.endpoint import router as onboarding_router
+from app.api.v1.plan_trip.endpoint import router as plan_trip_router
+from app.api.v1.pms.endpoint import router as pms_router
+from app.api.v1.recommend.endpoint import router as recommend_router
+from app.api.v1.reels.analyze import router as reels_analyze_router
+from app.api.v1.reels.endpoint import router as reels_router
+from app.api.v1.reels.jobs import router as reels_jobs_router
+from app.api.v1.referral.endpoint import router as referral_router
+from app.api.v1.search.endpoint import router as search_router
+from app.api.v1.trips.endpoint import router as trips_router
+from app.api.v1.users.endpoint import router as users_router
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
