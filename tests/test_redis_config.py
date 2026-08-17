@@ -125,6 +125,45 @@ class TestHealthMessage:
         out = self._health_with(monkeypatch, "redis://redis:6379/1", ping_fails=False)
         assert out == "ok"
 
+    def test_a_missing_password_stays_readable(self, monkeypatch):
+        """
+        Coolify's managed Redis sets `requirepass`, so a URL copied without its
+        credentials connects and is refused with `Authentication required.` —
+        which sounds like a permissions bug in the app rather than a missing
+        password in a URL. The message has to keep the host visible so the
+        reader can see the URL they supplied and notice what is not in it.
+
+        This is the case that actually happened: the generated env file guessed
+        a passwordless URL from a snapshot taken before the password existed.
+        """
+        monkeypatch.setattr("app.config.settings.redis_url", "redis://redis:6379/1")
+
+        class NoAuth:
+            def ping(self):
+                raise ConnectionError("Authentication required.")
+
+        monkeypatch.setattr("app.workers.job_store._get_redis", lambda: NoAuth())
+        from app.api.v1.health import _check_redis
+        out = _check_redis()
+        assert "Authentication required" in out
+        assert "redis://redis:6379/1" in out
+        assert "REDIS_URL is not set" not in out
+
+    def test_a_wrong_password_is_not_confused_with_a_missing_one(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.config.settings.redis_url", "redis://:nope@redis:6379/1")
+
+        class BadAuth:
+            def ping(self):
+                raise ConnectionError(
+                    "invalid username-password pair or user is disabled.")
+
+        monkeypatch.setattr("app.workers.job_store._get_redis", lambda: BadAuth())
+        from app.api.v1.health import _check_redis
+        out = _check_redis()
+        assert "invalid username-password" in out
+        assert "nope" not in out, "the rejected password must not be echoed"
+
 
 class TestTheTwoDeployments:
     def test_the_dev_default_is_database_zero(self):
