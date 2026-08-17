@@ -45,34 +45,50 @@ class TestRedaction:
 
 
 class TestUnconfiguredDetection:
-    def test_the_default_is_recognised_as_unset(self, monkeypatch):
-        default = Settings.model_fields["redis_url"].default
-        monkeypatch.setattr("app.config.settings.redis_url", default)
+    """
+    "Was it provided?", not "does it look like the default?" — the two differ
+    and the difference is a false alarm in the boot log.
+    """
+
+    def test_absent_is_unconfigured(self, monkeypatch):
+        monkeypatch.setattr("app.config._REDIS_URL_WAS_PROVIDED", False)
         assert redis_is_unconfigured()
 
-    def test_a_real_value_is_not(self, monkeypatch):
-        monkeypatch.setattr("app.config.settings.redis_url", "redis://redis:6379/1")
+    def test_supplied_is_configured(self, monkeypatch):
+        monkeypatch.setattr("app.config._REDIS_URL_WAS_PROVIDED", True)
         assert not redis_is_unconfigured()
 
-    def test_even_another_localhost_url_counts_as_configured(self, monkeypatch):
+    def test_pydantic_records_provision_from_the_environment(self, monkeypatch):
         """
-        Someone who deliberately points at localhost has configured it. Only
-        the untouched default means "nobody set this".
+        The mechanism, checked against pydantic directly rather than trusted.
+        `model_fields_set` is what separates "supplied" from "defaulted".
         """
-        monkeypatch.setattr("app.config.settings.redis_url", "redis://localhost:6379/3")
-        assert not redis_is_unconfigured()
+        monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
+        assert "redis_url" in Settings().model_fields_set
 
-    def test_it_tracks_the_field_default_rather_than_a_copy(self):
+    def test_set_to_exactly_the_default_still_counts_as_supplied(self, monkeypatch):
         """
-        Compared against `model_fields[...].default` on purpose. A repeated
-        literal here would silently stop matching the day the default changes,
-        and the check would quietly never fire again.
+        The case a value comparison gets wrong, and the reason this asks
+        pydantic instead. `redis://localhost:6379/0` is a legitimate thing to
+        set — a compose stack whose Redis really is on localhost — and telling
+        someone they have not set a variable they just set is how a warning
+        stops being read. It happened once, verifying the compose stack.
+        """
+        default = Settings.model_fields["redis_url"].default
+        monkeypatch.setenv("REDIS_URL", default)
+        assert "redis_url" in Settings().model_fields_set
+
+    def test_it_is_captured_once_rather_than_per_call(self):
+        """
+        The health endpoint calls this on every hit. Recomputing would re-read
+        `.env` from disk each time.
         """
         import inspect
 
         from app import config
 
-        assert "model_fields" in inspect.getsource(config.redis_is_unconfigured)
+        src = inspect.getsource(config.redis_is_unconfigured)
+        assert "Settings()" not in src
 
 
 class TestHealthMessage:
@@ -99,12 +115,14 @@ class TestHealthMessage:
         """
         The whole point. Production hit this and the message blamed Redis.
         """
+        monkeypatch.setattr("app.config._REDIS_URL_WAS_PROVIDED", False)
         default = Settings.model_fields["redis_url"].default
         out = self._health_with(monkeypatch, default)
         assert "REDIS_URL is not set" in out
         assert "fell back" in out
 
     def test_configured_but_unreachable_does_not_blame_the_variable(self, monkeypatch):
+        monkeypatch.setattr("app.config._REDIS_URL_WAS_PROVIDED", True)
         out = self._health_with(monkeypatch, "redis://redis:6379/1")
         assert "REDIS_URL is not set" not in out
         assert "redis://redis:6379/1" in out

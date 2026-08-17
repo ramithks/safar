@@ -1,0 +1,104 @@
+# StayOS — the hotel-OS deployment of this same repository.
+#
+# The marketplace stack is `docker-compose.yml`. This is its sibling: same
+# image, different database, its own Redis, its own hostname. Neither file
+# knows about the other and they share nothing at runtime.
+#
+#   marketplace   backend.travbuddy.in          uabxtdhxbamuhthxnhid
+#   StayOS        stayos-backend.travbuddy.in   rdlozqvuywtgsodunait
+#
+# ── why a Redis of its own ───────────────────────────────────────────────────
+#
+# The marketplace's Redis is a service *inside its own compose stack*. It is
+# not a shared resource, it is not reachable from another Coolify application,
+# and it has no password — `redis:7-alpine` with no `--requirepass` and a
+# healthcheck that runs `redis-cli ping` with no credentials.
+#
+# So "point StayOS at the marketplace's Redis with a different database number"
+# was never going to work, and the `redis` hostname a standalone StayOS
+# container resolves is some *other* Redis — which is why it answered
+# `Authentication required.` Giving StayOS its own removes the question: no
+# password to find, no shared server, and no way for one product's keys to
+# collide with the other's.
+#
+# `app/workers/celery_app.py` still routes hotel-OS tasks to a `hotelos` queue.
+# That is now belt and braces rather than the only thing keeping the two apart,
+# and it stays because it costs nothing and the failure it prevents is silent.
+#
+# ── environment ──────────────────────────────────────────────────────────────
+#
+# Everything except REDIS_URL comes from Coolify's environment — paste
+# `.env.stayos.coolify` there. `REDIS_URL` is set here instead, because it
+# describes this stack's own topology rather than a secret, and a value in a
+# compose `environment:` block wins over Coolify's tab. (That is exactly why
+# the marketplace works today while its Coolify variable still reads
+# `redis://localhost:6379/0`.)
+
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - stayos_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    expose:
+      - "8000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.stayos.rule=Host(`stayos-backend.travbuddy.in`)"
+      - "traefik.http.routers.stayos.entrypoints=https"
+      - "traefik.http.routers.stayos.tls.certresolver=letsencrypt"
+      - "traefik.http.services.stayos.loadbalancer.server.port=8000"
+    environment:
+      # This stack's own Redis. Database 0 — it is a server of its own, so
+      # there is nothing here to share a namespace with.
+      - REDIS_URL=redis://redis:6379/0
+      - TEMP_DIR=/tmp/stayos
+      - PLACES_CACHE_DIR=/tmp/stayos/places_cache
+    volumes:
+      - /tmp/stayos:/tmp/stayos
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    # `-Q hotelos` and nothing else. Messaging and marketing tasks route there;
+    # every marketplace task stays on the default `celery` queue, which this
+    # worker never subscribes to. Proven in tests/test_celery_routing.py and
+    # against a real broker.
+    command: celery -A app.workers.celery_app.celery_app worker --loglevel=info -Q hotelos --concurrency=${CELERY_CONCURRENCY:-4}
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - TEMP_DIR=/tmp/stayos
+      - PLACES_CACHE_DIR=/tmp/stayos/places_cache
+    volumes:
+      - /tmp/stayos:/tmp/stayos
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── no `beat` service, deliberately ─────────────────────────────────────────
+  #
+  # Every entry in `beat_schedule` is a marketplace task, and
+  # `travbuddy.partners.revert_intro_commission` fires hourly and *writes* to
+  # `partners` — a table that also exists, meaning something entirely
+  # different, in the hotel OS. Beat belongs to the marketplace stack alone.
+  #
+  # If the hotel OS ever needs its own scheduled work, give it its own schedule
+  # behind `settings.enable_hotel_os` rather than adding a second beat against
+  # the shared one.
+
+volumes:
+  stayos_redis_data:

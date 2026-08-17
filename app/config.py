@@ -324,12 +324,23 @@ def redis_target(url: str | None = None) -> str:
         return "<unparseable REDIS_URL>"
 
 
-def redis_is_unconfigured() -> bool:
-    """
-    True when `REDIS_URL` was never set and the development default survived.
+# Whether anybody actually supplied `REDIS_URL`, recorded once from the settings
+# object the app is really using.
+#
+# Asked of pydantic rather than answered by comparing the value to the default,
+# because those differ: `redis://localhost:6379/0` is a legitimate thing to set
+# — a compose stack whose Redis really is on localhost — and a value check calls
+# that "unset" and prints a boot error about a variable somebody just set. Which
+# it did, while verifying the compose stack. A warning that cries wolf once is a
+# warning nobody reads twice.
+#
+# `model_fields_set` covers every source pydantic-settings reads: the
+# environment, a `.env` file, an explicit argument. Only the field default is
+# absent from it. Captured at import rather than recomputed per call, so the
+# health endpoint does not re-read `.env` from disk on every hit.
+_REDIS_URL_WAS_PROVIDED = "redis_url" in settings.model_fields_set
 
-    Compared against the field's own default rather than a repeated literal, so
-    the two cannot drift apart.
-    """
-    default = Settings.model_fields["redis_url"].default
-    return settings.redis_url == default
+
+def redis_is_unconfigured() -> bool:
+    """True when `REDIS_URL` was never supplied and the default survived."""
+    return not _REDIS_URL_WAS_PROVIDED

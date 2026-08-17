@@ -52,7 +52,7 @@ changing.
 | `ENABLE_HOTEL_OS` | `true` | mounts `/api/v1/pms/*` and the messaging webhooks |
 | `APP_ENV` | `production` | |
 | `ALLOWED_ORIGINS` | `https://partner.travbuddy.in` | the only browser origin that calls this service |
-| `REDIS_URL` | the marketplace's, **with a different database number** — `…/1` where the marketplace uses `…/0` | see *Celery* below |
+| `REDIS_URL` | **do not set it in Coolify** — `docker-compose.stayos.yml` sets it to this stack's own Redis. See *Redis* below | |
 
 ### Set explicitly to off
 
@@ -150,44 +150,55 @@ Redis: redis://redis:6379/1              ← configured
 REDIS_URL is not set — falling back to…  ← not
 ```
 
-### The value
+### Where Redis comes from: its own, in this stack
 
-**Copy the marketplace service's `REDIS_URL` out of Coolify and change only the
-trailing database number.** Do not retype it from memory and do not take it from
-`coolify.env` — that file is a snapshot from June and predates the password:
+**Do not go looking for the marketplace's Redis password. There isn't one, and
+you could not reach that Redis anyway.**
 
-```
-marketplace   redis://:<password>@redis:6379/0
-StayOS        redis://:<password>@redis:6379/1
-                                            ↑ the only edit
-```
+`docker-compose.yml` shows why. The marketplace's Redis is a service *inside its
+own compose stack* — `redis:7-alpine`, no `--requirepass`, healthchecked with a
+bare `redis-cli ping`. It is not a shared resource and not reachable from a
+different Coolify application. That also explains a confusing detail: the
+marketplace's Coolify variable still reads `redis://localhost:6379/0` and the
+service is perfectly healthy, because its compose `environment:` block sets
+`redis://redis:6379/0` and a compose value wins over the Coolify tab.
 
-**Database 1**, where the marketplace uses 0. Queue routing is what actually
-keeps tasks apart; separate databases keep result keys and locks apart too.
+So a standalone StayOS container that resolves the hostname `redis` is reaching
+**some other Redis** — which is exactly why it answered `Authentication
+required.` Borrowing a Redis nobody chose for it is not a thing to fix; it is a
+thing to stop doing.
 
-The password matters and is easy to lose: Coolify's managed Redis sets
-`requirepass`, so a URL without one connects, gets refused, and reports
-`Authentication required.` — which sounds like a permissions problem in the app
-rather than a missing credential in a URL. Everything downstream is fine with an
-authenticated URL; the queue-isolation proof runs green against one.
+**Deploy StayOS with `docker-compose.stayos.yml`.** It is the marketplace's
+stack with the marketplace parts removed: its own `redis` service, its own
+volume, its own Traefik router name, `-Q hotelos` on the worker, and no `beat`.
+Redis then needs no password, no shared server and no coordination — and the two
+products cannot collide in Redis at all, because they are not in the same one.
 
-`redis` is a Docker-network hostname, so it only resolves if this service is in
-the **same Coolify project** as the Redis container.
+`REDIS_URL` is set in that file rather than in Coolify, because it describes this
+stack's topology rather than a secret. Everything else still comes from
+`.env.stayos.coolify` pasted into Coolify's environment.
 
-Each failure mode says something different, on purpose:
+If you would rather keep StayOS as a plain single-container app, the alternative
+is to add a **Redis resource** in Coolify to the StayOS project and use the
+connection string that resource's own page shows — Coolify generates the
+password there. That works, but it is a second thing to manage for no benefit
+the compose file does not already give you.
+
+### Reading the failure
+
+Each mode says something different, on purpose:
 
 | What the health check says | What it means |
 | --- | --- |
-| `REDIS_URL is not set, so this fell back to redis://localhost:6379/0` | the variable is missing |
-| `connecting to redis://redis:6379/1 — … nodename nor servname provided` | set, but the hostname does not resolve from this container — move the service into the Redis resource's project, or use an address that does |
-| `connecting to redis://redis:6379/1 — … Connection refused` | host resolves, nothing listening on that port |
-| `connecting to redis://redis:6379/1 — Authentication required.` | reachable, but the URL carries **no password** — copy the marketplace's whole URL, not just its host |
-| `connecting to redis://redis:6379/1 — invalid username-password pair` | wrong password |
+| `REDIS_URL is not set, so this fell back to redis://localhost:6379/0` | the variable is missing, and nothing listens on localhost in a container |
+| `connecting to redis://redis:6379/0 — … nodename nor servname provided` | no Redis on this stack's network — is the `redis` service in the compose file? |
+| `connecting to redis://redis:6379/0 — … Connection refused` | host resolves, nothing listening on that port |
+| `connecting to redis://redis:6379/1 — Authentication required.` | reached a Redis that wants a password — almost certainly **not this stack's**, which has none |
+| `connecting to … — invalid username-password pair` | wrong password |
 | `ok` | done |
 
-Note what the middle rows have in common: the URL in the message never contains
-the password, so any of these is safe to paste into a chat. That is
-`config.redis_target()` doing its job.
+The URL in every one of those is safe to paste: `config.redis_target()` strips
+credentials before the message is built.
 
 ## Celery
 
