@@ -166,3 +166,4 @@ scraper_health.json
 # Hotel-OS development database (Supabase project rdlozqvuywtgsodunait).
 # Real service-role credentials — never committed.
 .env.hotelos
+backups/
