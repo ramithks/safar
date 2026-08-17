@@ -712,7 +712,19 @@ def describe(plan: dict, *, apply: bool) -> str:
     print(f"     Marketplace listing   "
           + (f"CONNECTED  {plan['listing_id']}  ({plan['listing_status']})"
              if plan.get("listing_id") else "NONE"))
-    print(f"     Booking page          partner.travbuddy.in/stay/{plan['slug']}")
+    # Reserved, not live — and the difference matters enough to print.
+    #
+    # `/stay/{slug}` resolves through `public_booking.resolve_published`, which
+    # needs a `hotel_websites` row that is `published` with a snapshot in it.
+    # This migration deliberately does not create one: publishing a page under a
+    # hotel's own name is theirs to do, and a migration that quietly put three
+    # real businesses on the public internet would be doing it for them.
+    #
+    # The earlier version of this line printed the URL flat, which read as "this
+    # exists now". It does not, until the owner opens Website in the PWA and
+    # presses Publish — one click, and the slug below is the one they get.
+    print(f"     Booking page          partner.travbuddy.in/stay/{plan['slug']}"
+          "  — reserved; live once the owner publishes it (PWA → Website)")
 
     history = plan.get("history") or {}
     print(f"     Marketplace history   {history.get('listings', 0)} listing(s), "

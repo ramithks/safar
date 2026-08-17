@@ -87,52 +87,78 @@ if settings.request_timeout_seconds and settings.request_timeout_seconds > 0:
 # CORS — driven by ALLOWED_ORIGINS (comma-separated). Mobile clients don't
 # enforce CORS, but the PMS is a browser app on a different origin to this API,
 # so for StayOS this list is the difference between the front desk working and
-# every request failing a preflight.
+# every request failing a preflight. The marketplace needs it too: lib/search.ts
+# and lib/recommend.ts are called from Client Components on travbuddy.in, so
+# this list is load-bearing for the traveller site as well as for hotels.
 #
-# **The empty-list fallback is `*` only outside production.** It exists so a
-# fresh checkout runs without configuration; shipping it would let any page on
-# the internet make credentialed calls to a hotel's API. In production an empty
-# list is a misconfiguration worth failing loudly on, at boot, rather than
-# discovering as a security finding later.
-_origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
-_is_production = settings.app_env.lower().startswith("prod")
-
-# The origins this API is actually for. Used as the production default when
-# nothing is configured, so a deploy that forgets the variable comes up
-# *narrow* rather than either wide open or dead.
+# **Nothing here can refuse to boot.** Every branch ends with a usable list.
+# That is a deliberate reversal: the first two versions of this block raised —
+# once on an empty list, once on a wildcard — and both were wrong for the same
+# reason. This process also serves travbuddy.in. A misconfigured header is a
+# security finding; a process that will not start is an outage for every
+# traveller, every partner and both mobile apps at once, and the second is not
+# a proportionate way to prevent the first.
 #
-# Failing closed by raising was the first version of this, and it was wrong for
-# an API that also serves the marketplace: a redeploy with the variable unset
-# would have taken travbuddy.in down to fix a header. Refusing an explicit
-# wildcard is still worth doing — that is somebody choosing to be open — but
-# forgetting to set a value should not be an outage.
-_PRODUCTION_DEFAULT = [
+# The wildcard case is the one that made this concrete. `APP_ENV` is currently
+# unset in production and `ALLOWED_ORIGINS` is not in the deployment's
+# environment at all, so `allowed_origins` falls back to the `"*"` default in
+# config.py. Under the raising version, setting `APP_ENV=production` — on its
+# own, a tidying change nobody would think twice about — took the whole site
+# down at boot. Refusing the wildcard is still right; refusing it by *narrowing*
+# leaves the site up while the log says exactly what happened.
+# The origins this API is actually for, and the production answer to both
+# misconfigurations: an unset list and a wildcard one. A deploy that forgets the
+# variable, or inherits the `"*"` default, comes up *narrow* rather than either
+# wide open or dead.
+#
+# Vercel preview deployments of the marketplace are deliberately not here. A
+# preview is not production and should not be able to talk to production; if one
+# needs to, name it in ALLOWED_ORIGINS for as long as that is true.
+PRODUCTION_ORIGINS = [
     "https://partner.travbuddy.in",
     "https://travbuddy.in",
     "https://www.travbuddy.in",
 ]
 
-if _is_production and "*" in _origins:
-    raise RuntimeError(
-        "ALLOWED_ORIGINS contains '*' and APP_ENV is production. Name the "
-        "origins explicitly; a wildcard here lets any site on the internet make "
-        "credentialed calls to a hotel's API."
-    )
 
-if not _origins:
-    if _is_production:
-        _origins = list(_PRODUCTION_DEFAULT)
+def resolve_cors_origins(configured: str, app_env: str) -> list[str]:
+    """
+    The list to hand CORSMiddleware, given what was configured and where we are.
+
+    A function rather than four lines at import time so it can be tested without
+    reimporting the app — this decides whether a browser can reach the API at
+    all, and every wrong answer is either an outage or an exposure.
+    """
+    origins = [o.strip() for o in configured.split(",") if o.strip()]
+    is_production = app_env.lower().startswith("prod")
+
+    if is_production and "*" in origins:
+        logger.error(
+            "ALLOWED_ORIGINS contains '*' and APP_ENV is production — ignoring "
+            "it and serving %s instead. A wildcard here lets any page on the "
+            "internet make credentialed calls to a hotel's API. Set "
+            "ALLOWED_ORIGINS explicitly; this is a refusal, not configuration.",
+            ", ".join(PRODUCTION_ORIGINS),
+        )
+        return list(PRODUCTION_ORIGINS)
+
+    if origins:
+        return origins
+
+    if is_production:
         logger.warning(
             "ALLOWED_ORIGINS is unset in production — defaulting to %s. Set it "
             "explicitly; this default is a safety net, not configuration.",
-            ", ".join(_origins),
+            ", ".join(PRODUCTION_ORIGINS),
         )
-    else:
-        _origins = ["*"]
+        return list(PRODUCTION_ORIGINS)
+
+    return ["*"]
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_origins,
+    allow_origins=resolve_cors_origins(settings.allowed_origins, settings.app_env),
     allow_methods=["*"],
     allow_headers=["*"],
 )
