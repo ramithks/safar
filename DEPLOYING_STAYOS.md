@@ -123,6 +123,40 @@ https://stayos-backend.travbuddy.in/api/v1/messaging/instagram/webhook
 Both answer the `GET` verification handshake and take the `POST` deliveries, and
 both verify `X-Hub-Signature-256` against `*_APP_SECRET` before reading a body.
 
+## Coolify settings
+
+**Build Pack: `Docker Compose`.** Not `Dockerfile`.
+
+| Field | Value |
+| --- | --- |
+| Build Pack | **Docker Compose** |
+| Docker Compose Location | `/docker-compose.stayos.yml` |
+| Base Directory | `/` |
+| Domain | `https://stayos-backend.travbuddy.in` → the **`api`** service, port 8000 |
+| Environment | paste `.env.stayos.coolify` |
+
+Putting the compose path into the **Dockerfile Location** field instead feeds
+YAML to the Docker build and fails on the first line that is not a Docker
+instruction:
+
+```
+dockerfile parse error on line 37: unknown instruction: version:
+```
+
+The file is fine; the build pack is the wrong one. (The failed build rolls back
+cleanly — the previous version keeps serving.)
+
+Two things the Dockerfile build pack cannot give this service, which is why the
+switch is worth it rather than just a preference:
+
+- **A worker.** The image's `CMD` is uvicorn, so a Dockerfile deployment runs
+  the API and nothing else. StayOS had no Celery worker at all — messaging and
+  marketing tasks would have queued forever, silently, even with Redis working.
+- **A Redis.** See below.
+
+The compose file carries **no Traefik labels**; in compose mode Coolify
+generates its own from the domain set in the UI and hand-written ones fight it.
+
 ## Redis
 
 **`REDIS_URL` must be set. There is no safe default.**

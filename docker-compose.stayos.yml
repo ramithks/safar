@@ -1,5 +1,12 @@
 # StayOS — the hotel-OS deployment of this same repository.
 #
+# Coolify build pack: **Docker Compose**, not Dockerfile.
+# Set "Docker Compose Location" to /docker-compose.stayos.yml.
+#
+# Pasting this path into the *Dockerfile Location* field feeds YAML to the
+# Docker build and fails with `unknown instruction: version:` — the file is
+# fine, the build pack is the wrong one.
+#
 # The marketplace stack is `docker-compose.yml`. This is its sibling: same
 # image, different database, its own Redis, its own hostname. Neither file
 # knows about the other and they share nothing at runtime.
@@ -21,20 +28,33 @@
 # password to find, no shared server, and no way for one product's keys to
 # collide with the other's.
 #
-# `app/workers/celery_app.py` still routes hotel-OS tasks to a `hotelos` queue.
-# That is now belt and braces rather than the only thing keeping the two apart,
-# and it stays because it costs nothing and the failure it prevents is silent.
+# ── why a worker of its own ──────────────────────────────────────────────────
+#
+# The image's CMD is uvicorn, so a Dockerfile-build-pack deployment runs the
+# API and nothing else. StayOS had no Celery worker at all: messaging and
+# marketing tasks would have queued forever, silently, even once Redis worked.
+#
+# `app/workers/celery_app.py` routes hotel-OS tasks to a `hotelos` queue. With
+# separate Redis servers that routing is now belt and braces rather than the
+# only thing keeping the two products apart, and it stays because it costs
+# nothing and the failure it prevents is invisible.
 #
 # ── environment ──────────────────────────────────────────────────────────────
 #
 # Everything except REDIS_URL comes from Coolify's environment — paste
-# `.env.stayos.coolify` there. `REDIS_URL` is set here instead, because it
-# describes this stack's own topology rather than a secret, and a value in a
-# compose `environment:` block wins over Coolify's tab. (That is exactly why
-# the marketplace works today while its Coolify variable still reads
+# `.env.stayos.coolify` there. REDIS_URL is set here instead, because it
+# describes this stack's own topology rather than a secret, and a compose
+# `environment:` value wins over Coolify's tab. (That is exactly why the
+# marketplace works today while its Coolify variable still reads
 # `redis://localhost:6379/0`.)
-
-version: "3.9"
+#
+# ── routing ──────────────────────────────────────────────────────────────────
+#
+# **No Traefik labels here on purpose.** In compose mode Coolify generates its
+# own from the domain set in the UI, and hand-written ones fight it. The domain
+# is already configured as https://stayos-backend.travbuddy.in and must resolve
+# to the `api` service on port 8000. If Coolify asks which service a domain
+# belongs to, it is `api`.
 
 services:
   redis:
@@ -52,20 +72,18 @@ services:
     build: .
     expose:
       - "8000"
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.stayos.rule=Host(`stayos-backend.travbuddy.in`)"
-      - "traefik.http.routers.stayos.entrypoints=https"
-      - "traefik.http.routers.stayos.tls.certresolver=letsencrypt"
-      - "traefik.http.services.stayos.loadbalancer.server.port=8000"
     environment:
       # This stack's own Redis. Database 0 — it is a server of its own, so
       # there is nothing here to share a namespace with.
       - REDIS_URL=redis://redis:6379/0
       - TEMP_DIR=/tmp/stayos
       - PLACES_CACHE_DIR=/tmp/stayos/places_cache
-    volumes:
-      - /tmp/stayos:/tmp/stayos
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5).status == 200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     depends_on:
       redis:
         condition: service_healthy
@@ -82,8 +100,6 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - TEMP_DIR=/tmp/stayos
       - PLACES_CACHE_DIR=/tmp/stayos/places_cache
-    volumes:
-      - /tmp/stayos:/tmp/stayos
     depends_on:
       redis:
         condition: service_healthy
