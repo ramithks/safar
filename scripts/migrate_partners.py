@@ -270,12 +270,37 @@ def ensure_auth_user(email: str, full_name: str | None) -> tuple[str, bool]:
                  {"email": email, "email_confirm": True,
                   "user_metadata": {"full_name": full_name or ""}}, admin)
     if st in (200, 201) and isinstance(d, dict) and d.get("id"):
-        return d["id"], True
+        return _with_profile(d["id"], email, full_name), True
 
     rows = write_hotel_os(f"select id from auth.users where email = {q(email)} limit 1;")
     if rows:
-        return rows[0]["id"], False
+        return _with_profile(rows[0]["id"], email, full_name), False
     raise RuntimeError(f"could not create or find an account for {email}: {st} {str(d)[:200]}")
+
+
+def _with_profile(profile_id: str, email: str, full_name: str | None) -> str:
+    """
+    Make sure the account has a `profiles` row, rather than assuming it does.
+
+    `handle_new_user()` mirrors auth.users into profiles on insert, and for a
+    user this script creates that is enough. It is not enough for one that
+    already existed: this project was the old agency database until its `public`
+    schema was dropped on 2026-08-13, which took `profiles` with it and left
+    `auth.users` — a different schema — untouched. Every account predating that
+    is an orphan, and the first partner this migration touched turned out to be
+    one.
+
+    `partners.owner_id` is a foreign key to `profiles`, so without this the
+    migration fails on a constraint several statements later, naming a table
+    nobody was writing to.
+    """
+    write_hotel_os(f"""
+insert into public.profiles (id, email, full_name)
+values ({q(profile_id)}, {q(email)}, {q(full_name)})
+on conflict (id) do update
+   set email = coalesce(public.profiles.email, excluded.email),
+       full_name = coalesce(public.profiles.full_name, excluded.full_name);""")
+    return profile_id
 
 
 def invite_link(email: str) -> str | None:
@@ -310,7 +335,6 @@ def migrate(partner: dict, listing: dict | None, room_types: list[dict],
         return {"slug": partner["slug"], "skipped": "no email to create an account with"}
 
     property_id = str(uuid.uuid5(uuid.UUID(partner["id"]), "property"))
-    account_note = f"migrated:{partner['slug']}"
     today = date.today()
     free_until = today + timedelta(days=365)
 
@@ -392,10 +416,9 @@ on conflict (id) do update
         plan["billing_account"] = account_id
         write_hotel_os(f"""
 insert into public.subscriptions
-  (billing_account_id, plan_id, status, current_period_start, current_period_end,
-   metadata)
-select {q(account_id)}, sp.id, 'active', {q(today)}, {q(free_until)},
-       jsonb_build_object('note', {q(account_note)}, 'free_months', {FREE_MONTHS})
+  (billing_account_id, plan_id, property_id, status,
+   current_period_start, current_period_end)
+select {q(account_id)}, sp.id, {q(property_id)}, 'active', {q(today)}, {q(free_until)}
   from public.subscription_plans sp
  where sp.code = {q(STARTER_PLAN)}
    and not exists (select 1 from public.subscriptions s
