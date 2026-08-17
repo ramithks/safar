@@ -6,10 +6,21 @@ Move a marketplace partner onto the hotel OS, with a year on the house.
     ──────────────────────────────────          ──────────────────────────────
     partners                          ──────►   partners
     partner_listings (kind='hotel')   ──────►   properties
-      content->rooms[]                ──────►   room_types + rate_plans
+    listing_room_types (is_active)    ──────►   room_types
+      base_price ─┐
+                  ├── resolve ────────►   rate_plans (or switched off)
+    price_from ───┘
     profiles.email                    ──────►   a new auth user + invite link
                                       ──────►   subscription, 1 year, ₹0
                                       ──────►   credit grant
+
+**Where a room's price comes from.** `listing_room_types.base_price` when the
+hotelier set one. When they did not, `partner_listings.price_from` — which is
+not a fallback but *the* price the marketplace charges for a hotel room today:
+`api/v1/marketplace/payments.py` reads it directly into `quote_stay` with
+`quantity = rooms`, and never consults `listing_room_types` at all. A room with
+neither is `NEEDS_REVIEW` and reaches the hotel OS with its rate plan switched
+off. Nothing here ever produces a sellable ₹0 room. See `resolve_room_price`.
 
 **Read-only against production.** Every statement sent to the marketplace
 project is a select. Nothing about the partner's listing, bookings or plan
@@ -46,6 +57,7 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -176,15 +188,36 @@ def best_listing(partner_id: str) -> dict | None:
     rows = read_production(f"""
         select l.id, l.slug, l.title, l.city, l.address, l.status,
                l.description, l.summary, l.whatsapp,
-               coalesce(jsonb_array_length(l.content->'rooms'), 0) as room_count,
-               l.content->'rooms' as rooms
+               l.price_from, l.original_price, l.price_unit,
+               (select count(*) from public.listing_room_types rt
+                 where rt.listing_id = l.id and rt.is_active) as room_count
           from public.partner_listings l
          where l.partner_id = {q(partner_id)} and l.kind = 'hotel'
          order by (l.status = 'published') desc,
-                  coalesce(jsonb_array_length(l.content->'rooms'), 0) desc,
+                  (select count(*) from public.listing_room_types rt
+                    where rt.listing_id = l.id and rt.is_active) desc,
                   l.updated_at desc
          limit 1""")
     return rows[0] if rows else None
+
+
+def listing_rooms(listing_id: str) -> list[dict]:
+    """
+    The hotel's rooms, from `listing_room_types` rather than from
+    `partner_listings.content->'rooms'`.
+
+    Both exist and they are not the same thing. The JSON is what the listing
+    editor posts; `listing_room_types` is what it writes, and it is the only one
+    of the two that carries `is_active`. Reading the JSON migrated a room a
+    hotelier had already deactivated — Hotel Lotus has a "Delex Room" beside its
+    "Deluxe Room", a typo switched off months ago, and the JSON still holds it.
+    """
+    return read_production(f"""
+        select rt.id, rt.name, rt.base_price, rt.default_units, rt.occupancy,
+               rt.beds, rt.size, rt.sort_order
+          from public.listing_room_types rt
+         where rt.listing_id = {q(listing_id)} and rt.is_active
+         order by rt.sort_order, rt.name""")
 
 
 # ── mapping ──────────────────────────────────────────────────────────────────
@@ -201,49 +234,135 @@ def room_code(name: str, taken: set[str]) -> str:
     return code
 
 
-def to_paise(price) -> int:
-    """
-    Rupees to paise, and the only place this conversion happens.
+class PriceError(ValueError):
+    """A rupee value that must not become a price."""
 
-    `content->rooms[].price` is a **rupee** figure a hotelier typed into the
-    marketplace form — 1700 means ₹1,700. Everything in the hotel OS is paise.
-    Getting this wrong in either direction is a 100× pricing error that would
-    reach a real guest, so it is one function with one caller and a range check
-    either side of it.
+
+# A nightly rate above this is not a rate. The most expensive suite on the
+# marketplace is ₹15,500; a lakh and a half a night means somebody typed a
+# paise figure into a rupee field, or added zeros. Refused rather than clamped —
+# a clamp would invent a price, which is the one thing this must never do.
+MAX_NIGHTLY_RUPEES = Decimal("150000")
+
+
+def to_paise(rupees) -> int:
     """
-    rupees = float(price or 0)
-    if rupees <= 0:
-        return 0
-    if rupees > 500_000:
-        raise RuntimeError(
-            f"a nightly rate of ₹{rupees:,.0f} is not a rate — refusing to convert. "
-            f"If this is already paise, the marketplace form has changed."
+    Rupees to paise. The only conversion in this file, in either direction.
+
+    **Decimal, never float.** `float("1499.50") * 100` is 149949.99999999997,
+    and `int()` of that is ₹1,499.49 — a rupee lost on a rate that then gets
+    multiplied by nights and rooms. The marketplace stores these columns as
+    integer rupees today, so this is defensive rather than load-bearing; it
+    stops being defensive the first time somebody widens the column, and by
+    then nobody will be looking.
+
+    Refuses rather than coerces. Every rejection here is a room that does not
+    become sellable at a wrong price.
+    """
+    if rupees is None:
+        raise PriceError("no price")
+    try:
+        value = Decimal(str(rupees).strip())
+    except (InvalidOperation, AttributeError) as exc:
+        raise PriceError(f"{rupees!r} is not a number") from exc
+
+    if not value.is_finite():
+        raise PriceError(f"{rupees!r} is not a finite amount")
+    if value < 0:
+        raise PriceError(f"₹{value} is negative")
+    if value == 0:
+        raise PriceError("₹0")
+    if value > MAX_NIGHTLY_RUPEES:
+        raise PriceError(
+            f"₹{value:,} a night is not a rate — refusing to convert. "
+            f"If this is already paise, the marketplace column has changed."
         )
-    return int(round(rupees * 100))
+
+    paise = (value * 100).to_integral_value(rounding=ROUND_HALF_UP)
+    if paise <= 0 or paise > 2**31 - 1:
+        raise PriceError(f"₹{value} does not fit an integer paise column")
+    return int(paise)
 
 
-def plan_room_types(listing: dict | None) -> list[dict]:
-    rooms = (listing or {}).get("rooms") or []
+def to_rupees(paise: int) -> Decimal:
+    """The other direction, for the report. Exact, so what is printed is what was stored."""
+    return (Decimal(int(paise)) / 100).quantize(Decimal("0.01"))
+
+
+# ── the resolver ─────────────────────────────────────────────────────────────
+
+EXPLICIT = "explicit_room_price"
+INHERITED = "inherited_from_listing"
+NEEDS_REVIEW = "needs_review"
+
+
+def resolve_room_price(room: dict, listing: dict) -> tuple[int | None, str, str]:
+    """
+    What one room costs a night, and where that number came from.
+
+    Two sources, in this order, and the order is not a preference — it is what
+    the marketplace's own data model says:
+
+    **1. `listing_room_types.base_price`.** The hotelier typed a price against
+    this specific room. Nothing outranks that.
+
+    **2. `partner_listings.price_from`.** Not a fallback and not an
+    approximation: for a hotel it is *the* price the marketplace charges. The
+    quote path that takes the money —
+    `api/v1/marketplace/payments.py` — reads it directly:
+
+        if listing["kind"] == "hotel":
+            base = listing.get("price_from")
+            q = pricing.quote_stay(base_price_rupees=float(base), rooms=body.rooms, …)
+
+    and `quote_stay` passes it through as `unit_prices_paise` with
+    `quantity=rooms`. `listing_room_types.base_price` never enters that path at
+    all; it is what the room card on the page displays. So a guest booking this
+    hotel today is already charged `price_from` per room per night whichever
+    room they pick, and inheriting it is not a guess about what the room should
+    cost — it is the price it is being sold at right now.
+
+    Anything else is `NEEDS_REVIEW`. A room with no defensible price does not
+    become a room priced at zero.
+    """
+    for source, label in ((room.get("base_price"), EXPLICIT),
+                          (listing.get("price_from"), INHERITED)):
+        if source is None:
+            continue
+        try:
+            return to_paise(source), label, f"₹{Decimal(str(source)):,}"
+        except PriceError as exc:
+            # A bad explicit price does not fall through to the listing price
+            # silently — it is reported, and then the listing price is tried,
+            # because a typo in one field is not a reason to refuse the hotel.
+            room.setdefault("_price_notes", []).append(f"{label}: {exc}")
+
+    return None, NEEDS_REVIEW, "—"
+
+
+def plan_room_types(listing: dict | None, rooms: list[dict]) -> list[dict]:
     taken: set[str] = set()
     out = []
     for room in rooms:
         name = (room.get("name") or "Room").strip() or "Room"
-        paise = to_paise(room.get("price"))
+        paise, resolution, source = resolve_room_price(room, listing or {})
         out.append({
             "code": room_code(name, taken),
             "name": name,
-            "units": max(int(room.get("units") or 1), 1),
+            "units": min(max(int(room.get("default_units") or 1), 1), 999),
             # Clamped. The marketplace form takes whatever was typed, and one
             # of these says a room sleeps 22 — which is a mistake, not a
             # dormitory, and it would put a party of 22 through the occupancy
             # checks as if the room could hold them.
             "occupancy": min(max(int(room.get("occupancy") or 2), 1), 20),
             "paise": paise,
-            # A rate plan with no price is not a cheap room, it is an unfinished
-            # listing — and the public booking engine would sell it for nothing.
-            # The room type is still created, so the hotel is real and the owner
-            # can price it on the calendar; the plan arrives switched off.
-            "sellable": paise > 0,
+            "resolution": resolution,
+            "source": source,
+            "notes": room.get("_price_notes") or [],
+            # A room reaches public inventory only with a price behind it. This
+            # is the flag `rate_plans.is_active` is written from, and the one
+            # thing that guarantees no ₹0 room is ever sellable.
+            "sellable": paise is not None,
         })
     return out
 
@@ -347,6 +466,7 @@ def migrate(partner: dict, listing: dict | None, room_types: list[dict],
         "hotel": (listing or {}).get("title") or partner["brand_name"],
         "city": (listing or {}).get("city") or partner.get("city"),
         "slug": slugify((listing or {}).get("slug") or partner["slug"]),
+        "listing_price": (listing or {}).get("price_from"),
         "rooms": room_types,
         "units": sum(r["units"] for r in room_types),
         "free_until": free_until,
@@ -396,13 +516,18 @@ on conflict (id) do update
 
 insert into public.rate_plans
   (id, property_id, room_type_id, partner_id, code, name, meal_plan, audience,
-   base_price_paise, refundable,
-  is_active, sort_order)
+   base_price_paise, refundable, is_active, sort_order)
 values ({q(rp_id)}, {q(property_id)}, {q(rt_id)}, {q(partner['id'])},
         {q(room['code'] + '-EP')}, {q(room['name'] + ' — room only')}, 'EP',
-        'public', {room['paise']}, true, {q(room['sellable'])}, 1)
+        'public', {room['paise'] or 0}, true, {q(room['sellable'])}, 1)
+-- **base_price_paise is not in the update list, deliberately.** This migration
+-- fills a price in; it never corrects one. Once a hotel is live its rates are
+-- set on the calendar screen and the hotel OS is the system of record for them,
+-- so a re-run reaching back to the marketplace would silently undo a hotelier's
+-- own pricing. That is a far worse failure than a stale row. The name and the
+-- active flag are refreshed because neither of them is money.
 on conflict (id) do update
-   set base_price_paise = excluded.base_price_paise,
+   set name = excluded.name,
        is_active = excluded.is_active;""")
 
     # A year, free. The subscription row is what the usage screen reads for the
@@ -440,40 +565,61 @@ select {q(account_id)}, sp.id, {q(property_id)}, 'active', {q(today)}, {q(free_u
 
 # ── output ───────────────────────────────────────────────────────────────────
 
+RESOLUTION_LABEL = {
+    EXPLICIT: "explicit_room_price",
+    INHERITED: "inherited_from_listing",
+    NEEDS_REVIEW: "needs_review",
+}
+
+
 def describe(plan: dict, *, apply: bool) -> None:
+    """
+    Where every price came from, room by room.
+
+    The point of this output is that somebody can audit it before it becomes
+    money. A total is not auditable; "₹3,600, inherited from the listing price,
+    because the marketplace already charges that per room per night" is.
+    """
     if plan.get("skipped"):
         print(f"  ─ {plan['slug']}: skipped — {plan['skipped']}")
         return
 
-    print(f"\n  {plan['brand']}  ({plan['city'] or 'city unknown'})")
-    print(f"     hotel        {plan['hotel']}")
-    print(f"     url          partner.travbuddy.in  →  /stay/{plan['slug']}")
-    print(f"     owner        {plan['email']}"
+    print(f"\n  ── {plan['brand']} " + "─" * max(4, 56 - len(plan["brand"])))
+    print(f"     Hotel                 {plan['hotel']}")
+    print(f"     City                  {plan['city'] or 'unknown'}")
+    print(f"     Listing price         "
+          + (f"₹{plan['listing_price']:,}/night" if plan.get("listing_price")
+             else "not set"))
+    print(f"     Owner                 {plan['email']}"
           + (f"  ({plan['name']})" if plan.get("name") else ""))
-    if plan["rooms"]:
-        for room in plan["rooms"]:
-            rate = (f"₹{room['paise'] / 100:,.0f}/night" if room["sellable"]
-                    else "NO PRICE — plan created switched off")
-            print(f"     room         {room['code']:<5} {room['name'][:28]:<28} "
-                  f"×{room['units']:<3} sleeps {room['occupancy']:<3} {rate}")
-        print(f"     inventory    {plan['units']} rooms across "
-              f"{len(plan['rooms'])} type(s)")
-    else:
-        # Not a failure. A hotel with no rooms described yet is a hotel whose
-        # owner sets them up on the calendar screen; what matters is that they
-        # can sign in and find their own name on it.
-        print("     room         none described on the marketplace listing")
+    print(f"     Booking page          partner.travbuddy.in/stay/{plan['slug']}")
+
+    if not plan["rooms"]:
+        print("\n     No active room types on the marketplace listing.")
+    for room in plan["rooms"]:
+        ready = room["sellable"]
+        print(f"\n     Room                  {room['name']}")
+        print(f"       room-specific price {room['source'] if room['resolution'] == EXPLICIT else 'missing'}")
+        print(f"       resolved price      "
+              + (f"₹{to_rupees(room['paise']):,}/night" if ready else "—"))
+        print(f"       resolution          {RESOLUTION_LABEL[room['resolution']]}")
+        print(f"       inventory           {room['units']} room(s), sleeps {room['occupancy']}")
+        print(f"       status              {'READY' if ready else 'DISABLED — needs review'}")
+        for note in room["notes"]:
+            print(f"       ⚠ rejected          {note}")
+
     unpriced = [r for r in plan["rooms"] if not r["sellable"]]
     if unpriced:
-        print(f"     ⚠ warning    {len(unpriced)} room type(s) have no nightly rate. "
-              f"They are not sellable until the hotel prices them.")
-    print(f"     free until   {plan['free_until']}  ({plan['credits']:,} AI credits)")
+        print(f"\n     ⚠ {len(unpriced)} room(s) reach the hotel OS switched off. They cannot be")
+        print("       sold until somebody prices them on the calendar screen.")
+    print(f"\n     Free until            {plan['free_until']}  "
+          f"({plan['credits']:,} AI credits)")
 
     if apply:
         made = plan.get("account_created")
-        print(f"     account      {'created' if made else 'already existed'}")
+        print(f"     Account               {'created' if made else 'already existed'}")
         if plan.get("invite"):
-            print(f"     invite       {plan['invite']}")
+            print(f"     Invite                {plan['invite']}")
 
 
 def main() -> int:
@@ -496,12 +642,7 @@ def main() -> int:
     done, skipped = 0, 0
     for partner in partners:
         listing = best_listing(partner["id"])
-        try:
-            rooms = plan_room_types(listing)
-        except RuntimeError as exc:
-            print(f"  ─ {partner['slug']}: skipped — {exc}")
-            skipped += 1
-            continue
+        rooms = plan_room_types(listing, listing_rooms(listing["id"]) if listing else [])
         plan = migrate(partner, listing, rooms, apply=args.apply)
         describe(plan, apply=args.apply)
         skipped += 1 if plan.get("skipped") else 0
