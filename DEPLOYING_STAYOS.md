@@ -48,13 +48,26 @@ Vertex, Maps and Razorpay-test are the same accounts for both products.
 | `ALLOWED_ORIGINS` | `https://partner.travbuddy.in` | the only browser origin that calls this service |
 | `REDIS_URL` | the marketplace's, **with a different database number** — `…/1` where the marketplace uses `…/0` | see *Celery* below |
 
-### Must NOT be set
+### Set explicitly to off
+
+| Variable | Value | Why |
+| --- | --- | --- |
+| `EXPOSE_API_DOCS` | `false` | **`.env.hotelos` sets it to `true`** for local work. It publishes a complete map of every PMS route, parameter and model. The setting defaults to false, but say it anyway — see below. |
+| `MESSAGING_INLINE_PROCESSING` | `false` | Development and the E2E suite only. In production Meta must be acknowledged fast and the model call must happen in Celery. |
+
+> Belt and braces, and worth the two lines. `app/config.py` is a
+> pydantic-settings model that reads the `.env` **file** as well as the
+> environment, so locally `unset EXPOSE_API_DOCS` does not turn docs off — the
+> file still says true. Coolify has no `.env`, so the default would apply, but
+> an explicit `false` is right whether or not a file ever appears beside the
+> code. Verified: with it set, `stayos_backend_check.py` goes 20/20; without it
+> and with `.env` present, `/docs` answers 200.
+
+### Must NOT be set at all
 
 | Variable | Why |
 | --- | --- |
 | `SUPABASE_JWT_SECRET` | The marketplace's HS256 secret. StayOS tokens are ES256 and verify through JWKS. Copying it means an HS256 token would be checked against the wrong key; leaving it unset makes `app/deps/auth.py` refuse one loudly. |
-| `EXPOSE_API_DOCS` | **`.env.hotelos` sets this to `true`** for local work. Copied into Coolify it publishes a complete map of every PMS route, parameter and model. The default is false — leave it unset. |
-| `MESSAGING_INLINE_PROCESSING` | Development and the E2E suite only. In production Meta must be acknowledged fast and the model call must happen in Celery. |
 | `WHATSAPP_TEST_RECIPIENT`, `WHATSAPP_TEST_PHONE_NUMBER_ID` | Only `scripts/meta_smoke.py` reads them, and it sends a real message. |
 
 > ⚠ Do not paste `.env.hotelos` into Coolify. It is a **development** file:
