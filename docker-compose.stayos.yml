@@ -1,60 +1,43 @@
 # StayOS — the hotel-OS deployment of this same repository.
 #
-# Coolify build pack: **Docker Compose**, not Dockerfile.
-# Set "Docker Compose Location" to /docker-compose.stayos.yml.
-#
-# Pasting this path into the *Dockerfile Location* field feeds YAML to the
-# Docker build and fails with `unknown instruction: version:` — the file is
-# fine, the build pack is the wrong one.
+# Coolify build pack: Docker Compose. Compose file: /docker-compose.stayos.yml
 #
 # The marketplace stack is `docker-compose.yml`. This is its sibling: same
-# image, different database, its own Redis, its own hostname. Neither file
-# knows about the other and they share nothing at runtime.
+# image, different Supabase project, its own Redis, its own hostname. Neither
+# file knows about the other and they share nothing at runtime.
 #
 #   marketplace   backend.travbuddy.in          uabxtdhxbamuhthxnhid
 #   StayOS        stayos-backend.travbuddy.in   rdlozqvuywtgsodunait
 #
-# ── why a Redis of its own ───────────────────────────────────────────────────
+# ── Redis belongs to this stack ──────────────────────────────────────────────
 #
-# The marketplace's Redis is a service *inside its own compose stack*. It is
-# not a shared resource, it is not reachable from another Coolify application,
-# and it has no password — `redis:7-alpine` with no `--requirepass` and a
-# healthcheck that runs `redis-cli ping` with no credentials.
+# The marketplace's Redis is a service inside *its* compose stack: no password,
+# and not reachable from another Coolify application. Pointing StayOS at a
+# `redis` hostname from outside reached something else entirely and answered
+# `Authentication required.` The `redis` service below is this stack's own —
+# Docker's network puts it on the hostname `redis` for the containers in this
+# file and nowhere else, so there is no password to manage and no way for the
+# two products to collide in Redis at all.
 #
-# So "point StayOS at the marketplace's Redis with a different database number"
-# was never going to work, and the `redis` hostname a standalone StayOS
-# container resolves is some *other* Redis — which is why it answered
-# `Authentication required.` Giving StayOS its own removes the question: no
-# password to find, no shared server, and no way for one product's keys to
-# collide with the other's.
+# `app/workers/celery_app.py` still routes hotel-OS tasks to a `hotelos` queue.
+# With separate Redis servers that is belt and braces rather than the only
+# thing keeping the products apart, and it stays because it costs nothing and
+# the failure it prevents is silent.
 #
-# ── why a worker of its own ──────────────────────────────────────────────────
+# ── the worker is not optional ───────────────────────────────────────────────
 #
 # The image's CMD is uvicorn, so a Dockerfile-build-pack deployment runs the
-# API and nothing else. StayOS had no Celery worker at all: messaging and
-# marketing tasks would have queued forever, silently, even once Redis worked.
-#
-# `app/workers/celery_app.py` routes hotel-OS tasks to a `hotelos` queue. With
-# separate Redis servers that routing is now belt and braces rather than the
-# only thing keeping the two products apart, and it stays because it costs
-# nothing and the failure it prevents is invisible.
+# API alone. StayOS had no Celery worker at all: messaging and marketing tasks
+# would queue forever with nothing in any log saying so.
 #
 # ── environment ──────────────────────────────────────────────────────────────
 #
 # Everything except REDIS_URL comes from Coolify's environment — paste
-# `.env.stayos.coolify` there. REDIS_URL is set here instead, because it
-# describes this stack's own topology rather than a secret, and a compose
-# `environment:` value wins over Coolify's tab. (That is exactly why the
-# marketplace works today while its Coolify variable still reads
-# `redis://localhost:6379/0`.)
+# `.env.stayos.coolify` there. REDIS_URL is set per-service below because it
+# describes this stack's topology rather than a secret, and a compose
+# `environment:` value wins over Coolify's tab. Do not also set it in Coolify.
 #
-# ── routing ──────────────────────────────────────────────────────────────────
-#
-# **No Traefik labels here on purpose.** In compose mode Coolify generates its
-# own from the domain set in the UI, and hand-written ones fight it. The domain
-# is already configured as https://stayos-backend.travbuddy.in and must resolve
-# to the `api` service on port 8000. If Coolify asks which service a domain
-# belongs to, it is `api`.
+# No `version:` key: Compose v2 ignores it and warns that it is obsolete.
 
 services:
   redis:
@@ -72,18 +55,21 @@ services:
     build: .
     expose:
       - "8000"
+    labels:
+      # Router and service names are `stayos`, not `api` — the marketplace
+      # stack already registers `traefik.http.routers.api` on this same Traefik,
+      # and two routers of one name is one router.
+      - "traefik.enable=true"
+      - "traefik.http.routers.stayos.rule=Host(`stayos-backend.travbuddy.in`)"
+      - "traefik.http.routers.stayos.entrypoints=https"
+      - "traefik.http.routers.stayos.tls=true"
+      - "traefik.http.routers.stayos.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.stayos.service=stayos"
+      - "traefik.http.services.stayos.loadbalancer.server.port=8000"
     environment:
-      # This stack's own Redis. Database 0 — it is a server of its own, so
-      # there is nothing here to share a namespace with.
       - REDIS_URL=redis://redis:6379/0
       - TEMP_DIR=/tmp/stayos
       - PLACES_CACHE_DIR=/tmp/stayos/places_cache
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5).status == 200 else 1)\""]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
     depends_on:
       redis:
         condition: service_healthy
@@ -111,10 +97,6 @@ services:
   # `travbuddy.partners.revert_intro_commission` fires hourly and *writes* to
   # `partners` — a table that also exists, meaning something entirely
   # different, in the hotel OS. Beat belongs to the marketplace stack alone.
-  #
-  # If the hotel OS ever needs its own scheduled work, give it its own schedule
-  # behind `settings.enable_hotel_os` rather than adding a second beat against
-  # the shared one.
 
 volumes:
   stayos_redis_data:
