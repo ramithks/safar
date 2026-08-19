@@ -13,6 +13,12 @@ backup, every read replica, every `select *` in a support session, and in the
 PWA the moment somebody adds the column to a response model by accident. A row
 that names `'casa'` tells an attacker nothing.
 
+A third source exists for accounts a *hotel* connects itself through Instagram
+Business Login, because those tokens cannot be environment variables — there is
+no redeploy in a self-serve flow. A ref of `prop:<property_id>` reads from
+`messaging_credentials`, where the token is Fernet ciphertext and the key is in
+the environment, so a database dump still yields nothing. See store.py.
+
 `credentials_ref = 'sandbox'` (settings.whatsapp_sandbox_ref) selects the fake
 adapter and needs no secret at all — that is what makes a development
 connection unable to reach a real phone even if someone points it at one.
@@ -54,7 +60,25 @@ _CHANNEL_ENV = {
 }
 
 
-def resolve(credentials_ref: str, channel: str = "whatsapp") -> ChannelCredentials:
+def resolve(
+    credentials_ref: str,
+    channel: str = "whatsapp",
+    *,
+    db_token: str | None = None,
+) -> ChannelCredentials:
+    """
+    Turn a ref into secrets.
+
+    `db_token` is the per-hotel token already loaded from `messaging_credentials`
+    — passed in rather than fetched here so this function stays pure and
+    synchronous, and so the DB read happens on the executor where every other
+    DB read happens. `adapter_for_async` is what normally supplies it.
+
+    The app secret and verify token stay environmental even for a hotel's own
+    account: they belong to *our* Meta app, are the same for every hotel, and
+    storing a per-hotel copy of a shared secret is a way to end up with a stale
+    one that fails signature checks nobody can explain.
+    """
     ref = credentials_ref or "default"
     prefix, attr = _CHANNEL_ENV.get(channel, _CHANNEL_ENV["whatsapp"])
 
@@ -64,7 +88,8 @@ def resolve(credentials_ref: str, channel: str = "whatsapp") -> ChannelCredentia
         )
 
     return ChannelCredentials(
-        access_token=(_env(f"{prefix}_ACCESS_TOKEN", ref)
+        access_token=(db_token
+                      or _env(f"{prefix}_ACCESS_TOKEN", ref)
                       or getattr(settings, f"{attr}_access_token", None)),
         app_secret=(_env(f"{prefix}_APP_SECRET", ref)
                     or getattr(settings, f"{attr}_app_secret", None)),
@@ -74,7 +99,41 @@ def resolve(credentials_ref: str, channel: str = "whatsapp") -> ChannelCredentia
     )
 
 
+async def adapter_for_async(connection: dict):
+    """
+    Build the adapter, loading a per-hotel token off the event loop first.
+
+    This is what the send path uses. `adapter_for` below is the synchronous
+    twin for scripts and for connections whose ref is environmental; calling it
+    from a request handler with a `prop:` ref would do blocking DB I/O on the
+    event loop.
+    """
+    from app.db.client import run_db
+    from app.services.messaging import store
+
+    ref = connection.get("credentials_ref") or "default"
+    channel = connection.get("channel") or "whatsapp"
+    db_token = None
+    if store.is_db_ref(ref) and not connection.get("is_sandbox"):
+        db_token = await run_db(store.load_token, ref, channel)
+
+    return _build_adapter(connection, db_token=db_token)
+
+
 def adapter_for(connection: dict):
+    """Synchronous twin of `adapter_for_async`. Reads the database inline."""
+    from app.services.messaging import store
+
+    ref = connection.get("credentials_ref") or "default"
+    channel = connection.get("channel") or "whatsapp"
+    db_token = None
+    if store.is_db_ref(ref) and not connection.get("is_sandbox"):
+        db_token = store.load_token(ref, channel)
+
+    return _build_adapter(connection, db_token=db_token)
+
+
+def _build_adapter(connection: dict, *, db_token: str | None = None):
     """
     Build the adapter a connection should use.
 
@@ -95,7 +154,8 @@ def adapter_for(connection: dict):
     # from `phone_number_id is not None` would do exactly that the first time a
     # column is added.
     channel = connection.get("channel") or "whatsapp"
-    creds = resolve(connection.get("credentials_ref") or "default", channel)
+    creds = resolve(connection.get("credentials_ref") or "default", channel,
+                    db_token=db_token)
     sandbox = bool(connection.get("is_sandbox") or creds.is_sandbox)
 
     if channel == "instagram":
