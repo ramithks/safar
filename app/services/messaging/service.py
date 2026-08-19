@@ -701,7 +701,7 @@ async def send(
             template_name=message.get("template_name"), duplicate=True,
         )
 
-    adapter = creds_module.adapter_for(connection)
+    adapter = await creds_module.adapter_for_async(connection)
     try:
         if template is not None:
             result = await adapter.send_template(

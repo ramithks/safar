@@ -139,6 +139,44 @@ class Settings(BaseSettings):
     instagram_app_secret: Optional[str] = None
     instagram_api_version: str = "v21.0"
 
+    # ── Instagram Business Login (OAuth) ────────────────────────────────────
+    #
+    # Meta's "Instagram API with Instagram Login" flow, which is the one that
+    # lets a hotel connect its *own* account. Note these are the Instagram
+    # app's credentials (Meta app → Instagram → API setup with Instagram
+    # login), not the Facebook app id/secret on the Basic settings page. They
+    # look interchangeable and are not: the token exchange rejects the wrong
+    # pair with an "Invalid platform app" that says nothing useful.
+    instagram_app_id: Optional[str] = None
+    instagram_oauth_client_secret: Optional[str] = None
+
+    # Must byte-for-byte equal the "Redirect URL" configured in Meta. Meta
+    # compares the string, not the URL: a trailing slash, http vs https, or a
+    # different case in the host is a rejected callback. Set explicitly in
+    # production rather than derived from the request, because deriving it from
+    # a proxied Host header is how an open redirect gets built by accident.
+    instagram_redirect_uri: str = (
+        "https://stayos-backend.travbuddy.in/api/v1/messaging/instagram/oauth/callback"
+    )
+
+    # Minimum for an AI employee that reads and answers DMs. Anything more is a
+    # permission the hotel is asked to grant and we never use, which is both a
+    # worse consent screen and a longer app review.
+    instagram_oauth_scopes: str = "instagram_business_basic,instagram_business_manage_messages"
+
+    # Where the owner lands when the connection succeeds or fails. The callback
+    # appends ?instagram=connected or ?instagram=error&reason=…
+    pms_app_url: str = "https://partner.travbuddy.in"
+
+    # How long a signed OAuth `state` stays valid. It is a CSRF token and a
+    # round trip through Meta's consent screen, so minutes, not hours.
+    oauth_state_ttl_seconds: int = 600
+
+    # Fernet key for messaging_credentials.access_token_ciphertext. Unset means
+    # per-hotel tokens cannot be read or written — deliberately fatal at the
+    # boundary rather than silently falling back to storing them in the clear.
+    messaging_credentials_key: Optional[str] = None
+
     # The controlled smoke test, and only the controlled smoke test.
     #
     # Deliberately singular. `scripts/meta_smoke.py` messages exactly this
