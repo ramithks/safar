@@ -39,6 +39,22 @@ _TOKEN_CACHE_MAX = 1024
 _REMOTE_RETRIES = 3
 _hinted_missing_secret = False
 
+# Tolerance for clock skew between Supabase's auth server and this one, applied
+# to `iat`, `nbf` and `exp`.
+#
+# Without it, a token is rejected in the one place it matters most: the seconds
+# straight after signup. GoTrue stamps `iat` from its clock, the PWA sends the
+# token immediately, and if this machine's clock is a fraction behind, PyJWT
+# raises ImmatureSignatureError — "the token is not yet valid". The hotel owner
+# who has just created their account is told their session is invalid, and a
+# refresh fixes it, so it reads as random. Observed on a brand-new signup while
+# testing onboarding, which is exactly the path that cannot afford it.
+#
+# 60s is the usual allowance. It also extends an expired token's life by the
+# same 60s against a one-hour lifetime, which is the accepted side of the
+# trade: a clock nobody controls must not be able to lock users out.
+_CLOCK_SKEW_LEEWAY = 60
+
 
 def _get_auth_client() -> Client:
     global _supabase_client
@@ -82,10 +98,14 @@ def _verify_local(token: str):
             settings.supabase_jwt_secret,
             algorithms=["HS256"],
             audience="authenticated",
+            leeway=_CLOCK_SKEW_LEEWAY,
         )
     elif alg in ("RS256", "ES256"):
         key = _get_jwks_client().get_signing_key_from_jwt(token).key
-        payload = jwt.decode(token, key, algorithms=[alg], audience="authenticated")
+        payload = jwt.decode(
+            token, key, algorithms=[alg], audience="authenticated",
+            leeway=_CLOCK_SKEW_LEEWAY,
+        )
     else:
         return None
 
