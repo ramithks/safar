@@ -61,6 +61,12 @@ from app.api.v1.pms.schemas import (
     ConversationOut,
     DailyPointOut,
     GuestOut,
+    HotelCreateOut,
+    HotelCreateRequest,
+    OnboardingOut,
+    RatePlanCreateRequest,
+    RoomTypeCreateRequest,
+    RoomsCreateRequest,
     FolioEntryOut,
     MarginRowOut,
     MemberOut,
@@ -132,6 +138,7 @@ from app.services.pms import ari as ari_service
 from app.services.pms import availability as availability_service
 from app.services.pms import b2b as b2b_service
 from app.services.pms import clock
+from app.services.pms import onboarding as onboarding_service
 from app.services.pms import creators as creators_service
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
@@ -219,6 +226,124 @@ async def list_rate_plans(request: Request, property_id: str, member=Depends(req
 async def list_tasks(request: Request, property_id: str, member=Depends(require_member("tasks"))):
     rows = await workspace_service.list_tasks(property_id)
     return [TaskOut.from_row(r) for r in rows]
+
+
+
+# ── onboarding ───────────────────────────────────────────────────────────────
+# The half of the product that did not exist. Everything below `/properties/{id}`
+# assumed a hotel; nothing made one, so the only way onto StayOS was a script
+# somebody ran on a laptop.
+#
+# `require_user`, not `require_member`, on the first route only — there is no
+# property to be a member of yet. That is exactly why it takes no partner id
+# and no property id from the client: the owner is `auth.uid()` and nothing else.
+
+@router.post("/onboarding/hotel", response_model=HotelCreateOut, status_code=201)
+@limiter.limit("20/hour")
+async def create_hotel(request: Request, body: HotelCreateRequest, user=Depends(require_user)):
+    """
+    Create this person's hotel, and hire its AI employee.
+
+    Idempotent: a second call returns the hotel they already have rather than
+    a second one, because `partners.owner_id` is unique and a double-tap on a
+    slow connection is the ordinary case, not the exceptional one.
+    """
+    return await onboarding_service.create_hotel(
+        profile_id=str(user.id),
+        hotel_name=body.hotelName,
+        city=body.city,
+        owner_name=body.ownerName,
+        phone=body.phone,
+    )
+
+
+@router.get("/properties/{property_id}/onboarding", response_model=OnboardingOut)
+@limiter.limit("120/minute")
+async def get_onboarding(request: Request, property_id: str, member=Depends(require_member())):
+    """What is done, what is left, and whether this hotel can go live."""
+    return await onboarding_service.checklist(property_id)
+
+
+@router.post("/properties/{property_id}/room-types", response_model=RoomTypeOut, status_code=201)
+@limiter.limit("60/hour")
+async def create_room_type(
+    request: Request,
+    property_id: str,
+    body: RoomTypeCreateRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    A kind of room this hotel sells, and optionally what a night in it costs.
+
+    The price is taken here rather than in a second request because a room type
+    with no rate plan is not sellable, and a two-step flow is a flow that stops
+    between the steps.
+    """
+    room_type = await onboarding_service.add_room_type_with_price(
+        property_id=property_id,
+        partner_id=member.partner_id,
+        name=body.name,
+        total_units=body.totalUnits,
+        max_occupancy=body.maxOccupancy,
+        code=body.code,
+        price_paise=body.priceRupees * 100 if body.priceRupees is not None else None,
+        meal_plan=body.mealPlan,
+    )
+    return RoomTypeOut.from_row(room_type)
+
+
+@router.post("/properties/{property_id}/rate-plans", response_model=RatePlanOut, status_code=201)
+@limiter.limit("60/hour")
+async def create_rate_plan(
+    request: Request,
+    property_id: str,
+    body: RatePlanCreateRequest,
+    member=Depends(require_member("rates")),
+):
+    """What one night costs. Rupees in, paise stored — the conversion is here."""
+    row = await onboarding_service.add_rate_plan(
+        property_id=property_id,
+        partner_id=member.partner_id,
+        room_type_id=body.roomTypeId,
+        price_paise=body.priceRupees * 100,
+        name=body.name,
+        meal_plan=body.mealPlan,
+        audience=body.audience,
+        code=body.code,
+    )
+    return RatePlanOut.from_row(row)
+
+
+@router.post("/properties/{property_id}/rooms", response_model=list[RoomOut], status_code=201)
+@limiter.limit("60/hour")
+async def create_rooms(
+    request: Request,
+    property_id: str,
+    body: RoomsCreateRequest,
+    member=Depends(require_member("rates")),
+):
+    """The physical rooms, by number. Optional — inventory comes from the type."""
+    rows = await onboarding_service.add_rooms(
+        property_id=property_id,
+        partner_id=member.partner_id,
+        room_type_id=body.roomTypeId,
+        numbers=body.numbers,
+    )
+    return [RoomOut.from_row(r) for r in rows]
+
+
+@router.post("/properties/{property_id}/activate", response_model=OnboardingOut)
+@limiter.limit("30/hour")
+async def activate_property(
+    request: Request, property_id: str, member=Depends(require_member("rates")),
+):
+    """
+    Go live.
+
+    Refuses while anything required is missing, which is what keeps a hotel with
+    no rate out of search results instead of listing it at nothing.
+    """
+    return await onboarding_service.activate(property_id)
 
 
 # ── availability ─────────────────────────────────────────────────────────────

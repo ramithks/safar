@@ -1812,3 +1812,82 @@ class CreatorCampaignCreateRequest(BaseModel):
     guestDiscountPct: float = Field(default=0, ge=0, le=50)
     attributionWindowDays: int = Field(default=30, ge=1, le=180)
     minNights: int = Field(default=1, ge=1, le=30)
+
+
+# ── onboarding ───────────────────────────────────────────────────────────────
+# What a hotel owner fills in on their first morning. The vocabulary is theirs:
+# a "room type" is what the API calls it and what the screen calls "a kind of
+# room you sell", and nothing here mentions a partner, a tenant or a principal.
+#
+# Money arrives in **rupees** on these three, and only these three. Everywhere
+# else in this file it is paise, because everywhere else the number came from
+# the server. Here it came from a person typing into a box marked ₹, and asking
+# a hotelier to enter 350000 for a ₹3,500 room is how ₹0 rooms get created.
+
+class HotelCreateRequest(BaseModel):
+    hotelName: str = Field(min_length=2, max_length=120)
+    city: str = Field(min_length=2, max_length=80)
+    ownerName: str | None = Field(default=None, max_length=120)
+    phone: str | None = Field(default=None, max_length=20)
+
+
+class HotelCreateOut(BaseModel):
+    partnerId: str
+    propertyId: str
+    slug: str
+    name: str
+    status: str
+    created: bool
+
+
+class RoomTypeCreateRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    totalUnits: int = Field(ge=1, le=999)
+    maxOccupancy: int = Field(default=2, ge=1, le=30)
+    code: str | None = Field(default=None, max_length=12)
+    # Optional in the same call, because "a room with no price" is the state
+    # this whole module exists to prevent and a second request is a second
+    # chance to stop halfway.
+    priceRupees: int | None = Field(default=None, ge=1, le=1_000_000)
+    mealPlan: Literal["EP", "CP", "MAP", "AP"] = "CP"
+
+
+class RatePlanCreateRequest(BaseModel):
+    roomTypeId: str
+    priceRupees: int = Field(ge=1, le=1_000_000)
+    name: str | None = Field(default=None, max_length=80)
+    mealPlan: Literal["EP", "CP", "MAP", "AP"] = "CP"
+    audience: Literal["public", "b2b", "corporate", "creator", "internal"] = "public"
+    code: str | None = Field(default=None, max_length=16)
+
+
+class RoomsCreateRequest(BaseModel):
+    roomTypeId: str
+    numbers: list[str] = Field(min_length=1, max_length=200)
+
+
+class OnboardingStepOut(BaseModel):
+    id: str
+    label: str
+    done: bool
+    required: bool
+    href: str
+
+
+class OnboardingCountsOut(BaseModel):
+    roomTypes: int
+    ratePlans: int
+    rooms: int
+    agents: int
+
+
+class OnboardingOut(BaseModel):
+    propertyId: str
+    name: str
+    status: str
+    slug: str
+    steps: list[OnboardingStepOut]
+    remaining: int
+    canGoLive: bool
+    isLive: bool
+    counts: OnboardingCountsOut

@@ -63,6 +63,19 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
+def _headers(msg):
+    """Case-insensitive header dict.
+
+    `dict(HTTPMessage)` keeps whatever casing the server used and loses the
+    case-insensitive lookup, so over HTTP/1.1 — where the proxy title-cases
+    them — every `headers.get("access-control-allow-origin")` below silently
+    read `None`. That made the CORS section blind: it reported the PWA origin
+    as refused, and would have reported a *hostile* origin as refused too,
+    whatever the server actually sent.
+    """
+    return {k.lower(): v for k, v in msg.items()}
+
+
 def http(url, method="GET", body=None, headers=None, timeout=25):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -73,15 +86,15 @@ def http(url, method="GET", body=None, headers=None, timeout=25):
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read().decode()
             try:
-                return r.status, json.loads(raw), dict(r.headers)
+                return r.status, json.loads(raw), _headers(r.headers)
             except json.JSONDecodeError:
-                return r.status, raw, dict(r.headers)
+                return r.status, raw, _headers(r.headers)
     except urllib.error.HTTPError as e:
         raw = e.read().decode()
         try:
-            return e.code, json.loads(raw), dict(e.headers)
+            return e.code, json.loads(raw), _headers(e.headers)
         except json.JSONDecodeError:
-            return e.code, raw, dict(e.headers)
+            return e.code, raw, _headers(e.headers)
     except Exception as e:  # noqa: BLE001 — a dead host is an answer, not a crash
         return 0, str(e), {}
 
