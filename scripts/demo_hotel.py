@@ -395,6 +395,24 @@ async def _website(property_id: str) -> None:
     print("  website     published")
 
 
+def _sender_display(phone_number_id: str) -> str | None:
+    """What Meta says this sender's number is. None if it cannot be read."""
+    import json
+    import os
+    import urllib.request
+
+    token = (os.environ.get("WHATSAPP_ACCESS_TOKEN") or "").strip()
+    if not token:
+        return None
+    try:
+        url = (f"https://graph.facebook.com/v21.0/{phone_number_id}"
+               f"?fields=display_phone_number&access_token={token}")
+        with urllib.request.urlopen(url, timeout=20) as r:
+            return json.loads(r.read()).get("display_phone_number")
+    except Exception:  # noqa: BLE001 — a label must not fail a seed
+        return None
+
+
 def _channels(property_id: str, partner_id: str) -> None:
     """
     The row that says which hotel an inbound message belongs to.
@@ -425,19 +443,33 @@ def _channels(property_id: str, partner_id: str) -> None:
     import os
 
     db = get_db()
-    live_sender = (os.environ.get("WHATSAPP_TEST_PHONE_NUMBER_ID") or "").strip()
+    # A real, verified sender if there is one; Meta's test number only as a
+    # fallback. The distinction is not cosmetic — a test number can reach five
+    # allow-listed handsets and no guest, so a demo wired to one proves the
+    # pipeline and nothing about whether a hotel can trade.
+    real_sender = (os.environ.get("WHATSAPP_PHONE_NUMBER_ID") or "").strip()
+    test_sender = (os.environ.get("WHATSAPP_TEST_PHONE_NUMBER_ID") or "").strip()
+    live_sender = real_sender or test_sender
 
     if live_sender:
+        # The number staff see, read from Meta rather than from our own
+        # aspirations. It was being written from GUEST_PHONE, so the inbox
+        # showed +91 83687 32396 while messages actually came from a different
+        # number entirely — and the one thing a display number has to do is
+        # match the handset a guest is looking at.
+        shown = _sender_display(live_sender) or f"+91 {GUEST_PHONE[2:7]} {GUEST_PHONE[7:]}"
         row = {
             "phone_number_id": live_sender,
-            "waba_id": (os.environ.get("WHATSAPP_WABA_ID") or "").strip() or "meta-test",
+            "waba_id": (os.environ.get("WHATSAPP_WABA_ID") or "").strip() or "unknown",
             "display_name": HOTEL,
             "status": "connected",
             "credentials_ref": "default",
             "is_sandbox": False,
         }
-        note = f"live via Meta sender {live_sender} (test number — limited recipients)"
+        note = (f"live via Meta sender {live_sender}"
+                + ("" if real_sender else " (test number — allow-listed recipients only)"))
     else:
+        shown = f"+91 {GUEST_PHONE[2:7]} {GUEST_PHONE[7:]}"
         row = {
             "phone_number_id": f"demo-{GUEST_PHONE}",
             "waba_id": "demo-waba",
@@ -457,7 +489,7 @@ def _channels(property_id: str, partner_id: str) -> None:
 
     db.table("whatsapp_connections").upsert({
         "id": sid("60"), "property_id": property_id, "partner_id": partner_id,
-        "display_number": f"+91 {GUEST_PHONE[2:7]} {GUEST_PHONE[7:]}",
+        "display_number": shown,
         **row,
     }, on_conflict="id").execute()
     print(f"  WhatsApp    {note}")

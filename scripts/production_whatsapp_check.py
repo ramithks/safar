@@ -83,7 +83,11 @@ def main() -> int:
     args = ap.parse_args()
 
     secret = os.environ.get("WHATSAPP_APP_SECRET") or ""
-    sender = os.environ.get("WHATSAPP_TEST_PHONE_NUMBER_ID") or ""
+    # The real sender if one is configured; Meta's test number otherwise. The
+    # check has to run against whichever the hotel is actually wired to, or it
+    # proves a chain nobody is using.
+    sender = (os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
+              or os.environ.get("WHATSAPP_TEST_PHONE_NUMBER_ID") or "")
     guest = (os.environ.get("WHATSAPP_TEST_RECIPIENT") or "").lstrip("+")
     if not (secret and sender and guest):
         print("Set WHATSAPP_APP_SECRET, WHATSAPP_TEST_PHONE_NUMBER_ID and "
