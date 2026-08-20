@@ -177,6 +177,32 @@ class Settings(BaseSettings):
     # boundary rather than silently falling back to storing them in the clear.
     messaging_credentials_key: Optional[str] = None
 
+    # ── Google Business Profile ─────────────────────────────────────────────
+    #
+    # A standard Google Cloud OAuth **web application** client — not the service
+    # account in GOOGLE_SERVICE_ACCOUNT_JSON. The two are not interchangeable:
+    # a Business Profile is owned by a person, and only that person's consent
+    # can let us answer a review under the hotel's name. A service account has
+    # no listings and never will.
+    google_oauth_client_id: Optional[str] = None
+    google_oauth_client_secret: Optional[str] = None
+
+    # Byte-for-byte equal to an "Authorised redirect URI" on the OAuth client,
+    # for the same reason the Instagram one is: Google compares the string.
+    google_oauth_redirect_uri: str = (
+        "https://stayos-backend.travbuddy.in/api/v1/google/oauth/callback"
+    )
+
+    # One scope, and it is the only one Business Profile publishes. There is no
+    # narrower read-only variant to prefer — `business.manage` is least
+    # privilege here because it is the whole list.
+    google_oauth_scopes: str = "https://www.googleapis.com/auth/business.manage"
+
+    # Google's access tokens last an hour. Refresh a little early so a call that
+    # takes a moment to reach Google is not holding a token that expires in
+    # flight.
+    google_token_refresh_skew_seconds: int = 300
+
     # The controlled smoke test, and only the controlled smoke test.
     #
     # Deliberately singular. `scripts/meta_smoke.py` messages exactly this

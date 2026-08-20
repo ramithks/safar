@@ -22,6 +22,7 @@ marketplace/partner_ops.py.
 # FastAPI body resolution through slowapi's wrapper. Same note as
 # api/v1/admin/endpoint.py.
 import json
+import re
 import logging
 from datetime import date, datetime, timedelta, timezone
 
@@ -94,6 +95,9 @@ from app.api.v1.pms.schemas import (
     PublicServiceOut,
     PublicSiteOut,
     QuotedAddonOut,
+    WebChatIn,
+    WebChatOpenerOut,
+    WebChatOut,
     WebsiteConfigOut,
     WebsiteUpdateRequest,
     FolioOut,
@@ -149,6 +153,8 @@ from app.services.pms import frontdesk as frontdesk_service
 from app.services.pms import payments as payments_service
 from app.services.pms import stay_payment
 from app.services.pms import public_booking
+from app.services.pms import quote_payment
+from app.services.messaging import web_chat
 from app.services.pms import sync as sync_service
 from app.services.pms import website as website_service
 from app.services import razorpay
@@ -2775,6 +2781,71 @@ def _room_option(option, units: int) -> PublicRoomOptionOut:
     )
 
 
+@router.get("/public/hotels/{slug}/chat", response_model=WebChatOpenerOut)
+@limiter.limit("120/minute")
+async def get_public_chat_opener(request: Request, slug: str):
+    """
+    What the chat widget says before a visitor types.
+
+    Server-side rather than hard-coded in the widget because the suggestions
+    have to be true of *this* hotel: a homestay with no airport pickup should
+    not be offering one as an opening prompt, and the widget has no way to know
+    that. Only services the hotel has actually configured become suggestions.
+    """
+    prop = await public_booking.resolve_published(slug)
+
+    def _services() -> list[str]:
+        rows = (
+            get_db()
+            .table("services")
+            .select("name,category")
+            .eq("property_id", prop.id)
+            .eq("is_active", True)
+            .order("sort_order")
+            .limit(3)
+            .execute()
+            .data
+            or []
+        )
+        return [str(r["name"]) for r in rows if r.get("name")]
+
+    names = await run_db(_services)
+
+    suggestions = ["Do you have rooms tonight?", "What's included in the rate?"]
+    if names:
+        # Hotels name services for their own staff — "Airport pickup (Maharana
+        # Pratap)", "Spa — 60 min". Lower-casing the whole string turned a
+        # proper noun into "maharana pratap" and the parenthetical made the
+        # question unreadable, so trim to the part before the bracket or dash
+        # and only lower-case a leading word that is plainly not a name.
+        label = re.split(r"[(\u2014-]", names[0])[0].strip()
+        if label[:1].isupper() and not label.split(" ")[0].isupper():
+            label = label[0].lower() + label[1:]
+        suggestions.append(f"Do you offer {label}?")
+    suggestions.append("Can I book a room?")
+
+    return WebChatOpenerOut(greeting=web_chat.opening_line(prop.name), suggestions=suggestions)
+
+
+@router.post("/public/hotels/{slug}/chat", response_model=WebChatOut)
+@limiter.limit("30/minute")
+async def post_public_chat(request: Request, slug: str, body: WebChatIn):
+    """
+    One turn with the hotel's AI employee, from its own website.
+
+    Public and unauthenticated, because the person is a traveller who has not
+    booked anything yet — asking them to sign in to ask a question is how the
+    question does not get asked. What stands in for a session is the signed
+    token in `body.session`; see `services/pms/web_chat`.
+
+    The rate limit is per-IP and deliberately below the DM channels': a browser
+    is the cheapest place to point a script at a model, and a real visitor types
+    a few times a minute.
+    """
+    turn = await web_chat.ask(slug=slug, message=body.message, session=body.session)
+    return WebChatOut(reply=turn.reply, session=turn.session, handedOff=turn.handed_off)
+
+
 @router.get("/public/hotels/{slug}", response_model=PublicSiteOut)
 @limiter.limit("60/minute")
 async def get_public_hotel(request: Request, slug: str):
@@ -3161,15 +3232,41 @@ async def confirm_public_booking(
 # the browser and the webhook race to the same single outcome.
 
 
+# The two kinds of order this page can be showing. They differ in one way that
+# matters to the page: a stay balance is money against a booking that exists,
+# and a booking payment is money that will *create* one. Everything else — the
+# hotel's name, the dates, the amount, the settle-once race — is identical, so
+# they share the route rather than getting a second one.
+PAY_PAGE_PURPOSES = (stay_payment.PURPOSE, quote_payment.PURPOSE)
+
+
 async def _stay_payment_out(order: dict) -> StayPaymentOut:
     def _read():
         db = get_db()
-        res = (db.table("reservations")
-               .select("ref,guest_name,check_in,check_out")
-               .eq("id", order["reservation_id"]).limit(1).execute().data or [{}])[0]
         prop = (db.table("properties").select("name,currency")
                 .eq("id", order["property_id"]).limit(1).execute().data or [{}])[0]
-        return res, prop
+
+        if order.get("reservation_id"):
+            res = (db.table("reservations")
+                   .select("ref,guest_name,check_in,check_out")
+                   .eq("id", order["reservation_id"]).limit(1).execute().data or [{}])[0]
+            return res, prop
+
+        # A booking payment before it has settled: there is no reservation to
+        # read, so the dates come from the quote and the name from what the
+        # agent was told. Not a fallback for a missing row — this is the normal
+        # state of this kind of order right up until the guest pays.
+        quote = {}
+        if order.get("quote_id"):
+            quote = (db.table("quotes").select("check_in,check_out")
+                     .eq("id", order["quote_id"]).limit(1).execute().data or [{}])[0]
+        guest = order.get("guest_details") or {}
+        return {
+            "ref": "",
+            "guest_name": guest.get("fullName") or "Guest",
+            "check_in": quote.get("check_in"),
+            "check_out": quote.get("check_out"),
+        }, prop
 
     reservation, prop = await run_db(_read)
     return StayPaymentOut(
@@ -3200,7 +3297,7 @@ async def get_stay_payment(request: Request, order_id: str):
     saying so rather than a second chance to pay.
     """
     order = await payments_service.get(order_id)
-    if not order or order["purpose"] != stay_payment.PURPOSE:
+    if not order or order["purpose"] not in PAY_PAGE_PURPOSES:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that payment.")
     return await _stay_payment_out(order)
 
@@ -3224,13 +3321,18 @@ async def confirm_stay_payment(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "That payment could not be verified.")
 
     order = await payments_service.get(order_id)
-    if not order or order["purpose"] != stay_payment.PURPOSE:
+    if not order or order["purpose"] not in PAY_PAGE_PURPOSES:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that payment.")
 
     settlement = await payments_service.claim(order_id, body.razorpayPaymentId)
     if settlement.won:
         try:
-            await stay_payment.settle(settlement.order)
+            # The same table the webhook dispatches on, so the browser callback
+            # and the webhook cannot disagree about what settling this order
+            # means. A booking order creates the reservation here; a stay
+            # balance posts to the folio. Whichever arrives first wins the
+            # claim and the other one reads the finished state.
+            await FULFIL[settlement.order["purpose"]](settlement.order)  # type: ignore[operator]
         except Exception as exc:  # noqa: BLE001
             await payments_service.release(settlement.order["id"], str(exc)[:200])
             logger.exception("could not post stay payment %s", order_id)

@@ -222,3 +222,97 @@ async def release_hold(args: HoldArgs, ctx: AgentContext) -> tuple[dict, str]:
             "I couldn't find that reservation hold.",
         )
     return {"released": True, "holdId": args.hold_id}, args.hold_id
+
+
+# ── closing the sale ─────────────────────────────────────────────────────────
+
+
+class BookingPaymentLinkArgs(BaseModel):
+    quote_id: str = Field(description="The quote the guest agreed to.")
+    guest_name: str = Field(
+        min_length=1, max_length=120,
+        description="The guest's full name, as they gave it.",
+    )
+    guest_phone: str | None = Field(
+        default=None, max_length=32,
+        description="Their phone number, if they have given one.",
+    )
+    guest_email: str | None = Field(
+        default=None, max_length=200,
+        description="Their email, if they have given one.",
+    )
+
+
+@tool(
+    name="create_booking_payment_link",
+    description=(
+        "Take payment for a quote the guest has agreed to, when they do NOT "
+        "already have a booking. Returns a link: the guest taps it, pays by "
+        "UPI, card or netbanking, and the booking is confirmed automatically "
+        "the moment the payment goes through. Use this for 'book it', 'yes "
+        "please', 'how do I pay' on a new stay. Get a quote first. Does NOT "
+        "confirm anything by itself — tell the guest their booking is confirmed "
+        "once they have paid, never because they say they have."
+    ),
+    input_model=BookingPaymentLinkArgs,
+    # `rates`, matching `create_payment_link`. Asking for money against a price
+    # this agent was allowed to quote is part of selling a stay.
+    permission="rates",
+    # Selling, so the same floor as `get_quote` and `create_booking`. A hotel at
+    # level 2 gets an approval request, which is the same answer it gets today.
+    autonomy_floor=3,
+    mutating=True,
+    usage_type="ai.tool_write",
+    result_type="payment_link",
+    # Deliberately NOT `always_requires_approval`, and this is the one place in
+    # the system where that asymmetry is load-bearing, so it is worth stating.
+    #
+    # `create_booking` carries it because it takes a room off sale on a model's
+    # say-so, before any money has moved, and nobody can un-take a night. This
+    # tool takes no inventory at all: it raises a Razorpay order, and the
+    # reservation is created by `_fulfil_booking` only after a signed webhook
+    # says the guest has paid — the identical unattended path the hotel's own
+    # booking page has always used. A guest who never pays costs a held quote
+    # that expires by itself.
+    #
+    # Requiring approval here would mean a manager has to press a button before
+    # a guest is allowed to *give the hotel money*, which is not a safety
+    # property. It is the thing that stopped the AI employee closing a sale.
+    always_requires_approval=False,
+)
+async def create_booking_payment_link(
+    args: BookingPaymentLinkArgs, ctx: AgentContext
+) -> tuple[dict, str]:
+    from app.services.pms import quote_payment
+
+    try:
+        link = await quote_payment.create_link(
+            property_id=ctx.property_id,
+            partner_id=ctx.partner_id,
+            quote_id=args.quote_id,
+            guest_name=args.guest_name,
+            guest_phone=args.guest_phone or ctx.guest_phone,
+            guest_email=args.guest_email,
+            source=ctx.channel,
+        )
+    except quote_payment.QuotePaymentError as exc:
+        # Already written for a guest to read — see the module. Raised as
+        # OutOfScope so the runtime hands the sentence to the model rather than
+        # turning it into a failed run the guest sees nothing from.
+        raise OutOfScope(f"quote {args.quote_id}: {exc}", str(exc)) from exc
+
+    return (
+        {
+            "payUrl": link.pay_url,
+            "amountPaise": link.amount_paise,
+            "amountText": f"₹{link.amount_paise / 100:,.0f}",
+            "totalText": f"₹{link.total_paise / 100:,.0f}",
+            "balanceText": f"₹{link.balance_paise / 100:,.0f}",
+            "instruction": (
+                "Give the guest the link and the amount. Say the booking is "
+                "confirmed as soon as the payment goes through, and that the "
+                "rest is payable at the hotel if a balance remains."
+            ),
+        },
+        link.order_id,
+    )

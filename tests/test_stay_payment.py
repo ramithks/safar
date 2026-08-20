@@ -170,7 +170,10 @@ def test_asking_twice_returns_the_same_link(monkeypatch, razorpay_on):
     the room twice. An open link for the same amount is reused, and Razorpay is
     never called a second time.
     """
-    open_order = {"razorpay_order_id": "order_EXISTING", "status": "created",
+    # `id` is the row's own primary key, which is what the agent's action row
+    # records — Razorpay's `order_XXXX` is not a uuid and the insert rejected it.
+    open_order = {"id": "11111111-1111-4111-8111-111111111111",
+                  "razorpay_order_id": "order_EXISTING", "status": "created",
                   "amount_paise": 800_000, "reservation_id": "res-1"}
     monkeypatch.setattr(stay_payment, "get_db",
                         lambda: fake_db(RESERVATION, open_order=open_order))
@@ -179,6 +182,7 @@ def test_asking_twice_returns_the_same_link(monkeypatch, razorpay_on):
         property_id="prop-1", reservation_id="res-1",
     ))
     assert request.razorpay_order_id == "order_EXISTING"
+    assert request.order_id == "11111111-1111-4111-8111-111111111111"
     assert razorpay_on == {}, "Razorpay was called for a link that already existed"
 
 

@@ -52,6 +52,10 @@ DEFINITION = AgentDefinition(
         "get_quote",
         "release_hold",
         "create_booking",
+        # Closing it. Takes the money against a quote and lets the payment
+        # create the booking, which is the only way this agent can complete
+        # a sale without a manager pressing a button.
+        "create_booking_payment_link",
         # Getting paid. `create_payment_link` raises a Razorpay order against
         # the balance and hands back a URL; there is no tool anywhere that
         # marks a stay paid, because the only thing that may do that is a
@@ -70,7 +74,12 @@ DEFINITION = AgentDefinition(
         # Stopping
         "request_human_handoff",
     ),
-    channels=("whatsapp", "instagram"),
+    # The hotel's own website is the third place a guest meets this agent, and
+    # the first one they reach without an account, an app, or a message window.
+    # Same agent, same tools, same scope — `services/pms/web_chat.py` is a
+    # different transport and nothing more, which is why it is a channel here
+    # rather than a second agent somewhere else.
+    channels=("whatsapp", "instagram", "website"),
     system_prompt=(
         "You are the hotel's own assistant. Be warm and brief. Reply in the "
         "language the guest writes in."

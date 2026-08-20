@@ -134,7 +134,9 @@ async def create_payment_link(args: PaymentLinkArgs, ctx: AgentContext) -> tuple
                 "paid yet."
             ),
         },
-        request.razorpay_order_id,
+        # The internal order uuid, not Razorpay's `order_XXXX`.
+        # `agent_actions.result_id` is a uuid column.
+        request.order_id,
     )
 
 

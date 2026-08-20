@@ -1954,3 +1954,34 @@ class PaymentLinkOut(BaseModel):
     amountPaise: int
     balancePaise: int
     payUrl: str
+
+
+# ── the AI employee on the hotel's website ───────────────────────────────────
+
+
+class WebChatIn(BaseModel):
+    """
+    One message from a visitor on a hotel's public page.
+
+    `session` is the opaque token the previous response handed back. Absent on
+    the first message of a conversation and echoed unchanged after that; the
+    client never constructs one and cannot read what is inside it.
+    """
+
+    message: str = Field(min_length=1, max_length=1000)
+    session: str | None = Field(default=None, max_length=600)
+
+
+class WebChatOut(BaseModel):
+    reply: str
+    session: str
+    # True once a person at the hotel owns the thread. The widget stops
+    # promising an instant answer, because there will not be one.
+    handedOff: bool = False
+
+
+class WebChatOpenerOut(BaseModel):
+    """What the widget shows before anyone has typed."""
+
+    greeting: str
+    suggestions: list[str] = []

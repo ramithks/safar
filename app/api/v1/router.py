@@ -15,6 +15,7 @@ from app.api.v1.images import router as images_router
 from app.api.v1.marketplace.endpoint import router as marketplace_router
 from app.api.v1.marketplace.partner_ops import router as marketplace_partner_router
 from app.api.v1.marketplace.payments import router as marketplace_payments_router
+from app.api.v1.google.endpoint import router as google_router
 from app.api.v1.messaging.oauth import router as messaging_oauth_router
 from app.api.v1.messaging.webhooks import router as messaging_webhooks_router
 from app.api.v1.metrics import router as metrics_router
@@ -77,6 +78,10 @@ if settings.enable_hotel_os:
     router.include_router(pms_router)
     router.include_router(messaging_webhooks_router)
     router.include_router(messaging_oauth_router)
+    # Google Business Profile. Same gate as the rest: it reads and writes
+    # google_connections, which is a hotel-OS table, and a marketplace
+    # deployment has no such table to answer from.
+    router.include_router(google_router)
     logger.info("Hotel OS routes mounted (ENABLE_HOTEL_OS=true, db=%s)",
                 settings.supabase_url)
 else:

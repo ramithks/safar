@@ -39,6 +39,7 @@ from app.db.client import get_db, run_db
 from app.services.ai import classify, model_router, prompts, registry, usage as usage_mod
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import AgentError, ProviderError
+from app.services.ai import guardrails
 from app.services.ai.providers import ModelStep, Provider, for_name
 from app.services.ai.schemas import RunResult, ToolOutcome
 
@@ -338,6 +339,28 @@ async def run_turn(
             logger.warning("run %s hit the tool-turn ceiling", run_id)
             handoff = True
 
+        # Everything the agent has said, checked against everything it did.
+        #
+        # Last thing inside the try, so a fabricated reply is caught whatever
+        # produced it, and before any caller can deliver it. See
+        # services/ai/guardrails — this is where an invented payment link stops
+        # being a thing a guest can tap.
+        if reply and not handoff:
+            verdict = guardrails.check_reply(
+                reply,
+                tool_outputs=outcomes,
+                trusted_hosts=await _trusted_hosts(ctx),
+                history=history or [],
+            )
+            if not verdict.ok:
+                logger.error(
+                    "run %s refused by guardrails: %s | reply=%r",
+                    run_id, verdict.reason, reply[:300],
+                )
+                reply = prompts.handoff_reply(ctx)
+                handoff = True
+                error = f"guardrail: {verdict.reason}"
+
         if handoff:
             status = "escalated"
         if reply is None and not handoff:
@@ -452,3 +475,62 @@ def agent_is_handling(conversation: dict) -> bool:
 
 def new_conversation_id() -> str:
     return str(uuid.uuid4())
+
+
+# ── whose links an agent may send ────────────────────────────────────────────
+
+_TRUSTED_HOST_CACHE: dict[str, set[str]] = {}
+
+
+def _read_trusted_hosts(property_id: str) -> set[str]:
+    """
+    The domains this hotel is allowed to point a guest at.
+
+    Three sources, all of them ours or the hotel's own: the app every payment
+    and check-in link lives on, whatever custom domain the hotel has connected
+    to its website, and the website it told Google about. Nothing a model or a
+    guest can influence at request time is in here — that is the point.
+    """
+    from urllib.parse import urlparse
+
+    hosts: set[str] = set()
+
+    for base in (settings.pms_app_url, getattr(settings, "site_url", None)):
+        host = (urlparse(str(base or "")).hostname or "").lower()
+        if host:
+            hosts.add(host)
+
+    db = get_db()
+    site = (
+        db.table("hotel_websites").select("domain")
+        .eq("property_id", property_id).limit(1).execute().data or []
+    )
+    for row in site:
+        host = (urlparse(f"https://{row.get('domain')}").hostname or "").lower()
+        if host:
+            hosts.add(host)
+
+    try:
+        google = (
+            db.table("google_connections").select("website_uri")
+            .eq("property_id", property_id).limit(1).execute().data or []
+        )
+        for row in google:
+            host = (urlparse(str(row.get("website_uri") or "")).hostname or "").lower()
+            if host:
+                hosts.add(host)
+    except Exception:  # noqa: BLE001
+        # A deployment without the Google table is not a reason to refuse every
+        # link a hotel sends.
+        pass
+
+    return hosts
+
+
+async def _trusted_hosts(ctx: AgentContext) -> set[str]:
+    cached = _TRUSTED_HOST_CACHE.get(ctx.property_id)
+    if cached is not None:
+        return cached
+    hosts = await run_db(_read_trusted_hosts, ctx.property_id)
+    _TRUSTED_HOST_CACHE[ctx.property_id] = hosts
+    return hosts

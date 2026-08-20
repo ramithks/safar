@@ -67,6 +67,10 @@ DEFINITION = AgentDefinition(
         "propose_rate_exception",
         # Closing, and un-closing
         "create_booking",
+        # Closing it. Takes the money against a quote and lets the payment
+        # create the booking, which is the only way this agent can complete
+        # a sale without a manager pressing a button.
+        "create_booking_payment_link",
         "release_hold",
         # Following up — a ticket for a person, not a message this agent sends
         "create_task",
