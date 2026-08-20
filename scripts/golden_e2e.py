@@ -461,7 +461,67 @@ def main() -> int:
         check("charging twice with the same key charges once",
               int(repeat) == int(after), f"{after} -> {repeat}")
 
-    # ── 9. the owner asks how the day went ───────────────────────────────────
+    # ── 9. arrival, departure, and the bill ──────────────────────────────────
+    section("the guest arrives, stays, and settles up")
+
+    st, rooms = http(f"{API}/properties/{prop_id}/rooms", headers=desk)
+    free = [r for r in (rooms or [])
+            if r.get("roomTypeId") == room["roomTypeId"]
+            and (r.get("status") or "vacant") == "vacant"]
+    check("there is a clean room of the type they booked", len(free) >= 1,
+          f"{len(rooms or [])} rooms, none free of {room['name']}")
+
+    if free:
+        st, arrived = http(f"{API}/properties/{prop_id}/reservations/"
+                           f"{booking['id']}/check-in", "POST",
+                           {"roomId": free[0]["id"]}, desk)
+        check("the desk can check them in", st == 200
+              and arrived.get("status") == "checked_in", f"{st} {arrived}")
+
+        # A stay cannot be closed with money outstanding. That refusal is the
+        # feature -- a guest walking out on an unpaid folio is the failure the
+        # check exists for -- so the balance is settled first, the way a desk
+        # would take cash.
+        st, early = http(f"{API}/properties/{prop_id}/reservations/"
+                         f"{booking['id']}/check-out", "POST", {}, desk)
+        check("checking out with a balance owing is refused", st == 409,
+              f"{st} {early}")
+
+        st, folio = http(f"{API}/properties/{prop_id}/reservations/"
+                         f"{booking['id']}/folio", headers=desk)
+        owed = folio.get("balancePaise") if isinstance(folio, dict) else None
+        if owed is None:
+            owed = sum(e["amountPaise"] for e in (folio.get("entries") or []))
+        check("the folio says exactly what is owed", owed > 0, folio)
+
+        http(f"{API}/properties/{prop_id}/reservations/{booking['id']}/folio",
+             "POST", {"kind": "payment", "description": "Settled at the desk",
+                      "amountPaise": owed, "method": "cash",
+                      "idempotencyKey": f"e2e-settle-{TAG}"}, desk)
+
+        st, left = http(f"{API}/properties/{prop_id}/reservations/"
+                        f"{booking['id']}/check-out", "POST", {}, desk)
+        check("and once settled they can check out", st == 200
+              and left.get("status") == "checked_out", f"{st} {left}")
+
+        dirty = sql(f"""select housekeeping_status from rooms
+                         where id = '{free[0]["id"]}';""")
+        check("the room they left is queued for housekeeping",
+              dirty and dirty[0]["housekeeping_status"] == "dirty", dirty)
+
+        # The loyalty loop. Until a departure counts, `stays_count` is zero for
+        # everybody and the repeat-guest segment can never match anybody.
+        counted = sql(f"""select g.stays_count, g.total_spend_paise, g.last_stay_at
+                            from guests g join reservations r on r.guest_id = g.id
+                           where r.id = '{booking['id']}';""")
+        check("the stay is counted against the guest",
+              counted and int(counted[0]["stays_count"]) >= 1, counted)
+        check("and what they spent is on their record",
+              counted and int(counted[0]["total_spend_paise"]) > 0, counted)
+        check("with the date they left",
+              counted and counted[0]["last_stay_at"] is not None, counted)
+
+    # ── 10. the owner asks how the day went ──────────────────────────────────
     section("the owner can see it all")
 
     owner = signin(OWNER_EMAIL)
