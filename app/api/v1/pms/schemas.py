@@ -357,7 +357,17 @@ class RoomOut(BaseModel):
 
 class TaskCreateRequest(BaseModel):
     # Client-generated so the same complaint cannot become two tickets.
-    id: str = Field(min_length=8, max_length=64)
+    #
+    # Constrained to a uuid because the column is one. Without the pattern a
+    # malformed id reached Postgres and came back as a 500 marked
+    # `retryable: true` -- and the client that sends these is an offline queue,
+    # which would then retry a request that can never succeed, forever, on a
+    # receptionist's phone. A 422 stops the queue and says why.
+    id: str = Field(
+        min_length=36, max_length=36,
+        pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+    )
     title: str = Field(min_length=1, max_length=200)
     category: str
     priority: str = "normal"
@@ -1891,3 +1901,56 @@ class OnboardingOut(BaseModel):
     canGoLive: bool
     isLive: bool
     counts: OnboardingCountsOut
+
+
+# ── paying for a stay that already exists ────────────────────────────────────
+
+class StayPaymentOut(BaseModel):
+    """
+    What the pay page shows before it opens Checkout.
+
+    Deliberately thin. A payment link is a URL a guest may forward, paste into
+    a group chat or open on a shared phone, so this names the hotel, the stay
+    and the amount — enough to know what is being paid for — and nothing that
+    would be a leak if the wrong person opened it. No phone number, no email,
+    no room number, no folio.
+    """
+
+    orderId: str
+    hotelName: str
+    guestName: str
+    ref: str
+    amountPaise: int
+    currency: str = "INR"
+    status: str
+    razorpayKeyId: str | None = None
+    checkIn: str | None = None
+    checkOut: str | None = None
+
+
+class StayPaymentConfirmRequest(BaseModel):
+    razorpayOrderId: str
+    razorpayPaymentId: str
+    razorpaySignature: str
+
+
+class PaymentLinkRequest(BaseModel):
+    """
+    Ask a guest for money they already owe.
+
+    `amountRupees` is for a deposit or a part payment. Left out — which is the
+    ordinary case — the server uses the whole outstanding balance, read from
+    the reservation. There is no field for the total, because a desk that could
+    name an amount is a desk that could name the wrong one.
+    """
+
+    amountRupees: int | None = Field(default=None, ge=1)
+
+
+class PaymentLinkOut(BaseModel):
+    reservationId: str
+    ref: str
+    orderId: str
+    amountPaise: int
+    balancePaise: int
+    payUrl: str

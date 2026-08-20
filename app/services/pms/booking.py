@@ -322,6 +322,81 @@ def _payment_status(paid: int, total: int) -> str:
     return "token_paid" if paid <= total * 0.35 else "partially_paid"
 
 
+
+def _resolve_guest(
+    db, property_id: str, partner_id: str,
+    name: str, phone: str | None, email: str | None,
+) -> str | None:
+    """
+    The person, as opposed to the stay.
+
+    A reservation carries a name, a phone and an email as *text*. That is
+    enough to run a front desk and not enough to run a hotel: "has this person
+    stayed before", "how much have they spent with us", "who should get the
+    returning-guest offer" are all questions about a person, and none of them
+    can be asked of a string on a booking row.
+
+    Until this existed nothing wrote `guests` on the booking path, so every
+    real booking produced a stay with `guest_id` null. The guest list was
+    empty, the marketing audience could not see anybody who had actually
+    stayed, and the AI employee's `get_guest` never matched a returning guest.
+    The rows existed; nothing ever created one.
+
+    **Matched within the property, and only ever within it.** The same phone
+    number at two hotels is two guest records. Joining them would be a
+    cross-property leak dressed up as a convenience -- the same rule
+    `messaging.service` follows when it resolves a conversation.
+
+    Matched on the **last ten digits** of the phone, because a guest is
+    `+919876543210` on WhatsApp, `9876543210` at the desk and `09876543210` on
+    an OTA, and all three are one person. Email is the fallback for a booking
+    with no phone at all.
+
+    Never fatal. A hotel that cannot write a guest record still has to be able
+    to take the booking -- the stay is the thing the guest is standing there
+    for.
+    """
+    digits = "".join(c for c in (phone or "") if c.isdigit())
+    found: list[dict] = []
+    try:
+        if len(digits) >= 10:
+            found = (
+                db.table("guests").select("id,stays_count")
+                .eq("property_id", property_id)
+                .ilike("phone", f"%{digits[-10:]}")
+                .limit(1).execute().data or []
+            )
+        if not found and (email or "").strip():
+            found = (
+                db.table("guests").select("id,stays_count")
+                .eq("property_id", property_id)
+                .ilike("email", (email or "").strip())
+                .limit(1).execute().data or []
+            )
+        if found:
+            return found[0]["id"]
+
+        return (
+            db.table("guests").insert({
+                "property_id": property_id,
+                "partner_id": partner_id,
+                "name": (name or "Guest").strip()[:120],
+                "phone": (phone or "").strip() or None,
+                "email": (email or "").strip() or None,
+                # `stays_count` and `total_spend_paise` are deliberately left at
+                # their defaults. They describe stays that have *happened*, and
+                # a booking made this minute has not. Check-out is what moves
+                # them, so a guest who cancels never counts as having stayed.
+            }).execute().data[0]["id"]
+        )
+    except Exception:  # noqa: BLE001 — a guest record must not fail a booking
+        logger.warning(
+            "could not resolve a guest record for %s at %s", name, property_id,
+            exc_info=True,
+        )
+        return None
+
+
 async def create_reservation(
     *,
     property_id: str,
@@ -394,6 +469,12 @@ async def create_reservation(
 
         paid = max(0, min(int(token_paise or 0), q["total_paise"]))
 
+        # Before the reservation, so the row is linked from the moment it
+        # exists rather than by a second write that can fail on its own.
+        guest_id = _resolve_guest(
+            db, property_id, q["partner_id"], guest_name, guest_phone, guest_email,
+        )
+
         # A ref collision is a 1-in-30-million coincidence and a unique
         # constraint violation; retrying twice is cheaper than a wider ref.
         reservation = None
@@ -412,6 +493,7 @@ async def create_reservation(
                             "guest_name": guest_name,
                             "guest_phone": guest_phone,
                             "guest_email": guest_email,
+                            "guest_id": guest_id,
                             "check_in": q["check_in"],
                             "check_out": q["check_out"],
                             "nights": (check_out - check_in).days,
