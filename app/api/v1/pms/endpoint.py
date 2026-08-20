@@ -28,6 +28,10 @@ from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 
 from app.api.v1.pms.schemas import (
+    PaymentLinkOut,
+    PaymentLinkRequest,
+    StayPaymentConfirmRequest,
+    StayPaymentOut,
     AgencyBookingRequest,
     AgencyContractOut,
     AgencyMeOut,
@@ -143,6 +147,7 @@ from app.services.pms import creators as creators_service
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
 from app.services.pms import payments as payments_service
+from app.services.pms import stay_payment
 from app.services.pms import public_booking
 from app.services.pms import sync as sync_service
 from app.services.pms import website as website_service
@@ -776,6 +781,43 @@ async def post_folio(
     if body.kind in ("payment", "refund"):
         await creators_service.recalculate_for_reservation(reservation_id)
     return FolioEntryOut.from_row(row)
+
+
+@router.post("/properties/{property_id}/reservations/{reservation_id}/payment-link",
+             response_model=PaymentLinkOut)
+@limiter.limit("30/minute")
+async def create_payment_link(
+    request: Request,
+    property_id: str,
+    reservation_id: str,
+    body: PaymentLinkRequest,
+    member=Depends(require_member("frontdesk")),
+):
+    """
+    A link the desk can send a guest, on WhatsApp or by reading it out.
+
+    'frontdesk' rather than 'folio'. Asking for money that is already owed is
+    what a receptionist does all day; `folio` is the scope that *changes* what
+    is owed, and a receptionist who can collect a balance still must not be
+    able to discount one.
+
+    The AI employee reaches the same service through `create_payment_link`, so
+    a link sent by the agent and a link sent by the desk are the same row, the
+    same clamp and the same settlement — there is no second way to be owed
+    money.
+    """
+    try:
+        link = await stay_payment.create_request(
+            property_id=property_id,
+            reservation_id=reservation_id,
+            amount_paise=body.amountRupees * 100 if body.amountRupees else None,
+        )
+    except stay_payment.PaymentRequestError as exc:
+        # Already a sentence for a person: "that booking is already paid in
+        # full" is an answer the desk needs, not a stack trace.
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    return PaymentLinkOut(**link.as_dict())
 
 
 @router.post("/properties/{property_id}/night-audit", response_model=NightAuditOut)
@@ -3106,6 +3148,101 @@ async def confirm_public_booking(
     )
 
 
+# ── paying for a stay that already exists ────────────────────────────────────
+#
+#     AI employee / front desk ──► create_payment_link ──► /pay/{order}
+#                                                            │
+#                          folio payment ◄── confirm ◄────────┤
+#                                        ◄── webhook ◄────────┘
+#
+# The mirror of the booking engine above, with the reservation on the other
+# end: there the payment creates the stay, here the stay already exists and the
+# payment lands on its folio. Both settle through `payments_service.claim`, so
+# the browser and the webhook race to the same single outcome.
+
+
+async def _stay_payment_out(order: dict) -> StayPaymentOut:
+    def _read():
+        db = get_db()
+        res = (db.table("reservations")
+               .select("ref,guest_name,check_in,check_out")
+               .eq("id", order["reservation_id"]).limit(1).execute().data or [{}])[0]
+        prop = (db.table("properties").select("name,currency")
+                .eq("id", order["property_id"]).limit(1).execute().data or [{}])[0]
+        return res, prop
+
+    reservation, prop = await run_db(_read)
+    return StayPaymentOut(
+        orderId=order["razorpay_order_id"],
+        hotelName=prop.get("name") or "",
+        # First name only. The link is forwardable and a full name on a page
+        # anybody can open is more than the payer needs to recognise the stay.
+        guestName=(reservation.get("guest_name") or "Guest").split(" ")[0],
+        ref=reservation.get("ref") or "",
+        amountPaise=int(order["amount_paise"]),
+        currency=prop.get("currency") or "INR",
+        status=order["status"],
+        razorpayKeyId=razorpay.public_key_id() if order["status"] == "created" else None,
+        checkIn=str(reservation.get("check_in") or "") or None,
+        checkOut=str(reservation.get("check_out") or "") or None,
+    )
+
+
+@router.get("/public/payments/{order_id}", response_model=StayPaymentOut)
+@limiter.limit("30/minute")
+async def get_stay_payment(request: Request, order_id: str):
+    """
+    What a guest is being asked to pay, by the link they were sent.
+
+    No authentication: the Razorpay order id *is* the credential, and it is
+    random enough that guessing one is not a route in. The rate limit is what
+    stops somebody trying anyway. A guest who has already paid gets the page
+    saying so rather than a second chance to pay.
+    """
+    order = await payments_service.get(order_id)
+    if not order or order["purpose"] != stay_payment.PURPOSE:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that payment.")
+    return await _stay_payment_out(order)
+
+
+@router.post("/public/payments/{order_id}/confirm", response_model=StayPaymentOut)
+@limiter.limit("15/minute")
+async def confirm_stay_payment(
+    request: Request, order_id: str, body: StayPaymentConfirmRequest,
+):
+    """
+    The browser returning from Checkout, on the same terms as a booking: the
+    signature is checked, and this decides nothing the webhook could not decide
+    by itself.
+    """
+    if body.razorpayOrderId != order_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "That payment could not be verified.")
+
+    if not razorpay.verify_payment_signature(
+        body.razorpayOrderId, body.razorpayPaymentId, body.razorpaySignature
+    ):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "That payment could not be verified.")
+
+    order = await payments_service.get(order_id)
+    if not order or order["purpose"] != stay_payment.PURPOSE:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that payment.")
+
+    settlement = await payments_service.claim(order_id, body.razorpayPaymentId)
+    if settlement.won:
+        try:
+            await stay_payment.settle(settlement.order)
+        except Exception as exc:  # noqa: BLE001
+            await payments_service.release(settlement.order["id"], str(exc)[:200])
+            logger.exception("could not post stay payment %s", order_id)
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Your payment went through and we could not update the bill. "
+                "The hotel has been notified.",
+            ) from exc
+
+    return await _stay_payment_out(await payments_service.get(order_id))
+
+
 @router.post("/public/razorpay/webhook")
 async def public_razorpay_webhook(
     request: Request,
@@ -3169,11 +3306,27 @@ async def public_razorpay_webhook(
         # way there is nothing to do — and saying so is the whole point.
         return {"ok": True, "handled": "already settled"}
 
+    purpose = settlement.order.get("purpose")
+    # Dispatched by name, with no `else`. This was `if booking … else credits`,
+    # which meant every purpose added later — the first was `stay_balance` —
+    # was silently handed to the credits path, where it read a null
+    # billing_account_id, threw, released the order and made Razorpay retry the
+    # same failure for twenty-four hours. An unrecognised purpose is a
+    # deployment that is behind its own database, and the safe answer is to
+    # leave the order claimed and say so, not to guess which fulfilment it
+    # meant.
+    fulfil = FULFIL.get(purpose)
+
+    if fulfil is None:
+        logger.error("webhook cannot fulfil unknown purpose %r on order %s",
+                     purpose, order_id)
+        await payments_service.release(settlement.order["id"],
+                                       f"unknown purpose {purpose!r}")
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            "Could not fulfil the order.")
+
     try:
-        if settlement.order["purpose"] == "booking":
-            await _fulfil_booking(settlement.order)
-        else:
-            await _fulfil_credits(settlement.order)
+        await fulfil(settlement.order)
     except Exception as exc:  # noqa: BLE001
         await payments_service.release(settlement.order["id"], str(exc)[:200])
         logger.exception("webhook could not fulfil order %s", order_id)
@@ -3182,7 +3335,7 @@ async def public_razorpay_webhook(
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
                             "Could not fulfil the order.") from exc
 
-    return {"ok": True, "handled": settlement.order["purpose"]}
+    return {"ok": True, "handled": purpose}
 
 
 # ── M5.6 — buying credits ────────────────────────────────────────────────────
@@ -3217,6 +3370,22 @@ async def _fulfil_credits(order: dict) -> dict:
     )
     await payments_service.record_result(order["id"], ledger_key=key)
     return result
+
+
+# What settles each kind of payment order.
+#
+# A table rather than a chain of ifs, because the chain had an `else` on it and
+# the `else` meant "credits". Every purpose added after the first two was
+# therefore handed to the credits path, which read a null billing account and
+# threw — and because the webhook releases and 500s on a fulfilment error,
+# Razorpay retried that same failure for twenty-four hours. A dict has no
+# `else`, so the next purpose somebody adds cannot silently become a credit
+# grant.
+FULFIL: dict[str, object] = {
+    "booking": _fulfil_booking,
+    "credits": _fulfil_credits,
+    stay_payment.PURPOSE: stay_payment.settle,
+}
 
 
 @router.post("/properties/{property_id}/credits/order", response_model=CreditOrderOut)

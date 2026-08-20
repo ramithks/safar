@@ -52,6 +52,15 @@ DEFINITION = AgentDefinition(
         "get_quote",
         "release_hold",
         "create_booking",
+        # Getting paid. `create_payment_link` raises a Razorpay order against
+        # the balance and hands back a URL; there is no tool anywhere that
+        # marks a stay paid, because the only thing that may do that is a
+        # signed webhook. A guest who says "I have paid" is answered by
+        # looking, not by believing.
+        "create_payment_link",
+        # Arriving, and buying things once here.
+        "get_check_in_link",
+        "order_service",
         # Doing things
         "create_task",
         "assign_task",

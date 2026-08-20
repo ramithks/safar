@@ -270,4 +270,5 @@ def load_all() -> None:
         pricing,
         read,
         sales,
+        stay,
     )

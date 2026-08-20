@@ -125,6 +125,51 @@ async def check_in(property_id: str, reservation_id: str, room_id: str, member) 
     return await run_db(_write)
 
 
+def _count_the_stay(db, property_id: str, reservation: dict) -> None:
+    """
+    A departure is what makes somebody a returning guest.
+
+    `guests.stays_count`, `total_spend_paise` and `last_stay_at` existed and
+    nothing ever wrote them, so every guest in the system had stayed zero times
+    and spent nothing. The consequences were quiet and total: the `repeat_guest`
+    marketing segment reads `stays_count >= 2` and could never match anybody,
+    the guest list showed 0 stays beside a guest on their fourth visit, and a
+    VIP was whoever somebody had ticked by hand.
+
+    **Counted at check-out, not at booking.** A booking is an intention; a
+    check-out is a stay that happened. Counting at booking would make a guest
+    who cancelled twice look like a regular.
+
+    Guarded on the status transition above: `check_out` only reaches here when
+    it won the `status='checked_in'` update, so a second call returns early and
+    this cannot run twice for one stay. A guest who is walked out and back in
+    by the desk is the one case that double-counts, and a stay counted twice is
+    a far smaller wrong than every stay counted never.
+
+    Never fatal. A guest who has left has left; failing their check-out because
+    a statistic could not be written would strand a room.
+    """
+    guest_id = reservation.get("guest_id")
+    if not guest_id:
+        return
+    try:
+        rows = (db.table("guests").select("stays_count,total_spend_paise")
+                .eq("id", guest_id).eq("property_id", property_id)
+                .limit(1).execute().data or [])
+        if not rows:
+            return
+        db.table("guests").update({
+            "stays_count": int(rows[0].get("stays_count") or 0) + 1,
+            # What they actually paid, not what the stay was priced at: a
+            # comped night is not spend.
+            "total_spend_paise": int(rows[0].get("total_spend_paise") or 0)
+                                 + int(reservation.get("paid_paise") or 0),
+            "last_stay_at": reservation.get("check_out"),
+        }).eq("id", guest_id).execute()
+    except Exception:  # noqa: BLE001 — a statistic must not strand a room
+        logger.warning("could not count the stay for guest %s", guest_id, exc_info=True)
+
+
 async def check_out(property_id: str, reservation_id: str, member) -> dict:
     """
     Settle and release the room.
@@ -204,6 +249,8 @@ async def check_out(property_id: str, reservation_id: str, member) -> dict:
         # and should not have to be told.
         if r.get("room_id"):
             db.table("rooms").update({"housekeeping_status": "dirty"}).eq("id", r["room_id"]).execute()
+
+        _count_the_stay(db, property_id, updated.data[0])
 
         return updated.data[0]
 

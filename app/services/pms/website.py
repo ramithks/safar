@@ -118,20 +118,26 @@ def _ensure(property_id: str) -> dict:
     hotelier has actually asked for one.
     """
     db = get_db()
-    existing = _read(property_id)
-    if existing:
-        return existing
-
     prop = _property(property_id)
     if not prop:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
 
-    return db.table("hotel_websites").insert({
-        "property_id": property_id,
-        "partner_id": prop["partner_id"],
-        "draft": default_draft(prop["name"], prop.get("city")),
-        "travbuddy_path": f"/stay/{prop['slug']}",
-    }).execute().data[0]
+    existing = _read(property_id)
+    if existing:
+        # The live slug travels with the row. `project` needs it to say where
+        # the site actually is, and reading it here means the four endpoints
+        # that project a website do not each have to remember to fetch it.
+        return {**existing, "property_slug": prop["slug"]}
+
+    return {
+        **db.table("hotel_websites").insert({
+            "property_id": property_id,
+            "partner_id": prop["partner_id"],
+            "draft": default_draft(prop["name"], prop.get("city")),
+            "travbuddy_path": f"/stay/{prop['slug']}",
+        }).execute().data[0],
+        "property_slug": prop["slug"],
+    }
 
 
 async def get_config(property_id: str) -> dict:
@@ -149,7 +155,8 @@ def _save(property_id: str, template: str | None, draft: dict) -> dict:
         get_db().table("hotel_websites").update(patch)
         .eq("property_id", property_id).execute().data or []
     )
-    return updated[0] if updated else row
+    return {**(updated[0] if updated else row),
+            "property_slug": row.get("property_slug")}
 
 
 async def save_draft(property_id: str, *, template: str | None, draft: dict) -> dict:
@@ -181,7 +188,7 @@ def _publish(property_id: str, profile_id: str | None) -> dict:
             "travbuddy_path": f"/stay/{prop['slug']}",
         }).eq("property_id", property_id).execute().data or []
     )
-    return updated[0] if updated else row
+    return {**(updated[0] if updated else row), "property_slug": prop["slug"]}
 
 
 async def publish(property_id: str, profile_id: str | None) -> dict:
@@ -199,7 +206,8 @@ def _unpublish(property_id: str) -> dict:
             "status": "draft", "published_at": None,
         }).eq("property_id", property_id).execute().data or []
     )
-    return updated[0] if updated else row
+    return {**(updated[0] if updated else row),
+            "property_slug": row.get("property_slug")}
 
 
 async def unpublish(property_id: str) -> dict:
@@ -207,13 +215,27 @@ async def unpublish(property_id: str) -> dict:
 
 
 def project(row: dict, *, slug: str | None = None) -> dict:
-    """One shape, so the builder and the settings screen cannot disagree."""
+    """
+    One shape, so the builder and the settings screen cannot disagree.
+
+    **The address is derived from the property's slug, not from the stored
+    column.** `travbuddy_path` is written at publish time, so a hotel that
+    changes its slug afterwards keeps a stored path that points at a page which
+    no longer resolves -- and the settings screen would go on showing the
+    owner a dead link as though it were their website. The slug is the one
+    source of truth for where the site is; the column is a cache of it, and a
+    cache does not get to win an argument with the thing it caches.
+    """
     draft = row.get("draft") or {}
     return {
         "propertyId": row["property_id"],
         "template": row.get("template") or "boutique",
         "status": row.get("status") or "draft",
-        "travbuddyPath": row.get("travbuddy_path") or (f"/stay/{slug}" if slug else ""),
+        "travbuddyPath": (
+            f"/stay/{slug or row.get('property_slug')}"
+            if (slug or row.get("property_slug"))
+            else row.get("travbuddy_path") or ""
+        ),
         "domain": row.get("domain"),
         "headline": draft.get("headline") or "",
         "tagline": draft.get("tagline") or "",
