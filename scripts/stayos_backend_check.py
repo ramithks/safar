@@ -34,6 +34,8 @@ real one:
     --email deepak@casamandala.in --password ... --property <uuid>
 """
 import argparse
+import hashlib
+import hmac
 import json
 import sys
 import urllib.error
@@ -63,6 +65,11 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
+def skip(label: str) -> None:
+    """Not proven, and said so. A check that quietly vanishes reads as a pass."""
+    print(f"  ·    skipped — {label}")
+
+
 def _headers(msg):
     """Case-insensitive header dict.
 
@@ -76,14 +83,33 @@ def _headers(msg):
     return {k.lower(): v for k, v in msg.items()}
 
 
-def http(url, method="GET", body=None, headers=None, timeout=25):
-    data = json.dumps(body).encode() if body is not None else None
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Stop at the 3xx instead of following it.
+
+    The OAuth callback answers 303 to the PWA. Followed, that check would read
+    whatever partner.travbuddy.in returned and prove nothing about the backend.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT = urllib.request.build_opener(_NoRedirect)
+
+
+def http(url, method="GET", body=None, headers=None, timeout=25, *,
+         raw=None, follow=True):
+    """`raw` sends exact bytes — a signed body must be hashed as it is sent."""
+    data = raw if raw is not None else (
+        json.dumps(body).encode() if body is not None else None
+    )
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Content-Type", "application/json")
     for k, v in (headers or {}).items():
         req.add_header(k, v)
+    opener = urllib.request.urlopen if follow else _NO_REDIRECT.open
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with opener(req, timeout=timeout) as r:
             raw = r.read().decode()
             try:
                 return r.status, json.loads(raw), _headers(r.headers)
@@ -95,6 +121,8 @@ def http(url, method="GET", body=None, headers=None, timeout=25):
             return e.code, json.loads(raw), _headers(e.headers)
         except json.JSONDecodeError:
             return e.code, raw, _headers(e.headers)
+    except urllib.error.URLError as e:
+        return 0, str(e), {}
     except Exception as e:  # noqa: BLE001 — a dead host is an answer, not a crash
         return 0, str(e), {}
 
@@ -106,6 +134,10 @@ def main() -> int:
     ap.add_argument("--password", default=DEFAULT_PASSWORD)
     ap.add_argument("--property", default=DEFAULT_PROPERTY,
                     help="a property id that exists in the hotel OS")
+    ap.add_argument("--whatsapp-verify-token")
+    ap.add_argument("--whatsapp-app-secret")
+    ap.add_argument("--instagram-verify-token")
+    ap.add_argument("--instagram-app-secret")
     ap.add_argument("--supabase", default=f"https://{HOTEL_OS_REF}.supabase.co",
                     help="the hotel-OS Supabase project, for signing in")
     ap.add_argument("--anon-key", default=None,
@@ -215,6 +247,79 @@ def main() -> int:
         check(f"health does not echo {secret}", secret not in blob, blob[:120])
     st, _, _ = http(f"{base}/docs")
     check("the OpenAPI docs are not public", st == 404, str(st))
+
+    # ── 8. messaging is wired to Meta ─────────────────────────────────────────
+    #
+    # Everything here is provable from outside, which is the point: the
+    # credentials live in Coolify where nobody can read them back, so "did the
+    # paste actually land" has to be answered by asking the running service.
+    #
+    # The signature probes send a body with an EMPTY entry list. That passes
+    # the signature check, stores nothing and wakes no agent — a probe that
+    # injected a message would answer a real guest to prove a secret.
+    print("\n── 8. messaging is wired to Meta ──")
+
+    for channel, verify_token in (("whatsapp", args.whatsapp_verify_token),
+                                  ("instagram", args.instagram_verify_token)):
+        hook = f"{api}/messaging/{channel}/webhook"
+
+        st, _, _ = http(hook)
+        check(f"the {channel} webhook is mounted", st in (403, 422), str(st))
+
+        st, body, _ = http(
+            f"{hook}?hub.mode=subscribe&hub.verify_token=definitely-not-it&hub.challenge=X"
+        )
+        check(f"{channel} refuses a wrong verify token", st == 403, str(st))
+
+        if verify_token:
+            st, body, _ = http(
+                f"{hook}?hub.mode=subscribe&hub.verify_token={verify_token}"
+                f"&hub.challenge=PROBE_42"
+            )
+            # Meta reads the body, not the status: a 200 with the wrong body
+            # fails the subscription with no explanation on Meta's side.
+            check(f"{channel} echoes Meta's challenge verbatim",
+                  st == 200 and str(body).strip() == "PROBE_42",
+                  f"{st} {str(body)[:60]}")
+        else:
+            skip(f"{channel} handshake — pass --{channel}-verify-token to prove it")
+
+    for channel, secret, obj in (
+        ("whatsapp", args.whatsapp_app_secret, "whatsapp_business_account"),
+        ("instagram", args.instagram_app_secret, "instagram"),
+    ):
+        if not secret:
+            skip(f"{channel} signature — pass --{channel}-app-secret to prove it")
+            continue
+        payload = json.dumps({"object": obj, "entry": []}).encode()
+        sig = "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+        st, body, _ = http(f"{api}/messaging/{channel}/webhook", method="POST",
+                           raw=payload,
+                           headers={"X-Hub-Signature-256": sig})
+        check(f"this host verifies inbound {channel} with the app secret we hold",
+              st == 200,
+              f"{st} — the deployed {channel.upper()}_APP_SECRET is missing or "
+              f"is a different value, so every inbound webhook Meta sends is "
+              f"being rejected with 403")
+
+        st, _, _ = http(f"{api}/messaging/{channel}/webhook", method="POST",
+                        raw=payload,
+                        headers={"X-Hub-Signature-256": "sha256=" + "0" * 64})
+        check(f"and refuses a {channel} body signed with the wrong key", st == 403, str(st))
+
+    # The Instagram consent flow. A 303 back to the PWA is the contract: the
+    # person at the far end is a hotel owner in a browser, and a JSON error at
+    # the end of an OAuth round trip is a dead end.
+    st, _, headers = http(f"{api}/messaging/instagram/oauth/callback"
+                          "?error=access_denied&error_reason=user_denied",
+                          follow=False)
+    location = (headers or {}).get("location", "")
+    check("a declined Instagram consent redirects the owner back to the app",
+          st == 303 and location.startswith("https://"),
+          f"{st} → {location or 'no location header'}")
+    check("and it lands on the PWA, not localhost",
+          "localhost" not in location and "127.0.0.1" not in location,
+          location or "-")
 
     print(f"\n╔═ {passed} passed, {failed} failed")
     print(f"╚═ {base}\n")
