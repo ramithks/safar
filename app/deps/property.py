@@ -54,6 +54,42 @@ ROLE_PERMS: dict[str, set[str]] = {
 }
 
 
+# What the refusal says out loud.
+#
+# The message used to be f"Your role ({role}) cannot {perm}", which produced
+# "Your role (receptionist) cannot agents." at a receptionist who tried to
+# connect Instagram. The permission names are internal — `agents`, `ari`,
+# `folio` — and a staff member has never seen them. So both halves get a
+# human phrasing, and the message ends by naming who *can* do it, because the
+# next thing that person needs is not the rule but the way round it.
+ROLE_LABEL: dict[str, str] = {
+    "owner": "Owner",
+    "manager": "Manager",
+    "accounts": "Accounts",
+    "receptionist": "Receptionist",
+    "housekeeping": "Housekeeping",
+    "maintenance": "Maintenance",
+    "concierge": "Concierge",
+    "restaurant": "Restaurant",
+    "driver": "Driver",
+}
+
+PERM_VERB: dict[str, str] = {
+    "rates": "change rates and availability",
+    "billing": "see billing",
+    "members": "manage staff",
+    "agents": "set up the AI employee",
+    "reports": "open reports",
+    "frontdesk": "work the front desk",
+    "folio": "change a guest's bill",
+    "housekeeping": "update housekeeping",
+    "tasks": "manage tasks",
+    "messaging": "reply to guests",
+    "marketing": "run marketing campaigns",
+    "payouts": "manage payouts",
+}
+
+
 @dataclass(frozen=True)
 class Member:
     """The caller, resolved against one property."""
@@ -78,7 +114,9 @@ class Member:
         if not self.can(perm):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Your role ({self.role}) cannot {perm.replace('_', ' ')}.",
+                detail=(f"{ROLE_LABEL.get(self.role, self.role.title())}s "
+                        f"can't {PERM_VERB.get(perm, perm.replace('_', ' '))}. "
+                        f"Ask the owner or a manager."),
             )
 
 

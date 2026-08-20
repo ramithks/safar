@@ -199,10 +199,16 @@ async def exchange_code(code: str) -> tuple[str, str, tuple[str, ...]]:
         payload = {}
 
     if r.status_code >= 400 or not payload.get("access_token"):
+        message = _meta_error(payload, r.text[:200])
+        # "Invalid platform app" is not a failed connection, it is a broken
+        # deployment: the app id is not an Instagram Login app (most often the
+        # Facebook app id, which looks near-identical). Separated from the
+        # generic slug because the owner can retry the first one forever and it
+        # will never work, and because it is the one failure we caused.
+        reason = ("app_misconfigured" if "platform app" in message.lower()
+                  else "code_exchange_failed")
         raise InstagramOAuthError(
-            "code_exchange_failed",
-            f"Instagram refused the code ({r.status_code}): "
-            f"{_meta_error(payload, r.text[:200])}",
+            reason, f"Instagram refused the code ({r.status_code}): {message}",
         )
 
     permissions = payload.get("permissions") or []

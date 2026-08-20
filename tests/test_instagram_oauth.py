@@ -255,3 +255,49 @@ def test_sandbox_still_needs_no_secret_at_all():
     creds = credentials.resolve("sandbox", "instagram", db_token="ignored")
     assert creds.is_sandbox is True
     assert creds.access_token is None
+
+
+# ── telling our misconfiguration apart from their failed attempt ────────────
+
+
+@pytest.mark.parametrize(
+    "meta_message,expected_reason",
+    [
+        ("Invalid platform app", "app_misconfigured"),
+        ("Invalid authorization code", "code_exchange_failed"),
+        ("This authorization code has been used", "code_exchange_failed"),
+    ],
+)
+def test_a_wrong_app_id_is_reported_as_ours_not_theirs(
+    monkeypatch, meta_message, expected_reason
+):
+    """
+    "Invalid platform app" means the app id is not an Instagram Login app —
+    usually the Facebook one, which looks near-identical. An owner can retry
+    that forever and it will never work, so it must not share a slug with a
+    stale code, which retrying does fix.
+    """
+    import asyncio
+
+    class _Response:
+        status_code = 400
+        text = meta_message
+
+        def json(self):
+            return {"error_message": meta_message, "error_type": "OAuthException"}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def post(self, *_a, **_kw):
+            return _Response()
+
+    monkeypatch.setattr(ig_oauth.httpx, "AsyncClient", lambda **_kw: _Client())
+
+    with pytest.raises(ig_oauth.InstagramOAuthError) as exc:
+        asyncio.run(ig_oauth.exchange_code("some-code"))
+    assert exc.value.reason == expected_reason
