@@ -213,6 +213,26 @@ def main() -> int:
               for w in ("2:00", "2 pm", "2pm", "14:00", "two")),
           reply.get("body"))
 
+    print("\n── and Instagram routes the same way ──")
+    ig = (db.table("instagram_connections")
+          .select("property_id,instagram_account_id,username,is_sandbox,credentials_ref")
+          .eq("property_id", property_id).execute().data or [])
+    if not ig:
+        print("  ·    the demo hotel has no Instagram connection — skipped")
+    else:
+        check("its Instagram account is live, not a sandbox one",
+              ig[0]["is_sandbox"] is False
+              and ig[0]["credentials_ref"] != "sandbox", ig[0])
+        # Routing is by `recipient.id` on an inbound DM, which is the account
+        # id. Asserting the resolver agrees is what proves a DM would land on
+        # this hotel rather than nowhere.
+        resolved = db.rpc("resolve_instagram_property",
+                          {"p_account_id": ig[0]["instagram_account_id"]}).execute().data or []
+        check("an inbound DM to that account resolves to this hotel",
+              len(resolved) == 1
+              and str(resolved[0].get("property_id")) == str(property_id),
+              resolved)
+
     print(f"\n╔═ {PASS} passed, {FAIL} failed")
     print("╚═ " + ("Meta → webhook → hotel → AI employee → Meta → a real handset"
                    if not FAIL else "the production chain is broken"))

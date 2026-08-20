@@ -462,6 +462,57 @@ def _channels(property_id: str, partner_id: str) -> None:
     }, on_conflict="id").execute()
     print(f"  WhatsApp    {note}")
 
+    _instagram(property_id, partner_id)
+
+
+def _instagram(property_id: str, partner_id: str) -> None:
+    """
+    The demo hotel's Instagram, on the same terms as its WhatsApp.
+
+    An account id is only useful if we hold a token that can *act* as it, so it
+    is read from Meta rather than typed: `graph.instagram.com/me` with the
+    token in the environment answers with the id of whatever account that token
+    actually belongs to. Writing an id we could not authenticate as would
+    produce a row that routes an inbound DM to a hotel whose replies then fail.
+
+    A real hotel does not get its connection this way -- it presses "Connect
+    Instagram" in Settings and Business Login writes `prop:<id>` into
+    `messaging_credentials`. This is the demo standing in for that, using the
+    one account we own.
+    """
+    import json
+    import os
+    import urllib.request
+
+    db = get_db()
+    token = (os.environ.get("INSTAGRAM_ACCESS_TOKEN") or "").strip()
+
+    account_id = username = None
+    if token:
+        try:
+            url = ("https://graph.instagram.com/v21.0/me"
+                   f"?fields=id,username&access_token={token}")
+            with urllib.request.urlopen(url, timeout=20) as r:
+                me = json.loads(r.read())
+            account_id, username = me.get("id"), me.get("username")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  Instagram   could not read the account from Meta ({exc})")
+
+    if not account_id:
+        print("  Instagram   not connected — no usable token "
+              "(a real hotel connects its own in Settings)")
+        return
+
+    db.table("instagram_connections").delete() \
+      .eq("instagram_account_id", account_id).neq("id", sid("61")).execute()
+
+    db.table("instagram_connections").upsert({
+        "id": sid("61"), "property_id": property_id, "partner_id": partner_id,
+        "instagram_account_id": account_id, "username": username,
+        "status": "connected", "credentials_ref": "default", "is_sandbox": False,
+    }, on_conflict="id").execute()
+    print(f"  Instagram   live as @{username} ({account_id})")
+
 
 async def _go_live(property_id: str) -> None:
     """
