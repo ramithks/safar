@@ -111,13 +111,19 @@ async def record_run(
     agent_type: str | None = None,
     action_ids: dict[str, list[str]] | None = None,
     latency_ms: int | None = None,
+    channel: str | None = None,
 ) -> int:
     """
     Charge the events for one finished run.
 
-    One billable turn — priced by what the agent *is*, not by which model
-    answered — plus one non-billable row per tool call. The token counts ride on
-    the turn, because that is where the provider cost actually lands.
+    **Two different things, on purpose.** The turn is what the *provider* cost
+    us and is recorded per run, carrying the tokens. The conversation is what
+    the *hotel* bought and is charged once per thread per day, by channel. A
+    guest who asks six questions is one conversation and six turns, and the two
+    numbers answer two different people's questions.
+
+    Plus one non-billable row per tool call: a guest asking one question that
+    takes four lookups bought one conversation, not four.
     """
     turn_type = billing.usage_type_for_agent(agent_type, tier=usage.tier or None)
 
@@ -148,6 +154,35 @@ async def record_run(
         },
     )
     written = 1 if result.recorded else 0
+
+    # ── the conversation itself ─────────────────────────────────────────────
+    #
+    # Charged once per conversation per 24-hour window, whatever the turn above
+    # cost. This is the line on the hotel's bill: "42 Instagram conversations".
+    #
+    # The key carries the conversation and the window and nothing else — not the
+    # run, not the message, not the clock beyond the window index. That is the
+    # whole idempotency argument: every turn in the thread computes the same
+    # key, so the second message costs nothing, and so does a redelivered
+    # webhook, a Celery retry, a duplicated inbound message and a guest
+    # refreshing the page. `charge_usage` holds the unique index that makes the
+    # second call a no-op rather than a race.
+    conversation_type = billing.usage_type_for_channel(channel)
+    if conversation_type and conversation_id:
+        window = billing.conversation_window()
+        conversation_result = await billing.charge(
+            usage_type=conversation_type,
+            units=1,
+            idempotency_key=f"{conversation_type}:conv:{conversation_id}:{window}",
+            property_id=property_id,
+            agent_id=agent_id,
+            run_id=run_id,
+            conversation_id=conversation_id,
+            actor_type="agent",
+            actor_id=agent_id,
+            metadata={"channel": channel, "window": window},
+        )
+        written += 1 if conversation_result.recorded else 0
 
     for usage_type, count in usage.units.items():
         # The runtime still counts 'ai.conversation_turn' for its own debug

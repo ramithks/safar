@@ -102,6 +102,64 @@ CRITICAL_PURPOSES = {
 }
 
 
+# What a hotel is sold, by the place the guest is standing in.
+#
+# **A conversation, not a turn.** `ai.guest_conversation` is charged once per
+# agent run, which is once per guest message — so a guest who asks six questions
+# was six charges, and nobody could answer "how many conversations does 3,000
+# credits buy?", which is the only question an owner asks about credits. These
+# types are charged once per conversation per session window; the per-turn types
+# stay, at zero, because Vertex still bills us per turn and the operator's cost
+# model needs to see it.
+#
+# Absent from here on purpose: `internal`. A receptionist asking the front desk
+# agent something is not a guest conversation and is priced per turn, which is
+# what it is.
+USAGE_BY_GUEST_CHANNEL = {
+    "website":   "ai.conversation.website",
+    "instagram": "ai.conversation.instagram",
+    "whatsapp":  "ai.conversation.whatsapp",
+}
+
+# How long one conversation lasts for billing.
+#
+# Twenty-four hours, matching what Meta means by a conversation and what
+# `record_conversation` already does for WhatsApp — a hotel reading one bill
+# should not find two definitions of the word in it. A thread that goes quiet
+# and wakes a week later is a new conversation, which is also how a hotelier
+# would count it.
+#
+# It is a number here rather than a row because it is a definition, not a
+# price: changing it changes what the word "conversation" means on an invoice
+# already sent, and that is a decision with a migration attached, not a tuning
+# knob.
+CONVERSATION_WINDOW_SECONDS = 24 * 60 * 60
+
+
+def usage_type_for_channel(channel: str | None) -> str | None:
+    """
+    The conversation type for a guest channel, or None for anything else.
+
+    None is a real answer: a staff or internal thread has no conversation
+    price, and inventing one would bill a hotel for its own receptionist.
+    """
+    return USAGE_BY_GUEST_CHANNEL.get((channel or "").lower())
+
+
+def conversation_window(started_at: datetime | None = None) -> int:
+    """
+    Which window we are in, as an integer.
+
+    Absolute rather than relative to the conversation's own start: the key has
+    to be derivable from the clock alone by any process handling any retry,
+    and a window that began when the conversation did would need the
+    conversation row read first — on the path where the whole point is not
+    reading anything twice.
+    """
+    now = started_at or datetime.now(timezone.utc)
+    return int(now.timestamp()) // CONVERSATION_WINDOW_SECONDS
+
+
 def usage_type_for_agent(agent_type: str | None, tier: str | None = None) -> str:
     """
     What one turn of this agent is sold as.
@@ -449,6 +507,38 @@ async def grant(
         "p_expires_at": expires_at,
         "p_source_type": source_type,
         "p_source_id": source_id,
+        "p_actor_type": actor_type,
+        "p_actor_id": actor_id,
+        "p_metadata": metadata or {},
+    }) or {}
+
+
+async def debit(
+    *,
+    billing_account_id: str,
+    credits: int,
+    idempotency_key: str,
+    reason: str | None = None,
+    actor_type: str = "admin",
+    actor_id: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """
+    Take credits back. The mirror of `grant`, and the only way to.
+
+    `grant_credits` refuses a negative — a grant makes a bucket and a negative
+    bucket is not a thing — and `guard_wallet_cache` refuses an UPDATE on the
+    balance, correctly. So an operator who granted 5,000 by mistake had no way
+    back at all until this existed.
+
+    Positive `credits` here means "remove this many". A signed amount would be
+    one sign error away from doubling a balance somebody meant to halve.
+    """
+    return await run_db(_rpc, "debit_credits", {
+        "p_billing_account": billing_account_id,
+        "p_credits": credits,
+        "p_idempotency_key": idempotency_key,
+        "p_reason": reason,
         "p_actor_type": actor_type,
         "p_actor_id": actor_id,
         "p_metadata": metadata or {},

@@ -396,8 +396,17 @@ async def ask(
     # The same credit gate the pipeline uses, and it fails open on a Supabase
     # outage for the same reason: a hotel reading as "out of credits" because a
     # database was slow is worse than one free turn.
+    # Priced as the *conversation*, not the turn.
+    #
+    # The gate used to ask `usage_type_for_agent`, which is now a zero-rated
+    # per-turn type — so it would have allowed every turn at any balance, and
+    # the hotel would have discovered its credits were gone by looking at the
+    # ledger rather than by the AI stopping. What a guest conversation costs is
+    # what has to be affordable before one starts.
     decision = await billing.allowed(
-        usage_type=billing.usage_type_for_agent(agent_type), property_id=prop.id
+        usage_type=(billing.usage_type_for_channel("website")
+                    or billing.usage_type_for_agent(agent_type)),
+        property_id=prop.id,
     )
     if not decision.allowed:
         logger.info("website agent paused on %s: %s", conversation["id"], decision.reason)

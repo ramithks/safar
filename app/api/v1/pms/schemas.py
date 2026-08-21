@@ -913,6 +913,69 @@ class UsageEventOut(BaseModel):
     createdAt: datetime
 
 
+class PlanStateOut(BaseModel):
+    """
+    The hotel's plan, in one shape.
+
+    Every string here is already written for a hotel owner. No status enum
+    reaches a screen — `past_due` is a word for this file and the database, and
+    what an owner reads is "Your last payment didn't go through."
+    """
+
+    status: str
+    headline: str
+    detail: str = ""
+    planName: str
+    pricePaise: int
+    billingPeriod: str = "monthly"
+    includedCredits: int = 0
+    currentPeriodEnd: datetime | None = None
+    cancelAtPeriodEnd: bool = False
+    couponCode: str | None = None
+    graceUntil: datetime | None = None
+    # Is the AI still answering guests? Not the same as "active" — a failed
+    # payment keeps working through its grace period.
+    serving: bool = True
+    canStart: bool = False
+
+
+class CouponPreviewOut(BaseModel):
+    """What a code is worth, priced by the server against the real plan."""
+
+    code: str
+    label: str
+    kind: str
+    firstPaymentPaise: int
+    discountPaise: int
+    renewalPaise: int
+    freeDays: int = 0
+    description: str = ""
+
+
+class CouponRequest(BaseModel):
+    code: str = Field(max_length=32)
+
+
+class SubscribeRequest(BaseModel):
+    # Optional, and validated server-side against `plan_coupons`. There is no
+    # price, no plan id and no amount in this request on purpose: a client that
+    # can name its own price is a client that will.
+    couponCode: str | None = Field(default=None, max_length=32)
+
+
+class CheckoutOut(BaseModel):
+    """Everything Razorpay Checkout needs, and nothing it could be lied to with."""
+
+    razorpaySubscriptionId: str
+    razorpayKeyId: str
+    planName: str
+    amountPaise: int
+    firstPaymentPaise: int
+    currency: str = "INR"
+    couponCode: str | None = None
+    couponLabel: str | None = None
+
+
 class BillingSummaryOut(BaseModel):
     plan: str | None = None
     # What the plan costs, from the plan catalogue.

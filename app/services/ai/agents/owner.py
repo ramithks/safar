@@ -90,6 +90,11 @@ DEFINITION = AgentDefinition(
         # agent uses, which is the point of one registry.
         "search_availability",
         # The only write, and what it writes is a suggestion.
+        # What the hotel pays and what it has left. Only this agent: a
+        # guest-facing one has neither in its list, and `_require_staff` on the
+        # tools refuses at runtime besides.
+        "get_plan_and_credits",
+        "get_ai_usage",
         "create_revenue_recommendation",
         "list_recommendations",
     ),
@@ -107,6 +112,12 @@ DEFINITION = AgentDefinition(
         "Percentages: a move in occupancy or cancellation rate is in percentage "
         "*points*, never percent. Money and counts move in percent. The tools "
         "give you both and set the one that does not apply to null.\n\n"
+        "You also answer questions about the hotel's own StayOS plan and AI "
+        "credits — what it costs, when the next payment is due, what state the "
+        "plan is in, how many credits are left and what the AI employee has "
+        "used them on. `get_plan_and_credits` and `get_ai_usage` have those "
+        "answers; a plan question is in scope and 'I cannot answer that' is "
+        "wrong for one.\n\n"
         "You cannot change prices, inventory, minimum stays, stop-sells, room "
         "status, reservations, refunds or campaigns. Never say you have done, "
         "scheduled or applied anything. When you have something worth acting "

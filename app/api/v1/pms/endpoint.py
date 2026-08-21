@@ -99,6 +99,11 @@ from app.api.v1.pms.schemas import (
     WebChatOpenerOut,
     WebChatOut,
     WebsiteConfigOut,
+    PlanStateOut,
+    CouponPreviewOut,
+    CouponRequest,
+    SubscribeRequest,
+    CheckoutOut,
     DomainOut,
     DomainRequest,
     DnsRecordOut,
@@ -158,6 +163,9 @@ from app.services.pms import payments as payments_service
 from app.services.pms import stay_payment
 from app.services.pms import public_booking
 from app.services.pms import quote_payment
+from app.services.billing import subscription as subscription_service
+from app.services.billing import plan_coupons as plan_coupons_service
+from app.services.pms import webhook_log
 from app.services.messaging import web_chat
 from app.services.pms import sync as sync_service
 from app.services.pms import website as website_service
@@ -3354,10 +3362,53 @@ async def confirm_stay_payment(
     return await _stay_payment_out(await payments_service.get(order_id))
 
 
+async def _redeem_plan_coupon(subscription_row: dict) -> None:
+    """
+    Record the coupon this mandate used, once.
+
+    Called only from `subscription.authenticated` / `.activated`, which is the
+    first moment Razorpay has confirmed the mandate is real. Doing it at
+    checkout would let anybody who opens Razorpay and closes the tab spend a
+    redemption — and on a capped code, take it from a hotel that would have
+    paid.
+
+    Failure is logged and swallowed: the mandate is authorised and the hotel is
+    live, and refusing that because a marketing counter did not increment would
+    be the wrong way round. The redemption row is recoverable from the
+    subscription's own `coupon_id`.
+    """
+    coupon_id = subscription_row.get("coupon_id")
+    if not coupon_id:
+        return
+    try:
+        prop = await run_db(
+            lambda: get_db().table("properties").select("partner_id")
+            .eq("id", subscription_row["property_id"]).limit(1).execute().data or []
+        )
+        partner_id = (prop[0] or {}).get("partner_id") if prop else None
+        if not partner_id:
+            return
+        recorded = await plan_coupons_service.redeem(
+            coupon_id=coupon_id,
+            partner_id=partner_id,
+            property_id=subscription_row.get("property_id"),
+            subscription_id=subscription_row.get("id"),
+            razorpay_subscription_id=subscription_row.get("razorpay_subscription_id"),
+            value_paise=int(subscription_row.get("amount_paise") or 0),
+        )
+        logger.info("coupon %s on mandate %s: %s", coupon_id,
+                    subscription_row.get("razorpay_subscription_id"),
+                    "redeemed" if recorded else "already redeemed")
+    except Exception:  # noqa: BLE001
+        logger.exception("could not record coupon redemption for %s",
+                         subscription_row.get("razorpay_subscription_id"))
+
+
 @router.post("/public/razorpay/webhook")
 async def public_razorpay_webhook(
     request: Request,
     x_razorpay_signature: str = Header(default=None),
+    x_razorpay_event_id: str = Header(default=None),
 ):
     """
     Razorpay's server-to-server callback. The reliable path.
@@ -3391,8 +3442,78 @@ async def public_razorpay_webhook(
     order_id = payment.get("order_id") or (
         (payload.get("order") or {}).get("entity") or {}
     ).get("id")
+    subscription_entity = (payload.get("subscription") or {}).get("entity") or {}
+    subscription_id = subscription_entity.get("id") or payment.get("subscription_id")
+
+    # ── seen it already? ────────────────────────────────────────────────────
+    #
+    # Before any handler, and before the order lookup — a redelivered event
+    # should cost one insert that fails, not a fulfilment path that has to be
+    # safe to run twice. Every handler below is anyway; this is the cheaper
+    # guard in front, and the reconciliation log when the two sides disagree.
+    fresh = await webhook_log.claim(
+        x_razorpay_event_id, name, event,
+        subscription_id=subscription_id,
+        payment_id=payment.get("id"),
+        order_id=order_id,
+    )
+    if not fresh:
+        return {"ok": True, "handled": "already seen"}
+
+    # ── the hotel's own ₹999 mandate ────────────────────────────────────────
+    #
+    # Handled before the order branch because a subscription event carries no
+    # order id and would otherwise fall out of the early return below. This is
+    # the only path that may activate a plan or grant a month of credits: the
+    # browser callback cannot, by construction.
+    if name.startswith("subscription."):
+        if not subscription_id:
+            await webhook_log.mark(x_razorpay_event_id, "ignored")
+            return {"ok": True, "ignored": "no subscription id"}
+        try:
+            if name == "subscription.charged":
+                invoice = (payload.get("invoice") or {}).get("entity") or {}
+                payment_id = payment.get("id")
+                if not payment_id:
+                    await webhook_log.mark(x_razorpay_event_id, "ignored")
+                    return {"ok": True, "ignored": "charge with no payment id"}
+                result = await subscription_service.record_charge(
+                    razorpay_subscription_id=subscription_id,
+                    payment_id=payment_id,
+                    amount_paise=int(payment.get("amount") or 0) or None,
+                    invoice_id=invoice.get("id"),
+                )
+                await webhook_log.mark(x_razorpay_event_id, "processed")
+                return {"ok": True, "handled": name, **result}
+
+            updated = await subscription_service.apply_status(
+                subscription_id,
+                subscription_entity.get("status") or name.split(".", 1)[1],
+                subscription_entity,
+            )
+            # A free-days mandate defers its first charge, so
+            # `subscription.charged` will not arrive for weeks and this is the
+            # only server-side event that says the mandate is real. The coupon
+            # is redeemed here and **never a charge**: on an ordinary mandate
+            # the authentication payment *is* the first ₹999, and
+            # `subscription.charged` grants against that same payment id.
+            if updated and name in ("subscription.authenticated",
+                                    "subscription.activated"):
+                await _redeem_plan_coupon(updated)
+            await webhook_log.mark(x_razorpay_event_id, "processed")
+            return {"ok": True, "handled": name}
+        except Exception as exc:  # noqa: BLE001
+            # 500 so Razorpay retries. Every handler above is idempotent, so a
+            # redelivery is safe; swallowing a transient database error would
+            # leave a hotel that has paid without its plan and without a trace.
+            await webhook_log.mark(x_razorpay_event_id, "failed", str(exc))
+            logger.exception("subscription webhook %s failed — asking for a retry", name)
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR, "Handler failed; please retry.",
+            ) from None
 
     if not order_id:
+        await webhook_log.mark(x_razorpay_event_id, "ignored")
         return {"ok": True, "ignored": "no order id"}
 
     order = await payments_service.get(order_id)
@@ -3787,6 +3908,125 @@ async def resolve_site_host(request: Request, host: str = Query(max_length=253))
     if not found:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that hotel.")
     return PublicSiteHostOut(slug=found["slug"], name=found.get("name") or "")
+
+
+# ── the hotel's plan ─────────────────────────────────────────────────────────
+#
+#   GET    …/plan               what it costs and where this hotel stands
+#   POST   …/plan/coupon        price a code, without spending it
+#   POST   …/plan/subscribe     open a mandate; nothing is active yet
+#   POST   …/plan/cancel        stop it
+#
+# `billing`, which owners and accounts hold and nobody else does. A receptionist
+# has no business seeing what the hotel pays, and no business starting it.
+#
+# **No route here takes a price, a plan id or an amount.** The plan comes from
+# `subscription_plans`, the discount from `plan_coupons`, and the only thing
+# that may set a subscription to active is a signature-verified webhook.
+
+@router.get("/properties/{property_id}/plan", response_model=PlanStateOut)
+@limiter.limit("120/minute")
+async def get_plan_state(
+    request: Request, property_id: str, member=Depends(require_member("billing")),
+):
+    """Where this hotel stands on the ₹999 plan, in the hotel's own words."""
+    plan_row = await subscription_service.plan()
+    row = await subscription_service.current(property_id)
+    return PlanStateOut(**subscription_service.project(row, plan_row))
+
+
+@router.post("/properties/{property_id}/plan/coupon", response_model=CouponPreviewOut)
+@limiter.limit("20/minute")
+async def preview_plan_coupon(
+    request: Request,
+    property_id: str,
+    body: CouponRequest,
+    member=Depends(require_member("billing")),
+):
+    """
+    What a code is worth, before anybody commits to anything.
+
+    Reads only — a preview must never spend a redemption, or a hotel that types
+    a capped code and changes its mind has taken it from one that would have
+    paid. Rate limited because this is also the endpoint somebody would use to
+    guess codes; every rejection is the same sentence for the same reason.
+    """
+    plan_row = await subscription_service.plan()
+    try:
+        discount = await plan_coupons_service.resolve(
+            body.code,
+            partner_id=str(member.partner_id),
+            price_paise=int(plan_row["price_paise"]),
+        )
+    except plan_coupons_service.CouponError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.message) from None
+
+    return CouponPreviewOut(
+        code=discount.code, label=discount.label, kind=discount.kind,
+        firstPaymentPaise=discount.first_payment_paise,
+        discountPaise=discount.discount_paise,
+        renewalPaise=discount.renewal_paise,
+        freeDays=discount.free_days,
+        description=discount.description,
+    )
+
+
+@router.post("/properties/{property_id}/plan/subscribe", response_model=CheckoutOut)
+@limiter.limit("10/hour")
+async def start_plan(
+    request: Request,
+    property_id: str,
+    body: SubscribeRequest,
+    member=Depends(require_member("billing")),
+):
+    """
+    Open a mandate and hand back what Checkout needs.
+
+    **Nothing is active when this returns.** The row is written `pending`, the
+    owner authorises in Razorpay's own sheet, and a webhook is what makes it
+    real. Rate limited hard: each call mints a Razorpay subscription, and a
+    double-clicked button should cost one.
+    """
+    try:
+        checkout = await subscription_service.start(
+            property_id=property_id,
+            partner_id=str(member.partner_id),
+            coupon_code=body.couponCode,
+        )
+    except plan_coupons_service.CouponError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.message) from None
+    except subscription_service.SubscriptionError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.message) from None
+
+    return CheckoutOut(
+        razorpaySubscriptionId=checkout.razorpay_subscription_id,
+        razorpayKeyId=checkout.razorpay_key_id,
+        planName=checkout.plan_name,
+        amountPaise=checkout.amount_paise,
+        firstPaymentPaise=checkout.first_payment_paise,
+        currency=checkout.currency,
+        couponCode=checkout.coupon_code,
+        couponLabel=checkout.coupon_label,
+    )
+
+
+@router.post("/properties/{property_id}/plan/cancel", response_model=PlanStateOut)
+@limiter.limit("10/hour")
+async def cancel_plan(
+    request: Request, property_id: str, member=Depends(require_member("billing")),
+):
+    """
+    Stop the plan at the end of the cycle the hotel has already paid for.
+
+    Never immediately: they bought the month.
+    """
+    try:
+        await subscription_service.cancel(property_id, at_cycle_end=True)
+    except subscription_service.SubscriptionError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.message) from None
+    plan_row = await subscription_service.plan()
+    return PlanStateOut(**subscription_service.project(
+        await subscription_service.current(property_id), plan_row))
 
 
 # ── M6: the B2B agent portal ─────────────────────────────────────────────────
