@@ -11,6 +11,7 @@ router = APIRouter()
 async def health_check():
     checks = {
         "redis": _check_redis(),
+        "agent_worker": _check_worker(),
         "supabase": await _check_supabase(),
         "google_vision_api": _check_vision_api(),
         "google_places_api": _check_places_api(),
@@ -59,6 +60,45 @@ def _check_redis() -> str:
             return (f"error: REDIS_URL is not set, so this fell back to "
                     f"{redis_target()} — {e}")
         return f"error: connecting to {redis_target()} — {e}"
+
+
+def _check_worker() -> str:
+    """
+    Is anything actually consuming the queue an Instagram message goes into?
+
+    This is the failure that has no symptom. Meta posts a DM, the webhook
+    persists it, the conversation appears in the inbox, the webhook returns
+    200, and `dispatch` enqueues the work — and if no Celery worker is
+    subscribed to `hotelos`, that is where it stops. Nothing errors. Every log
+    line is green. The hotel simply finds, some hours later, that its AI
+    employee never answered anybody, and there is no screen in the product that
+    would have told them.
+
+    So it is a dependency like Redis is a dependency. `control.ping` asks the
+    workers themselves rather than reading a config file, which is the
+    difference between "a worker is defined in the compose file" and "a worker
+    is running right now".
+
+    Only meaningful where the queue is used at all: a deployment with
+    MESSAGING_INLINE_PROCESSING answers messages in the web process on purpose,
+    and there is no worker to miss.
+    """
+    from app.config import settings
+
+    if settings.messaging_inline_processing:
+        return "ok"
+    try:
+        from app.workers.celery_app import celery_app
+
+        replies = celery_app.control.ping(timeout=1.5) or []
+        if not replies:
+            return (
+                "error: no worker answered the hotelos queue — inbound guest "
+                "messages will be stored but never replied to"
+            )
+        return "ok"
+    except Exception as e:  # noqa: BLE001
+        return f"error: could not reach the worker — {type(e).__name__}: {e}"
 
 
 def _check_vision_api() -> str:

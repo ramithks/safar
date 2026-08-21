@@ -129,6 +129,38 @@ async def create_task(args: CreateTaskArgs, ctx: AgentContext) -> tuple[dict, st
     if not room:
         room = args.room_number
 
+    # A ticket nobody can act on is worse than no ticket.
+    #
+    # The question is not "do we know this guest's name" — it is **can a member
+    # of staff get back to whoever asked**. On Instagram and WhatsApp they can:
+    # the conversation is bound to a real account, so a ticket with no room on
+    # it is still a job someone can pick up and reply to. That is why a
+    # complaint from an Instagram guest we have never met still becomes a
+    # maintenance ticket, and `scripts/instagram_e2e.py` asserts it does.
+    #
+    # The hotel's own website is the one channel where they cannot. It is open
+    # to the internet, the visitor has no account, and the session ends with
+    # the tab. Asked for two extra towels by one of them, this tool cheerfully
+    # raised
+    #
+    #     #1014  Two extra towels   room: —   guest: —
+    #
+    # which reaches a housekeeper as a job with no door to knock on and no way
+    # to ask, and leaves the task queue open to anybody who can type. So on an
+    # anonymous channel the request has to be attached to something: a booking,
+    # a guest we know, or a room they name. Failing all three the agent asks,
+    # which is what a receptionist would do and costs one message.
+    anonymous_channel = ctx.channel in ("website", None)
+    identified = bool(ctx.reservation_id or ctx.guest_id or ctx.guest_phone)
+    if not room and anonymous_channel and not identified:
+        raise OutOfScope(
+            "no room, no booking and no identified guest on an anonymous "
+            "channel — the ticket would reach staff with nothing to act on "
+            "and no way to ask",
+            "Happy to get that sorted — which room are you in? If you haven't "
+            "checked in yet, your booking reference works too.",
+        )
+
     task_id = str(uuid.uuid4())
     try:
         task = await frontdesk_service.create_task(

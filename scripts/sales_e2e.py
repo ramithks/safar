@@ -58,6 +58,7 @@ from app.db.client import get_db  # noqa: E402
 from app.services.ai import approvals, classify, registry, routing, runtime  # noqa: E402
 from app.services.ai import context as ai_context  # noqa: E402
 from app.services.ai import provisioning  # noqa: E402
+from app.services.ai.agents.sales import DEFINITION as sales_definition  # noqa: E402
 from app.services.ai.providers import EchoProvider  # noqa: E402
 from app.services.pms import booking as booking_service  # noqa: E402
 from app.services.pms import negotiation  # noqa: E402
@@ -282,10 +283,22 @@ agent_row = (
 db.table("agents").update({"autonomy_level": 2, "status": "active"}).eq(
     "id", agent_row["id"]).execute()
 
+# Undo this suite's own fixture from a previous run before reading anything.
+#
+# §8 grants `create_booking` to exercise the approval machinery, and an upsert
+# survives the process. Without this reset the next run reads its predecessor's
+# fixture and reports production as holding a tool production does not hold —
+# a suite lying to itself about the thing it exists to check.
+db.table("agent_tools").update({"enabled": False}) \
+  .eq("agent_id", agent_row["id"]).eq("tool_name", "create_booking").execute()
+
+# `enabled` matters: `context.py` loads grants with `.eq("enabled", True)` and
+# `permissions.check` refuses a disabled one, so a row that exists and is off is
+# not a grant. Reading the rows without the flag was reading history.
 granted = {
     t["tool_name"] for t in
-    (db.table("agent_tools").select("tool_name").eq("agent_id", agent_row["id"])
-     .execute().data or [])
+    (db.table("agent_tools").select("tool_name,enabled").eq("agent_id", agent_row["id"])
+     .eq("enabled", True).execute().data or [])
 }
 scopes = {
     p["scope"] for p in
@@ -293,7 +306,32 @@ scopes = {
      .execute().data or [])
 }
 check("it holds the selling tools", {"search_availability", "get_quote",
-                                     "create_booking", "propose_rate_exception"} <= granted)
+                                     "create_booking_payment_link",
+                                     "propose_rate_exception"} <= granted)
+# And not the one that takes a room off sale before any money has moved.
+#
+# The Sales agent answers Instagram unattended — `routing._PRIORITY` puts it
+# ahead of the Guest agent there — so a fork between "queue a booking for a
+# manager" and "send a payment link" was a fork a model took on its own, in
+# front of a guest, with no person watching. It took the wrong one and wrote
+# "[payment link will be here]". There is now one road and it goes through
+# payment, which confirms the booking anyway.
+check("and not create_booking, which no guest-facing agent may hold",
+      "create_booking" not in granted, str(sorted(granted))[:200])
+
+# Granted back for the rest of this suite, deliberately and only here.
+#
+# §8 below is the only end-to-end exercise of propose → approve → execute →
+# reservation that this repository has, and the machinery it proves is real and
+# still used (`post_folio_charge`, `execute_campaign`, `propose_rate_exception`
+# all queue the same way). Dropping the section to match the new production
+# configuration would trade a launch fix for a hole in the audit-path coverage.
+# So the suite grants the tool to its own fixture, and the check above is what
+# holds production to the opposite.
+db.table("agent_tools").upsert(
+    {"agent_id": agent_row["id"], "tool_name": "create_booking", "enabled": True},
+    on_conflict="agent_id,tool_name",
+).execute()
 check("it does not hold the front desk's operational tools",
       not ({"check_in", "check_out", "post_folio_charge", "set_room_status"} & granted),
       str(sorted(granted & {"check_in", "check_out", "post_folio_charge"})))
@@ -1362,9 +1400,18 @@ check("and it carries everything a future screen needs",
       {"autonomyLevel", "permissions", "tools", "creditsCharged", "actionsCount",
        "conversationsCount", "pendingApprovals", "status"} <= set(AgentOut.model_fields),
       str(sorted(AgentOut.model_fields)))
+# Every tool the definition lists has an enabled row, and the scopes are there.
+# A count against `granted` used to stand here, which broke the moment this
+# suite granted itself a fixture tool — it was measuring the fixture, not the
+# hotel.
+_enabled_now = {
+    t["tool_name"] for t in
+    (db.table("agent_tools").select("tool_name").eq("agent_id", agent_row["id"])
+     .eq("enabled", True).execute().data or [])
+}
 check("the sales agent's rows are all present for it to read",
-      len(db.table("agent_tools").select("tool_name").eq("agent_id", agent_row["id"])
-          .eq("enabled", True).execute().data or []) == len(granted) and bool(scopes))
+      set(sales_definition.tools) <= _enabled_now and bool(scopes),
+      str(sorted(set(sales_definition.tools) - _enabled_now)))
 check("including its approval queue",
       isinstance(db.table("agent_actions").select("id")
                  .eq("agent_id", agent_row["id"]).eq("status", "awaiting_approval")
@@ -1474,6 +1521,10 @@ db.table("conversations").update({"handler": "ai"}).eq("property_id", PROPERTY).
 # the product rather than this suite's leftovers.
 reset_inventory()
 FIXTURE.close()
+# Put the fixture grant back the way production has it, after every check.
+db.table("agent_tools").update({"enabled": False}) \
+  .eq("agent_id", agent_row["id"]).eq("tool_name", "create_booking").execute()
+
 print(f"\n╔═ {PASS} passed, {FAIL} failed")
 print("╚═ REAL DATABASE · REAL PMS · REAL LEDGER · "
       + ("REAL GEMINI" if WITH_GEMINI else "SCRIPTED MODEL"))

@@ -106,6 +106,25 @@ class ToolSpec:
     # fully expressed by the pydantic model, which is true of most tools.
     precheck: Callable[..., Awaitable[None]] | None = None
 
+    # What the *model* should do while a human looks at the proposal.
+    #
+    # The audit trail records why a tool was deferred in the system's own words
+    # ("create_booking is configured to require approval at this property").
+    # Handing that same sentence to the model produced this, to a guest, on the
+    # website of a hotel that had just quoted them a real price:
+    #
+    #     I'm sorry, I wasn't able to book the room directly.
+    #
+    # Nothing had gone wrong. The gate had done exactly its job. But the model
+    # was told about an internal rule and had nothing to do with the
+    # information except apologise for it — so the guest heard the hotel's
+    # configuration as a failure, and heard it before being offered the payment
+    # link that would have booked them in immediately.
+    #
+    # A deferral is a fork in the conversation, not a dead end. This is the
+    # other road, written for the model rather than for the record.
+    when_deferred: str | None = None
+
     # Checked again just before an *approved* proposal executes.
     #
     # A proposal and its approval are separated by however long a manager takes

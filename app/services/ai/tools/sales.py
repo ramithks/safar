@@ -273,6 +273,12 @@ async def _revalidate_exception(args: "RateExceptionArgs", ctx: AgentContext) ->
     # grants unlimited-within-ceiling discounts unattended, which is the thing
     # `max_discount_pct` exists to prevent.
     always_requires_approval=True,
+    when_deferred=(
+        "The discount is NOT approved and the guest does not have it. Tell "
+        "them you have asked the hotel and will come back — do not quote the "
+        "discounted figure, do not imply it is likely, and do not apologise. "
+        "The price they still have is the one you already quoted."
+    ),
     precheck=_precheck_exception,
     revalidate=_revalidate_exception,
 )

@@ -43,27 +43,48 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-# Tools whose output is allowed to put a number in a guest's hands. Anything
-# not here — an availability search, a knowledge lookup — explicitly is not,
-# which is why `search_availability` already tells the model in its own output
-# not to price from it. This is that instruction made enforceable.
-PRICING_TOOLS = frozenset(
-    {
-        "get_quote",
-        "get_stay_options",
-        "search_availability",
-        "list_services",
-        "order_service",
-        "get_folio",
-        "post_folio_charge",
-        "create_payment_link",
-        "create_booking_payment_link",
-        "get_reservation",
-        "find_reservation",
-        "get_stay",
-        "propose_rate_exception",
-        "get_negotiation_policy",
-    }
+# Every amount an agent says has to appear in something the system actually
+# produced on this run. There is deliberately no allow-list of "pricing tools"
+# any more.
+#
+# There was one, and it was wrong in a way that only showed up on the Owner
+# Copilot. The set named the tools that price a *stay* — `get_quote`,
+# `get_stay_options` and so on — so an owner asking "what did we take last
+# week?" got an answer built from `get_revenue`, which was not in the set, and
+# every rupee figure in it counted as unbacked. The copilot's reply was
+# discarded and the owner was told a colleague would get back to them. About
+# their own hotel's revenue.
+#
+# The rule that was meant all along is simpler and stricter in the place that
+# matters: the number must be in a tool result. Which tool produced it is not
+# the question — whether anything did, is.
+
+# A stand-in where a real value should be.
+#
+# The reply that produced this rule, verbatim, to a guest who had just asked to
+# book a room:
+#
+#     Please use this link to pay ₹7,168 and confirm your reservation:
+#     [payment link will be here].
+#
+# The link rule below did not fire, because there was no link — that is the
+# whole failure. The model had reached for a tool, been told the action needed
+# approval, and composed the sentence it *would* have written if the tool had
+# succeeded. A guest cannot tap a placeholder and cannot tell that the hotel
+# did not mean to send one.
+#
+# Deliberately narrow: bracketed or braced text with no closing punctuation
+# inside it. Ordinary asides in square brackets are rare in a hotel's replies
+# and never contain the words this catches.
+_PLACEHOLDER = re.compile(
+    r"""(?xi)
+    ( \[ [^\]
+]{0,60} (link|url|here|insert|placeholder|name|amount|price|todo|xxx) [^\]
+]{0,60} \]
+    | \{\{ [^}
+]{0,60} \}\}
+    | < [a-z_ ]{0,40} (link|url|here|insert|name|amount) [a-z_ ]{0,40} > )
+    """
 )
 
 _URL = re.compile(r"""(?xi)\b(?:https?://|www\.)[^\s<>"'\)\]]+""")
@@ -182,12 +203,23 @@ def check_reply(
         return Verdict(True)
 
     blob_parts: list[str] = []
-    tools_run: set[str] = set()
     for outcome in tool_outputs or []:
-        tools_run.add(getattr(outcome, "tool", "") or "")
         output = getattr(outcome, "output", None)
         if output is not None:
-            blob_parts.append(json.dumps(output, default=str))
+            # `ensure_ascii=False`, and it is load-bearing rather than tidy.
+            #
+            # The default escapes ₹ to `\u20b9`, and the `9` on the end of that
+            # escape fuses with the digits after it: a tool returning "₹5,734"
+            # became the text `\u20b95,734`, out of which the number scanner
+            # read "20" and "95734" and never "5734". So a payment link with a
+            # balance due at the hotel — the single most common shape of a real
+            # booking — produced a reply the guardrail could not back, and the
+            # guest got a handoff instead of the link they had just asked for.
+            #
+            # Every amount in this system is written with a rupee sign in front
+            # of it. Escaping the one character the whole rule is about was a
+            # decision nobody made.
+            blob_parts.append(json.dumps(output, default=str, ensure_ascii=False))
     tool_blob = " ".join(blob_parts)
 
     prior_agent_text = " ".join(
@@ -195,6 +227,15 @@ def check_reply(
         for m in (history or [])
         if m.get("role") == "assistant"
     )
+
+    # ── a stand-in for something real ───────────────────────────────────
+    stand_in = _PLACEHOLDER.search(text)
+    if stand_in:
+        return Verdict(
+            False,
+            f"reply contained a placeholder instead of a real value "
+            f"({stand_in.group(0)[:40]!r})",
+        )
 
     # ── links ───────────────────────────────────────────────────────────
     urls = _URL.findall(text)
@@ -212,25 +253,18 @@ def check_reply(
                 )
 
     # ── money ───────────────────────────────────────────────────────────
+    #
+    # One rule: an amount must be in a tool result from this run, or already in
+    # something this agent said earlier in the conversation. Restating "as I
+    # mentioned, ₹7,168" is normal; conjuring a total nobody computed is not.
     amounts = _amounts_in(text)
     if amounts:
-        if not (tools_run & PRICING_TOOLS):
-            # Nothing on this run computed a price. A number already in the
-            # conversation may still be restated.
-            allowed = _amounts_in(prior_agent_text)
-            unbacked = amounts - allowed
-            if unbacked:
-                return Verdict(
-                    False,
-                    f"reply quoted {sorted(unbacked)} with no pricing tool on this run",
-                )
-        else:
-            allowed = _paise_and_rupees(tool_blob) | _amounts_in(prior_agent_text)
-            unbacked = amounts - allowed
-            if unbacked:
-                return Verdict(
-                    False,
-                    f"reply quoted {sorted(unbacked)}, which no tool result contains",
-                )
+        allowed = _paise_and_rupees(tool_blob) | _amounts_in(prior_agent_text)
+        unbacked = amounts - allowed
+        if unbacked:
+            return Verdict(
+                False,
+                f"reply quoted {sorted(unbacked)}, which no tool result contains",
+            )
 
     return Verdict(True)

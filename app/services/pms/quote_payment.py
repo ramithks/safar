@@ -39,6 +39,7 @@ which was priced server-side by `booking.create_quote`. There is no argument on
 any function in this module that money could be passed through.
 """
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -137,6 +138,22 @@ async def create_link(
     guest to read, because the caller is an AI agent that will put it in front
     of one.
     """
+    # A quote id that is not an id at all.
+    #
+    # The model passed "48M0A" — the tail of a booking reference it had seen —
+    # and PostgREST answered `invalid input syntax for type uuid`, which the
+    # registry turned into a failed tool call, which turned into "a member of
+    # our team will help you" to a guest who was ready to pay. Checked here,
+    # where every caller passes through, rather than as a pattern on the
+    # argument model: the same mistake reaches this function from the booking
+    # page too.
+    try:
+        uuid.UUID(str(quote_id))
+    except (ValueError, AttributeError, TypeError):
+        raise QuotePaymentError(
+            "I couldn't find that price. Let me get you a fresh one."
+        ) from None
+
     quote = await run_db(_quote, quote_id, property_id)
     if not quote:
         # Includes a quote belonging to another hotel. Deliberately the same

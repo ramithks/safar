@@ -179,6 +179,19 @@ class Settings(BaseSettings):
 
     # ── Google Business Profile ─────────────────────────────────────────────
     #
+    # **Off, and off is the launch decision rather than an accident.** StayOS
+    # launches on two channels a hotel can switch on by itself today — its own
+    # website and Instagram. Google is written, tested and dormant: it needs a
+    # Cloud OAuth client and an approved Google access request before reviews
+    # or posts work at all, and a Connect button that leads to a wall is worse
+    # for a new hotel than a channel that is simply not there yet.
+    #
+    # The flag gates the routes (api/v1/router.py) and the Channels row
+    # (api/v1/messaging/oauth.py) from one place, so switching it on is the
+    # whole of turning the feature on. Nothing was deleted; nothing is shown.
+    enable_google_business_profile: bool = False
+
+    #
     # A standard Google Cloud OAuth **web application** client — not the service
     # account in GOOGLE_SERVICE_ACCOUNT_JSON. The two are not interchangeable:
     # a Business Profile is owned by a person, and only that person's consent

@@ -254,14 +254,20 @@ async def get_channels(
             db.table("properties").select("slug")
             .eq("id", property_id).limit(1).execute().data or [{}]
         )[0]
-        try:
-            google = (
-                db.table("google_connections")
-                .select("status,location_title,is_verified,average_rating,review_count")
-                .eq("property_id", property_id).limit(1).execute().data or []
-            )
-        except Exception:  # noqa: BLE001
-            google = []
+        # Not read at all while Google is out of launch scope — see
+        # `settings.enable_google_business_profile`. A deployment that has
+        # never had the table should not be paying a failed query per screen
+        # load to find that out.
+        google: list[dict] = []
+        if settings.enable_google_business_profile:
+            try:
+                google = (
+                    db.table("google_connections")
+                    .select("status,location_title,is_verified,average_rating,review_count")
+                    .eq("property_id", property_id).limit(1).execute().data or []
+                )
+            except Exception:  # noqa: BLE001
+                google = []
         return {
             "site": site[0] if site else None,
             "instagram": instagram[0] if instagram else None,
@@ -327,42 +333,51 @@ async def get_channels(
         ))
 
     # ── Google Business Profile ──
-    google = found["google"]
-    state = (google or {}).get("status")
-    if state == "connected":
-        rating = (google or {}).get("average_rating")
-        count = (google or {}).get("review_count")
-        detail = "Manage your Google presence and reply to reviews from here."
-        if rating and count:
-            detail = f"{rating}★ from {count} reviews. Reply to them from here."
-        channels.append(ChannelOut(
-            id="google", name="Google Business Profile", state="connected",
-            headline=google.get("location_title") or "Connected",
-            detail=detail, action="Manage",
-        ))
-    elif state == "pending":
-        channels.append(ChannelOut(
-            id="google", name="Google Business Profile", state="action_needed",
-            headline="Almost there",
-            detail="Choose which of your Google listings is this hotel.",
-            action="Choose listing",
-        ))
-    elif state == "error":
-        channels.append(ChannelOut(
-            id="google", name="Google Business Profile", state="action_needed",
-            headline="Needs reconnecting",
-            detail="Your Google connection has expired. Reconnect it and we'll pick up "
-                   "where we left off.",
-            action="Reconnect",
-        ))
-    else:
-        channels.append(ChannelOut(
-            id="google", name="Google Business Profile", state="not_connected",
-            headline="Not connected",
-            detail="Travellers find you on Google. Reply to reviews and post offers "
-                   "without leaving StayOS.",
-            action="Connect Google",
-        ))
+    #
+    # Written, tested, and not shown. StayOS launches on the two channels a
+    # hotel can switch on for itself; Google needs an approved access request
+    # from us before a review reply or a post works at all, so a row here would
+    # be a Connect button leading to a wall. It is not listed as "coming soon"
+    # either — a hotelier weighing this product up is not asking about Google,
+    # and a soon that has no date is noise on the one screen that should read
+    # as a short, finishable list.
+    if settings.enable_google_business_profile:
+        google = found["google"]
+        state = (google or {}).get("status")
+        if state == "connected":
+            rating = (google or {}).get("average_rating")
+            count = (google or {}).get("review_count")
+            detail = "Manage your Google presence and reply to reviews from here."
+            if rating and count:
+                detail = f"{rating}★ from {count} reviews. Reply to them from here."
+            channels.append(ChannelOut(
+                id="google", name="Google Business Profile", state="connected",
+                headline=google.get("location_title") or "Connected",
+                detail=detail, action="Manage",
+            ))
+        elif state == "pending":
+            channels.append(ChannelOut(
+                id="google", name="Google Business Profile", state="action_needed",
+                headline="Almost there",
+                detail="Choose which of your Google listings is this hotel.",
+                action="Choose listing",
+            ))
+        elif state == "error":
+            channels.append(ChannelOut(
+                id="google", name="Google Business Profile", state="action_needed",
+                headline="Needs reconnecting",
+                detail="Your Google connection has expired. Reconnect it and we'll pick up "
+                       "where we left off.",
+                action="Reconnect",
+            ))
+        else:
+            channels.append(ChannelOut(
+                id="google", name="Google Business Profile", state="not_connected",
+                headline="Not connected",
+                detail="Travellers find you on Google. Reply to reviews and post offers "
+                       "without leaving StayOS.",
+                action="Connect Google",
+            ))
 
     # ── not yet ──
     #

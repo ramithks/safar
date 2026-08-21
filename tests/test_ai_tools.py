@@ -475,14 +475,48 @@ def test_the_guest_agent_cannot_move_money_on_an_existing_stay():
         assert forbidden not in guest.permissions
 
 
-def test_every_selling_tool_the_guest_agent_holds_is_gated_by_autonomy():
-    # The dial a hotel turns is autonomy, and it has to be the only one. A tool
-    # granted without its scope would look enabled and refuse; a scope granted
-    # without the autonomy would look dangerous and be inert.
+def test_the_guest_agent_can_sell_at_the_level_it_ships_at():
+    """
+    The dial a hotel turns is autonomy, and it has to be the only one: a tool
+    granted without its scope looks enabled and refuses; a scope granted
+    without the autonomy looks dangerous and is inert.
+
+    This used to assert the opposite — that every selling tool sat *above* the
+    shipping level — and it was true, and it meant a hotel that signed up and
+    published its site had an AI employee which answered "I'm sorry, that quote
+    needs to be approved by our hotel team" to the first guest who asked a
+    price. The gate was doing nothing for safety and everything to stop the
+    product working, because `get_quote` reads the hotel's own rate table and
+    invents nothing.
+
+    What actually protects the hotel is one rung up from here and is asserted
+    in `test_taking_a_room_off_sale_always_needs_a_person`.
+    """
     from app.services.ai.agents import get
 
     guest = get("guest")
-    for name in ("get_quote", "create_booking"):
+    for name in ("get_quote", "get_stay_options", "create_booking_payment_link"):
         spec = registry.REGISTRY[name]
-        assert spec.permission in guest.permissions, name
-        assert spec.autonomy_floor > guest.autonomy_level, name
+        # `permission=None` means the tool needs no scope beyond existing —
+        # reading what the hotel already publishes.
+        if spec.permission is not None:
+            assert spec.permission in guest.permissions, name
+        assert spec.autonomy_floor <= guest.autonomy_level, name
+
+
+def test_taking_a_room_off_sale_always_needs_a_person():
+    """
+    The line the autonomy default must never cross.
+
+    Money moving *to* the hotel is safe — the guest chose it and a Razorpay
+    order is reversible. A room leaving inventory on a model's say-so is not:
+    nobody can un-take a night, and the guest who was turned away is already
+    gone. So `create_booking` is gated unconditionally, and no guest-facing
+    agent holds it at all.
+    """
+    from app.services.ai.agents import get
+
+    assert registry.REGISTRY["create_booking"].always_requires_approval
+    assert registry.REGISTRY["post_folio_charge"].always_requires_approval
+    for agent_type in ("guest", "sales"):
+        assert "create_booking" not in get(agent_type).tools, agent_type

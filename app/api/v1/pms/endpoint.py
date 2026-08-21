@@ -99,6 +99,10 @@ from app.api.v1.pms.schemas import (
     WebChatOpenerOut,
     WebChatOut,
     WebsiteConfigOut,
+    DomainOut,
+    DomainRequest,
+    DnsRecordOut,
+    PublicSiteHostOut,
     WebsiteUpdateRequest,
     FolioOut,
     FolioPostRequest,
@@ -157,6 +161,7 @@ from app.services.pms import quote_payment
 from app.services.messaging import web_chat
 from app.services.pms import sync as sync_service
 from app.services.pms import website as website_service
+from app.services.pms import domains as domains_service
 from app.services import razorpay
 from app.services.ai import approvals
 from app.services.ai.errors import AgentError
@@ -1596,6 +1601,7 @@ async def list_agent_actions(
             conversationId=run.get("conversation_id"),
             tool=r["tool"], input=r.get("input") or {}, output=summary,
             refusalReason=r.get("refusal_reason"),
+            whyWaiting=approvals.why_waiting(r["tool"], r["status"]),
             resultType=r.get("result_type"), resultId=r.get("result_id"),
             status=r["status"], createdAt=r["created_at"],
             latencyMs=r.get("latency_ms") or 0,
@@ -1685,6 +1691,7 @@ async def decide_agent_action(
         tool=row["tool"], input=row.get("input") or {},
         output=row.get("refusal_reason") or "",
         refusalReason=row.get("refusal_reason"),
+        whyWaiting=approvals.why_waiting(row["tool"], row["status"]),
         resultType=row.get("result_type"), resultId=row.get("result_id"),
         status=row["status"], createdAt=row["created_at"],
         latencyMs=row.get("latency_ms") or 0,
@@ -1777,7 +1784,7 @@ async def get_billing_summary(
         sub = (
             db.table("subscriptions")
             .select("current_period_start,current_period_end,"
-                    "subscription_plans(code,name,included_allowances)")
+                    "subscription_plans(code,name,included_allowances,price_paise,billing_period)")
             .eq("billing_account_id", account)
             .in_("status", ["trialing", "active"])
             .order("current_period_start", desc=True)
@@ -1840,6 +1847,8 @@ async def get_billing_summary(
 
     return BillingSummaryOut(
         plan=plan.get("name") or plan.get("code"),
+        pricePaise=int(plan.get("price_paise") or 0),
+        billingPeriod=str(plan.get("billing_period") or "monthly"),
         periodStart=period_start,
         periodEnd=period_end,
         freeUntil=_as_date(transition.get("endsAt")) if transition else None,
@@ -3603,6 +3612,30 @@ async def list_payment_orders(
 
 # ── M5.4 — the website builder's own API ─────────────────────────────────────
 
+async def _domain_out(property_id: str) -> DomainOut:
+    """
+    The stored state plus a live look at DNS.
+
+    The lookup happens on read rather than on a schedule because the moment an
+    owner is looking at this screen is the moment they have just edited their
+    zone and want to know whether it took. A cached answer here is the one
+    thing that would make the screen useless.
+    """
+    row = await website_service.get_config(property_id)
+    state = domains_service.project(row)
+    records = []
+    if state["domain"]:
+        records = [
+            DnsRecordOut(type=r.type, name=r.name, value=r.value, found=r.found)
+            for r in await domains_service.records_for(state["domain"], state["token"])
+        ]
+    return DomainOut(
+        status=state["status"], domain=state["domain"],
+        verifiedAt=state["verifiedAt"], checkedAt=state["checkedAt"],
+        error=state["error"], records=records,
+    )
+
+
 @router.get("/properties/{property_id}/website", response_model=WebsiteConfigOut)
 @limiter.limit("120/minute")
 async def get_website(
@@ -3617,7 +3650,10 @@ async def get_website(
     hotel's home page.
     """
     row = await website_service.get_config(property_id)
-    return website_service.project(row)
+    return {
+        **website_service.project(row),
+        **await website_service.direct_30d(property_id),
+    }
 
 
 @router.patch("/properties/{property_id}/website", response_model=WebsiteConfigOut)
@@ -3666,6 +3702,91 @@ async def unpublish_website(
     """
     row = await website_service.unpublish(property_id)
     return website_service.project(row)
+
+
+# ── the hotel's own address ──────────────────────────────────────────────────
+#
+#   PUT    …/website/domain          claim it, and get the two records to add
+#   POST   …/website/domain/verify   look at real DNS and say what is there
+#   DELETE …/website/domain          disconnect; the TravBuddy address remains
+#
+# `rates`, matching the rest of the builder: which address a hotel sells itself
+# under is a commercial decision, not a front-desk one.
+#
+# None of these serve anything. `services/pms/domains.hotel_for_host` is the
+# only thing that turns a hostname into a hotel, and it answers for a verified
+# domain on a published site and nothing else.
+
+@router.get("/properties/{property_id}/website/domain", response_model=DomainOut)
+@limiter.limit("60/minute")
+async def get_website_domain(
+    request: Request, property_id: str, member=Depends(require_member("rates")),
+):
+    """The address, and whether each DNS record is visible from the internet."""
+    return await _domain_out(property_id)
+
+
+@router.put("/properties/{property_id}/website/domain", response_model=DomainOut)
+@limiter.limit("20/hour")
+async def set_website_domain(
+    request: Request,
+    property_id: str,
+    body: DomainRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    Claim a domain. Nothing is served on it yet and nobody is told it is.
+
+    Rate limited hard: this is the endpoint that mints an ownership token, and
+    an unbounded one is a way to ask which domains are already connected here.
+    """
+    await domains_service.claim(property_id, body.domain)
+    return await _domain_out(property_id)
+
+
+@router.post("/properties/{property_id}/website/domain/verify", response_model=DomainOut)
+@limiter.limit("20/hour")
+async def verify_website_domain(
+    request: Request, property_id: str, member=Depends(require_member("rates")),
+):
+    """
+    Check the real DNS now.
+
+    "Still not there" is a legitimate answer and comes back as a 200 with the
+    records showing which half is missing — a 4xx here would read to the owner
+    as *they* did something wrong, when the usual truth is that their registrar
+    has not propagated yet.
+    """
+    await domains_service.verify(property_id)
+    return await _domain_out(property_id)
+
+
+@router.delete("/properties/{property_id}/website/domain", response_model=DomainOut)
+@limiter.limit("20/hour")
+async def clear_website_domain(
+    request: Request, property_id: str, member=Depends(require_member("rates")),
+):
+    """Disconnect. The hotel is never off the internet — /stay/[slug] remains."""
+    await domains_service.release(property_id)
+    return await _domain_out(property_id)
+
+
+@router.get("/public/sites/by-host", response_model=PublicSiteHostOut)
+@limiter.limit("120/minute")
+async def resolve_site_host(request: Request, host: str = Query(max_length=253)):
+    """
+    Which hotel a hostname belongs to.
+
+    Public and unauthenticated because it runs before anything else on a guest's
+    first paint: the browser is on `www.grandhotel.com` and the app has to know
+    whose booking page to render before it can render anything. It returns a
+    slug and a name — both already public on that page — and 404s for a host
+    that is not verified, not published, or not ours.
+    """
+    found = await domains_service.hotel_for_host(host)
+    if not found:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that hotel.")
+    return PublicSiteHostOut(slug=found["slug"], name=found.get("name") or "")
 
 
 # ── M6: the B2B agent portal ─────────────────────────────────────────────────

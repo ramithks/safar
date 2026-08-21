@@ -78,10 +78,16 @@ if settings.enable_hotel_os:
     router.include_router(pms_router)
     router.include_router(messaging_webhooks_router)
     router.include_router(messaging_oauth_router)
-    # Google Business Profile. Same gate as the rest: it reads and writes
-    # google_connections, which is a hotel-OS table, and a marketplace
-    # deployment has no such table to answer from.
-    router.include_router(google_router)
+    # Google Business Profile: hotel-OS *and* switched on.
+    #
+    # Two conditions, not one. The outer flag is about which database this
+    # process talks to; the inner one is a launch decision — Google is not part
+    # of the two-channel launch, needs a Cloud OAuth client and an approved
+    # access request before reviews or posts work, and until then every route
+    # here would answer a hotel owner with a wall. Unmounted, they 404, which
+    # is the honest answer to "does this deployment do Google".
+    if settings.enable_google_business_profile:
+        router.include_router(google_router)
     logger.info("Hotel OS routes mounted (ENABLE_HOTEL_OS=true, db=%s)",
                 settings.supabase_url)
 else:

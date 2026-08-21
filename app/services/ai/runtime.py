@@ -282,6 +282,7 @@ async def run_turn(
     seq = 0
     reply: str | None = None
     handoff = False
+    retried_empty = False
     status = "succeeded"
     error: str | None = None
 
@@ -292,6 +293,28 @@ async def run_turn(
             )
             turn_usage.add_tokens(step.tokens_in, step.tokens_out, step.tokens_thought)
             turn_usage.used_model(choice.model)
+
+            # An empty completion: no text, no tool call, no error.
+            #
+            # Twelve turns in three days ended here, and each one showed a
+            # guest "someone will reply shortly" for a question the agent could
+            # have answered — the model simply returned nothing that time.
+            # `vertex.py` retries transport failures across regions, but this is
+            # not one: the call succeeded and came back blank, so nothing below
+            # it has anything to retry.
+            #
+            # Asking again is cheap and usually works, because what failed was
+            # a sample rather than a system. Once per run: a model that answers
+            # empty twice is having a bad minute, and the honest end of that is
+            # a person. The second answer goes through the ordinary path below,
+            # tool calls and all, rather than a shortcut of its own.
+            if not step.wants_tools and not (step.reply or "").strip() and not retried_empty:
+                retried_empty = True
+                logger.info("run %s: empty completion, asking once more", run_id)
+                step = await llm.step(
+                    model=choice.model, messages=messages, tools=tools, params=params
+                )
+                turn_usage.add_tokens(step.tokens_in, step.tokens_out, step.tokens_thought)
 
             if not step.wants_tools:
                 reply = (step.reply or "").strip() or None

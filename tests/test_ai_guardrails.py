@@ -161,3 +161,108 @@ class TestOrdinaryRepliesAreUntouched:
         # guardrail must not turn it into a *refused* one and change the reason.
         assert check("", []).ok
         assert check("   ", []).ok
+
+
+# ── the rule is about evidence, not about which tool produced it ─────────────
+
+
+def test_the_owner_copilot_may_report_its_own_hotels_revenue():
+    """
+    The regression that took the Owner Copilot off the air.
+
+    The money rule used to require one of a named set of *pricing* tools on the
+    run. Analytics tools were not in it, so an owner asking what the week took
+    got a correct answer built from `get_revenue` — and the guardrail threw it
+    away and told them somebody would get back to them. About their own hotel.
+
+    A number in a tool result is evidence whichever tool returned it.
+    """
+    verdict = guardrails.check_reply(
+        "You took ₹184,500 last week, and ADR was ₹4,000.",
+        tool_outputs=[
+            FakeOutcome("get_revenue", {"revenuePaise": 18450000}),
+            FakeOutcome("get_occupancy", {"adrPaise": 400000, "occupancy": 0.71}),
+        ],
+        trusted_hosts=set(),
+        history=[],
+    )
+    assert verdict.ok, verdict.reason
+
+
+def test_a_number_no_tool_returned_is_still_refused_for_the_owner_too():
+    """The widening must not become "staff screens are unchecked"."""
+    verdict = guardrails.check_reply(
+        "You took ₹250,000 last week.",
+        tool_outputs=[FakeOutcome("get_revenue", {"revenuePaise": 18450000})],
+        trusted_hosts=set(),
+        history=[],
+    )
+    assert not verdict.ok
+
+
+def test_a_service_price_from_the_hotels_own_list_is_backed():
+    # The upsell path: `list_services` is what the hotel itself charges.
+    verdict = guardrails.check_reply(
+        "Airport pickup is ₹1,200.",
+        tool_outputs=[FakeOutcome("list_services", {"services": [
+            {"name": "Airport pickup", "pricePaise": 120000},
+        ]})],
+        trusted_hosts=set(),
+        history=[],
+    )
+    assert verdict.ok, verdict.reason
+
+
+# ── a stand-in is not a value ────────────────────────────────────────────────
+
+
+class TestPlaceholders:
+    """
+    The reply that produced this rule, to a guest who had just asked to book:
+
+        Please use this link to pay ₹7,168 and confirm your reservation:
+        [payment link will be here].
+
+    Nothing in the link rule fired, because there was no link — which is the
+    entire failure. The model had been told its tool needed approval and wrote
+    the sentence it would have written if the tool had worked.
+    """
+
+    def test_the_transcript_that_caused_this(self):
+        verdict = check(
+            "Please use this link to pay and confirm: [payment link will be here].",
+            [FakeOutcome("get_quote", {"totalPaise": 716800})],
+        )
+        assert not verdict.ok
+        assert "placeholder" in verdict.reason
+
+    def test_a_template_variable_never_reaches_a_guest(self):
+        assert not check("Hello {{guest_name}}, your room is ready.", []).ok
+        assert not check("Send it to <insert link here>", []).ok
+
+    def test_an_ordinary_aside_in_brackets_is_fine(self):
+        # Hotels write like this. A rule that catches it is a rule that turns
+        # working conversations into handoffs.
+        assert check("Breakfast is 7–10 on the rooftop [weather permitting].", []).ok
+        assert check("Your room (Deluxe Double) is on the second floor.", []).ok
+
+
+def test_a_rupee_sign_does_not_swallow_the_number_behind_it():
+    """
+    The bug that made every payment link with a balance hand off.
+
+    `json.dumps` escapes ₹ to `\\u20b9`. The `9` at the end of that escape is a
+    digit, so the scanner read `\\u20b95,734` as "20" and "95734" — and the one
+    number actually in the tool result, 5734, was nowhere in the allowed set.
+    Every amount in this product is written with a rupee sign in front of it,
+    so this affected all of them.
+    """
+    verdict = check(
+        "₹1,434 to confirm now, and the balance of ₹5,734 at the hotel — total ₹7,168.",
+        [FakeOutcome("create_booking_payment_link", {
+            "payNowText": "₹1,434",
+            "dueAtHotelText": "₹5,734",
+            "totalText": "₹7,168",
+        })],
+    )
+    assert verdict.ok, verdict.reason

@@ -782,6 +782,13 @@ async def update_task_status(args: TaskStatusArgs, ctx: AgentContext) -> tuple[d
     # one of them is nailed down. This is the one that gets nailed down: a
     # charge is the only thing here a guest disputes at the desk two days later.
     always_requires_approval=True,
+    when_deferred=(
+        "The charge is NOT on the bill and the guest owes nothing extra yet. "
+        "The hotel has to agree it first. Tell the guest you have asked the "
+        "team to add it, and carry on with whatever else they need — do not "
+        "apologise, and never read the new total back to them as though it "
+        "had gone on."
+    ),
 )
 async def post_folio_charge(args: FolioChargeArgs, ctx: AgentContext) -> tuple[dict, str]:
     """

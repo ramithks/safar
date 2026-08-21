@@ -716,6 +716,11 @@ class AgentActionOut(BaseModel):
     input: dict = {}
     output: str = ""
     refusalReason: str | None = None
+    # The same fact as `refusalReason`, in the hotel's words, and only while
+    # the action is actually waiting. `refusalReason` stays exactly as the
+    # runtime wrote it — it is the audit trail — and is not what the owner is
+    # shown.
+    whyWaiting: str | None = None
     resultType: str | None = None
     resultId: str | None = None
     status: str
@@ -762,6 +767,11 @@ class ConsoleActionOut(BaseModel):
     tool: str
     status: str
     refusalReason: str | None = None
+    # The same fact as `refusalReason`, in the hotel's words, and only while
+    # the action is actually waiting. `refusalReason` stays exactly as the
+    # runtime wrote it — it is the audit trail — and is not what the owner is
+    # shown.
+    whyWaiting: str | None = None
     resultType: str | None = None
     resultId: str | None = None
     latencyMs: int = 0
@@ -905,6 +915,14 @@ class UsageEventOut(BaseModel):
 
 class BillingSummaryOut(BaseModel):
     plan: str | None = None
+    # What the plan costs, from the plan catalogue.
+    #
+    # The client used to hard-code 0 here with a comment saying a price belongs
+    # to the catalogue and a client that computes one can disagree with the
+    # invoice. Both true — and the answer was to *send* it, not to render "₹0
+    # per property, billed monthly" on a hotel's own billing screen.
+    pricePaise: int = 0
+    billingPeriod: str = "monthly"
     # camelCase like every other field in this file. These two were snake_case
     # and the PWA has been reading `periodStart`/`periodEnd` — so the usage
     # screen's "billing period ends" has been rendering an empty date since the
@@ -1497,6 +1515,39 @@ class PublicBookingOut(BaseModel):
     currency: str = "INR"
 
 
+class DnsRecordOut(BaseModel):
+    """One row of the table the owner copies into their registrar."""
+
+    type: str
+    name: str
+    value: str
+    # Whether the public internet can see it yet. Both records are always
+    # returned so a half-finished setup shows *which* half.
+    found: bool
+
+
+class DomainOut(BaseModel):
+    # none · pending · verified · error
+    status: str = "none"
+    domain: str | None = None
+    verifiedAt: datetime | None = None
+    checkedAt: datetime | None = None
+    # Already a sentence for a hotel owner, never a resolver error.
+    error: str | None = None
+    records: list[DnsRecordOut] = []
+
+
+class DomainRequest(BaseModel):
+    domain: str = Field(max_length=253)
+
+
+class PublicSiteHostOut(BaseModel):
+    """Which hotel a hostname belongs to. Public, and deliberately thin."""
+
+    slug: str
+    name: str
+
+
 class WebsiteConfigOut(BaseModel):
     propertyId: str
     template: str
@@ -1515,6 +1566,15 @@ class WebsiteConfigOut(BaseModel):
     sections: list[dict] = []
     publishedAt: datetime | None = None
     hasUnpublishedChanges: bool = False
+    # The hotel's own address, if it has claimed one. `domain` above stays for
+    # the one thing it was ever used for — printing where the site is — and
+    # this carries the state behind it.
+    customDomain: DomainOut = Field(default_factory=DomainOut)
+    # What the site has sold in the last 30 days. Real rows, both of them —
+    # there is no visitor counter on `/stay/[slug]`, so there is no view count
+    # here and no conversion rate built on one.
+    directBookings30d: int = 0
+    directRevenue30dPaise: int = 0
 
 
 class WebsiteUpdateRequest(BaseModel):

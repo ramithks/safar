@@ -104,6 +104,26 @@ async def _revalidate_booking(args: "BookingArgs", ctx: AgentContext) -> None:
     # will not be the first hotel to try it, and the queue costs a manager ten
     # seconds against a booking they cannot un-take.
     always_requires_approval=True,
+    # And this is the sentence that keeps the gate from reading as a fault.
+    #
+    # Because the flag above is unconditional, *every* guest who says "book it"
+    # lands here. Told only that approval was required, the model apologised —
+    # "I'm sorry, I wasn't able to book the room directly" — and a guest who
+    # had just been quoted a real price heard the hotel's own safety rule as
+    # the hotel being unable to sell them a room.
+    #
+    # There is nothing to be sorry about: the guest can pay right now, and
+    # paying is what confirms a booking anyway. So the deferral points at the
+    # road that works instead of describing the one that is closed.
+    when_deferred=(
+        "Nothing is booked and no room is held. Do NOT apologise and do NOT "
+        "say the booking failed — a hotel confirms on payment. Call "
+        "create_booking_payment_link for this same quote and give the guest "
+        "the link. Tell them the room is confirmed once the payment goes "
+        "through; do NOT tell them it is reserved, held or booked before "
+        "then, because it is not and somebody else may take it. Only if that "
+        "also refuses should you hand over to the team."
+    ),
 )
 async def create_booking(args: BookingArgs, ctx: AgentContext) -> tuple[dict, str]:
     ceiling = ctx.limits.get("max_booking_value_paise")
@@ -301,17 +321,49 @@ async def create_booking_payment_link(
         # turning it into a failed run the guest sees nothing from.
         raise OutOfScope(f"quote {args.quote_id}: {exc}", str(exc)) from exc
 
+    # Three amounts, and only one of them is what the link charges.
+    #
+    # The first version returned `amountText`, `totalText` and `balanceText` as
+    # a flat set with an instruction to "give the guest the link and the
+    # amount". The model picked the total. A guest was told
+    #
+    #     Please use this link to complete your booking for ₹7,168
+    #
+    # and the page it opened asked for ₹1,434, because this property takes a
+    # deposit and the rest is paid at the hotel. Both numbers were correct and
+    # the sentence was wrong, which is the worst of the three possibilities —
+    # a guest who spots it thinks they are being overcharged, and a guest who
+    # does not thinks their stay is paid for.
+    #
+    # So the ready sentence is built here, where the numbers are, and the
+    # instruction is to use it rather than to compose one. The fields stay for
+    # a question like "what's the total?", which the model should still be able
+    # to answer without another tool call.
+    amount_text = f"₹{link.amount_paise / 100:,.0f}"
+    total_text = f"₹{link.total_paise / 100:,.0f}"
+    due_at_hotel = link.total_paise - link.amount_paise
+
+    if due_at_hotel > 0:
+        say = (
+            f"{amount_text} to confirm now, and the balance of "
+            f"₹{due_at_hotel / 100:,.0f} at the hotel — total {total_text}."
+        )
+    else:
+        say = f"{amount_text}, which is the full amount."
+
     return (
         {
             "payUrl": link.pay_url,
-            "amountPaise": link.amount_paise,
-            "amountText": f"₹{link.amount_paise / 100:,.0f}",
-            "totalText": f"₹{link.total_paise / 100:,.0f}",
-            "balanceText": f"₹{link.balance_paise / 100:,.0f}",
+            "sayThis": say,
+            "payNowText": amount_text,
+            "payNowPaise": link.amount_paise,
+            "totalText": total_text,
+            "dueAtHotelText": f"₹{due_at_hotel / 100:,.0f}",
             "instruction": (
-                "Give the guest the link and the amount. Say the booking is "
-                "confirmed as soon as the payment goes through, and that the "
-                "rest is payable at the hotel if a balance remains."
+                "Send the guest the payUrl and say sayThis, close to word for "
+                "word. The link charges payNowText and nothing else — never "
+                "tell them to pay totalText through it. Say the booking is "
+                "confirmed as soon as the payment goes through."
             ),
         },
         link.order_id,
