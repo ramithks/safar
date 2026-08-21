@@ -3,6 +3,7 @@ import logging
 from fastapi import APIRouter
 
 from app.api.v1.admin.catalog import router as admin_catalog_router
+from app.api.v1.admin.billing import router as admin_billing_router
 from app.api.v1.admin.endpoint import router as admin_router
 from app.api.v1.admin.trips import router as admin_trips_router
 from app.api.v1.autocomplete.endpoint import router as autocomplete_router
@@ -97,6 +98,7 @@ else:
     )
 
 router.include_router(admin_router)
+router.include_router(admin_billing_router)
 router.include_router(admin_trips_router)
 router.include_router(admin_catalog_router)
 router.include_router(users_router)

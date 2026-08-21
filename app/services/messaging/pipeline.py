@@ -241,8 +241,16 @@ async def process_conversation(conversation_id: str, *, provider=None, classifie
     #
     # `billing.allowed()` fails open, so a Supabase outage does not read to a
     # hotelier as being cut off for non-payment.
+    # Priced as the *conversation*, not the turn.
+    #
+    # The gate used to ask `usage_type_for_agent`, which is now a zero-rated
+    # per-turn type — so it would have allowed every turn at any balance, and
+    # the hotel would have discovered its credits were gone by looking at the
+    # ledger rather than by the AI stopping. What a guest conversation costs is
+    # what has to be affordable before one starts.
     decision = await billing.allowed(
-        usage_type=billing.usage_type_for_agent(agent_type),
+        usage_type=(billing.usage_type_for_channel(conversation.get("channel"))
+                    or billing.usage_type_for_agent(agent_type)),
         property_id=conversation["property_id"],
     )
     if not decision.allowed:

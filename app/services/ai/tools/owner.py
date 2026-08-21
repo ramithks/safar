@@ -38,13 +38,14 @@ produced, so a model that writes "6 of 8 rooms are sold" without the server
 having said so is refused with the reason and can correct itself.
 """
 import logging
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 from pydantic import BaseModel, Field
 
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import OutOfScope, PermissionDenied, ToolUnavailable
 from app.services.ai.registry import tool
+from app.db.client import get_db, run_db
 from app.services.pms import analytics
 from app.services.pms import recommendations as recs
 
@@ -700,3 +701,137 @@ async def list_recommendations(args: RecommendationListArgs, ctx: AgentContext) 
         }
         for r in rows
     ]
+
+
+# ── what the hotel is paying, and what it has left ───────────────────────────
+#
+# The Owner Copilot is the only agent that may read any of this. `_require_staff`
+# is on both tools and is the whole boundary: a guest-facing agent has neither
+# in its tool list, and if one ever did, the check would refuse it at runtime
+# rather than trusting the list. A guest asking "how much do you pay TravBuddy"
+# gets nothing, which is the correct amount of the hotel's commercial position
+# to give a stranger.
+
+
+class BillingArgs(BaseModel):
+    """No arguments. The subject is this hotel and cannot be another."""
+
+
+@tool(
+    name="get_plan_and_credits",
+    description=(
+        "What this hotel pays for StayOS, what state the plan is in, when the "
+        "next payment is due, how many AI credits are left, and what one "
+        "conversation costs on each channel. Use for 'how many credits do I "
+        "have', 'when is my next payment', 'how much am I paying', 'what does "
+        "an Instagram conversation cost', 'why are my credits low'. Never "
+        "quote a figure that is not in this result."
+    ),
+    input_model=BillingArgs,
+    permission="reports",
+    autonomy_floor=0,
+    mutating=False,
+    usage_type="ai.tool_read",
+)
+async def get_plan_and_credits(args: BillingArgs, ctx: AgentContext) -> dict:
+    _require_staff(ctx)
+    from app.services import billing
+    from app.services.billing import subscription as subscription_service
+
+    plan_row = await subscription_service.plan()
+    state = subscription_service.project(
+        await subscription_service.current(ctx.property_id), plan_row
+    )
+
+    # One public door. This reached for `billing._conversation_rates` — a
+    # private function that is not exported from the package — so every call
+    # died with `module 'app.services.billing' has no attribute
+    # '_conversation_rates'` and the copilot answered "I do not know" when an
+    # owner asked about their own bill. The tool swallowed it into a failed
+    # action, which is exactly the shape of failure that survives a test suite:
+    # nothing raised, the turn succeeded, and the answer was wrong.
+    #
+    # `credits_summary` is the same call the billing screen makes, so the two
+    # cannot disagree either.
+    summary = await billing.credits_summary(ctx.property_id, days=30)
+    balance = summary["balance"]
+    rates = summary["rates"]
+    cheapest = min([r for r in rates.values() if r > 0], default=0)
+
+    return {
+        "planName": state["planName"],
+        "planStatus": state["status"],
+        "planSays": state["headline"],
+        "monthlyText": f"₹{state['pricePaise'] / 100:,.0f}",
+        "nextPaymentDate": state["currentPeriodEnd"],
+        "cancelAtPeriodEnd": state["cancelAtPeriodEnd"],
+        "creditsRemaining": balance,
+        "creditsIncludedEachMonth": state["includedCredits"],
+        "creditCostPerConversation": rates,
+        "conversationsRemaining": int(balance // cheapest) if cheapest else None,
+        "instruction": (
+            "Answer with these numbers and no others. 'planSays' is already "
+            "written for the owner — use its wording for the plan's state "
+            "rather than inventing your own. When planStatus is 'none' the "
+            "hotel has not started paying yet: say what it costs and that they "
+            "can start it from Plan & usage, rather than saying you do not "
+            "know. A null nextPaymentDate means there is no payment due, not "
+            "that the date is missing."
+        ),
+    }
+
+
+class UsageArgs(BaseModel):
+    days: int = Field(default=30, ge=1, le=90,
+                      description="How far back to count. Defaults to 30 days.")
+
+
+@tool(
+    name="get_ai_usage",
+    description=(
+        "How many guest conversations the AI employee has handled, by channel, "
+        "and how many credits that used. Use for 'how many conversations did we "
+        "have this month', 'how many Instagram conversations', 'how many credits "
+        "did we use this week'."
+    ),
+    input_model=UsageArgs,
+    permission="reports",
+    autonomy_floor=0,
+    mutating=False,
+    usage_type="ai.tool_read",
+)
+async def get_ai_usage(args: UsageArgs, ctx: AgentContext) -> dict:
+    _require_staff(ctx)
+    from app.services import billing
+
+    # The same function the billing screen calls. Two implementations of "how
+    # many conversations did we have" is two numbers an owner can catch us
+    # disagreeing on.
+    summary = await billing.credits_summary(ctx.property_id, days=args.days)
+
+    return {
+        "days": args.days,
+        "conversationsByChannel": {
+            row["channel"]: row["conversations"] for row in summary["byChannel"]
+        },
+        "creditsByChannel": {
+            row["channel"]: row["credits"] for row in summary["byChannel"]
+        },
+        "conversationsTotal": summary["conversationsTotal"],
+        "creditsUsed": summary["creditsUsed"],
+        # Staff assists and campaign copy — real spend that is not a guest
+        # conversation. Named, because an owner adding the channels up and
+        # missing the total would think we had lost some.
+        "creditsOnStaffAndMarketing": summary["otherCredits"],
+        "creditsRemaining": summary["balance"],
+        "creditCostPerConversation": summary["rates"],
+        "instruction": (
+            "A conversation is a whole thread with one guest, not one message. "
+            "Say so if the owner seems to be counting messages. Costs per "
+            "conversation are in creditCostPerConversation — never state one "
+            "from memory. WhatsApp is not launched yet, so do not report it "
+            "unless it has conversations."
+        ),
+    }
+
+

@@ -436,6 +436,11 @@ async def run_turn(
             usage=turn_usage,
             action_ids=action_ids,
             latency_ms=latency,
+            # What the hotel is billed by. `ctx.channel` is the guest's channel
+            # for a guest-facing run and 'internal' for a staff one, and
+            # `usage_type_for_channel` returns nothing for the second — a
+            # receptionist's question is not a guest conversation.
+            channel=ctx.channel,
         )
     except Exception:  # noqa: BLE001
         logger.warning("could not record usage for run %s", run_id, exc_info=True)

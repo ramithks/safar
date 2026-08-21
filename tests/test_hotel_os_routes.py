@@ -36,13 +36,29 @@ def _mounted(monkeypatch, *, enabled: bool) -> list[str]:
 
 
 class TestTheDefault:
-    def test_off_unless_asked_for(self):
+    def test_off_unless_asked_for(self, monkeypatch):
         """
         A fresh Settings() is a marketplace deployment. The default has to be
         the safe one because the marketplace's environment is the one nobody
         edits — it must be correct with no variable set at all.
+
+        **The variable is cleared first, and that is the whole point.** This
+        used to call `Settings()` and read whatever was in the ambient
+        environment, so it asserted "the default is off" while actually
+        measuring the developer's shell. On a clean shell it passed; on any
+        machine with `.env.hotelos` sourced — which is every machine StayOS is
+        worked on — it failed, for a reason that had nothing to do with the
+        code. A test that fails on the developer's machine and passes in CI is
+        a test people learn to ignore, and this one guards the marketplace
+        against mounting an entire product's routes by accident.
         """
-        assert Settings().enable_hotel_os is False
+        monkeypatch.delenv("ENABLE_HOTEL_OS", raising=False)
+        assert Settings(_env_file=None).enable_hotel_os is False
+
+    def test_and_on_when_it_is_asked_for(self, monkeypatch):
+        """The other half: setting it must actually reach the setting."""
+        monkeypatch.setenv("ENABLE_HOTEL_OS", "true")
+        assert Settings(_env_file=None).enable_hotel_os is True
 
 
 class TestWhatIsMounted:

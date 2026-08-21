@@ -913,6 +913,107 @@ class UsageEventOut(BaseModel):
     createdAt: datetime
 
 
+class PlanStateOut(BaseModel):
+    """
+    The hotel's plan, in one shape.
+
+    Every string here is already written for a hotel owner. No status enum
+    reaches a screen — `past_due` is a word for this file and the database, and
+    what an owner reads is "Your last payment didn't go through."
+    """
+
+    status: str
+    headline: str
+    detail: str = ""
+    planName: str
+    pricePaise: int
+    billingPeriod: str = "monthly"
+    includedCredits: int = 0
+    # A one-off bonus on the first paid cycle, configured on the plan row.
+    # Zero means there is no offer running, and the screen says nothing.
+    signupBonusCredits: int = 0
+    signupBonusLabel: str = "Launch bonus"
+    currentPeriodEnd: datetime | None = None
+    cancelAtPeriodEnd: bool = False
+    couponCode: str | None = None
+    graceUntil: datetime | None = None
+    # Is the AI still answering guests? Not the same as "active" — a failed
+    # payment keeps working through its grace period.
+    serving: bool = True
+    canStart: bool = False
+
+
+class ChannelUsageOut(BaseModel):
+    channel: str
+    conversations: int = 0
+    credits: int = 0
+    # What one conversation costs here today, from the rate card.
+    creditsEach: int = 0
+
+
+class CreditPoolOut(BaseModel):
+    kind: str
+    # Already in the hotel's words — "Monthly credits", "Launch bonus".
+    label: str
+    remaining: int
+
+
+class CreditsSummaryOut(BaseModel):
+    """
+    Where a hotel's credits came from and what they went on.
+
+    Two halves answering two questions: `remainingByKind` is what the hotel was
+    given and still holds, `byChannel` is what it spent and on which guests.
+    A single "credits used" number is true and tells nobody anything.
+    """
+
+    balance: int = 0
+    creditsUsed: int = 0
+    conversationsTotal: int = 0
+    # Staff assists, campaign copy, reports. Real spend, not guest conversations.
+    otherCredits: int = 0
+    byChannel: list[ChannelUsageOut] = []
+    remainingByKind: list[CreditPoolOut] = []
+    days: int = 30
+
+
+class CouponPreviewOut(BaseModel):
+    """What a code is worth, priced by the server against the real plan."""
+
+    code: str
+    label: str
+    kind: str
+    firstPaymentPaise: int
+    discountPaise: int
+    renewalPaise: int
+    freeDays: int = 0
+    description: str = ""
+
+
+class CouponRequest(BaseModel):
+    code: str = Field(max_length=32)
+
+
+class SubscribeRequest(BaseModel):
+    # Optional, and validated server-side against `plan_coupons`. There is no
+    # price, no plan id and no amount in this request on purpose: a client that
+    # can name its own price is a client that will.
+    couponCode: str | None = Field(default=None, max_length=32)
+
+
+class CheckoutOut(BaseModel):
+    """Everything Razorpay Checkout needs, and nothing it could be lied to with."""
+
+    razorpaySubscriptionId: str
+    razorpayKeyId: str
+    planName: str
+    amountPaise: int
+    firstPaymentPaise: int
+    currency: str = "INR"
+    couponCode: str | None = None
+    couponLabel: str | None = None
+
+
 class BillingSummaryOut(BaseModel):
     plan: str | None = None
     # What the plan costs, from the plan catalogue.
