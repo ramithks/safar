@@ -42,6 +42,11 @@ How you work:
 - When a guest asks two things in one message, answer both, and look each one up
   separately. Answering the easy half from a tool and the other half from memory
   is the mistake that matters here.
+- Photos: `get_room_types` returns a `photos` list for each room. If it has
+  links, send them — that is what they are for, and "photos hain?" is one of the
+  first things a guest asks. If the list is empty, say the hotel has not put
+  photos up yet and offer to pass them to the team; do not say you are unable
+  to show photos, which is not true and reads as a limitation of the hotel.
 - If a tool refuses, tell the guest plainly what happens next. Do not retry it
   and do not work around it.
 - When someone asks for a person, is upset, is disputing money, or wants
@@ -306,6 +311,26 @@ def build_system_prompt(ctx: AgentContext) -> str:
             situation.append(
                 "You do not know who this is yet. Do not assume they have a booking."
             )
+    # The quote this conversation is in the middle of, if there is one.
+    #
+    # **A messaging booking spans turns and the model has no memory of tools.**
+    # `_history` carries message text only, so the quote id created on one turn
+    # is gone by the next — which produced this, in production, from a guest
+    # who had just been quoted and asked to give their name:
+    #
+    #     I need a quote ID from the previous step. Let me generate one again.
+    #
+    # It then re-quoted, and the re-quote failed because its *own* hold from a
+    # minute earlier had taken the last rooms. The guest was told the room was
+    # booked, then that it was unavailable, then nothing.
+    #
+    # A quote belongs to the conversation — `quotes.conversation_id` has always
+    # been written and nothing ever read it back. Stating it here is what makes
+    # "book it" on the next message resolvable at all.
+    live = _live_quote(ctx)
+    if live:
+        parts.append(live)
+
     parts.append("\n".join(situation))
 
     if ctx.system_prompt:
@@ -364,6 +389,65 @@ def forget_identity(property_id: str | None = None) -> None:
         _identity_cache.pop(property_id, None)
     else:
         _identity_cache.clear()
+
+
+def _live_quote(ctx: AgentContext) -> str | None:
+    """
+    The active, unexpired quote on this conversation, as a sentence.
+
+    Read fresh every turn and never cached: a quote expires in fifteen minutes
+    and a stale one in a prompt is how a model quotes a price that has gone.
+    Guest-scoped conversations only — a staff console turn has no single
+    subject and would be reading somebody else's.
+    """
+    if not ctx.conversation_id:
+        return None
+
+    from datetime import datetime, timezone
+
+    from app.db.client import get_db
+
+    try:
+        rows = (
+            get_db().table("quotes")
+            .select("id,total_paise,check_in,check_out,units,adults,children,"
+                    "expires_at,status,room_type_id")
+            .eq("conversation_id", ctx.conversation_id)
+            .eq("status", "active")
+            .order("created_at", desc=True).limit(1)
+            .execute().data or []
+        )
+    except Exception:  # noqa: BLE001 — a prompt is not worth failing a turn over
+        logger.warning("could not read the live quote for conversation %s",
+                       ctx.conversation_id, exc_info=True)
+        return None
+
+    if not rows:
+        return None
+    quote = rows[0]
+
+    try:
+        expires = datetime.fromisoformat(str(quote["expires_at"]).replace("Z", "+00:00"))
+        if expires <= datetime.now(timezone.utc):
+            return None
+    except (ValueError, TypeError):
+        return None
+
+    party = f"{quote.get('adults') or 0} adults"
+    if quote.get("children"):
+        party += f" and {quote['children']} children"
+
+    return (
+        "There is a live quote on this conversation. Use this id for anything "
+        "that needs one — do NOT ask the guest for it and do NOT create a "
+        f"second quote unless the stay has changed:\n"
+        f"  quote_id: {quote['id']}\n"
+        f"  {quote['check_in']} to {quote['check_out']}, "
+        f"{quote.get('units') or 1} room(s), {party}\n"
+        f"  total: ₹{(quote.get('total_paise') or 0) / 100:,.0f}\n"
+        "It is not a booking. Nothing is held for the guest until they have "
+        "paid, so never tell them it is reserved, booked or confirmed."
+    )
 
 
 def _today(ctx: AgentContext) -> str:

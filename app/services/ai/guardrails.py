@@ -87,6 +87,45 @@ _PLACEHOLDER = re.compile(
     """
 )
 
+# Tools that actually put a room in a guest's name, or money in the hotel's.
+#
+# Nothing else licenses the sentence "you are booked".
+CONFIRMING_TOOLS = frozenset({
+    "create_booking",
+    "create_booking_payment_link",
+    "create_payment_link",
+    "check_in",
+})
+
+# Saying a stay is secured when it is not.
+#
+# The reply this exists for, sent to a real guest on Instagram after a run
+# whose only tools were `get_stay_options` and `get_quote`:
+#
+#     Okay, aapke 2 Deluxe King Bed rooms 10 September se 14 September tak ke
+#     liye book ho gaye hain.        ("your 2 rooms have been booked")
+#
+# Nothing was booked. A minute later the same agent said those rooms were not
+# available. A guest who stops reading at the first message arrives at a hotel
+# with no reservation — the single worst thing this product can do, and worse
+# than any invented price, because the guest acts on it by travelling.
+#
+# Hinglish and Hindi are here because the transcript was: an English-only rule
+# would have caught nothing on the conversation it was written for.
+_CONFIRMED = re.compile(
+    r"(?xi)"
+    r"("
+    r"  book(?:ed|ing)\s+(?:is\s+)?(?:confirm|complete|done|secur)"
+    r"| (?:is|are|has\ been|have\ been)\s+(?:now\s+)?(?:booked|reserved|confirmed)"
+    r"| reservation\s+(?:is\s+)?confirm"
+    r"| rooms?\s+(?:are|is)\s+(?:now\s+)?(?:yours|held|blocked)"
+    r"| book\s+ho\s+ga(?:ye|ya|yi)"
+    r"| confirm\s+ho\s+ga(?:ye|ya|yi)"
+    r"| \u092c\u0941\u0915\s*\u0939\u094b\s*\u0917"
+    r"| \u0915\u0928\u094d\u092b\u093c\u0930\u094d\u092e\s*\u0939\u094b\s*\u0917"
+    r")"
+)
+
 _URL = re.compile(r"""(?xi)\b(?:https?://|www\.)[^\s<>"'\)\]]+""")
 
 # ₹1,234 / ₹ 1234.50 / Rs. 1,234 / INR 1234 / 1,234 rupees
@@ -203,7 +242,9 @@ def check_reply(
         return Verdict(True)
 
     blob_parts: list[str] = []
+    tools_run: set[str] = set()
     for outcome in tool_outputs or []:
+        tools_run.add(getattr(outcome, "tool", "") or "")
         output = getattr(outcome, "output", None)
         if output is not None:
             # `ensure_ascii=False`, and it is load-bearing rather than tidy.
@@ -251,6 +292,19 @@ def check_reply(
                     False,
                     f"reply contained an unverified link ({host or url[:40]!r})",
                 )
+
+    # ── a booking nobody made ───────────────────────────────────────────
+    #
+    # Checked before money, because it is the more expensive lie: a guest who
+    # believes a wrong price argues at the desk, and a guest who believes a
+    # wrong booking arrives with luggage.
+    confirmed = _CONFIRMED.search(text)
+    if confirmed and not (tools_run & CONFIRMING_TOOLS):
+        return Verdict(
+            False,
+            f"reply said a stay was secured ({confirmed.group(0)[:40]!r}) "
+            "with nothing on this run that secures one",
+        )
 
     # ── money ───────────────────────────────────────────────────────────
     #

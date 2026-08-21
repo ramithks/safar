@@ -75,8 +75,12 @@ def call(tool_name: str, args: dict, ctx: AgentContext):
 
 
 TASK_ARGS = {"title": "AC not cooling in 204", "category": "maintenance"}
+# Real uuids, because ids are validated at the tool boundary now — a
+# placeholder here would be refused before reaching the gate under test, and
+# the test would pass for the wrong reason or fail for one.
 QUOTE_ARGS = {
-    "room_type_id": "rt", "rate_plan_id": "rp",
+    "room_type_id": "d0d0d0d0-0001-4001-8001-000000000001",
+    "rate_plan_id": "e0e0e0e0-0001-4001-8001-000000000001",
     "check_in": "2026-09-01", "check_out": "2026-09-03",
 }
 
@@ -271,26 +275,26 @@ def test_booking_always_requires_approval():
 # ── the injection boundary ───────────────────────────────────────────────────
 
 def test_a_guest_cannot_read_a_reservation_outside_their_conversation():
-    ctx = make_ctx(reservation_id="res-mine")
+    ctx = make_ctx(reservation_id="11111111-1111-4111-8111-111111111111")
     with pytest.raises(OutOfScope):
-        run(ctx.require_reservation("res-someone-else"))
+        run(ctx.require_reservation("b0b0b0b0-0002-4002-8002-000000000002"))
 
 
 def test_the_conversations_own_reservation_is_allowed():
-    ctx = make_ctx(reservation_id="res-mine")
-    assert run(ctx.require_reservation("res-mine")) == "res-mine"
+    ctx = make_ctx(reservation_id="11111111-1111-4111-8111-111111111111")
+    assert run(ctx.require_reservation("11111111-1111-4111-8111-111111111111")) == "11111111-1111-4111-8111-111111111111"
 
 
 def test_get_reservation_refuses_a_stranger_id_before_touching_the_database():
     # If the scope check did not run first this would reach get_db() and raise a
     # connection error rather than a refusal, so asserting on `status` is also
     # asserting on the ordering.
-    ctx = make_ctx(reservation_id="res-mine")
-    out = call("get_reservation", {"reservation_id": "res-theirs"}, ctx)
+    ctx = make_ctx(reservation_id="11111111-1111-4111-8111-111111111111")
+    out = call("get_reservation", {"reservation_id": "22222222-2222-4222-8222-222222222222"}, ctx)
     assert out.status == "refused"
     assert "does not belong to this conversation" in out.refusal_reason
     # And the guest is told something that does not confirm the id exists.
-    assert "res-theirs" not in (out.guest_message or "")
+    assert "22222222-2222-4222-8222-222222222222" not in (out.guest_message or "")
 
 
 def test_a_conversation_with_no_booking_can_read_nothing():

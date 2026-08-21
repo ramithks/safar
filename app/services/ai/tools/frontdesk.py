@@ -44,6 +44,7 @@ from pydantic import BaseModel, Field
 from app.db.client import get_db, run_db
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import AgentError, OutOfScope, PermissionDenied, ToolUnavailable
+from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
 from app.services.ai.tools import ACTOR_TASK
 from app.services.pms import clock
@@ -163,7 +164,7 @@ class FindReservationArgs(BaseModel):
 
 
 class ReservationArgs(BaseModel):
-    reservation_id: str = Field(description="The reservation's id, from find_reservation.")
+    reservation_id: ResourceId = Field(description="The reservation's id, from find_reservation.")
 
 
 class RoomArgs(BaseModel):
@@ -183,7 +184,7 @@ class SetRoomStatusArgs(BaseModel):
 
 
 class CheckInArgs(BaseModel):
-    reservation_id: str = Field(description="The reservation's id, from find_reservation.")
+    reservation_id: ResourceId = Field(description="The reservation's id, from find_reservation.")
     room_number: str | None = Field(
         default=None, max_length=12,
         description=(
@@ -201,7 +202,7 @@ class ListTasksArgs(BaseModel):
 
 
 class TaskStatusArgs(BaseModel):
-    task_id: str
+    task_id: ResourceId
     status: str = Field(description=f"One of: {', '.join(TASK_STATUSES)}.")
 
 
@@ -231,7 +232,7 @@ class StaffTaskArgs(BaseModel):
 
 
 class FolioChargeArgs(BaseModel):
-    reservation_id: str = Field(description="Whose folio, from find_reservation.")
+    reservation_id: ResourceId = Field(description="Whose folio, from find_reservation.")
     description: str = Field(
         min_length=3, max_length=120,
         description="What the charge is for, as it should read on the guest's bill.",

@@ -44,6 +44,7 @@ from pydantic import BaseModel, Field
 
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import OutOfScope, PermissionDenied, ToolUnavailable
+from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
 from app.db.client import get_db, run_db
 from app.services.pms import analytics
@@ -177,7 +178,7 @@ class RecommendationArgs(BaseModel):
             "you cannot make any of these changes."
         ),
     )
-    room_type_id: str | None = Field(
+    room_type_id: ResourceId | None = Field(
         default=None,
         description="When the recommendation is about one room type.",
     )

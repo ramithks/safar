@@ -611,8 +611,22 @@ _, after_hold = turn(
     "still free?",
 )
 sea_left = next(r for r in after_hold[0]["output"]["roomTypes"] if r["code"] == "SEA")["unitsLeft"]
+# **Two viewpoints, and they must differ.** A hold taken *for this guest* is a
+# room this guest can still have — asking again from inside the same
+# conversation and being told it has gone is what produced, in production:
+#
+#     Ok, 2 rooms available hain.  …  Maaf karna, available nahi hain.
+#
+# So the holder still sees it, and that is the point of `for_conversation`.
+check("the guest it is held for can still have it",
+      sea_left == 10, f"10 → {sea_left}")
+
+everyone_else = sql(f"""select units_left from public.property_availability(
+                          '{PROPERTY}'::uuid, '{FRIDAY}'::date, '{SUNDAY}'::date)
+                         where room_type_id = '{SEA}' limit 1;""")
 check("and the room it holds is no longer sellable to anyone else",
-      sea_left == 9, f"10 → {sea_left}")
+      everyone_else and everyone_else[0]["units_left"] == 9,
+      f"everyone else sees {everyone_else[0]['units_left'] if everyone_else else '?'}")
 
 print("\n══ 8. booking, which a person still has to allow ══")
 
@@ -746,6 +760,12 @@ check("and the refusal comes from the inventory function, not from a prompt",
       second[0].get("refusal_reason") or "")
 
 print("\n══ 12. sold out, and what may be offered instead ══")
+
+# Let go of this conversation's own holds first. They are added back to the
+# caller that owns them — deliberately — so a conversation still holding a room
+# is not the "nothing is free" scenario this section is about.
+sql(f"""update public.inventory_holds set status = 'released'
+         where conversation_id = '{CONVERSATION["id"]}' and status = 'active';""")
 
 sql(f"""insert into public.room_inventory
           (room_type_id, property_id, partner_id, date, units_total, units_booked)

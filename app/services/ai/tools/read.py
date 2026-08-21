@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from app.db.client import get_db, run_db
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import OutOfScope, ToolUnavailable
+from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
 from app.services.pms import availability as availability_service
 from app.services.pms import clock
@@ -65,11 +66,11 @@ class KnowledgeArgs(BaseModel):
 
 
 class ReservationArgs(BaseModel):
-    reservation_id: str = Field(description="The reservation's id.")
+    reservation_id: ResourceId = Field(description="The reservation's id.")
 
 
 class TaskArgs(BaseModel):
-    task_id: str = Field(description="The task's id.")
+    task_id: ResourceId = Field(description="The task's id.")
 
 
 class AvailabilityArgs(BaseModel):
@@ -316,6 +317,17 @@ async def get_room_types(_args: NoArgs, ctx: AgentContext) -> list[dict]:
             "name": r["name"],
             "maxOccupancy": r.get("max_occupancy"),
             "bedType": r.get("bed_type"),
+            # The three the hotel fills in, and the reason this tool exists at
+            # all. Without them a guest asking "what's in the Deluxe?" or
+            # "photos hain?" got "I can only give you information in text" —
+            # which was true and useless, and happened twice in one real
+            # conversation while the guest was trying to buy.
+            "description": r.get("description") or None,
+            "sizeSqft": r.get("size_sqft"),
+            "amenities": r.get("amenities") or [],
+            # Links the hotel gave us. There is no image hosting here, so these
+            # are the hotel's own URLs and may be sent as links.
+            "photos": r.get("photos") or [],
         }
         for r in rows
     ]
@@ -647,6 +659,10 @@ async def search_availability(args: AvailabilityArgs, ctx: AgentContext) -> dict
     options = await availability_service.stay_options(
         ctx.property_id, args.check_in, args.check_out,
         units=args.units, audience="public",
+        # A room this conversation is already holding is still available to
+        # it. Without this, quoting takes a hold and the very next
+        # availability check reports the rooms it just quoted as gone.
+        for_conversation=ctx.conversation_id,
     )
 
     sellable = [o for o in options if o.units_left >= args.units]
@@ -698,6 +714,10 @@ async def get_stay_options(args: AvailabilityArgs, ctx: AgentContext) -> dict:
     options = await availability_service.stay_options(
         ctx.property_id, args.check_in, args.check_out,
         units=args.units, audience="public",
+        # A room this conversation is already holding is still available to
+        # it. Without this, quoting takes a hold and the very next
+        # availability check reports the rooms it just quoted as gone.
+        for_conversation=ctx.conversation_id,
     )
 
     out = []
