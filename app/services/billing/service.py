@@ -31,7 +31,7 @@ only AI and messaging degrade.
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.db.client import get_db, run_db
@@ -685,3 +685,142 @@ async def check_low_balance(billing_account_id: str) -> LowBalanceEvent:
     return LowBalanceEvent(notify=True, tier=tier, previous=previous,
                            available=available,
                            billing_account_id=billing_account_id)
+
+
+# ── what an owner sees ───────────────────────────────────────────────────────
+
+
+def _conversation_rates() -> dict[str, int]:
+    """
+    What one conversation costs on each channel, live from the rate card.
+
+    Read rather than assumed anywhere: changing Instagram to 10 credits is an
+    UPDATE, and every screen that quotes a price has to follow without a
+    deploy. The card is effective-dated, so this asks for the row with no
+    `effective_to` — last month's invoice keeps pointing at last month's price.
+    """
+    rows = (
+        get_db().table("usage_rate_card")
+        .select("usage_type,credits_per_unit,effective_to")
+        .like("usage_type", "ai.conversation.%")
+        .execute().data or []
+    )
+    return {
+        row["usage_type"].rsplit(".", 1)[-1]: int(float(row["credits_per_unit"]))
+        for row in rows
+        if row.get("effective_to") is None
+    }
+
+
+def _credits_summary(property_id: str, billing_account_id: str, days: int) -> dict:
+    """
+    Where a hotel's credits came from and what they went on.
+
+    Two halves, and they answer two different questions. The buckets say what
+    the hotel was *given* — the monthly allowance, a launch bonus, a top-up it
+    bought — and an owner asking "what am I paying for" is really asking to see
+    those separately. The usage events say what was *spent*, by channel, which
+    is the only unit an owner counts in.
+
+    Deliberately not a single number. "1,160 credits used" is true and tells
+    nobody anything; "73 Instagram conversations, 584 credits" is the same fact
+    in a shape somebody can act on.
+    """
+    db = get_db()
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    events = (
+        db.table("usage_events")
+        .select("usage_type,credits_charged")
+        .eq("property_id", property_id)
+        .eq("status", "charged")
+        .gte("created_at", since)
+        .limit(10000)
+        .execute().data or []
+    )
+
+    rates = _conversation_rates()
+    by_channel: dict[str, dict] = {
+        channel: {"channel": channel, "conversations": 0, "credits": 0,
+                  "creditsEach": rate}
+        for channel, rate in rates.items()
+    }
+    other_credits = 0
+    for event in events:
+        charged = int(event.get("credits_charged") or 0)
+        usage_type = event["usage_type"]
+        if usage_type.startswith("ai.conversation."):
+            channel = usage_type.rsplit(".", 1)[-1]
+            bucket = by_channel.setdefault(
+                channel,
+                {"channel": channel, "conversations": 0, "credits": 0,
+                 "creditsEach": rates.get(channel, 0)},
+            )
+            bucket["conversations"] += 1
+            bucket["credits"] += charged
+        else:
+            # Staff assists, campaign copy, reports. Real spend, and not a
+            # guest conversation — rolling it into one of the channels above
+            # would overstate what the AI employee costs per guest.
+            other_credits += charged
+
+    buckets = (
+        db.table("credit_buckets")
+        .select("kind,credits_granted,credits_remaining,status,metadata,granted_at,"
+                "wallet_id,credit_wallets!inner(billing_account_id)")
+        .eq("credit_wallets.billing_account_id", billing_account_id)
+        .gt("credits_remaining", 0)
+        .execute().data or []
+    )
+    by_kind: dict[str, dict] = {}
+    for bucket in buckets:
+        kind = bucket["kind"]
+        label = (bucket.get("metadata") or {}).get("reason") or KIND_LABEL.get(kind, kind)
+        entry = by_kind.setdefault(kind, {"kind": kind, "label": label, "remaining": 0})
+        entry["remaining"] += int(bucket.get("credits_remaining") or 0)
+
+    return {
+        "byChannel": [
+            b for b in sorted(by_channel.values(), key=lambda x: -x["credits"])
+        ],
+        "otherCredits": other_credits,
+        "conversationsTotal": sum(b["conversations"] for b in by_channel.values()),
+        "creditsUsed": sum(b["credits"] for b in by_channel.values()) + other_credits,
+        "remainingByKind": sorted(by_kind.values(), key=lambda x: -x["remaining"]),
+        "rates": rates,
+        "days": days,
+    }
+
+
+# What a bucket is, in the hotel's words. A bucket whose grant carried its own
+# reason uses that instead — "Launch bonus" beats "Promotional credits".
+KIND_LABEL = {
+    "subscription": "Monthly credits",
+    "promotional": "Bonus credits",
+    "bonus": "Bonus credits",
+    "purchased": "Credits you bought",
+    "trial": "Trial credits",
+    "free": "Free credits",
+    "adjustment": "Adjustment",
+}
+
+
+async def credits_summary(property_id: str, *, days: int = 30) -> dict:
+    """
+    The owner's credit picture. Returns an empty shape when there is no wallet.
+
+    One function so the billing screen and the Owner Copilot cannot disagree
+    about what a hotel has spent — the fastest way to lose an owner's trust in
+    a number is to show them two of it.
+    """
+    account = await account_for_property(property_id)
+    if not account:
+        return {"byChannel": [], "otherCredits": 0, "conversationsTotal": 0,
+                "creditsUsed": 0, "remainingByKind": [],
+                "rates": await run_db(_conversation_rates), "days": days,
+                "balance": 0}
+
+    summary = await run_db(_credits_summary, property_id, account, days)
+    state = await wallet_state(account)
+    summary["balance"] = int((state or {}).get("balance") or 0)
+    return summary

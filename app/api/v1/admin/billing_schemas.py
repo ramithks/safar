@@ -25,6 +25,13 @@ class AdminHotelOut(BaseModel):
     hasMandate: bool = False
     couponCode: str | None = None
     currentPeriodEnd: datetime | None = None
+    startedAt: datetime | None = None
+    # When money last actually arrived, from the ledger. `planStatus` says what
+    # Razorpay thinks; this says when we were last paid, and the two are the
+    # first pair an operator compares when something looks wrong.
+    lastPaidAt: datetime | None = None
+    graceUntil: datetime | None = None
+    cancelAtPeriodEnd: bool = False
     credits: int = 0
     websiteConversations: int = 0
     instagramConversations: int = 0
@@ -116,3 +123,14 @@ class RedemptionOut(BaseModel):
     valuePaise: int = 0
     razorpaySubscriptionId: str | None = None
     redeemedAt: datetime
+
+
+class AuditEntryOut(BaseModel):
+    """One thing a person chose to do to a hotel's money."""
+
+    id: str
+    actor: str
+    action: str
+    reason: str | None = None
+    credits: int | None = None
+    createdAt: datetime

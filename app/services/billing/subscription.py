@@ -187,7 +187,7 @@ def _latest_subscription(property_id: str) -> dict | None:
     """
     rows = (
         get_db().table("subscriptions")
-        .select("*, subscription_plans(code,name,price_paise,billing_period,credit_grant)")
+        .select("*, subscription_plans(code,name,price_paise,billing_period,credit_grant,signup_bonus_credits,signup_bonus_label)")
         .eq("property_id", property_id)
         .order("created_at", desc=True).limit(1)
         .execute().data or []
@@ -198,7 +198,7 @@ def _latest_subscription(property_id: str) -> dict | None:
 def _by_razorpay_id(razorpay_subscription_id: str) -> dict | None:
     rows = (
         get_db().table("subscriptions")
-        .select("*, subscription_plans(code,name,price_paise,credit_grant)")
+        .select("*, subscription_plans(code,name,price_paise,credit_grant,signup_bonus_credits,signup_bonus_label)")
         .eq("razorpay_subscription_id", razorpay_subscription_id)
         .limit(1).execute().data or []
     )
@@ -426,7 +426,9 @@ async def record_charge(
             billing_account_id=account,
             kind="subscription",
             credits=grant_credits,
-            # The whole idempotency argument, in one string.
+            # The whole idempotency argument, in one string. Keyed on the
+            # payment id, so a redelivered event grants nothing and next
+            # month's genuine charge — a different payment — grants again.
             idempotency_key=f"subscription:{razorpay_subscription_id}:{payment_id}",
             source_type="subscription",
             source_id=row["id"],
@@ -442,10 +444,39 @@ async def record_charge(
             grant_credits, account, payment_id, granted.get("duplicate"),
         )
 
+    # ── the launch bonus ────────────────────────────────────────────────────
+    #
+    # Once per hotel, on the first cycle it pays for. The key is the **billing
+    # account**, not the payment, so a hotel that cancels in October and comes
+    # back in December does not collect it a second time — and a redelivered
+    # webhook, which is the common case, grants nothing either.
+    #
+    # Its own bucket kind and its own label, so the hotel's credit history
+    # reads "+2,000 Launch bonus" beside "+3,000 StayOS subscription" rather
+    # than one unexplained 5,000. The two have different lifetimes and an
+    # owner asking "what did I actually buy" needs to see which is which.
+    bonus_amount = int(plan_row.get("signup_bonus_credits") or 0)
+    bonus_label = plan_row.get("signup_bonus_label") or "Launch bonus"
+    bonus = {}
+    if account and bonus_amount > 0:
+        bonus = await billing.grant(
+            billing_account_id=account,
+            kind="promotional",
+            credits=bonus_amount,
+            idempotency_key=f"signup-bonus:{account}",
+            source_type="subscription",
+            source_id=row["id"],
+            actor_type="system",
+            metadata={"reason": bonus_label, "paymentId": payment_id},
+        )
+        if not bonus.get("duplicate"):
+            logger.info("granted %s %s credits to %s", bonus_amount, bonus_label, account)
+
     return {
         "status": "charged",
         "subscription_id": row["id"],
         "credits_granted": 0 if granted.get("duplicate") else grant_credits,
+        "bonus_granted": 0 if (bonus.get("duplicate") or not bonus) else bonus_amount,
         "duplicate": bool(granted.get("duplicate")),
     }
 
@@ -534,6 +565,8 @@ def project(row: dict | None, plan_row: dict) -> dict:
         "pricePaise": int(plan_row.get("price_paise") or 0),
         "billingPeriod": plan_row.get("billing_period") or "monthly",
         "includedCredits": int(plan_row.get("credit_grant") or 0),
+        "signupBonusCredits": int(plan_row.get("signup_bonus_credits") or 0),
+        "signupBonusLabel": plan_row.get("signup_bonus_label") or "Launch bonus",
         "currentPeriodEnd": (row or {}).get("current_period_end"),
         "cancelAtPeriodEnd": bool((row or {}).get("cancel_at_period_end")),
         "couponCode": (row or {}).get("coupon_code"),

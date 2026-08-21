@@ -42,6 +42,17 @@ INSTAGRAM = "instagram"
 # The staff console. A channel with no provider and nothing to send to —
 # see WINDOWLESS below for why it is named here but has no policy row.
 INTERNAL = "internal"
+# The chat on the hotel's own booking page. Also windowless, and for a
+# different reason worth stating: there is no provider *and* no rule to
+# inherit. A 24-hour window exists because Meta bills by one; a guest sitting
+# on a web page can be replied to for as long as the page is open, and after
+# that there is nobody to deliver to at all.
+WEBSITE = "website"
+# A call and an email a member of staff logged against a guest. The database
+# has always allowed both on `conversations.channel`; nothing writes one today,
+# and the moment something does it must not be the Inbox that finds out.
+PHONE = "phone"
+EMAIL = "email"
 
 
 @dataclass(frozen=True)
@@ -145,7 +156,29 @@ _POLICIES = {
 # So the two cases are now distinguishable: a channel in here has no window and
 # says so; a channel in neither place is one nobody has thought about, and that
 # still raises.
-WINDOWLESS = frozenset({INTERNAL})
+# **`website` was the second one, and it broke the same screen.** The website
+# chat was added after this set was written, its conversations carry
+# `channel='website'`, and `list_conversations` walks every row — so a single
+# guest asking a question on a hotel's own booking page made that hotel's
+# Inbox 500 with `no messaging policy for channel 'website'`. The hotel could
+# not read its own guest messages, and the failure was in the screen rather
+# than in the channel that caused it, which is why it survived a launch audit:
+# the conversation worked, the reply was sent, and the Inbox was the only thing
+# that stopped.
+#
+# `phone` and `email` are here for the same reason and were found by writing
+# that test rather than by anybody hitting them: the CHECK on
+# `conversations.channel` has allowed both since it was written, nothing
+# creates one today, and the first hotel to log a phone enquiry would have
+# taken its own Inbox down. Neither carries a window — a call is over when it
+# is over, and an email has no 24-hour rule to inherit.
+#
+# The lesson the `internal` fix half-learned: any channel the *database* can
+# store has to be in `_POLICIES` or in here, and adding one without doing that
+# is a screen-level 500 nobody sees until a guest triggers it.
+# `tests/test_messaging_policy.py` asserts exactly that, against the CHECK
+# constraint's own list.
+WINDOWLESS = frozenset({INTERNAL, WEBSITE, PHONE, EMAIL})
 
 
 def has_window(channel: str | None) -> bool:

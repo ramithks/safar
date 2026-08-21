@@ -34,6 +34,7 @@ from app.services.billing import service as billing_service
 from app.api.v1.admin.billing_schemas import (
     AdminCouponOut,
     AdminHotelOut,
+    AuditEntryOut,
     CouponUpsertRequest,
     CreditAdjustRequest,
     LedgerEntryOut,
@@ -75,10 +76,24 @@ def _hotels(search: str | None, limit: int) -> list[dict]:
 
     subs = {}
     for srow in (db.table("subscriptions")
-                 .select("property_id,status,current_period_end,razorpay_subscription_id,coupon_code")
+                 .select("property_id,status,current_period_end,razorpay_subscription_id,"
+                         "coupon_code,started_at,razorpay_payment_id,grace_until,"
+                         "cancel_at_period_end")
                  .in_("property_id", ids).execute().data or []):
         if srow.get("property_id"):
             subs[srow["property_id"]] = srow
+
+    # When money last arrived. Read from the ledger rather than from the
+    # subscription row, because the row holds only the *latest* payment id and
+    # an operator asking "when did they last pay" means the date.
+    last_paid: dict[str, str] = {}
+    if accounts:
+        for entry in (db.table("credit_ledger")
+                      .select("billing_account_id,created_at,reference_type")
+                      .in_("billing_account_id", accounts)
+                      .eq("reference_type", "subscription")
+                      .order("created_at", desc=True).limit(500).execute().data or []):
+            last_paid.setdefault(entry["billing_account_id"], entry["created_at"])
 
     # Usage this month, by conversation type. One query for every hotel on the
     # page rather than one per hotel: this list is the screen an operator keeps
@@ -111,6 +126,10 @@ def _hotels(search: str | None, limit: int) -> list[dict]:
             "hasMandate": bool(sub.get("razorpay_subscription_id")),
             "couponCode": sub.get("coupon_code"),
             "currentPeriodEnd": sub.get("current_period_end"),
+            "startedAt": sub.get("started_at"),
+            "lastPaidAt": last_paid.get(r.get("billing_account_id")),
+            "graceUntil": sub.get("grace_until"),
+            "cancelAtPeriodEnd": bool(sub.get("cancel_at_period_end")),
             "credits": wallets.get(r.get("billing_account_id"), 0),
             "websiteConversations": u.get("website", 0),
             "instagramConversations": u.get("instagram", 0),
@@ -189,6 +208,40 @@ async def hotel_ledger(
 # ── credits ──────────────────────────────────────────────────────────────────
 
 
+def _audit_for(entity_id: str, limit: int) -> list[dict]:
+    rows = (
+        get_db().table("admin_audit_log")
+        .select("id,actor,action,reason,metadata,created_at")
+        .eq("entity_id", entity_id)
+        .order("created_at", desc=True).limit(limit).execute().data or []
+    )
+    return [{
+        "id": r["id"], "actor": r["actor"], "action": r["action"],
+        "reason": r.get("reason"),
+        "credits": (r.get("metadata") or {}).get("credits"),
+        "createdAt": r["created_at"],
+    } for r in rows]
+
+
+@router.get("/hotels/{billing_account_id}/audit", response_model=list[AuditEntryOut])
+@limiter.limit("60/minute")
+async def hotel_audit(
+    request: Request,
+    billing_account_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    admin: AdminIdentity = Depends(require_admin),
+):
+    """
+    Who touched this hotel's money, and why.
+
+    Separate from the ledger on purpose: the ledger is every movement including
+    the automatic ones, and this is only the ones a person chose to make. When
+    a balance looks wrong the question is almost always "did somebody do this",
+    and forty subscription grants in between make that hard to see.
+    """
+    return await run_db(_audit_for, billing_account_id, limit)
+
+
 @router.post("/credits/adjust", response_model=Ok)
 @limiter.limit("30/minute")
 async def adjust_credits(
@@ -250,7 +303,7 @@ async def adjust_credits(
             actor_type="admin",
             metadata={"by": admin.actor},
         )
-    await admin_audit.record(
+    audited = await admin_audit.record(
         actor=admin.actor,
         action="credits.adjust",
         entity_type="billing_account",
@@ -265,10 +318,19 @@ async def adjust_credits(
             "balanceAfter": result.get("balance_after"),
         },
     )
+    # Said out loud, to the one person who can do something about it.
+    #
+    # The movement has already committed — refusing here would tell the
+    # operator nothing happened when the credits moved, which is the worse of
+    # the two lies. What must not happen is the third thing, which is what
+    # happened for a year: reporting plain success while the trail had a hole
+    # in it and only a log line knew.
+    trail = "" if audited else " (couldn't write the audit trail — tell an engineer)"
+
     if result.get("duplicate"):
-        return Ok(message="Already applied — nothing changed.")
+        return Ok(message=f"Already applied — nothing changed.{trail}")
     verb = "added" if body.credits > 0 else "removed"
-    return Ok(message=f"{abs(body.credits):,} credits {verb}.")
+    return Ok(message=f"{abs(body.credits):,} credits {verb}.{trail}")
 
 
 # ── coupons ──────────────────────────────────────────────────────────────────

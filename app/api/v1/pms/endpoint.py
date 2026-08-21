@@ -100,6 +100,7 @@ from app.api.v1.pms.schemas import (
     WebChatOut,
     WebsiteConfigOut,
     PlanStateOut,
+    CreditsSummaryOut,
     CouponPreviewOut,
     CouponRequest,
     SubscribeRequest,
@@ -3933,6 +3934,24 @@ async def get_plan_state(
     plan_row = await subscription_service.plan()
     row = await subscription_service.current(property_id)
     return PlanStateOut(**subscription_service.project(row, plan_row))
+
+
+@router.get("/properties/{property_id}/credits", response_model=CreditsSummaryOut)
+@limiter.limit("120/minute")
+async def get_credits_summary(
+    request: Request,
+    property_id: str,
+    days: int = Query(default=30, ge=1, le=90),
+    member=Depends(require_member("billing")),
+):
+    """
+    What the hotel has left, where it came from, and what it went on.
+
+    The same function the Owner Copilot calls, so the screen and the answer to
+    "how many credits do I have" cannot disagree — showing an owner two versions
+    of a number is the fastest way to lose their trust in both.
+    """
+    return CreditsSummaryOut(**await billing.credits_summary(property_id, days=days))
 
 
 @router.post("/properties/{property_id}/plan/coupon", response_model=CouponPreviewOut)

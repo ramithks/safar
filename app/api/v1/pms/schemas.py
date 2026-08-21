@@ -929,6 +929,10 @@ class PlanStateOut(BaseModel):
     pricePaise: int
     billingPeriod: str = "monthly"
     includedCredits: int = 0
+    # A one-off bonus on the first paid cycle, configured on the plan row.
+    # Zero means there is no offer running, and the screen says nothing.
+    signupBonusCredits: int = 0
+    signupBonusLabel: str = "Launch bonus"
     currentPeriodEnd: datetime | None = None
     cancelAtPeriodEnd: bool = False
     couponCode: str | None = None
@@ -937,6 +941,40 @@ class PlanStateOut(BaseModel):
     # payment keeps working through its grace period.
     serving: bool = True
     canStart: bool = False
+
+
+class ChannelUsageOut(BaseModel):
+    channel: str
+    conversations: int = 0
+    credits: int = 0
+    # What one conversation costs here today, from the rate card.
+    creditsEach: int = 0
+
+
+class CreditPoolOut(BaseModel):
+    kind: str
+    # Already in the hotel's words — "Monthly credits", "Launch bonus".
+    label: str
+    remaining: int
+
+
+class CreditsSummaryOut(BaseModel):
+    """
+    Where a hotel's credits came from and what they went on.
+
+    Two halves answering two questions: `remainingByKind` is what the hotel was
+    given and still holds, `byChannel` is what it spent and on which guests.
+    A single "credits used" number is true and tells nobody anything.
+    """
+
+    balance: int = 0
+    creditsUsed: int = 0
+    conversationsTotal: int = 0
+    # Staff assists, campaign copy, reports. Real spend, not guest conversations.
+    otherCredits: int = 0
+    byChannel: list[ChannelUsageOut] = []
+    remainingByKind: list[CreditPoolOut] = []
+    days: int = 30
 
 
 class CouponPreviewOut(BaseModel):

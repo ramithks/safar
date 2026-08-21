@@ -742,13 +742,20 @@ async def get_plan_and_credits(args: BillingArgs, ctx: AgentContext) -> dict:
     state = subscription_service.project(
         await subscription_service.current(ctx.property_id), plan_row
     )
-    _, wallet = await billing.wallet_for_property(ctx.property_id)
-    balance = int((wallet or {}).get("balance") or 0)
 
-    # What the balance means in the only unit an owner thinks in. Read from the
-    # live rate card rather than assumed, so a price change moves this number
-    # without anybody remembering to.
-    rates = await run_db(_conversation_rates)
+    # One public door. This reached for `billing._conversation_rates` — a
+    # private function that is not exported from the package — so every call
+    # died with `module 'app.services.billing' has no attribute
+    # '_conversation_rates'` and the copilot answered "I do not know" when an
+    # owner asked about their own bill. The tool swallowed it into a failed
+    # action, which is exactly the shape of failure that survives a test suite:
+    # nothing raised, the turn succeeded, and the answer was wrong.
+    #
+    # `credits_summary` is the same call the billing screen makes, so the two
+    # cannot disagree either.
+    summary = await billing.credits_summary(ctx.property_id, days=30)
+    balance = summary["balance"]
+    rates = summary["rates"]
     cheapest = min([r for r in rates.values() if r > 0], default=0)
 
     return {
@@ -774,19 +781,6 @@ async def get_plan_and_credits(args: BillingArgs, ctx: AgentContext) -> dict:
     }
 
 
-def _conversation_rates() -> dict:
-    """What each channel costs today, from the rate card."""
-    rows = (
-        get_db().table("usage_rate_card")
-        .select("usage_type,credits_per_unit,effective_to")
-        .like("usage_type", "ai.conversation.%").execute().data or []
-    )
-    return {
-        row["usage_type"].rsplit(".", 1)[-1]: int(float(row["credits_per_unit"]))
-        for row in rows if row.get("effective_to") is None
-    }
-
-
 class UsageArgs(BaseModel):
     days: int = Field(default=30, ge=1, le=90,
                       description="How far back to count. Defaults to 30 days.")
@@ -808,52 +802,36 @@ class UsageArgs(BaseModel):
 )
 async def get_ai_usage(args: UsageArgs, ctx: AgentContext) -> dict:
     _require_staff(ctx)
-    rows = await run_db(_usage_rows, ctx.property_id, args.days)
+    from app.services import billing
 
-    by_channel: dict[str, int] = {}
-    credits = 0
-    for row in rows:
-        credits += int(row.get("credits_charged") or 0)
-        usage_type = row["usage_type"]
-        if usage_type.startswith("ai.conversation."):
-            channel = usage_type.rsplit(".", 1)[-1]
-            by_channel[channel] = by_channel.get(channel, 0) + 1
+    # The same function the billing screen calls. Two implementations of "how
+    # many conversations did we have" is two numbers an owner can catch us
+    # disagreeing on.
+    summary = await billing.credits_summary(ctx.property_id, days=args.days)
 
-    # The prices ride along with the counts.
-    #
-    # Asked "what does an Instagram conversation cost me", the model reached
-    # for this tool rather than `get_plan_and_credits`, found no rate in it,
-    # and answered "two credits" — which is the price of a *Meta* messaging
-    # conversation, a different line on a different card, and not what the
-    # hotel pays. The guardrail did not catch it because 2 is below the floor
-    # that stops "2 rooms" being read as money.
-    #
-    # Nothing is fixed by telling the model to call the other tool. What fixes
-    # it is the number being in the tool it actually reaches for.
-    rates = await run_db(_conversation_rates)
     return {
         "days": args.days,
-        "conversationsByChannel": by_channel,
-        "conversationsTotal": sum(by_channel.values()),
-        "creditsUsed": credits,
-        "creditCostPerConversation": rates,
+        "conversationsByChannel": {
+            row["channel"]: row["conversations"] for row in summary["byChannel"]
+        },
+        "creditsByChannel": {
+            row["channel"]: row["credits"] for row in summary["byChannel"]
+        },
+        "conversationsTotal": summary["conversationsTotal"],
+        "creditsUsed": summary["creditsUsed"],
+        # Staff assists and campaign copy — real spend that is not a guest
+        # conversation. Named, because an owner adding the channels up and
+        # missing the total would think we had lost some.
+        "creditsOnStaffAndMarketing": summary["otherCredits"],
+        "creditsRemaining": summary["balance"],
+        "creditCostPerConversation": summary["rates"],
         "instruction": (
             "A conversation is a whole thread with one guest, not one message. "
             "Say so if the owner seems to be counting messages. Costs per "
             "conversation are in creditCostPerConversation — never state one "
-            "from memory."
+            "from memory. WhatsApp is not launched yet, so do not report it "
+            "unless it has conversations."
         ),
     }
 
 
-def _usage_rows(property_id: str, days: int) -> list[dict]:
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    return (
-        get_db().table("usage_events")
-        .select("usage_type,credits_charged")
-        .eq("property_id", property_id)
-        .eq("status", "charged")
-        .gte("created_at", since)
-        .limit(5000)
-        .execute().data or []
-    )

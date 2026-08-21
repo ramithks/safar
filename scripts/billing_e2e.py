@@ -362,27 +362,65 @@ def main():
     section("the charge is what grants the credits")
     payment_id = f"pay_qa_{TAG}"
     before = balance(DEMO)
+    # The launch bonus is once per hotel **ever**, keyed on the billing
+    # account — so on the demo hotel it has already landed on a previous run of
+    # this suite. That is the behaviour, not a problem, and it makes the
+    # stronger assertion the available one: whether it lands depends on whether
+    # this hotel has had it, and both branches are checked below.
+    bonus_already = sql(f"""select count(*) n from credit_ledger l
+                             join properties p on p.billing_account_id = l.billing_account_id
+                             where p.id = '{DEMO}'
+                               and l.idempotency_key like 'signup-bonus:%';""")[0]["n"] > 0
     st, d = deliver("subscription.charged", {"id": mandate, "status": "active"},
                     event_id=f"evt_qa_{TAG}_charge1",
                     payment={"id": payment_id, "amount": 99900},
                     invoice={"id": f"inv_qa_{TAG}"})
     check("the charge is handled", st == 200, f"{st} {d}")
-    granted = balance(DEMO) - before
+    moved = balance(DEMO) - before
+    granted = plan["includedCredits"]
+    configured_bonus = int(plan.get("signupBonusCredits") or 0)
+    bonus = 0 if bonus_already else configured_bonus
     check(f"a month of credits is granted ({granted})",
-          granted == plan["includedCredits"], f"{granted} vs {plan['includedCredits']}")
+          (d or {}).get("credits_granted") == granted, d)
+    check("  and the balance moved by exactly that, plus any first-time bonus",
+          moved == granted + bonus, f"{moved} vs {granted} + {bonus}")
+
+    # The launch bonus rides on the same event and is keyed on the *account*,
+    # so it lands once for this hotel ever — not once per cycle like the
+    # allowance above.
+    if configured_bonus and not bonus_already:
+        check(f"the {plan['signupBonusLabel'].lower()} lands too ({configured_bonus})",
+              (d or {}).get("bonus_granted") == configured_bonus, d)
+    elif configured_bonus:
+        # The stronger assertion, and the one that matters in production: a
+        # hotel that has already had the bonus does not collect it again — not
+        # on a second charge, not on a resubscribe.
+        check("the launch bonus is once per hotel, ever",
+              (d or {}).get("bonus_granted") == 0, d)
+    if configured_bonus:
+        check("  and it is in its own bucket, so the history reads",
+              sql(f"""select count(*) n from credit_buckets b
+                       join credit_wallets w on w.id = b.wallet_id
+                       join properties p on p.billing_account_id = w.billing_account_id
+                       where p.id = '{DEMO}' and b.kind = 'promotional'
+                         and b.metadata->>'reason' = '{plan["signupBonusLabel"]}';""")[0]["n"] >= 1)
 
     st, d = deliver("subscription.charged", {"id": mandate, "status": "active"},
                     event_id=f"evt_qa_{TAG}_charge1_retry",
                     payment={"id": payment_id, "amount": 99900})
     check("a redelivered charge grants nothing",
-          balance(DEMO) - before == granted, balance(DEMO) - before)
+          balance(DEMO) - before == granted + bonus, balance(DEMO) - before)
     check("  and says it was a duplicate", (d or {}).get("duplicate") is True, d)
+    check("  and the bonus is not granted twice",
+          (d or {}).get("bonus_granted") == 0, d)
 
-    st, _ = deliver("subscription.charged", {"id": mandate, "status": "active"},
+    st, d = deliver("subscription.charged", {"id": mandate, "status": "active"},
                     event_id=f"evt_qa_{TAG}_charge2",
                     payment={"id": f"pay_qa_{TAG}_month2", "amount": 99900})
-    check("next month's charge grants again",
-          balance(DEMO) - before == granted * 2, balance(DEMO) - before)
+    check("next month's charge grants the allowance again",
+          (d or {}).get("credits_granted") == granted, d)
+    check("  but not a second launch bonus",
+          (d or {}).get("bonus_granted") == 0, d)
     # `credit_ledger` is append-only — `guard_credit_ledger` refuses a delete,
     # which is the whole point of it. So the extra month is reversed the way an
     # operator would reverse it, which exercises the path that matters.
@@ -390,6 +428,32 @@ def main():
          {"billingAccountId": account_of(DEMO), "credits": -granted,
           "kind": "adjustment", "reason": "QA: second month reversed",
           "reference": f"qa-{TAG}-rev2"}, ADMIN)
+
+    section("what the owner is shown about their credits")
+    st, credits = http(f"{API}/pms/properties/{DEMO}/credits", headers=owner)
+    check("the credit summary answers", st == 200, st)
+    check("its balance is the wallet's", credits.get("balance") == balance(DEMO),
+          f"{credits.get('balance')} vs {balance(DEMO)}")
+    channels = {c["channel"]: c for c in credits.get("byChannel", [])}
+    check("it prices every guest channel from the rate card",
+          channels.get("website", {}).get("creditsEach") == 5
+          and channels.get("instagram", {}).get("creditsEach") == 8,
+          str(channels)[:160])
+    check("and the pools say where the credits came from",
+          any(p["remaining"] > 0 for p in credits.get("remainingByKind", [])),
+          credits.get("remainingByKind"))
+    # Named, when there is any of it left. A spent bonus is legitimately absent
+    # from "what you have left" — it is in the history, which is where a spent
+    # thing belongs.
+    pools = " ".join((p["label"] or "").lower() for p in credits["remainingByKind"])
+    if configured_bonus and not bonus_already:
+        check("  including the launch bonus, named",
+              plan["signupBonusLabel"].lower() in pools, credits["remainingByKind"])
+    if reception:
+        st, _ = http(f"{API}/pms/properties/{DEMO}/credits", headers=reception)
+        check("a receptionist cannot see the hotel's credits", st == 403, st)
+    st, _ = http(f"{API}/pms/properties/{OTHER}/credits", headers=owner)
+    check("and one hotel cannot see another's", st == 404, st)
 
     # ── 8 ────────────────────────────────────────────────────────────────────
     section("a failed payment does not switch the hotel off")
