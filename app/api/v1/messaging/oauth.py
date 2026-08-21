@@ -38,6 +38,7 @@ from app.core.limiter import limiter
 from app.db.client import get_db, run_db
 from app.deps.property import require_member
 from app.services.messaging import store
+from app.services.messaging.crypto import CredentialCryptoError
 from app.services.messaging.instagram import oauth as ig_oauth
 
 logger = logging.getLogger(__name__)
@@ -175,6 +176,26 @@ async def instagram_oauth_callback(
 
     try:
         await run_db(_persist, claims, account)
+    except CredentialCryptoError:
+        # **Retrying cannot help, so the owner must not be told to.**
+        #
+        # This is `MESSAGING_CREDENTIALS_KEY` missing from the deployment: the
+        # consent succeeded, Meta handed us a real token, and we have no key to
+        # encrypt it with. It happened in production and the hotelier tried
+        # three times in thirty-five seconds, because the screen said "please
+        # try again" — which is the correct message for a dropped connection
+        # and a cruel one for a configuration we have not done.
+        #
+        # Logged as an error with the fix in the message, because the person
+        # who can act on it is us and the only place they will look is here.
+        logger.error(
+            "instagram connected for property %s but MESSAGING_CREDENTIALS_KEY is "
+            "not set on this deployment — no hotel can connect a channel until "
+            "it is. Generate one with: python -c \"from cryptography.fernet "
+            "import Fernet; print(Fernet.generate_key().decode())\"",
+            claims.get("p"),
+        )
+        return _back_to_app(instagram="error", reason="save_not_configured")
     except Exception:  # noqa: BLE001
         # The token is valid and we could not keep it. Say so plainly rather
         # than sending the owner back to a screen that claims success.

@@ -12,6 +12,7 @@ async def health_check():
     checks = {
         "redis": _check_redis(),
         "agent_worker": _check_worker(),
+        "channel_credentials": _check_credentials_key(),
         "supabase": await _check_supabase(),
         "google_vision_api": _check_vision_api(),
         "google_places_api": _check_places_api(),
@@ -99,6 +100,40 @@ def _check_worker() -> str:
         return "ok"
     except Exception as e:  # noqa: BLE001
         return f"error: could not reach the worker — {type(e).__name__}: {e}"
+
+
+def _check_credentials_key() -> str:
+    """
+    Can a hotel connect Instagram at all?
+
+    Every per-hotel channel token is Fernet-encrypted before it is stored, so a
+    missing `MESSAGING_CREDENTIALS_KEY` means no hotel can connect a channel —
+    and there is no symptom anywhere until one tries. In production a real
+    hotel completed Instagram's consent screen three times in thirty-five
+    seconds, each time handing us a valid token we then threw away, because the
+    key had never been pasted into the deployment.
+
+    Nothing else would have caught it. The service starts, every screen loads,
+    the OAuth round-trip works, and the failure is in the last step of a flow
+    only a customer performs.
+
+    The key itself is never touched here — `Fernet(key)` validates the format
+    and nothing decrypts, so this cannot leak anything and cannot fail on data.
+    """
+    from app.config import settings
+
+    key = (settings.messaging_credentials_key or "").strip()
+    if not key:
+        return ("error: MESSAGING_CREDENTIALS_KEY is not set — no hotel can "
+                "connect Instagram or WhatsApp on this deployment")
+    try:
+        from cryptography.fernet import Fernet
+
+        Fernet(key.encode())
+        return "ok"
+    except Exception:  # noqa: BLE001
+        return ("error: MESSAGING_CREDENTIALS_KEY is not a valid Fernet key "
+                "(32 url-safe base64-encoded bytes)")
 
 
 def _check_vision_api() -> str:
