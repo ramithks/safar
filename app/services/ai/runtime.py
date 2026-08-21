@@ -39,6 +39,7 @@ from app.db.client import get_db, run_db
 from app.services.ai import classify, model_router, prompts, registry, usage as usage_mod
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import AgentError, ProviderError
+from app.services.ai import guardrails
 from app.services.ai.providers import ModelStep, Provider, for_name
 from app.services.ai.schemas import RunResult, ToolOutcome
 
@@ -281,6 +282,7 @@ async def run_turn(
     seq = 0
     reply: str | None = None
     handoff = False
+    retried_empty = False
     status = "succeeded"
     error: str | None = None
 
@@ -291,6 +293,28 @@ async def run_turn(
             )
             turn_usage.add_tokens(step.tokens_in, step.tokens_out, step.tokens_thought)
             turn_usage.used_model(choice.model)
+
+            # An empty completion: no text, no tool call, no error.
+            #
+            # Twelve turns in three days ended here, and each one showed a
+            # guest "someone will reply shortly" for a question the agent could
+            # have answered — the model simply returned nothing that time.
+            # `vertex.py` retries transport failures across regions, but this is
+            # not one: the call succeeded and came back blank, so nothing below
+            # it has anything to retry.
+            #
+            # Asking again is cheap and usually works, because what failed was
+            # a sample rather than a system. Once per run: a model that answers
+            # empty twice is having a bad minute, and the honest end of that is
+            # a person. The second answer goes through the ordinary path below,
+            # tool calls and all, rather than a shortcut of its own.
+            if not step.wants_tools and not (step.reply or "").strip() and not retried_empty:
+                retried_empty = True
+                logger.info("run %s: empty completion, asking once more", run_id)
+                step = await llm.step(
+                    model=choice.model, messages=messages, tools=tools, params=params
+                )
+                turn_usage.add_tokens(step.tokens_in, step.tokens_out, step.tokens_thought)
 
             if not step.wants_tools:
                 reply = (step.reply or "").strip() or None
@@ -337,6 +361,28 @@ async def run_turn(
             # than a truncated guess.
             logger.warning("run %s hit the tool-turn ceiling", run_id)
             handoff = True
+
+        # Everything the agent has said, checked against everything it did.
+        #
+        # Last thing inside the try, so a fabricated reply is caught whatever
+        # produced it, and before any caller can deliver it. See
+        # services/ai/guardrails — this is where an invented payment link stops
+        # being a thing a guest can tap.
+        if reply and not handoff:
+            verdict = guardrails.check_reply(
+                reply,
+                tool_outputs=outcomes,
+                trusted_hosts=await _trusted_hosts(ctx),
+                history=history or [],
+            )
+            if not verdict.ok:
+                logger.error(
+                    "run %s refused by guardrails: %s | reply=%r",
+                    run_id, verdict.reason, reply[:300],
+                )
+                reply = prompts.handoff_reply(ctx)
+                handoff = True
+                error = f"guardrail: {verdict.reason}"
 
         if handoff:
             status = "escalated"
@@ -452,3 +498,62 @@ def agent_is_handling(conversation: dict) -> bool:
 
 def new_conversation_id() -> str:
     return str(uuid.uuid4())
+
+
+# ── whose links an agent may send ────────────────────────────────────────────
+
+_TRUSTED_HOST_CACHE: dict[str, set[str]] = {}
+
+
+def _read_trusted_hosts(property_id: str) -> set[str]:
+    """
+    The domains this hotel is allowed to point a guest at.
+
+    Three sources, all of them ours or the hotel's own: the app every payment
+    and check-in link lives on, whatever custom domain the hotel has connected
+    to its website, and the website it told Google about. Nothing a model or a
+    guest can influence at request time is in here — that is the point.
+    """
+    from urllib.parse import urlparse
+
+    hosts: set[str] = set()
+
+    for base in (settings.pms_app_url, getattr(settings, "site_url", None)):
+        host = (urlparse(str(base or "")).hostname or "").lower()
+        if host:
+            hosts.add(host)
+
+    db = get_db()
+    site = (
+        db.table("hotel_websites").select("domain")
+        .eq("property_id", property_id).limit(1).execute().data or []
+    )
+    for row in site:
+        host = (urlparse(f"https://{row.get('domain')}").hostname or "").lower()
+        if host:
+            hosts.add(host)
+
+    try:
+        google = (
+            db.table("google_connections").select("website_uri")
+            .eq("property_id", property_id).limit(1).execute().data or []
+        )
+        for row in google:
+            host = (urlparse(str(row.get("website_uri") or "")).hostname or "").lower()
+            if host:
+                hosts.add(host)
+    except Exception:  # noqa: BLE001
+        # A deployment without the Google table is not a reason to refuse every
+        # link a hotel sends.
+        pass
+
+    return hosts
+
+
+async def _trusted_hosts(ctx: AgentContext) -> set[str]:
+    cached = _TRUSTED_HOST_CACHE.get(ctx.property_id)
+    if cached is not None:
+        return cached
+    hosts = await run_db(_read_trusted_hosts, ctx.property_id)
+    _TRUSTED_HOST_CACHE[ctx.property_id] = hosts
+    return hosts

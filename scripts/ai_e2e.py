@@ -523,6 +523,17 @@ if quoted["status"] == "executed":
     check("and giving it back releases the room",
           released and released[0]["status"] != "active", str(released))
 
+# `create_booking` is no longer granted to the Guest agent in production — see
+# `agents/guest.py`: an unattended agent that can both queue a booking and send
+# a payment link has a fork, and it took the wrong one in front of a guest. The
+# tool and its unconditional approval gate are still real, and this suite is the
+# place that proves the gate holds, so the fixture grants it for these two
+# checks and hands it back below.
+sql(f"""insert into public.agent_tools (agent_id, tool_name, enabled)
+        select id, 'create_booking', true from public.agents
+        where property_id = '{PROPERTY}' and agent_type = 'guest'
+        on conflict (agent_id, tool_name) do update set enabled = true;""")
+
 # A booking still needs a person, at any autonomy level.
 result = run(runtime.run_turn(
     fresh_ctx(), "I'll take it",
@@ -538,6 +549,12 @@ check("a booking always waits for a human, even at level 3",
 
 sql(f"""update public.agents set autonomy_level = 2
         where property_id = '{PROPERTY}' and agent_type = 'guest';""")
+
+sql(f"""update public.agent_tools set enabled = false
+        from public.agents a
+        where agent_tools.agent_id = a.id and a.property_id = '{PROPERTY}'
+          and a.agent_type = 'guest' and agent_tools.tool_name = 'create_booking';""")
+
 
 
 # ── tool authorization ───────────────────────────────────────────────────────
@@ -780,6 +797,17 @@ sql(f"""insert into public.agent_permissions (agent_id, scope)
         values ('a9e00000-0000-4000-8000-000000000001', 'rates')
         on conflict do nothing;""")
 
+# `create_booking` is no longer granted to the Guest agent in production — see
+# `agents/guest.py`: an unattended agent that can both queue a booking and send
+# a payment link has a fork, and it took the wrong one in front of a guest. The
+# tool and its unconditional approval gate are still real, and this suite is the
+# place that proves the gate holds, so the fixture grants it for these two
+# checks and hands it back below.
+sql(f"""insert into public.agent_tools (agent_id, tool_name, enabled)
+        select id, 'create_booking', true from public.agents
+        where property_id = '{PROPERTY}' and agent_type = 'guest'
+        on conflict (agent_id, tool_name) do update set enabled = true;""")
+
 # Booking always needs approval, and its quote must still be live.
 booking_proposal = run(runtime.run_turn(
     fresh_ctx(), "I'll take it",
@@ -794,6 +822,13 @@ missing_quote = run(approvals.execute_approved(
 check("a booking against a quote that does not exist is refused",
       not missing_quote.ok and missing_quote.code == "QUOTE_NOT_FOUND",
       f"{missing_quote.code} {missing_quote.detail}")
+
+# Hand the fixture grant back: production does not give the Guest agent
+# `create_booking`, and a suite that leaves it on has changed the hotel.
+sql(f"""update public.agent_tools set enabled = false
+        from public.agents a
+        where agent_tools.agent_id = a.id and a.property_id = '{PROPERTY}'
+          and a.agent_type = 'guest' and agent_tools.tool_name = 'create_booking';""")
 
 print(f"\n{PASS} passed, {FAIL} failed")
 FIXTURE.close()

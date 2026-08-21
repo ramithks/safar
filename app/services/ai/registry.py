@@ -56,6 +56,7 @@ def tool(
     creates_result: bool = False,
     always_requires_approval: bool = False,
     scoped_to_conversation: bool = False,
+    when_deferred: str | None = None,
     precheck: Callable | None = None,
     revalidate: Callable | None = None,
 ) -> Callable:
@@ -85,6 +86,7 @@ def tool(
             creates_result=creates_result,
             always_requires_approval=always_requires_approval,
             scoped_to_conversation=scoped_to_conversation,
+            when_deferred=when_deferred,
             precheck=precheck,
             revalidate=revalidate,
         )
@@ -207,9 +209,22 @@ async def execute(
     if verdict == autonomy.APPROVE:
         # Recorded, queued, and reported honestly to both the model and the
         # guest. Nothing has happened yet and nobody is told it has.
+        #
+        # The audit row and the model are told different things, deliberately.
+        # `refusal_reason` stays the system's own sentence, because that is what
+        # a person reviewing the queue needs. `model_message` carries the
+        # tool's `when_deferred` instead, because the model's only useful
+        # response to "this is queued" is to take the other road — and told the
+        # internal rule instead, it apologises to the guest for it.
         exc = ApprovalRequired(autonomy.explain(spec, ctx))
         out = refusal(exc)
         out.input = args.model_dump(mode="json")
+        out.model_message = spec.when_deferred or (
+            "Not done yet — someone from the hotel has to approve this, which "
+            "is not instant. Do not apologise and do not say it is done. Tell "
+            "the guest it has gone to the team, and offer anything else you "
+            "can do right now."
+        )
         return out
 
     # Between the proposal and the approval, the hotel moved. Checked here

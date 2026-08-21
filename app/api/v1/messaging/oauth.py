@@ -30,6 +30,7 @@ import logging
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, status
+from pydantic import BaseModel
 from fastapi.responses import RedirectResponse
 
 from app.config import settings
@@ -184,6 +185,220 @@ async def instagram_oauth_callback(
     logger.info("instagram connected: property=%s account=%s (@%s)",
                 claims.get("p"), account.instagram_account_id, account.username)
     return _back_to_app(instagram="connected", account=account.username or "")
+
+
+# ── the Channels screen ─────────────────────────────────────────────────────
+
+
+class ChannelOut(BaseModel):
+    """
+    One row on the Channels screen.
+
+    Everything here is already in a hotelier's words. There is no slug, no
+    provider name and no status code, because this response *is* what gets
+    rendered — a screen that has to translate a backend enum into a sentence is
+    a screen where the two drift apart.
+    """
+
+    id: str
+    name: str
+    # live · connected · action_needed · coming_soon · not_connected
+    state: str
+    headline: str
+    detail: str
+    # What the button says, or null when there is nothing to press.
+    action: str | None = None
+    # Where an already-live channel can be seen.
+    url: str | None = None
+
+
+class ChannelsOut(BaseModel):
+    channels: list[ChannelOut]
+    # "Your AI employee is answering in 2 places."
+    liveCount: int
+
+
+@router.get("/properties/{property_id}/channels", response_model=ChannelsOut)
+@limiter.limit("120/minute")
+async def get_channels(
+    request: Request,
+    property_id: str,
+    member=Depends(require_member("messaging")),
+):
+    """
+    Everywhere this hotel's AI employee can meet a guest, and whether it does.
+
+    One call for one screen, deliberately. The alternative was four reads the
+    client stitches together, which is four loading states, four failure modes
+    and four chances for the screen to say "Instagram: —" while it waits.
+
+    **A channel that is not available yet says so honestly.** WhatsApp is not
+    an error and is not "disconnected"; it is coming, and the row says that.
+    Showing a red disconnected badge for something a hotel cannot connect yet
+    teaches an owner their setup is broken.
+    """
+
+    def _read() -> dict:
+        db = get_db()
+        site = (
+            db.table("hotel_websites")
+            .select("status,domain,travbuddy_path")
+            .eq("property_id", property_id).limit(1).execute().data or []
+        )
+        instagram = (
+            db.table("instagram_connections")
+            .select("username,status,is_sandbox,last_error")
+            .eq("property_id", property_id).limit(1).execute().data or []
+        )
+        prop = (
+            db.table("properties").select("slug")
+            .eq("id", property_id).limit(1).execute().data or [{}]
+        )[0]
+        # Not read at all while Google is out of launch scope — see
+        # `settings.enable_google_business_profile`. A deployment that has
+        # never had the table should not be paying a failed query per screen
+        # load to find that out.
+        google: list[dict] = []
+        if settings.enable_google_business_profile:
+            try:
+                google = (
+                    db.table("google_connections")
+                    .select("status,location_title,is_verified,average_rating,review_count")
+                    .eq("property_id", property_id).limit(1).execute().data or []
+                )
+            except Exception:  # noqa: BLE001
+                google = []
+        return {
+            "site": site[0] if site else None,
+            "instagram": instagram[0] if instagram else None,
+            "google": google[0] if google else None,
+            "slug": prop.get("slug") or "",
+        }
+
+    found = await run_db(_read)
+    base = settings.pms_app_url.rstrip("/")
+    channels: list[ChannelOut] = []
+
+    # ── the hotel's own website ──
+    site = found["site"]
+    if site and site.get("status") == "published":
+        # A custom domain wins; otherwise the path the website service wrote at
+        # publish time; otherwise the slug. Three fallbacks because a hotel that
+        # is live must always have somewhere to click through to.
+        path = site.get("travbuddy_path") or f"/stay/{found['slug']}"
+        live_url = f"https://{site['domain']}" if site.get("domain") else f"{base}{path}"
+        # The headline is the address, not the word "Live" — the badge beside it
+        # already says that, and what an owner actually wants to read here is
+        # where their site is.
+        shown = site["domain"] if site.get("domain") else live_url.split("://", 1)[-1]
+        channels.append(ChannelOut(
+            id="website", name="Hotel website", state="live",
+            headline=shown,
+            detail="Guests can browse rooms, ask questions and book direct.",
+            action="View site", url=live_url,
+        ))
+    else:
+        channels.append(ChannelOut(
+            id="website", name="Hotel website", state="not_connected",
+            headline="Not published yet",
+            detail="Publish your website and guests can book you direct, with your "
+                   "AI employee answering on the page.",
+            action="Set up website",
+        ))
+
+    # ── Instagram ──
+    instagram = found["instagram"]
+    if instagram and instagram.get("status") == "connected" and not instagram.get("is_sandbox"):
+        handle = instagram.get("username")
+        channels.append(ChannelOut(
+            id="instagram", name="Instagram", state="connected",
+            headline=f"@{handle}" if handle else "Your Instagram account",
+            detail="Your AI employee answers Instagram messages.",
+            action="Disconnect",
+        ))
+    elif instagram and instagram.get("status") not in (None, "connected"):
+        channels.append(ChannelOut(
+            id="instagram", name="Instagram", state="action_needed",
+            headline="Needs reconnecting",
+            detail=instagram.get("last_error")
+                   or "Instagram messages aren't reaching your AI employee. Reconnect to fix it.",
+            action="Reconnect",
+        ))
+    else:
+        channels.append(ChannelOut(
+            id="instagram", name="Instagram", state="not_connected",
+            headline="Not connected",
+            detail="Connect the account guests already message you on.",
+            action="Connect Instagram",
+        ))
+
+    # ── Google Business Profile ──
+    #
+    # Written, tested, and not shown. StayOS launches on the two channels a
+    # hotel can switch on for itself; Google needs an approved access request
+    # from us before a review reply or a post works at all, so a row here would
+    # be a Connect button leading to a wall. It is not listed as "coming soon"
+    # either — a hotelier weighing this product up is not asking about Google,
+    # and a soon that has no date is noise on the one screen that should read
+    # as a short, finishable list.
+    if settings.enable_google_business_profile:
+        google = found["google"]
+        state = (google or {}).get("status")
+        if state == "connected":
+            rating = (google or {}).get("average_rating")
+            count = (google or {}).get("review_count")
+            detail = "Manage your Google presence and reply to reviews from here."
+            if rating and count:
+                detail = f"{rating}★ from {count} reviews. Reply to them from here."
+            channels.append(ChannelOut(
+                id="google", name="Google Business Profile", state="connected",
+                headline=google.get("location_title") or "Connected",
+                detail=detail, action="Manage",
+            ))
+        elif state == "pending":
+            channels.append(ChannelOut(
+                id="google", name="Google Business Profile", state="action_needed",
+                headline="Almost there",
+                detail="Choose which of your Google listings is this hotel.",
+                action="Choose listing",
+            ))
+        elif state == "error":
+            channels.append(ChannelOut(
+                id="google", name="Google Business Profile", state="action_needed",
+                headline="Needs reconnecting",
+                detail="Your Google connection has expired. Reconnect it and we'll pick up "
+                       "where we left off.",
+                action="Reconnect",
+            ))
+        else:
+            channels.append(ChannelOut(
+                id="google", name="Google Business Profile", state="not_connected",
+                headline="Not connected",
+                detail="Travellers find you on Google. Reply to reviews and post offers "
+                       "without leaving StayOS.",
+                action="Connect Google",
+            ))
+
+    # ── not yet ──
+    #
+    # Listed rather than hidden. A hotelier deciding whether to move their
+    # enquiries here is asking "will this cover WhatsApp?", and the honest
+    # answer is "soon" — an absent row reads as "never".
+    channels.append(ChannelOut(
+        id="whatsapp", name="WhatsApp", state="coming_soon",
+        headline="Launching soon",
+        detail="Your AI employee will answer WhatsApp messages too.",
+    ))
+    channels.append(ChannelOut(
+        id="messenger", name="Facebook Messenger", state="coming_soon",
+        headline="Coming soon",
+        detail="One AI employee, more places to meet your guests.",
+    ))
+
+    return ChannelsOut(
+        channels=channels,
+        liveCount=sum(1 for c in channels if c.state in ("live", "connected")),
+    )
 
 
 # ── deauthorize and data deletion ───────────────────────────────────────────

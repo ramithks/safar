@@ -267,3 +267,51 @@ def _agent_type(agent_id: str) -> str | None:
         return rows[0]["agent_type"] if rows else None
     except Exception:  # noqa: BLE001
         return None
+
+
+# ── what an owner reads instead of the audit line ────────────────────────────
+#
+# `autonomy.explain()` writes the precise sentence: "create_booking needs
+# autonomy 3 (transactional within limits); this agent is at 2 (safe
+# operational actions)". That belongs in the record, and it belonged on the
+# approvals screen for as long as nobody looked at the approvals screen as a
+# hotel owner. It names a function, a ladder and two rungs of a scale nothing
+# else in the product mentions.
+#
+# So the audit keeps its sentence and the owner gets one about their hotel. The
+# tool is what they actually care about — "the AI wants to take a booking" —
+# and the reason is always the same underneath: it is not allowed to on its
+# own, and they are being asked.
+
+ACTION_WORDS: dict[str, str] = {
+    "create_booking": "take a booking",
+    "create_booking_payment_link": "send a payment link",
+    "create_payment_link": "send a payment link",
+    "post_folio_charge": "add a charge to a guest's bill",
+    "propose_rate_exception": "give a discount bigger than its limit",
+    "execute_campaign": "send a campaign to your guests",
+    "check_in": "check a guest in",
+    "check_out": "check a guest out",
+    "order_service": "order an extra for a guest",
+    "create_task": "raise a job for your team",
+    "assign_task": "assign a job",
+    "set_room_status": "change a room's status",
+    "send_message": "send a message to a guest",
+    "release_hold": "release a held room",
+}
+
+
+def why_waiting(tool: str, status: str) -> str | None:
+    """
+    One sentence, for the person who has to say yes or no.
+
+    Returns None for anything that is not waiting — a finished action needs no
+    explanation, and inventing one would put a sentence under every row.
+    """
+    if status != "awaiting_approval":
+        return None
+    what = ACTION_WORDS.get(tool)
+    if not what:
+        # An unmapped tool still gets a true sentence rather than its own name.
+        return "Your AI employee needs your approval before it can do this."
+    return f"Your AI employee wants to {what}, and needs your approval first."

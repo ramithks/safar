@@ -520,6 +520,12 @@ async def _revalidate_execute(args: "CampaignRef", ctx: AgentContext) -> None:
     # outbound — which is the one capability nobody should acquire by turning a
     # dial they were told was about speed.
     always_requires_approval=True,
+    when_deferred=(
+        "Nothing was sent and no guest has been messaged. A manager sends "
+        "campaigns, always. Say it is with them for approval and stop there — "
+        "do not offer to send it another way, and do not treat this as a "
+        "failure to report."
+    ),
     precheck=_precheck_execute,
     revalidate=_revalidate_execute,
 )

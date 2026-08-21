@@ -22,7 +22,7 @@ save must not be a publish. Two rows would be a second answer to "is this
 property live"; two tables would be worse.
 """
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
 
@@ -74,6 +74,10 @@ def _normalise(draft: dict, existing: dict) -> dict:
     to the public, and a field nobody designed is a field nobody escaped.
     """
     out = dict(existing or {})
+    # `domain` is deliberately absent from this list and always was — which is
+    # why the builder's old "Custom domain" box silently discarded what was
+    # typed into it. It is not draft content: it is a claim that has to be
+    # proved, so it has its own routes and its own state. See services/pms/domains.
     for key in ("headline", "tagline", "about", "accentColor",
                 "heroImageUrl", "contactPhone", "contactEmail"):
         if key in draft:
@@ -142,6 +146,42 @@ def _ensure(property_id: str) -> dict:
 
 async def get_config(property_id: str) -> dict:
     return await run_db(_ensure, property_id)
+
+
+def _direct_30d(property_id: str) -> dict:
+    """
+    What the hotel's own site has actually sold in the last 30 days.
+
+    **Bookings and money, and deliberately not page views.** The builder used to
+    show a "Performance" card with Views, Bookings and a conversion rate; none
+    of the three were ever sent by this service, so `site.views30d` was
+    `undefined` in the browser and `.toLocaleString()` on it took the whole
+    Website screen down with a React error boundary. The screen worked in
+    development because the seed data had the fields.
+
+    The repair is not to start sending a views number. Nothing counts visitors
+    to `/stay/[slug]` — there is no analytics on that page — so any figure here
+    would be invented, and a conversion rate built on an invented denominator
+    is worse than no card at all. Bookings and revenue are rows in a table.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=30)).date().isoformat()
+    rows = (
+        get_db().table("reservations")
+        .select("total_paise,status,created_at")
+        .eq("property_id", property_id)
+        .eq("source", "direct")
+        .gte("created_at", since)
+        .execute().data or []
+    )
+    live = [r for r in rows if r.get("status") not in ("cancelled", "no_show")]
+    return {
+        "directBookings30d": len(live),
+        "directRevenue30dPaise": sum(int(r.get("total_paise") or 0) for r in live),
+    }
+
+
+async def direct_30d(property_id: str) -> dict:
+    return await run_db(_direct_30d, property_id)
 
 
 def _save(property_id: str, template: str | None, draft: dict) -> dict:
@@ -236,7 +276,11 @@ def project(row: dict, *, slug: str | None = None) -> dict:
             if (slug or row.get("property_slug"))
             else row.get("travbuddy_path") or ""
         ),
-        "domain": row.get("domain"),
+        # Only a domain that actually resolves. A pending one is a claim, not
+        # an address, and printing it as "Live at grandhotel.com" while the
+        # DNS is still missing is the screen telling an owner their site is
+        # somewhere it is not. The claim itself lives in `customDomain`.
+        "domain": row.get("domain") if row.get("domain_status") == "verified" else None,
         "headline": draft.get("headline") or "",
         "tagline": draft.get("tagline") or "",
         "about": draft.get("about") or "",
@@ -248,6 +292,17 @@ def project(row: dict, *, slug: str | None = None) -> dict:
         "contactEmail": draft.get("contactEmail"),
         "sections": draft.get("sections") or [],
         "publishedAt": row.get("published_at"),
+        # The claim and its state, so the builder can render the setup steps
+        # without a second round trip. The DNS lookup is not done here — that
+        # is `/website/domain`, which an owner asks for by opening the panel.
+        "customDomain": {
+            "status": row.get("domain_status") or "none",
+            "domain": row.get("domain"),
+            "verifiedAt": row.get("domain_verified_at"),
+            "checkedAt": row.get("domain_checked_at"),
+            "error": row.get("domain_error"),
+            "records": [],
+        },
         # Whether the draft has moved since the last publish. What it drives is
         # a "you have unpublished changes" line, which is the one thing a
         # builder must tell somebody who thinks they have already shipped.

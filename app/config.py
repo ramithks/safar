@@ -177,6 +177,45 @@ class Settings(BaseSettings):
     # boundary rather than silently falling back to storing them in the clear.
     messaging_credentials_key: Optional[str] = None
 
+    # ── Google Business Profile ─────────────────────────────────────────────
+    #
+    # **Off, and off is the launch decision rather than an accident.** StayOS
+    # launches on two channels a hotel can switch on by itself today — its own
+    # website and Instagram. Google is written, tested and dormant: it needs a
+    # Cloud OAuth client and an approved Google access request before reviews
+    # or posts work at all, and a Connect button that leads to a wall is worse
+    # for a new hotel than a channel that is simply not there yet.
+    #
+    # The flag gates the routes (api/v1/router.py) and the Channels row
+    # (api/v1/messaging/oauth.py) from one place, so switching it on is the
+    # whole of turning the feature on. Nothing was deleted; nothing is shown.
+    enable_google_business_profile: bool = False
+
+    #
+    # A standard Google Cloud OAuth **web application** client — not the service
+    # account in GOOGLE_SERVICE_ACCOUNT_JSON. The two are not interchangeable:
+    # a Business Profile is owned by a person, and only that person's consent
+    # can let us answer a review under the hotel's name. A service account has
+    # no listings and never will.
+    google_oauth_client_id: Optional[str] = None
+    google_oauth_client_secret: Optional[str] = None
+
+    # Byte-for-byte equal to an "Authorised redirect URI" on the OAuth client,
+    # for the same reason the Instagram one is: Google compares the string.
+    google_oauth_redirect_uri: str = (
+        "https://stayos-backend.travbuddy.in/api/v1/google/oauth/callback"
+    )
+
+    # One scope, and it is the only one Business Profile publishes. There is no
+    # narrower read-only variant to prefer — `business.manage` is least
+    # privilege here because it is the whole list.
+    google_oauth_scopes: str = "https://www.googleapis.com/auth/business.manage"
+
+    # Google's access tokens last an hour. Refresh a little early so a call that
+    # takes a moment to reach Google is not holding a token that expires in
+    # flight.
+    google_token_refresh_skew_seconds: int = 300
+
     # The controlled smoke test, and only the controlled smoke test.
     #
     # Deliberately singular. `scripts/meta_smoke.py` messages exactly this

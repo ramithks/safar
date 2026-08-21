@@ -82,6 +82,93 @@ def load_token(credentials_ref: str, channel: str) -> str | None:
         return None
 
 
+def load_refresh_token(credentials_ref: str, channel: str) -> str | None:
+    """
+    The decrypted refresh token for a ref, or None.
+
+    Separate from `load_token` and deliberately not expiry-checked. A Google
+    access token expires every hour and the refresh token is what survives that
+    — refusing to hand it back because the *access* token beside it has gone
+    stale would make the one credential that can fix the problem unreachable at
+    exactly the moment it is needed.
+
+    Only `status` gates it, because a revoked credential must stay dead.
+    """
+    if not is_db_ref(credentials_ref):
+        return None
+
+    db = get_db()
+    row = (
+        db.table(TABLE)
+        .select("refresh_token_ciphertext,status")
+        .eq("channel", channel)
+        .eq("credentials_ref", credentials_ref)
+        .limit(1)
+        .execute()
+    )
+    if not row.data:
+        return None
+
+    record = row.data[0]
+    if record.get("status") != "active":
+        return None
+
+    ciphertext = record.get("refresh_token_ciphertext")
+    if not ciphertext:
+        return None
+
+    try:
+        return crypto.decrypt(ciphertext)
+    except crypto.CredentialCryptoError:
+        logger.exception("could not decrypt refresh token for %s", credentials_ref)
+        return None
+
+
+def update_access_token(
+    *,
+    channel: str,
+    credentials_ref: str,
+    access_token: str,
+    expires_in: int | None,
+    refresh_token: str | None = None,
+) -> bool:
+    """
+    Replace only the access token on an existing credential.
+
+    A refresh is not a reconnection, and must not be written as one. `save_token`
+    upserts the whole row, so calling it on the hourly Google refresh would
+    overwrite `external_account_id`, `scopes` and `partner_id` with whatever the
+    refresh response happened to contain — which for `external_account_id` is
+    nothing. This touches the three columns a refresh actually changes and
+    leaves the identity of the credential alone.
+    """
+    expires_at = None
+    if expires_in:
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))).isoformat()
+
+    patch = {
+        "access_token_ciphertext": crypto.encrypt(access_token),
+        "token_expires_at": expires_at,
+        "last_refreshed_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Google normally omits this on refresh, but rotates it occasionally. When
+    # it does arrive it is the new credential and the old one stops working.
+    if refresh_token:
+        patch["refresh_token_ciphertext"] = crypto.encrypt(refresh_token)
+
+    db = get_db()
+    result = (
+        db.table(TABLE)
+        .update(patch)
+        .eq("channel", channel)
+        .eq("credentials_ref", credentials_ref)
+        .eq("status", "active")
+        .execute()
+    )
+    return bool(result.data)
+
+
 def save_token(
     *,
     channel: str,
@@ -92,8 +179,18 @@ def save_token(
     expires_in: int | None,
     scopes: tuple[str, ...] | list[str] | None,
     external_account_id: str | None,
+    refresh_token: str | None = None,
 ) -> dict:
-    """Store (or replace) the token for a ref. Reconnecting overwrites."""
+    """
+    Store (or replace) the token for a ref. Reconnecting overwrites.
+
+    `refresh_token` is optional and, when omitted, **the stored one is left
+    alone**. That is not a convenience — it is required for correctness on
+    Google. Google returns a refresh token on the first consent and omits it on
+    every subsequent refresh, so writing `None` through on a routine hourly
+    refresh would erase the only credential that can perform the next one, and
+    the hotel would silently drop off Google an hour later.
+    """
     expires_at = None
     if expires_in:
         expires_at = (datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))).isoformat()
@@ -112,6 +209,8 @@ def save_token(
         "last_refreshed_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    if refresh_token:
+        payload["refresh_token_ciphertext"] = crypto.encrypt(refresh_token)
 
     db = get_db()
     result = (

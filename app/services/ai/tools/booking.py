@@ -104,6 +104,26 @@ async def _revalidate_booking(args: "BookingArgs", ctx: AgentContext) -> None:
     # will not be the first hotel to try it, and the queue costs a manager ten
     # seconds against a booking they cannot un-take.
     always_requires_approval=True,
+    # And this is the sentence that keeps the gate from reading as a fault.
+    #
+    # Because the flag above is unconditional, *every* guest who says "book it"
+    # lands here. Told only that approval was required, the model apologised —
+    # "I'm sorry, I wasn't able to book the room directly" — and a guest who
+    # had just been quoted a real price heard the hotel's own safety rule as
+    # the hotel being unable to sell them a room.
+    #
+    # There is nothing to be sorry about: the guest can pay right now, and
+    # paying is what confirms a booking anyway. So the deferral points at the
+    # road that works instead of describing the one that is closed.
+    when_deferred=(
+        "Nothing is booked and no room is held. Do NOT apologise and do NOT "
+        "say the booking failed — a hotel confirms on payment. Call "
+        "create_booking_payment_link for this same quote and give the guest "
+        "the link. Tell them the room is confirmed once the payment goes "
+        "through; do NOT tell them it is reserved, held or booked before "
+        "then, because it is not and somebody else may take it. Only if that "
+        "also refuses should you hand over to the team."
+    ),
 )
 async def create_booking(args: BookingArgs, ctx: AgentContext) -> tuple[dict, str]:
     ceiling = ctx.limits.get("max_booking_value_paise")
@@ -222,3 +242,129 @@ async def release_hold(args: HoldArgs, ctx: AgentContext) -> tuple[dict, str]:
             "I couldn't find that reservation hold.",
         )
     return {"released": True, "holdId": args.hold_id}, args.hold_id
+
+
+# ── closing the sale ─────────────────────────────────────────────────────────
+
+
+class BookingPaymentLinkArgs(BaseModel):
+    quote_id: str = Field(description="The quote the guest agreed to.")
+    guest_name: str = Field(
+        min_length=1, max_length=120,
+        description="The guest's full name, as they gave it.",
+    )
+    guest_phone: str | None = Field(
+        default=None, max_length=32,
+        description="Their phone number, if they have given one.",
+    )
+    guest_email: str | None = Field(
+        default=None, max_length=200,
+        description="Their email, if they have given one.",
+    )
+
+
+@tool(
+    name="create_booking_payment_link",
+    description=(
+        "Take payment for a quote the guest has agreed to, when they do NOT "
+        "already have a booking. Returns a link: the guest taps it, pays by "
+        "UPI, card or netbanking, and the booking is confirmed automatically "
+        "the moment the payment goes through. Use this for 'book it', 'yes "
+        "please', 'how do I pay' on a new stay. Get a quote first. Does NOT "
+        "confirm anything by itself — tell the guest their booking is confirmed "
+        "once they have paid, never because they say they have."
+    ),
+    input_model=BookingPaymentLinkArgs,
+    # `rates`, matching `create_payment_link`. Asking for money against a price
+    # this agent was allowed to quote is part of selling a stay.
+    permission="rates",
+    # Selling, so the same floor as `get_quote` and `create_booking`. A hotel at
+    # level 2 gets an approval request, which is the same answer it gets today.
+    autonomy_floor=3,
+    mutating=True,
+    usage_type="ai.tool_write",
+    result_type="payment_link",
+    # Deliberately NOT `always_requires_approval`, and this is the one place in
+    # the system where that asymmetry is load-bearing, so it is worth stating.
+    #
+    # `create_booking` carries it because it takes a room off sale on a model's
+    # say-so, before any money has moved, and nobody can un-take a night. This
+    # tool takes no inventory at all: it raises a Razorpay order, and the
+    # reservation is created by `_fulfil_booking` only after a signed webhook
+    # says the guest has paid — the identical unattended path the hotel's own
+    # booking page has always used. A guest who never pays costs a held quote
+    # that expires by itself.
+    #
+    # Requiring approval here would mean a manager has to press a button before
+    # a guest is allowed to *give the hotel money*, which is not a safety
+    # property. It is the thing that stopped the AI employee closing a sale.
+    always_requires_approval=False,
+)
+async def create_booking_payment_link(
+    args: BookingPaymentLinkArgs, ctx: AgentContext
+) -> tuple[dict, str]:
+    from app.services.pms import quote_payment
+
+    try:
+        link = await quote_payment.create_link(
+            property_id=ctx.property_id,
+            partner_id=ctx.partner_id,
+            quote_id=args.quote_id,
+            guest_name=args.guest_name,
+            guest_phone=args.guest_phone or ctx.guest_phone,
+            guest_email=args.guest_email,
+            source=ctx.channel,
+        )
+    except quote_payment.QuotePaymentError as exc:
+        # Already written for a guest to read — see the module. Raised as
+        # OutOfScope so the runtime hands the sentence to the model rather than
+        # turning it into a failed run the guest sees nothing from.
+        raise OutOfScope(f"quote {args.quote_id}: {exc}", str(exc)) from exc
+
+    # Three amounts, and only one of them is what the link charges.
+    #
+    # The first version returned `amountText`, `totalText` and `balanceText` as
+    # a flat set with an instruction to "give the guest the link and the
+    # amount". The model picked the total. A guest was told
+    #
+    #     Please use this link to complete your booking for ₹7,168
+    #
+    # and the page it opened asked for ₹1,434, because this property takes a
+    # deposit and the rest is paid at the hotel. Both numbers were correct and
+    # the sentence was wrong, which is the worst of the three possibilities —
+    # a guest who spots it thinks they are being overcharged, and a guest who
+    # does not thinks their stay is paid for.
+    #
+    # So the ready sentence is built here, where the numbers are, and the
+    # instruction is to use it rather than to compose one. The fields stay for
+    # a question like "what's the total?", which the model should still be able
+    # to answer without another tool call.
+    amount_text = f"₹{link.amount_paise / 100:,.0f}"
+    total_text = f"₹{link.total_paise / 100:,.0f}"
+    due_at_hotel = link.total_paise - link.amount_paise
+
+    if due_at_hotel > 0:
+        say = (
+            f"{amount_text} to confirm now, and the balance of "
+            f"₹{due_at_hotel / 100:,.0f} at the hotel — total {total_text}."
+        )
+    else:
+        say = f"{amount_text}, which is the full amount."
+
+    return (
+        {
+            "payUrl": link.pay_url,
+            "sayThis": say,
+            "payNowText": amount_text,
+            "payNowPaise": link.amount_paise,
+            "totalText": total_text,
+            "dueAtHotelText": f"₹{due_at_hotel / 100:,.0f}",
+            "instruction": (
+                "Send the guest the payUrl and say sayThis, close to word for "
+                "word. The link charges payNowText and nothing else — never "
+                "tell them to pay totalText through it. Say the booking is "
+                "confirmed as soon as the payment goes through."
+            ),
+        },
+        link.order_id,
+    )

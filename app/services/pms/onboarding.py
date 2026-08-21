@@ -32,6 +32,7 @@ check that matters lives where the typing happens.
 """
 import asyncio
 import logging
+from datetime import datetime, timezone
 import re
 import unicodedata
 
@@ -160,6 +161,41 @@ def _create_hotel(
             .data[0]["id"]
         )
         created_partner = True
+
+    # The owner's own staff row.
+    #
+    # `deps/property._load` and `workspace._memberships_for` both fall back to
+    # `partners.owner_id`, so an owner without this row can still work — which
+    # is exactly why its absence went unnoticed. What it broke was quieter:
+    # the Staff screen reads `partner_members`, so every hotel that signed up
+    # through this route showed a team with nobody in it, not even the person
+    # reading the screen, and "Add your first staff member" as the only thing
+    # on it. Three hotels in production are in that state.
+    #
+    # Written after the partner exists and before anything else, upserted on
+    # the (partner, profile) pair so the double-tap path does not make a
+    # second one. A failure here must not fail a signup — the fallback is
+    # still there and the hotel is still usable.
+    try:
+        db.table("partner_members").upsert(
+            {
+                "partner_id": partner_id,
+                "profile_id": profile_id,
+                "role": "owner",
+                # Empty means every property this partner has, now and later.
+                # Naming the property here would silently exclude the owner
+                # from their own second hotel.
+                "property_ids": [],
+                "status": "active",
+                "accepted_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="partner_id,profile_id",
+        ).execute()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "could not write the owner's member row for partner %s", partner_id,
+            exc_info=True,
+        )
 
     # A partner who already has a property is finished here — this is the
     # double-tap path, and making a second hotel would be the wrong repair.

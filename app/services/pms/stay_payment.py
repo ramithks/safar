@@ -50,6 +50,12 @@ class PaymentRequestError(Exception):
 class PaymentRequest:
     reservation_id: str
     ref: str
+    # Our own `payment_orders.id`, and separate from Razorpay's on purpose.
+    # `agent_actions.result_id` is a uuid column, so an AI-issued link that
+    # reported Razorpay's `order_XXXX` there failed the insert every time — the
+    # link worked and the audit row silently did not exist. There were zero
+    # `payment_link` actions in production for exactly that reason.
+    order_id: str
     razorpay_order_id: str
     amount_paise: int
     balance_paise: int
@@ -171,6 +177,7 @@ async def create_request(
         return PaymentRequest(
             reservation_id=reservation_id,
             ref=reservation["ref"],
+            order_id=existing["id"],
             razorpay_order_id=existing["razorpay_order_id"],
             amount_paise=wanted,
             balance_paise=balance,
@@ -189,7 +196,7 @@ async def create_request(
     )
 
     try:
-        await run_db(
+        written = await run_db(
             _insert_order,
             {
                 "razorpay_order_id": order["id"],
@@ -219,6 +226,7 @@ async def create_request(
         return PaymentRequest(
             reservation_id=reservation_id,
             ref=reservation["ref"],
+            order_id=other["id"],
             razorpay_order_id=other["razorpay_order_id"],
             amount_paise=wanted,
             balance_paise=balance,
@@ -232,6 +240,7 @@ async def create_request(
     return PaymentRequest(
         reservation_id=reservation_id,
         ref=reservation["ref"],
+        order_id=written["id"],
         razorpay_order_id=order["id"],
         amount_paise=wanted,
         balance_paise=balance,

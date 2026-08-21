@@ -170,7 +170,10 @@ def test_asking_twice_returns_the_same_link(monkeypatch, razorpay_on):
     the room twice. An open link for the same amount is reused, and Razorpay is
     never called a second time.
     """
-    open_order = {"razorpay_order_id": "order_EXISTING", "status": "created",
+    # `id` is the row's own primary key, which is what the agent's action row
+    # records — Razorpay's `order_XXXX` is not a uuid and the insert rejected it.
+    open_order = {"id": "11111111-1111-4111-8111-111111111111",
+                  "razorpay_order_id": "order_EXISTING", "status": "created",
                   "amount_paise": 800_000, "reservation_id": "res-1"}
     monkeypatch.setattr(stay_payment, "get_db",
                         lambda: fake_db(RESERVATION, open_order=open_order))
@@ -179,6 +182,7 @@ def test_asking_twice_returns_the_same_link(monkeypatch, razorpay_on):
         property_id="prop-1", reservation_id="res-1",
     ))
     assert request.razorpay_order_id == "order_EXISTING"
+    assert request.order_id == "11111111-1111-4111-8111-111111111111"
     assert razorpay_on == {}, "Razorpay was called for a link that already existed"
 
 
@@ -217,16 +221,33 @@ def test_no_tool_anywhere_can_mark_a_stay_paid():
         assert spec.permission != "folio", f"{name} can change a guest's bill"
 
 
-def test_ordering_an_extra_needs_a_higher_autonomy_than_answering():
+def test_an_extra_is_sold_from_a_price_list_and_a_bill_charge_is_not():
     """
-    Putting a charge on somebody's bill is not the same act as telling them the
-    check-in time. At the guest agent's shipping level of 2 this must produce
-    an approval request rather than a charge.
+    Two ways to put money on a guest's bill, and only one of them may run
+    unattended.
+
+    `order_service` sells a thing the hotel itself listed, at the price the
+    hotel itself set, because a guest asked for it — an airport pickup at
+    ₹1,200 that appears on `list_services`. There is no number for a model to
+    invent, and refusing to do it is refusing the upsell the product is sold
+    on.
+
+    `post_folio_charge` takes an arbitrary amount and puts it on somebody's
+    bill. It carries `always_requires_approval`, which configuration cannot
+    switch off, and that is the real protection — not the shipping level, which
+    an owner is free to move.
+
+    This used to assert that `order_service` sat above the guest agent's level.
+    It did, and the level moved, and the assertion was measuring the dial
+    rather than the thing the dial must never reach.
     """
     registry.load_all()
     from app.services.ai.agents import get
 
-    assert registry.REGISTRY["order_service"].autonomy_floor > get("guest").autonomy_level
+    guest = get("guest")
+    assert registry.REGISTRY["order_service"].autonomy_floor <= guest.autonomy_level
+    assert registry.REGISTRY["post_folio_charge"].always_requires_approval
+    assert "post_folio_charge" not in guest.tools
     assert registry.REGISTRY["get_check_in_link"].mutating is False
 
 

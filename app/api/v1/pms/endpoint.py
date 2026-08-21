@@ -22,6 +22,7 @@ marketplace/partner_ops.py.
 # FastAPI body resolution through slowapi's wrapper. Same note as
 # api/v1/admin/endpoint.py.
 import json
+import re
 import logging
 from datetime import date, datetime, timedelta, timezone
 
@@ -94,7 +95,14 @@ from app.api.v1.pms.schemas import (
     PublicServiceOut,
     PublicSiteOut,
     QuotedAddonOut,
+    WebChatIn,
+    WebChatOpenerOut,
+    WebChatOut,
     WebsiteConfigOut,
+    DomainOut,
+    DomainRequest,
+    DnsRecordOut,
+    PublicSiteHostOut,
     WebsiteUpdateRequest,
     FolioOut,
     FolioPostRequest,
@@ -149,8 +157,11 @@ from app.services.pms import frontdesk as frontdesk_service
 from app.services.pms import payments as payments_service
 from app.services.pms import stay_payment
 from app.services.pms import public_booking
+from app.services.pms import quote_payment
+from app.services.messaging import web_chat
 from app.services.pms import sync as sync_service
 from app.services.pms import website as website_service
+from app.services.pms import domains as domains_service
 from app.services import razorpay
 from app.services.ai import approvals
 from app.services.ai.errors import AgentError
@@ -1590,6 +1601,7 @@ async def list_agent_actions(
             conversationId=run.get("conversation_id"),
             tool=r["tool"], input=r.get("input") or {}, output=summary,
             refusalReason=r.get("refusal_reason"),
+            whyWaiting=approvals.why_waiting(r["tool"], r["status"]),
             resultType=r.get("result_type"), resultId=r.get("result_id"),
             status=r["status"], createdAt=r["created_at"],
             latencyMs=r.get("latency_ms") or 0,
@@ -1679,6 +1691,7 @@ async def decide_agent_action(
         tool=row["tool"], input=row.get("input") or {},
         output=row.get("refusal_reason") or "",
         refusalReason=row.get("refusal_reason"),
+        whyWaiting=approvals.why_waiting(row["tool"], row["status"]),
         resultType=row.get("result_type"), resultId=row.get("result_id"),
         status=row["status"], createdAt=row["created_at"],
         latencyMs=row.get("latency_ms") or 0,
@@ -1771,7 +1784,7 @@ async def get_billing_summary(
         sub = (
             db.table("subscriptions")
             .select("current_period_start,current_period_end,"
-                    "subscription_plans(code,name,included_allowances)")
+                    "subscription_plans(code,name,included_allowances,price_paise,billing_period)")
             .eq("billing_account_id", account)
             .in_("status", ["trialing", "active"])
             .order("current_period_start", desc=True)
@@ -1834,6 +1847,8 @@ async def get_billing_summary(
 
     return BillingSummaryOut(
         plan=plan.get("name") or plan.get("code"),
+        pricePaise=int(plan.get("price_paise") or 0),
+        billingPeriod=str(plan.get("billing_period") or "monthly"),
         periodStart=period_start,
         periodEnd=period_end,
         freeUntil=_as_date(transition.get("endsAt")) if transition else None,
@@ -2775,6 +2790,71 @@ def _room_option(option, units: int) -> PublicRoomOptionOut:
     )
 
 
+@router.get("/public/hotels/{slug}/chat", response_model=WebChatOpenerOut)
+@limiter.limit("120/minute")
+async def get_public_chat_opener(request: Request, slug: str):
+    """
+    What the chat widget says before a visitor types.
+
+    Server-side rather than hard-coded in the widget because the suggestions
+    have to be true of *this* hotel: a homestay with no airport pickup should
+    not be offering one as an opening prompt, and the widget has no way to know
+    that. Only services the hotel has actually configured become suggestions.
+    """
+    prop = await public_booking.resolve_published(slug)
+
+    def _services() -> list[str]:
+        rows = (
+            get_db()
+            .table("services")
+            .select("name,category")
+            .eq("property_id", prop.id)
+            .eq("is_active", True)
+            .order("sort_order")
+            .limit(3)
+            .execute()
+            .data
+            or []
+        )
+        return [str(r["name"]) for r in rows if r.get("name")]
+
+    names = await run_db(_services)
+
+    suggestions = ["Do you have rooms tonight?", "What's included in the rate?"]
+    if names:
+        # Hotels name services for their own staff — "Airport pickup (Maharana
+        # Pratap)", "Spa — 60 min". Lower-casing the whole string turned a
+        # proper noun into "maharana pratap" and the parenthetical made the
+        # question unreadable, so trim to the part before the bracket or dash
+        # and only lower-case a leading word that is plainly not a name.
+        label = re.split(r"[(\u2014-]", names[0])[0].strip()
+        if label[:1].isupper() and not label.split(" ")[0].isupper():
+            label = label[0].lower() + label[1:]
+        suggestions.append(f"Do you offer {label}?")
+    suggestions.append("Can I book a room?")
+
+    return WebChatOpenerOut(greeting=web_chat.opening_line(prop.name), suggestions=suggestions)
+
+
+@router.post("/public/hotels/{slug}/chat", response_model=WebChatOut)
+@limiter.limit("30/minute")
+async def post_public_chat(request: Request, slug: str, body: WebChatIn):
+    """
+    One turn with the hotel's AI employee, from its own website.
+
+    Public and unauthenticated, because the person is a traveller who has not
+    booked anything yet — asking them to sign in to ask a question is how the
+    question does not get asked. What stands in for a session is the signed
+    token in `body.session`; see `services/pms/web_chat`.
+
+    The rate limit is per-IP and deliberately below the DM channels': a browser
+    is the cheapest place to point a script at a model, and a real visitor types
+    a few times a minute.
+    """
+    turn = await web_chat.ask(slug=slug, message=body.message, session=body.session)
+    return WebChatOut(reply=turn.reply, session=turn.session, handedOff=turn.handed_off)
+
+
 @router.get("/public/hotels/{slug}", response_model=PublicSiteOut)
 @limiter.limit("60/minute")
 async def get_public_hotel(request: Request, slug: str):
@@ -3161,15 +3241,41 @@ async def confirm_public_booking(
 # the browser and the webhook race to the same single outcome.
 
 
+# The two kinds of order this page can be showing. They differ in one way that
+# matters to the page: a stay balance is money against a booking that exists,
+# and a booking payment is money that will *create* one. Everything else — the
+# hotel's name, the dates, the amount, the settle-once race — is identical, so
+# they share the route rather than getting a second one.
+PAY_PAGE_PURPOSES = (stay_payment.PURPOSE, quote_payment.PURPOSE)
+
+
 async def _stay_payment_out(order: dict) -> StayPaymentOut:
     def _read():
         db = get_db()
-        res = (db.table("reservations")
-               .select("ref,guest_name,check_in,check_out")
-               .eq("id", order["reservation_id"]).limit(1).execute().data or [{}])[0]
         prop = (db.table("properties").select("name,currency")
                 .eq("id", order["property_id"]).limit(1).execute().data or [{}])[0]
-        return res, prop
+
+        if order.get("reservation_id"):
+            res = (db.table("reservations")
+                   .select("ref,guest_name,check_in,check_out")
+                   .eq("id", order["reservation_id"]).limit(1).execute().data or [{}])[0]
+            return res, prop
+
+        # A booking payment before it has settled: there is no reservation to
+        # read, so the dates come from the quote and the name from what the
+        # agent was told. Not a fallback for a missing row — this is the normal
+        # state of this kind of order right up until the guest pays.
+        quote = {}
+        if order.get("quote_id"):
+            quote = (db.table("quotes").select("check_in,check_out")
+                     .eq("id", order["quote_id"]).limit(1).execute().data or [{}])[0]
+        guest = order.get("guest_details") or {}
+        return {
+            "ref": "",
+            "guest_name": guest.get("fullName") or "Guest",
+            "check_in": quote.get("check_in"),
+            "check_out": quote.get("check_out"),
+        }, prop
 
     reservation, prop = await run_db(_read)
     return StayPaymentOut(
@@ -3200,7 +3306,7 @@ async def get_stay_payment(request: Request, order_id: str):
     saying so rather than a second chance to pay.
     """
     order = await payments_service.get(order_id)
-    if not order or order["purpose"] != stay_payment.PURPOSE:
+    if not order or order["purpose"] not in PAY_PAGE_PURPOSES:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that payment.")
     return await _stay_payment_out(order)
 
@@ -3224,13 +3330,18 @@ async def confirm_stay_payment(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "That payment could not be verified.")
 
     order = await payments_service.get(order_id)
-    if not order or order["purpose"] != stay_payment.PURPOSE:
+    if not order or order["purpose"] not in PAY_PAGE_PURPOSES:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that payment.")
 
     settlement = await payments_service.claim(order_id, body.razorpayPaymentId)
     if settlement.won:
         try:
-            await stay_payment.settle(settlement.order)
+            # The same table the webhook dispatches on, so the browser callback
+            # and the webhook cannot disagree about what settling this order
+            # means. A booking order creates the reservation here; a stay
+            # balance posts to the folio. Whichever arrives first wins the
+            # claim and the other one reads the finished state.
+            await FULFIL[settlement.order["purpose"]](settlement.order)  # type: ignore[operator]
         except Exception as exc:  # noqa: BLE001
             await payments_service.release(settlement.order["id"], str(exc)[:200])
             logger.exception("could not post stay payment %s", order_id)
@@ -3501,6 +3612,30 @@ async def list_payment_orders(
 
 # ── M5.4 — the website builder's own API ─────────────────────────────────────
 
+async def _domain_out(property_id: str) -> DomainOut:
+    """
+    The stored state plus a live look at DNS.
+
+    The lookup happens on read rather than on a schedule because the moment an
+    owner is looking at this screen is the moment they have just edited their
+    zone and want to know whether it took. A cached answer here is the one
+    thing that would make the screen useless.
+    """
+    row = await website_service.get_config(property_id)
+    state = domains_service.project(row)
+    records = []
+    if state["domain"]:
+        records = [
+            DnsRecordOut(type=r.type, name=r.name, value=r.value, found=r.found)
+            for r in await domains_service.records_for(state["domain"], state["token"])
+        ]
+    return DomainOut(
+        status=state["status"], domain=state["domain"],
+        verifiedAt=state["verifiedAt"], checkedAt=state["checkedAt"],
+        error=state["error"], records=records,
+    )
+
+
 @router.get("/properties/{property_id}/website", response_model=WebsiteConfigOut)
 @limiter.limit("120/minute")
 async def get_website(
@@ -3515,7 +3650,10 @@ async def get_website(
     hotel's home page.
     """
     row = await website_service.get_config(property_id)
-    return website_service.project(row)
+    return {
+        **website_service.project(row),
+        **await website_service.direct_30d(property_id),
+    }
 
 
 @router.patch("/properties/{property_id}/website", response_model=WebsiteConfigOut)
@@ -3564,6 +3702,91 @@ async def unpublish_website(
     """
     row = await website_service.unpublish(property_id)
     return website_service.project(row)
+
+
+# ── the hotel's own address ──────────────────────────────────────────────────
+#
+#   PUT    …/website/domain          claim it, and get the two records to add
+#   POST   …/website/domain/verify   look at real DNS and say what is there
+#   DELETE …/website/domain          disconnect; the TravBuddy address remains
+#
+# `rates`, matching the rest of the builder: which address a hotel sells itself
+# under is a commercial decision, not a front-desk one.
+#
+# None of these serve anything. `services/pms/domains.hotel_for_host` is the
+# only thing that turns a hostname into a hotel, and it answers for a verified
+# domain on a published site and nothing else.
+
+@router.get("/properties/{property_id}/website/domain", response_model=DomainOut)
+@limiter.limit("60/minute")
+async def get_website_domain(
+    request: Request, property_id: str, member=Depends(require_member("rates")),
+):
+    """The address, and whether each DNS record is visible from the internet."""
+    return await _domain_out(property_id)
+
+
+@router.put("/properties/{property_id}/website/domain", response_model=DomainOut)
+@limiter.limit("20/hour")
+async def set_website_domain(
+    request: Request,
+    property_id: str,
+    body: DomainRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    Claim a domain. Nothing is served on it yet and nobody is told it is.
+
+    Rate limited hard: this is the endpoint that mints an ownership token, and
+    an unbounded one is a way to ask which domains are already connected here.
+    """
+    await domains_service.claim(property_id, body.domain)
+    return await _domain_out(property_id)
+
+
+@router.post("/properties/{property_id}/website/domain/verify", response_model=DomainOut)
+@limiter.limit("20/hour")
+async def verify_website_domain(
+    request: Request, property_id: str, member=Depends(require_member("rates")),
+):
+    """
+    Check the real DNS now.
+
+    "Still not there" is a legitimate answer and comes back as a 200 with the
+    records showing which half is missing — a 4xx here would read to the owner
+    as *they* did something wrong, when the usual truth is that their registrar
+    has not propagated yet.
+    """
+    await domains_service.verify(property_id)
+    return await _domain_out(property_id)
+
+
+@router.delete("/properties/{property_id}/website/domain", response_model=DomainOut)
+@limiter.limit("20/hour")
+async def clear_website_domain(
+    request: Request, property_id: str, member=Depends(require_member("rates")),
+):
+    """Disconnect. The hotel is never off the internet — /stay/[slug] remains."""
+    await domains_service.release(property_id)
+    return await _domain_out(property_id)
+
+
+@router.get("/public/sites/by-host", response_model=PublicSiteHostOut)
+@limiter.limit("120/minute")
+async def resolve_site_host(request: Request, host: str = Query(max_length=253)):
+    """
+    Which hotel a hostname belongs to.
+
+    Public and unauthenticated because it runs before anything else on a guest's
+    first paint: the browser is on `www.grandhotel.com` and the app has to know
+    whose booking page to render before it can render anything. It returns a
+    slug and a name — both already public on that page — and 404s for a host
+    that is not verified, not published, or not ours.
+    """
+    found = await domains_service.hotel_for_host(host)
+    if not found:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that hotel.")
+    return PublicSiteHostOut(slug=found["slug"], name=found.get("name") or "")
 
 
 # ── M6: the B2B agent portal ─────────────────────────────────────────────────

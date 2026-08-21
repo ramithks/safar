@@ -45,7 +45,32 @@ DEFINITION = AgentDefinition(
         "Answers enquiries on WhatsApp and Instagram: availability, options, "
         "prices, and booking the room."
     ),
-    autonomy_level=2,
+    # Level 3, and this is the number the product is sold on.
+    #
+    # It shipped at 2 and the effect was that a hotel which signed up, added a
+    # room and published its site got an AI employee that could not tell a
+    # guest the price. `get_quote` has a floor of 3, so the very first real
+    # conversation on a brand-new hotel went:
+    #
+    #     guest  How much?
+    #     hotel  I'm sorry, that quote needs to be approved by our hotel team.
+    #
+    # Nobody would buy that twice, and no owner would find the dial that fixes
+    # it because nothing told them there was one. The demo hotel only worked
+    # because it had been raised by hand.
+    #
+    # Three is not a relaxation of anything that matters. What it adds is
+    # quoting from the hotel's own rate table, sending a payment link, and
+    # checking a guest in. What stays exactly where it was: `create_booking`
+    # carries `always_requires_approval` unconditionally, so no room leaves
+    # inventory on a model's word; `post_folio_charge` is gated the same way,
+    # so nothing reaches a guest's bill unseen; and every limit in
+    # `agent_configs.limits` still applies. The agent can take money and cannot
+    # spend it.
+    #
+    # An owner who wants less can move the dial down on the AI employee screen;
+    # it is one control, in their words, and it is theirs.
+    autonomy_level=3,
     # The same four the Guest agent holds. `frontdesk` is here because
     # `create_booking` requires it and for no other reason — the tools that scope
     # checks in and folio charges to it are not granted, and `agent_tools` is a
@@ -66,7 +91,29 @@ DEFINITION = AgentDefinition(
         "get_negotiation_policy",
         "propose_rate_exception",
         # Closing, and un-closing
-        "create_booking",
+        # `create_booking` is deliberately NOT here.
+        #
+        # It was, and the gate on it produced a fork this agent could not be
+        # trusted to take. Asked to book, the model called `create_booking`,
+        # got back "queued for approval", and was expected to follow the
+        # tool's `when_deferred` hint over to `create_booking_payment_link`.
+        # It usually did. On one live conversation it did not, and wrote:
+        #
+        #     Please use this link to pay ₹7,168 and confirm your
+        #     reservation: [payment link will be here].
+        #
+        # No prompt fixes that reliably, because the failure is the model
+        # ending its turn rather than saying something we can check. Removing
+        # the tool removes the fork: for a guest with no booking there is one
+        # road to a room, it goes through payment, and it is the road that
+        # confirms instantly anyway.
+        #
+        # Staff keep it. The Front Desk agent works next to a person who can
+        # approve, which is the situation the approval queue was designed for.
+        # Closing it. Takes the money against a quote and lets the payment
+        # create the booking, which is the only way this agent can complete
+        # a sale without a manager pressing a button.
+        "create_booking_payment_link",
         "release_hold",
         # Following up — a ticket for a person, not a message this agent sends
         "create_task",
