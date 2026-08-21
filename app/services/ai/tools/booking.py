@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from app.db.client import get_db, run_db
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import OutOfScope, ToolUnavailable
+from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
 from app.services.ai.tools import ACTOR_RESERVATION
 from app.services.pms import booking as booking_service
@@ -27,7 +28,7 @@ from app.services.pms import creators as creators_service
 
 
 class BookingArgs(BaseModel):
-    quote_id: str = Field(description="From get_quote. The price and dates come from it.")
+    quote_id: ResourceId = Field(description="From get_quote. The price and dates come from it.")
     guest_name: str = Field(min_length=2, max_length=120)
     guest_phone: str | None = Field(default=None, max_length=20)
     guest_email: str | None = Field(default=None, max_length=160)
@@ -35,7 +36,7 @@ class BookingArgs(BaseModel):
 
 
 class HoldArgs(BaseModel):
-    hold_id: str = Field(description="From get_quote.")
+    hold_id: ResourceId = Field(description="From get_quote.")
 
 
 async def _revalidate_booking(args: "BookingArgs", ctx: AgentContext) -> None:
@@ -248,7 +249,7 @@ async def release_hold(args: HoldArgs, ctx: AgentContext) -> tuple[dict, str]:
 
 
 class BookingPaymentLinkArgs(BaseModel):
-    quote_id: str = Field(description="The quote the guest agreed to.")
+    quote_id: ResourceId = Field(description="The quote the guest agreed to.")
     guest_name: str = Field(
         min_length=1, max_length=120,
         description="The guest's full name, as they gave it.",

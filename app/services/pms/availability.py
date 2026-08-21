@@ -56,6 +56,50 @@ class StayOption:
     rate_plans: list[RatePlanOption]
 
 
+def _own_holds(property_id: str, conversation_id: str,
+               check_in: date, check_out: date) -> dict[str, int]:
+    """
+    Units this conversation is holding right now, by room type.
+
+    Only `active` holds that have not expired, and only ones covering the same
+    stay — a hold for different dates is not a room this guest can have on
+    these ones. Failure is an empty dict rather than an exception: showing a
+    guest slightly less availability is a worse day than a 500, and the numbers
+    without this are what every other caller already sees.
+    """
+    from datetime import datetime, timezone
+
+    try:
+        rows = (
+            get_db().table("inventory_holds")
+            .select("room_type_id,units,check_in,check_out,expires_at,status")
+            .eq("property_id", property_id)
+            .eq("conversation_id", conversation_id)
+            .eq("status", "active")
+            .execute().data or []
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("could not read own holds for conversation %s",
+                       conversation_id, exc_info=True)
+        return {}
+
+    now = datetime.now(timezone.utc)
+    held: dict[str, int] = {}
+    for row in rows:
+        if str(row.get("check_in")) != check_in.isoformat():
+            continue
+        if str(row.get("check_out")) != check_out.isoformat():
+            continue
+        try:
+            expires = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+        except (ValueError, TypeError, KeyError):
+            continue
+        if expires <= now:
+            continue
+        held[row["room_type_id"]] = held.get(row["room_type_id"], 0) + int(row.get("units") or 0)
+    return held
+
+
 def _fetch(property_id: str, check_in: date, check_out: date, audience: str | None):
     db = get_db()
     avail = db.rpc(
@@ -95,10 +139,27 @@ async def stay_options(
     check_out: date,
     units: int = 1,
     audience: str | None = None,
+    for_conversation: str | None = None,
 ) -> list[StayOption]:
     """
     Every room type that could take this stay, priced on every rate plan the
     audience may see.
+
+    `for_conversation` adds back the rooms this conversation is *already*
+    holding. A quote takes a hold, and the hold counts against `units_left`
+    like any other — so on the very next turn the agent asked what was
+    available and was told the rooms it had just quoted were gone. In
+    production, to a real guest:
+
+        Ok, 10 September se 14 September tak 2 rooms available hain.
+        …
+        Maaf karna, King Bed rooms 10 September se 14 September tak available
+        nahi hain.
+
+    Two rooms of that type existed and the agent's own quote held both. The
+    guest was told the room was theirs, then that it did not exist. Nobody
+    else's hold is added back — only the caller's own, which is the one that
+    was taken *for* them.
 
     `audience=None` returns everything — the front desk sees agent rates because
     it books on behalf of agents. The public booking engine must pass 'public',
@@ -113,11 +174,20 @@ async def stay_options(
     avail, rates, plans, types = await run_db(_fetch, property_id, check_in, check_out, audience)
     days = date_range(check_in, check_out)
 
+    mine = (
+        await run_db(_own_holds, property_id, for_conversation, check_in, check_out)
+        if for_conversation else {}
+    )
+
     # room_type_id -> date -> units_left
     left_by_type: dict[str, dict[str, int]] = {}
     stop_sell: dict[str, set[str]] = {}
     for row in avail:
-        left_by_type.setdefault(row["room_type_id"], {})[row["date"]] = row["units_left"]
+        # A room this conversation is already holding is a room it can still
+        # have. Added back per room type, for every night of the stay, because
+        # a hold covers the whole stay or none of it.
+        left = row["units_left"] + mine.get(row["room_type_id"], 0)
+        left_by_type.setdefault(row["room_type_id"], {})[row["date"]] = left
         if row.get("stop_sell"):
             stop_sell.setdefault(row["room_type_id"], set()).add(row["date"])
 

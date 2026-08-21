@@ -19,6 +19,8 @@ own bug.
 """
 from dataclasses import dataclass
 
+import pytest
+
 from app.services.ai import guardrails
 
 
@@ -266,3 +268,88 @@ def test_a_rupee_sign_does_not_swallow_the_number_behind_it():
         })],
     )
     assert verdict.ok, verdict.reason
+
+
+# ── a booking nobody made ────────────────────────────────────────────────────
+
+
+class TestInventedConfirmations:
+    """
+    The most expensive sentence this product can send.
+
+    A real guest on Instagram, after a run whose only tools were
+    `get_stay_options` and `get_quote`:
+
+        Okay, aapke 2 Deluxe King Bed rooms 10 September se 14 September tak ke
+        liye book ho gaye hain.          ("your 2 rooms have been booked")
+
+    Nothing was booked. A minute later the same agent said those rooms were not
+    available. A guest who stops reading at the first message arrives at a hotel
+    with no reservation — worse than any invented price, because they act on it
+    by travelling.
+    """
+
+    QUOTED = [FakeOutcome("get_quote", {"totalPaise": 3584000})]
+    PAID = [FakeOutcome("create_booking_payment_link", {"payNowPaise": 143360})]
+
+    def test_the_transcript_that_caused_this(self):
+        verdict = check(
+            "Okay, aapke 2 Deluxe King Bed rooms 10 September se 14 September "
+            "tak ke liye book ho gaye hain.",
+            self.QUOTED,
+        )
+        assert not verdict.ok
+        assert "secured" in verdict.reason
+
+    @pytest.mark.parametrize("claim", [
+        "Your rooms are now booked.",
+        "Your reservation is confirmed.",
+        "Your booking is complete.",
+        "The rooms are yours.",
+        "Your rooms are held for you.",
+        "आपके कमरे बुक हो गए हैं।",
+        "Aapka room confirm ho gaya hai.",
+    ])
+    def test_no_wording_of_it_gets_through(self, claim):
+        """
+        Hindi and Hinglish are here because the transcript was. An English-only
+        rule would have caught nothing on the conversation it was written for.
+        """
+        assert not check(claim, self.QUOTED).ok, claim
+
+    @pytest.mark.parametrize("fine", [
+        "Your booking will be confirmed once the payment goes through.",
+        "I can hold that for you if you'd like to book.",
+        "Two rooms are available for those dates.",
+        "Booking a room is easy — just tell me your dates.",
+        "Would you like me to book it?",
+        "Shall I send you a payment link to confirm the booking?",
+    ])
+    def test_talking_about_booking_is_not_claiming_one(self, fine):
+        """
+        The rule has to leave the whole sales conversation intact. A guardrail
+        that fires on "would you like to book?" would hand every enquiry to a
+        human and be switched off within a day.
+        """
+        assert check(fine, self.QUOTED).ok, fine
+
+    def test_a_real_confirmation_is_allowed(self):
+        """Once something has actually secured the stay, saying so is the job."""
+        assert check("Your booking is confirmed.", self.PAID).ok
+
+    def test_check_in_also_licenses_it(self):
+        assert check("You're all checked in.",
+                     [FakeOutcome("check_in", {"room": "204"})]).ok
+
+    def test_the_tools_that_license_it_are_the_ones_that_secure_a_stay(self):
+        """
+        Asserted as a set rather than left implicit: adding a tool here is
+        granting permission to tell a guest they have a room, and that should
+        be a deliberate line in a diff.
+        """
+        assert guardrails.CONFIRMING_TOOLS == {
+            "create_booking",
+            "create_booking_payment_link",
+            "create_payment_link",
+            "check_in",
+        }

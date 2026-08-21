@@ -21,14 +21,15 @@ from pydantic import BaseModel, Field
 
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import OutOfScope, ToolUnavailable
+from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
 from app.services.ai.tools import ACTOR_QUOTE
 from app.services.pms import booking as booking_service
 
 
 class QuoteArgs(BaseModel):
-    room_type_id: str = Field(description="From search_availability or get_stay_options.")
-    rate_plan_id: str = Field(description="From get_stay_options.")
+    room_type_id: ResourceId = Field(description="From search_availability or get_stay_options.")
+    rate_plan_id: ResourceId = Field(description="From get_stay_options.")
     check_in: date
     check_out: date
     units: int = Field(default=1, ge=1, le=10)
@@ -69,6 +70,12 @@ async def _revalidate_quote(args: "QuoteArgs", ctx: AgentContext) -> None:
     options = await availability_service.stay_options(
         ctx.property_id, args.check_in, args.check_out,
         units=args.units, audience="public",
+        # Deliberately NOT `for_conversation`. This is the staleness check that
+        # runs when a manager approves a proposal minutes later, and its whole
+        # job is to catch a room that has gone. Adding this conversation's own
+        # holds back here would let an approval proceed on stock somebody else
+        # has since taken — the read tools want the guest's own hold counted,
+        # a revalidation wants the world as it is.
     )
     room = next((o for o in options if o.room_type_id == args.room_type_id), None)
     if room is None or room.units_left < args.units:

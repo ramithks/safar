@@ -313,6 +313,11 @@ async def create_room_type(
         code=body.code,
         price_paise=body.priceRupees * 100 if body.priceRupees is not None else None,
         meal_plan=body.mealPlan,
+        description=body.description,
+        bed_type=body.bedType,
+        size_sqft=body.sizeSqft,
+        amenities=body.amenities,
+        photos=body.photos,
     )
     return RoomTypeOut.from_row(room_type)
 

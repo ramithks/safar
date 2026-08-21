@@ -489,6 +489,12 @@ class RoomTypeOut(BaseModel):
     maxOccupancy: int
     standardOccupancy: int
     bedType: str
+    # What the room is, for the screens and for the AI employee. Empty is a
+    # real and visible answer — the Rooms screen shows what is still missing.
+    description: str = ""
+    sizeSqft: int | None = None
+    amenities: list[str] = []
+    photos: list[str] = []
     sortOrder: int
     isActive: bool
 
@@ -503,6 +509,10 @@ class RoomTypeOut(BaseModel):
             maxOccupancy=row["max_occupancy"],
             standardOccupancy=row["standard_occupancy"],
             bedType=row.get("bed_type") or "",
+            description=row.get("description") or "",
+            sizeSqft=row.get("size_sqft"),
+            amenities=row.get("amenities") or [],
+            photos=row.get("photos") or [],
             sortOrder=row.get("sort_order") or 0,
             isActive=row["is_active"],
         )
@@ -2016,6 +2026,26 @@ class RoomTypeCreateRequest(BaseModel):
     totalUnits: int = Field(ge=1, le=999)
     maxOccupancy: int = Field(default=2, ge=1, le=30)
     code: str | None = Field(default=None, max_length=12)
+
+    # What the room actually is.
+    #
+    # `room_types` has carried these columns since it was created and nothing
+    # ever wrote to them: every room in production has a null description, no
+    # amenities and no photos. So an AI employee asked "what's in the Deluxe?"
+    # or "photos hain?" had nothing to answer with, and said so — on a real
+    # guest conversation, twice, while the guest was trying to buy.
+    #
+    # Optional, deliberately. A hotel that wants to sell a room tonight should
+    # not be blocked from creating one; what the product owes them is asking,
+    # and showing them the gap afterwards.
+    description: str | None = Field(default=None, max_length=2000)
+    bedType: str | None = Field(default=None, max_length=60)
+    sizeSqft: int | None = Field(default=None, ge=30, le=20_000)
+    amenities: list[str] | None = Field(default=None)
+    # URLs the hotel already has — their website, their Instagram. StayOS has
+    # no image storage, and pretending otherwise with a half-built uploader
+    # would be worse than taking a link that already works.
+    photos: list[str] | None = Field(default=None)
     # Optional in the same call, because "a room with no price" is the state
     # this whole module exists to prevent and a second request is a second
     # chance to stop halfway.

@@ -41,6 +41,7 @@ from pydantic import BaseModel, Field
 
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import OutOfScope, ToolUnavailable
+from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
 from app.services.marketing import audience as audience_module
 from app.services.marketing import campaigns as campaign_module
@@ -100,11 +101,11 @@ class CampaignArgs(BaseModel):
 
 
 class CampaignRef(BaseModel):
-    campaign_id: str = Field(description="From create_campaign.")
+    campaign_id: ResourceId = Field(description="From create_campaign.")
 
 
 class ScheduleArgs(BaseModel):
-    campaign_id: str
+    campaign_id: ResourceId
     note: str | None = Field(
         default=None, max_length=300,
         description="One line for the manager deciding. Why this, why now.",
@@ -112,12 +113,12 @@ class ScheduleArgs(BaseModel):
 
 
 class CancelArgs(BaseModel):
-    campaign_id: str
+    campaign_id: ResourceId
     reason: str = Field(max_length=200)
 
 
 class MessageArgs(BaseModel):
-    campaign_id: str
+    campaign_id: ResourceId
     body: str = Field(min_length=10, max_length=1000)
 
 

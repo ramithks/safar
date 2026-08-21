@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from app.db.client import get_db, run_db
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import OutOfScope, ToolUnavailable
+from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
 from app.services.ai.tools import ACTOR_TASK
 from app.services.ai.tools import read as read_tools
@@ -57,7 +58,7 @@ class CreateTaskArgs(BaseModel):
 
 
 class AssignTaskArgs(BaseModel):
-    task_id: str
+    task_id: ResourceId
     member_id: str | None = Field(
         default=None,
         description="Leave empty to route by category to whoever covers it.",
@@ -65,7 +66,7 @@ class AssignTaskArgs(BaseModel):
 
 
 class TaskStatusArgs(BaseModel):
-    task_id: str
+    task_id: ResourceId
 
 
 @tool(

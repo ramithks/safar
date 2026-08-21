@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 from app.db.client import get_db, run_db
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import OutOfScope, ToolUnavailable
+from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
 from app.services.pms import public_booking, stay_payment
 
@@ -66,7 +67,7 @@ async def _this_stay(ctx: AgentContext, reservation_id: str | None) -> str:
 # ── paying ───────────────────────────────────────────────────────────────────
 
 class PaymentLinkArgs(BaseModel):
-    reservation_id: str | None = Field(
+    reservation_id: ResourceId | None = Field(
         default=None,
         description="Leave empty for the booking in this chat.",
     )
@@ -143,7 +144,7 @@ async def create_payment_link(args: PaymentLinkArgs, ctx: AgentContext) -> tuple
 # ── checking in ──────────────────────────────────────────────────────────────
 
 class CheckInLinkArgs(BaseModel):
-    reservation_id: str | None = Field(
+    reservation_id: ResourceId | None = Field(
         default=None,
         description="Leave empty for the booking in this chat.",
     )
@@ -214,13 +215,13 @@ async def get_check_in_link(args: CheckInLinkArgs, ctx: AgentContext) -> tuple[d
 # ── buying something during the stay ─────────────────────────────────────────
 
 class OrderServiceArgs(BaseModel):
-    service_id: str = Field(description="From list_services. Never invent one.")
+    service_id: ResourceId = Field(description="From list_services. Never invent one.")
     quantity: int = Field(default=1, ge=1, le=20)
     service_date: str | None = Field(
         default=None,
         description="YYYY-MM-DD. Leave empty for the day the guest arrives.",
     )
-    reservation_id: str | None = Field(
+    reservation_id: ResourceId | None = Field(
         default=None,
         description="Leave empty for the booking in this chat.",
     )

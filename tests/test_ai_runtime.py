@@ -30,8 +30,8 @@ registry.load_all()
 
 PROPERTY = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 PARTNER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-CONVERSATION = "conv-0001"
-RESERVATION = "res-0001"
+CONVERSATION = "c0c0c0c0-0001-4001-8001-000000000001"
+RESERVATION = "a0a0a0a0-0001-4001-8001-000000000001"
 
 
 def run(coro):
@@ -56,7 +56,7 @@ def db(monkeypatch) -> FakeDb:
          "check_in": "2026-08-14", "check_out": "2026-08-17", "nights": 3, "units": 1,
          "room_id": "room-204", "total_paise": 448000, "paid_paise": 0,
          "payment_status": "unpaid", "guest_id": "guest-1"},
-        {"id": "res-someone-else", "property_id": PROPERTY, "partner_id": PARTNER,
+        {"id": "b0b0b0b0-0002-4002-8002-000000000002", "property_id": PROPERTY, "partner_id": PARTNER,
          "ref": "TB-OTHER1", "status": "confirmed", "guest_name": "Someone Else",
          "check_in": "2026-08-20", "check_out": "2026-08-22", "nights": 2, "units": 1,
          "total_paise": 300000, "paid_paise": 0, "guest_id": "guest-2"},
@@ -290,7 +290,7 @@ def test_the_model_is_told_why_it_was_refused(db):
 def test_an_action_above_autonomy_is_queued_for_a_human(db):
     ctx = make_ctx(autonomy_level=2, scopes=("tasks", "messaging", "rates"))
     provider = EchoProvider([
-        [("get_quote", {"room_type_id": "rt", "rate_plan_id": "rp",
+        [("get_quote", {"room_type_id": "d0d0d0d0-0001-4001-8001-000000000001", "rate_plan_id": "e0e0e0e0-0001-4001-8001-000000000001",
                         "check_in": "2026-09-01", "check_out": "2026-09-03"})],
         "I've asked the team to confirm that price.",
     ])
@@ -310,7 +310,7 @@ def test_a_guest_cannot_read_another_guests_booking_however_they_ask(db):
     # The model faithfully passes on what the guest typed. The refusal is a set
     # membership test in Python, so the phrasing is irrelevant.
     provider = EchoProvider([
-        [("get_reservation", {"reservation_id": "res-someone-else"})],
+        [("get_reservation", {"reservation_id": "b0b0b0b0-0002-4002-8002-000000000002"})],
         "I can only see the booking linked to this chat.",
     ])
     run(runtime.run_turn(

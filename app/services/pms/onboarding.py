@@ -338,6 +338,11 @@ def _add_room_type(
     total_units: int,
     max_occupancy: int,
     code: str | None,
+    description: str | None = None,
+    bed_type: str | None = None,
+    size_sqft: int | None = None,
+    amenities: list[str] | None = None,
+    photos: list[str] | None = None,
 ) -> dict:
     db = get_db()
     name = (name or "").strip()
@@ -382,18 +387,45 @@ def _add_room_type(
             "total_units": total_units,
             "max_occupancy": max_occupancy,
             "standard_occupancy": min(2, max_occupancy),
+            "description": (description or "").strip() or None,
+            "bed_type": (bed_type or "").strip() or None,
+            "size_sqft": size_sqft,
+            # Trimmed and de-duplicated, because a list a person typed is a
+            # list with "AC", "ac" and a trailing space in it.
+            "amenities": _clean_list(amenities, limit=30, length=60),
+            "photos": _clean_list(photos, limit=12, length=500),
         })
         .execute()
         .data[0]
     )
 
 
+def _clean_list(values: list[str] | None, *, limit: int, length: int) -> list[str]:
+    """Trimmed, de-duplicated, bounded. Order preserved — a hotel lists what it
+    thinks matters first."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in (values or []):
+        item = str(raw or "").strip()[:length]
+        if not item or item.lower() in seen:
+            continue
+        seen.add(item.lower())
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
 async def add_room_type(
     *, property_id: str, partner_id: str, name: str,
     total_units: int, max_occupancy: int = 2, code: str | None = None,
+    description: str | None = None, bed_type: str | None = None,
+    size_sqft: int | None = None, amenities: list[str] | None = None,
+    photos: list[str] | None = None,
 ) -> dict:
     return await run_db(
         _add_room_type, property_id, partner_id, name, total_units, max_occupancy, code,
+        description, bed_type, size_sqft, amenities, photos,
     )
 
 
@@ -406,6 +438,9 @@ def _delete_room_type(property_id: str, room_type_id: str) -> None:
 async def add_room_type_with_price(
     *, property_id: str, partner_id: str, name: str, total_units: int,
     max_occupancy: int, code: str | None, price_paise: int | None, meal_plan: str,
+    description: str | None = None, bed_type: str | None = None,
+    size_sqft: int | None = None, amenities: list[str] | None = None,
+    photos: list[str] | None = None,
 ) -> dict:
     """
     A room and what it costs, as one act.
@@ -421,6 +456,8 @@ async def add_room_type_with_price(
     room_type = await add_room_type(
         property_id=property_id, partner_id=partner_id, name=name,
         total_units=total_units, max_occupancy=max_occupancy, code=code,
+        description=description, bed_type=bed_type, size_sqft=size_sqft,
+        amenities=amenities, photos=photos,
     )
     if price_paise is None:
         return room_type
