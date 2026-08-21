@@ -99,3 +99,81 @@ def test_the_billing_channels_and_the_policy_channels_agree():
 
     for channel in billing.USAGE_BY_GUEST_CHANNEL:
         assert channel in STORABLE_CHANNELS, channel
+
+
+# ── the key every channel connection depends on ──────────────────────────────
+
+
+class TestCredentialsKeyIsVisible:
+    """
+    A missing `MESSAGING_CREDENTIALS_KEY` must be visible before a hotel finds it.
+
+    In production a real hotel completed Instagram's consent screen three times
+    in thirty-five seconds. Each time Meta handed us a valid token and each time
+    we threw it away, because the key had never been pasted into the deployment.
+    The service was healthy, every screen loaded, the OAuth round-trip worked —
+    the failure was in the last step of a flow only a customer performs, and the
+    screen told them to try again.
+    """
+
+    def test_a_missing_key_is_an_unhealthy_dependency(self, monkeypatch):
+        from app.api.v1 import health
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "messaging_credentials_key", "")
+        result = health._check_credentials_key()
+        assert result.startswith("error:")
+        # The sentence has to say what it costs, or it reads as one more
+        # optional integration nobody has got round to.
+        assert "connect" in result.lower()
+
+    def test_a_malformed_key_is_caught_too(self, monkeypatch):
+        from app.api.v1 import health
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "messaging_credentials_key", "not-a-fernet-key")
+        assert health._check_credentials_key().startswith("error:")
+
+    def test_a_real_key_passes(self, monkeypatch):
+        from cryptography.fernet import Fernet
+
+        from app.api.v1 import health
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "messaging_credentials_key",
+                            Fernet.generate_key().decode())
+        assert health._check_credentials_key() == "ok"
+
+    def test_the_key_itself_never_appears_in_the_answer(self, monkeypatch):
+        """The health endpoint is public on some deployments. It says whether,
+        never what."""
+        from cryptography.fernet import Fernet
+
+        from app.api.v1 import health
+        from app.config import settings
+
+        key = Fernet.generate_key().decode()
+        monkeypatch.setattr(settings, "messaging_credentials_key", key)
+        assert key not in health._check_credentials_key()
+        monkeypatch.setattr(settings, "messaging_credentials_key", "bad" + key)
+        assert key not in health._check_credentials_key()
+
+
+def test_a_hotel_is_not_asked_to_retry_a_key_we_have_not_set():
+    """
+    The owner-facing half.
+
+    `save_failed` says "please try again", which is right for a dropped
+    connection and wrong for a missing key — retrying is futile and the hotel
+    cannot fix it. The callback distinguishes the two, and this asserts the
+    distinction exists rather than the wording, which is the PWA's.
+    """
+    import inspect
+
+    from app.api.v1.messaging import oauth
+
+    source = inspect.getsource(oauth.instagram_oauth_callback)
+    assert "CredentialCryptoError" in source
+    assert "save_not_configured" in source
+    # And the generic handler still exists for everything else.
+    assert "save_failed" in source
