@@ -17,7 +17,11 @@ The ordering is deliberate: our rules first, the hotel's voice second, the
 conversation last. A model reads the whole thing, but the parts that must not be
 negotiable are the parts furthest from anything a guest typed.
 """
+import logging
+
 from app.services.ai.context import AgentContext
+
+logger = logging.getLogger(__name__)
 
 # The part that never changes, and never mentions a permission by name — an
 # agent that knows what it is forbidden is an agent that can be asked to explain
@@ -264,7 +268,19 @@ def build_system_prompt(ctx: AgentContext) -> str:
     # date to read "tomorrow" correctly, and it needs to know who it is talking
     # to — which for a staff agent is a colleague and for a guest agent is
     # someone who may or may not have a booking.
-    situation = [f"Today is {_today(ctx)} at this property."]
+    # Which hotel this is, in the prompt rather than behind a tool call.
+    #
+    # **Every conversation used to spend a model round-trip learning its own
+    # name.** A guest said "Hello", the agent called `get_property` to find out
+    # where it worked, and the answer came back on a second model call — about
+    # two seconds, on the first thing a guest ever sees, to fetch a fact that
+    # is printed on the hotel's own website.
+    #
+    # Only the name and the city. Check-in times, policies and amenities stay
+    # in `get_property`: they are facts a hotel edits, and a stale copy of a
+    # check-in time inside a prompt is worse than a tool call. A hotel's name
+    # is not a fact that changes mid-conversation.
+    situation = [f"You work at {_identity(ctx)}.", f"Today is {_today(ctx)} at this property."]
     if staff:
         if ctx.member_name:
             situation.append(f"You are speaking to {ctx.member_name}, who works here.")
@@ -303,6 +319,51 @@ def build_system_prompt(ctx: AgentContext) -> str:
         parts.append(f"Sign off with: {signature}")
 
     return "\n\n".join(parts)
+
+
+# Cached the same way and for the same reason as the timezone: a property's
+# name changes approximately never, and this is on the path of every turn.
+_IDENTITY_TTL_SECONDS = 300.0
+_identity_cache: dict[str, tuple[float, str]] = {}
+
+
+def _identity(ctx: AgentContext) -> str:
+    """"Anandi House Udaipur, in Udaipur" — or a safe generic if unreadable."""
+    import time as _time
+
+    from app.db.client import get_db
+
+    hit = _identity_cache.get(ctx.property_id)
+    now = _time.monotonic()
+    if hit and now - hit[0] < _IDENTITY_TTL_SECONDS:
+        return hit[1]
+
+    try:
+        rows = (
+            get_db().table("properties").select("name,city")
+            .eq("id", ctx.property_id).limit(1).execute().data or []
+        )
+        row = rows[0] if rows else {}
+        name = (row.get("name") or "").strip()
+        city = (row.get("city") or "").strip()
+        described = f"{name}, a hotel in {city}" if name and city else (name or "this hotel")
+    except Exception:  # noqa: BLE001
+        # A prompt is not worth failing a turn over, and `get_property` still
+        # carries the name — this is a shortcut, not the source of truth.
+        logger.warning("could not read property identity for %s", ctx.property_id,
+                       exc_info=True)
+        return hit[1] if hit else "this hotel"
+
+    _identity_cache[ctx.property_id] = (now, described)
+    return described
+
+
+def forget_identity(property_id: str | None = None) -> None:
+    """Drop a cached name — for tests, and for whatever renames a hotel."""
+    if property_id:
+        _identity_cache.pop(property_id, None)
+    else:
+        _identity_cache.clear()
 
 
 def _today(ctx: AgentContext) -> str:

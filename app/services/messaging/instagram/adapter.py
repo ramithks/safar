@@ -90,8 +90,40 @@ class InstagramAdapter:
         self._version = api_version or settings.instagram_api_version
 
     @property
+    def _host(self) -> str:
+        """
+        Which Meta host will accept this token.
+
+        **There are two Instagram messaging APIs and they are not
+        interchangeable.** `oauth.py` says so in its own docstring and this file
+        did not listen:
+
+            Instagram API with *Facebook* Login   EAAB… token → graph.facebook.com
+            Instagram API with *Instagram* Login  IGAA… token → graph.instagram.com
+
+        We use Instagram Business Login — the consent screen at
+        `www.instagram.com/oauth/authorize` — so every token we hold is an
+        `IGAA…` one. Posting it to graph.facebook.com produced, in production,
+        on the first real guest message a real hotel ever received:
+
+            400  Invalid OAuth access token - Cannot parse access token
+
+        Facebook was right: it is not a Facebook token. The guest saw nothing,
+        the reply sat in the hotel's inbox marked failed, and the connection
+        looked perfectly healthy on every screen.
+
+        Decided from the token itself rather than from configuration, because
+        the token is the thing that actually determines the answer — and a
+        deployment that later adds Facebook Login must not need a second
+        setting to keep working.
+        """
+        if (self._token or "").startswith("IG"):
+            return "https://graph.instagram.com"
+        return "https://graph.facebook.com"
+
+    @property
     def _url(self) -> str:
-        return (f"https://graph.facebook.com/{self._version}"
+        return (f"{self._host}/{self._version}"
                 f"/{self.instagram_account_id}/messages")
 
     async def _post(self, payload: dict, *, client_reference: str) -> SendResult:

@@ -52,6 +52,16 @@ def http(url, method="GET", body=None, headers=None):
 
 raw = subprocess.check_output(["security", "find-generic-password", "-s", "Supabase CLI", "-w"], text=True).strip()
 MGMT = base64.b64decode(raw.removeprefix("go-keyring-base64:")).decode()
+
+
+def sql(query):
+    """Read-only, and only ever used to *find* a fixture — never to make one."""
+    st, body = http(f"https://api.supabase.com/v1/projects/{REF}/database/query", "POST",
+                    {"query": query},
+                    {"Authorization": f"Bearer {MGMT}", "User-Agent": "SupabaseCLI/2.0.0"})
+    if st not in (200, 201):
+        raise RuntimeError(f"SQL failed: {st} {str(body)[:200]}")
+    return body
 keys = http(f"https://api.supabase.com/v1/projects/{REF}/api-keys?reveal=true",
             headers={"Authorization": f"Bearer {MGMT}", "User-Agent": "SupabaseCLI/2.0.0"})[1]
 ANON = [k["api_key"] for k in keys if k.get("name") == "anon"][0]
@@ -126,8 +136,24 @@ check("a published hotel is public", st == 200, st)
 check("and carries no owner, no email, no phone of the hotelier",
       not any(k in json.dumps(d or {}).lower() for k in ("partner_id", "owner", "@casamandala")),
       json.dumps(d or {})[:200])
-st, _ = http(f"{API}/pms/public/hotels/harry-bhiwani")
-check("an unpublished hotel is not", st == 404, st)
+# An unpublished hotel is not public — asked of whichever hotel is actually
+# unpublished right now, rather than of one named here.
+#
+# This used to name `harry-bhiwani`, which was a draft when the suite was
+# written and is a live customer today. The check then failed for the best
+# possible reason: a real hotel had published its website. A test that goes red
+# when a customer succeeds is a test that gets muted.
+draft = sql("""select slug from hotel_websites w
+                join properties p on p.id = w.property_id
+               where w.status <> 'published' limit 1;""")
+if draft:
+    st, _ = http(f"{API}/pms/public/hotels/{draft[0]['slug']}")
+    check(f"an unpublished hotel is not ({draft[0]['slug']})", st == 404, st)
+else:
+    # Nothing unpublished to ask about. Prove the rule the other way rather
+    # than skipping it: a slug nobody owns must 404 too.
+    st, _ = http(f"{API}/pms/public/hotels/no-such-hotel-anywhere")
+    check("a hotel that does not exist is not public", st == 404, st)
 
 print(f"\n══ {PASS} passed, {FAIL} failed ══")
 raise SystemExit(1 if FAIL else 0)

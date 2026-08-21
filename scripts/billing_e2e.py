@@ -171,6 +171,16 @@ def main():
     if not ADMIN["X-Admin-Passcode"]:
         print("ADMIN_API_PASSCODE is not set; the admin half cannot run.")
         return 2
+    # And that the *server* agrees with it. A passcode set here but not on the
+    # running process makes every admin call 404, which then surfaces three
+    # sections later as "that coupon code isn't valid" — a true sentence about
+    # a coupon that was never created, and half an hour to chase.
+    if http(f"{API}/admin/hotels?limit=1", headers=ADMIN)[0] != 200:
+        print("The API on :8010 is not accepting this ADMIN_API_PASSCODE.\n"
+              "Start it with the same value this script has:\n"
+              "  ADMIN_API_PASSCODE=… uvicorn app.main:app --port 8010")
+        return 2
+
 
     owner = signin(DEMO_OWNER)
     reception = signin(DEMO_RECEPTION)
