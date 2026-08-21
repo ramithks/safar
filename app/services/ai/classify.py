@@ -117,6 +117,54 @@ def default_task(agent_type: str | None) -> str:
     return candidates(agent_type)[0]
 
 
+# What "hello" is, per agent.
+#
+# **`default_task` is the wrong answer for a greeting on the Sales agent.** Its
+# candidate list starts with `availability`, so a guest who opened a DM with
+# "Hello" was routed as an availability query — and answered
+#
+#     Hello! To help you find a room, could you please tell me your desired
+#     arrival and departure dates, and how many adults and children will be
+#     staying?
+#
+# to somebody who had said one word. That is a real transcript from the first
+# guest message a real hotel ever received on Instagram. It is not wrong so
+# much as deaf: nobody opens with "hi" and expects an intake form.
+_OPENING_TASK = {
+    "guest": "guest_conversation",
+    "sales": "guest_faq",
+}
+
+# A message carrying no routing signal at all.
+#
+# Deliberately a small closed list rather than a length cut-off or a fuzzy
+# match. "No" is two characters and means something; "when?" is five and is a
+# real question. What is safe to skip the classifier for is the set of things
+# that are *only* an opening — and if one is missed, the cost is the classifier
+# running as it does today, which is the behaviour we already have.
+_OPENINGS = frozenset({
+    "hi", "hii", "hiii", "hey", "heyy", "hello", "helo", "hlo", "yo",
+    "hi there", "hey there", "hello there",
+    "good morning", "good afternoon", "good evening", "gm", "ge",
+    "namaste", "namaskar", "hola", "salaam", "assalamualaikum",
+    "hi!", "hello!", "hey!", "hi.", "hello.", "hey.",
+})
+
+
+def is_opening(message: str | None) -> bool:
+    """Is this only a greeting — nothing to route on?"""
+    cleaned = " ".join((message or "").strip().lower().split())
+    return cleaned in _OPENINGS
+
+
+def opening_task(agent_type: str | None) -> str:
+    """The conversational task, for a message that carries no other signal."""
+    task = _OPENING_TASK.get(agent_type or "")
+    if task and task in candidates(agent_type):
+        return task
+    return default_task(agent_type)
+
+
 @dataclass(frozen=True)
 class Classification:
     """What was decided, what it cost, and whether a model was involved at all."""
@@ -174,6 +222,19 @@ class ModelClassifier:
                        history: list[dict] | None = None) -> Classification:
         allowed = candidates(agent_type)
         fallback = default_task(agent_type)
+
+        # "Hello" does not need a model to route it, and paid 2.3 seconds for
+        # the privilege — measured in production, on the slowest and most
+        # visible turn there is: the first thing a guest ever says. Skipping it
+        # is worth doing for the latency alone and fixes the routing as well,
+        # since the answer the model gave for a greeting was `availability`.
+        #
+        # Only for the *opening* message. Once a thread has history a bare "hi"
+        # may well be an answer to something, and that is the classifier's job.
+        if not history and is_opening(message):
+            task = opening_task(agent_type)
+            return Classification(task=task, tier=model_router.tier_of(task),
+                                  source="default")
 
         choice = model_router.select(
             agent_type=agent_type, task="intent_classification"
