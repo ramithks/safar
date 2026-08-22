@@ -236,3 +236,78 @@ def test_an_unchanged_draft_is_left_exactly_alone():
     draft, changes = apply({"room": "Nobody", "field": "priceRupees", "value": "1"})
     assert "found" not in draft or draft.get("found") == DRAFT.get("found")
     assert changes == []
+
+
+# ── the header the model sometimes will not carry down ───────────────────────
+
+def test_a_draft_with_rooms_and_no_prices_is_read_again(monkeypatch):
+    """
+    A rate sheet puts the price basis once, above the rows. About one run in
+    four the model reads each row in isolation and returns the names, the unit
+    counts, and null for every price — which is not a document with no prices,
+    it is the header dropped. The gateway's ladder cannot see it, because the
+    answer is valid JSON, so the check is on the shape of the result.
+    """
+    import asyncio
+
+    calls: list[str] = []
+
+    async def two_answers(contents, *, tier="muscle", **kwargs):
+        calls.append(tier)
+        if tier == "muscle":
+            return {"confidence": 0.7, "room_types": [
+                {"name": "Deluxe Balcony", "total_units": 4},
+                {"name": "Garden Standard", "total_units": 6}]}
+        return {"confidence": 0.9, "room_types": [
+            {"name": "Deluxe Balcony", "total_units": 4, "price_rupees": 4500},
+            {"name": "Garden Standard", "total_units": 6, "price_rupees": 3200}]}
+
+    monkeypatch.setattr(extract, "generate_json", two_answers)
+    draft = asyncio.run(extract.extract_hotel(text="a tariff table" * 5))
+
+    assert calls == ["muscle", "brain"]
+    assert [r["priceRupees"] for r in draft["roomTypes"]] == [4500, 3200]
+
+
+def test_a_draft_that_already_has_a_price_is_not_read_twice():
+    """One retry on a shape, not a second call on every extraction."""
+    import asyncio
+
+    calls: list[str] = []
+
+    async def priced(contents, *, tier="muscle", **kwargs):
+        calls.append(tier)
+        return {"confidence": 0.9, "room_types": [
+            {"name": "Deluxe Balcony", "total_units": 4, "price_rupees": 4500}]}
+
+    import pytest as _pytest
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(extract, "generate_json", priced)
+        asyncio.run(extract.extract_hotel(text="a tariff table" * 5))
+    assert calls == ["muscle"]
+
+
+def test_a_brochure_that_really_has_no_prices_keeps_its_first_answer(monkeypatch):
+    """A facilities PDF costs one extra call and comes back the same, rather
+    than coming back empty."""
+    import asyncio
+
+    async def never_priced(contents, *, tier="muscle", **kwargs):
+        return {"confidence": 0.6, "room_types": [{"name": "Garden Standard"}]}
+
+    monkeypatch.setattr(extract, "generate_json", never_priced)
+    draft = asyncio.run(extract.extract_hotel(text="a facilities brochure" * 5))
+    assert [r["name"] for r in draft["roomTypes"]] == ["Garden Standard"]
+
+
+def test_a_failed_retry_does_not_lose_the_first_draft(monkeypatch):
+    import asyncio
+
+    async def muscle_ok_brain_dies(contents, *, tier="muscle", **kwargs):
+        if tier == "brain":
+            raise RuntimeError("the reasoning tier is down")
+        return {"confidence": 0.7, "room_types": [{"name": "Garden Standard"}]}
+
+    monkeypatch.setattr(extract, "generate_json", muscle_ok_brain_dies)
+    draft = asyncio.run(extract.extract_hotel(text="a tariff table" * 5))
+    assert [r["name"] for r in draft["roomTypes"]] == ["Garden Standard"]

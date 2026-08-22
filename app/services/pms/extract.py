@@ -440,14 +440,47 @@ async def extract_hotel(
     if len(parts) == 1:
         raise ValueError("nothing to read: pass text or a file")
 
+    contents = [{"role": "user", "parts": parts}]
     raw = await generate_json(
-        [{"role": "user", "parts": parts}],
-        tier="muscle",
-        response_schema=EXTRACTION_SCHEMA,
-        temperature=0.1,
+        contents, tier="muscle", response_schema=EXTRACTION_SCHEMA, temperature=0.1,
     )
-
     draft = normalise(raw if isinstance(raw, dict) else {})
+
+    # **The header the model sometimes still will not carry down.**
+    #
+    # A rate sheet puts the price basis once, above the rows: "Tariff (per room
+    # per night, breakfast included)". A rule about reading tables fixed this
+    # most of the time — and about one run in four it comes back with the room
+    # names, the unit counts, and null for every price, occupancy, bed type and
+    # meal plan. That is not a document with no prices; it is the model reading
+    # each row in isolation, and a hotelier who hits it has to type in exactly
+    # what the importer exists to save them typing.
+    #
+    # The gateway's ladder cannot catch it, because the answer is valid JSON.
+    # So the check is here and it is on the shape of the result: rooms found and
+    # not one price among them is not something a rate sheet looks like. One
+    # retry, on the reasoning tier, and only on that shape — a genuine
+    # facilities brochure costs one extra call and comes back the same.
+    if draft["roomTypes"] and not any(r["priceRupees"] for r in draft["roomTypes"]):
+        logger.info("[pms] extraction found %d rooms and no prices; retrying on brain",
+                    len(draft["roomTypes"]))
+        try:
+            retry = await generate_json(
+                contents, tier="brain", response_schema=EXTRACTION_SCHEMA,
+                temperature=0.1,
+            )
+            second = normalise(retry if isinstance(retry, dict) else {})
+            # Kept only if it is actually better. A second empty answer means
+            # the document really has no prices, and the first draft already
+            # says so.
+            if any(r["priceRupees"] for r in second["roomTypes"]):
+                draft = second
+        except Exception:  # noqa: BLE001
+            # The first draft is a real answer. A failed second attempt is not
+            # a reason to hand the hotelier nothing.
+            logger.warning("[pms] price retry failed; keeping the first draft",
+                           exc_info=True)
+
     draft["found"] = found_lines(draft)
     return draft
 

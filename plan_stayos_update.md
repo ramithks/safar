@@ -847,9 +847,86 @@ onboarding 65 · golden 88 · ai 98 · sales 185 · instagram 70 · payment stat
 
 ## Phase 9 — Evidence
 
-- [ ] **9.1** Replay the reference transcript end to end against the new build.
-- [ ] **9.2** Record before/after tokens, latency and model mix in this file.
-- [ ] **9.3** Full suite green (currently 1,045 unit + 19 E2E).
+- [x] **9.1** The reference transcript, replayed. ✅ DONE —
+      `scripts/replay_e2e.py`, real model, real pipeline, real database.
+
+      The guest's own messages go back through the webhook and every one of the
+      nine failures is asserted to be something else now. **Every assertion is
+      about a row or a tool call, not about wording** — a live model phrases
+      things differently every run, and a suite that pinned its prose would be
+      measuring the wrong thing. The two exceptions are both negative: no
+      Devanagari after the guest asked for Hinglish, and no internal vocabulary
+      in front of a guest.
+
+      | | then | now |
+      | --- | --- | --- |
+      | ① "hinglish m baat karo" | Hindi again two turns later | stored on the conversation; no Devanagari after |
+      | ② "Photos h?" | *"main aapko photos nahi dikha sakta"* | real attachments, from this hotel's rooms |
+      | ③ "book kardi" | *"book ho gaye hain"* — for a quote | no such claim; the guardrail refuses one |
+      | ④ "Sahil" | *"mujhe ek quote ID ki zarurat hai"* | no internal vocabulary anywhere |
+      | ⑤ a room offered, then refused | flip-flopped in three turns | one availability answer |
+      | ⑥ | *"quote generate karne mein takleef"* | no internal failure narrated |
+      | ⑦ an hour's gap | every fact re-asked | dates, party and rooms still on the thread |
+      | ⑧ "payment hogyi" | a guess | `get_booking_status`, then the truth |
+      | ⑨ "check karo" | handed to a person | answered |
+
+      **What the replay itself caught.** On one run the model tried to tell the
+      guest *"Booking confirm"* with nothing on the run that secures a booking
+      — failure ③ attempting to happen again — and the guardrail refused the
+      reply. The suite now records those refusals and prints them, because a
+      refused lie is the strongest evidence in this file.
+
+      It also cost two lessons about writing the suite: a `500` substring match
+      failed on the agent correctly quoting *₹4,500*, and a handoff parks the
+      thread with a human so every later message goes unanswered. Both are
+      fixed — word boundaries, and the thread is handed back with a printed
+      note, because a sale that stalls until somebody notices is a finding.
+
+- [x] **9.2** Before and after, measured rather than claimed. ✅ DONE.
+
+      | | reference conversation | replay |
+      | --- | --- | --- |
+      | turns | 22 | 11 |
+      | tokens_in per turn | avg 4,844 · median 3,036 · max 11,131 | avg 6,271 |
+      | latency | avg 5.9 s · max 13.2 s | avg 7.3 s |
+      | model mix | `conversation` ×22 | `conversation` ×10, `reasoning` ×1 |
+      | outcome | escalated to a human, sale lost | answered |
+
+      **Per-turn tokens went up, not down, and that is the honest number.**
+      Phase 3 narrows the tool catalogue a turn is shown, which is real; but
+      the turns here also *do* more — photographs, a booking-status read, a live
+      quote — and the reference conversation spent most of its turns re-asking
+      questions, which is cheap. The comparison worth making is the whole
+      conversation: eleven turns to reach a point the original needed
+      twenty-two to fail at.
+
+      These are two different conversations, not an A/B: the replay is a subset
+      of the guest's messages against a different property's inventory. Read
+      the table as a shape, not a benchmark.
+
+      One thing the numbers show that nothing else did: `vertex.py` uses a
+      **120-second timeout on a guest-facing chat turn**, and one turn during
+      this work took 107 seconds before failing. A guest on Instagram waiting
+      two minutes has gone. Recorded rather than changed — the reasoning tier
+      may legitimately need it, and picking a per-tier timeout is a decision
+      somebody should make deliberately.
+
+- [x] **9.3** Full suite green. ✅ DONE.
+
+      `1,304 unit` · instagram_e2e 70 · ai_e2e 98 · sales_e2e 185 ·
+      checkin_e2e 57 · inbox_e2e 28 · tenant_isolation_e2e 49 · extract_e2e 26
+      · onboarding_e2e 65 · golden_e2e 88 · replay_e2e 16.
+
+      **One real bug came out of running these repeatedly rather than once.**
+      `extract_e2e` failed one run in four with every price, occupancy, bed
+      type and meal plan null — the table-header failure the plan records as
+      fixed in 4.2, still happening a quarter of the time. It is not a flaky
+      test: a hotelier hitting that run has to type in exactly what the importer
+      exists to save them typing. The gateway's ladder cannot catch it because
+      the answer is valid JSON, so `extract_hotel` now checks the *shape* —
+      rooms found and not one price among them is not what a rate sheet looks
+      like — and retries once on the reasoning tier. Five consecutive green runs
+      after; four unit tests pin the branch without calling a model.
 
 ---
 
