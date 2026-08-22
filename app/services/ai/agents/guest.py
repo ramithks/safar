@@ -63,6 +63,9 @@ DEFINITION = AgentDefinition(
         "get_property_policies",
         "get_property_knowledge",
         "get_room_types",
+        # Actual pictures, in the chat. "photos hain?" is one of the first
+        # things a guest asks and a link to a gallery is not an answer to it.
+        "send_room_photos",
         "list_services",
         # Knowing this guest — all scoped to the conversation, none of them
         # taking a guest id the model could be talked into changing.

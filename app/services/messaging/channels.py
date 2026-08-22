@@ -126,7 +126,20 @@ class SendResult:
 
 
 class ChannelAdapter(Protocol):
-    """What every channel must do. Deliberately two methods."""
+    """
+    What every channel must do. Three methods, and the third was hard-won.
+
+    `send_image` exists because a guest's first question is "photos hain?" and
+    a link to a gallery is not an answer to it — on Instagram especially, where
+    the whole medium is pictures and a URL renders as a grey rectangle nobody
+    taps. The agent had been taught to share room photographs some weeks before
+    any hotel could have one, and then before any channel could send one.
+
+    It is on the protocol rather than bolted onto one adapter so that a channel
+    which cannot do it has to say so out loud, the way `send_template` refuses
+    on Instagram. A capability that silently degrades to text is a capability
+    nobody can reason about.
+    """
 
     channel: str
     # True when this adapter talks to a fake. Carried on the adapter rather than
@@ -135,6 +148,10 @@ class ChannelAdapter(Protocol):
     is_sandbox: bool
 
     async def send_text(self, *, to: str, body: str, client_reference: str) -> SendResult: ...
+
+    async def send_image(
+        self, *, to: str, image_url: str, caption: str | None, client_reference: str
+    ) -> SendResult: ...
 
     async def send_template(
         self,

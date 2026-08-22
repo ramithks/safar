@@ -33,8 +33,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Sent:
     to: str
-    kind: str                 # text · template
+    kind: str                 # text · template · image
     body: str | None = None
+    image_url: str | None = None
     template_name: str | None = None
     language: str | None = None
     parameters: list[str] = field(default_factory=list)
@@ -91,6 +92,18 @@ class FakeWhatsAppAdapter:
         self._check_failures()
         return self._record(Sent(to=to, kind="text", body=body,
                                  client_reference=client_reference))
+
+    async def send_image(self, *, to: str, image_url: str, caption: str | None,
+                         client_reference: str) -> SendResult:
+        """WhatsApp carries the caption on the image, so the fake records both."""
+        sent = Sent(to=to, kind="image", body=caption, image_url=image_url,
+                    client_reference=client_reference)
+        sent.external_id = f"wamid.FAKE{uuid.uuid4().hex[:20]}"
+        type(self).outbox.append(sent)
+        logger.debug("fake whatsapp image → %s: %s", to, image_url)
+        return SendResult(external_id=sent.external_id, status="sent",
+                          raw={"sandbox": True, "clientReference": client_reference})
+
 
     async def send_template(
         self,

@@ -406,8 +406,59 @@ and twenty-one room types, and two of twenty-one have a description.
       Phase 5.1 and needs the same review-then-approve gate.
 - [ ] **4.3** Conversational correction of an extracted draft ("isme breakfast
       included nahi hai") mapping to the structured field.
-- [ ] **4.4** Instagram media send: attach room photos as real IG attachments
-      where the API allows; fall back to the room page link.
+- [x] **4.4** Instagram media send: room photos go out as real attachments.
+      ✅ DONE.
+
+      The failure this closes is a sentence a paying guest was actually sent:
+      *"I'm sorry, main aapko rooms ki photos nahi dikha sakta."* Three things
+      had to be true before that could stop being the answer, and none was — a
+      hotel needed somewhere to put a photograph (4.1/4.2), a channel needed a
+      way to send one, and the agent needed a tool that was not "paste a link".
+
+      `ChannelAdapter` grew a third method, `send_image`. Instagram posts an
+      `attachment` of type `image`; WhatsApp posts `type: "image"` with a
+      caption. Neither degrades to text on failure — a capability that silently
+      becomes something else is one nobody can reason about.
+
+      Everything still routes through `messaging.send()`, which is the one
+      choke point every outbound message passes: the window rule, the credit
+      gate, the idempotent queue row and the meter all live there. `send()`
+      takes `image_url`, records `message_type="image"` and `media_urls=[url]`,
+      and refuses `image_url` together with `template`.
+
+      The tool is `send_room_photos` (permission `messaging`, autonomy floor 2,
+      granted to the guest and sales agents by migration
+      `a_guest_who_asks_for_photos_can_be_sent_photos`). Its whole input model
+      is `{room_type_id?, caption?}`:
+
+      **The model names a room; it never names a URL.** The photographs are read
+      from `room_types.photos` for *this* property, so there is no argument
+      through which a model — or a guest talking to one — can make a hotel send
+      an arbitrary image. The prose guardrail that catches invented links has no
+      attachment twin, and this is why it does not need one.
+
+      Naming a room sends up to `MAX_PHOTOS = 4` of it; naming none sends one of
+      each room, because "show me the rooms" is a menu rather than a gallery.
+      The caption rides on the first picture only. A hotel with no photos gets
+      `sent: 0` and an instruction that says the hotel has not uploaded photos
+      yet and explicitly *"do NOT say you are unable to show photos"* — the
+      difference between a fixable gap and a product that looks incapable.
+
+      One real bug came out of running it rather than reading it:
+      `conversation_messages.media_urls` is NOT NULL with a `{}` default, and
+      writing an explicit null overrides a default instead of falling back to
+      it — so the first *plain text* reply after this landed failed to persist.
+      FakeDb does not enforce NOT NULL, so only the live Instagram run could
+      catch it. Now pinned by a unit test.
+
+      Tests: `tests/test_room_photos.py` (14) — the 4-photo cap, menu mode,
+      caption placement, idempotent `client_reference`, the model-cannot-name-a-
+      URL property asserted against the registry, cross-property isolation,
+      inactive rooms, the honest no-photos answer, partial-failure tolerance,
+      and the two row-shape regressions.
+
+      Suites green afterwards: 1,220 unit · instagram_e2e 70 · ai_e2e 98 ·
+      sales_e2e 185.
 - [x] **4.5** Completeness — delivered as Phase 5's readiness report rather than
       a score. See below.
 

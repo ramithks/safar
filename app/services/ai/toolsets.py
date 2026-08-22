@@ -62,6 +62,7 @@ CORE = frozenset({
 # same breath far more often than not.
 BY_TASK: dict[str, frozenset[str]] = {
     "guest_faq": frozenset({
+        "send_room_photos",
         "get_property_policies", "get_room_types", "list_services",
     }),
     "guest_request": frozenset({
@@ -73,6 +74,7 @@ BY_TASK: dict[str, frozenset[str]] = {
         "get_booking_status", "get_check_in_link", "get_property_policies",
     }),
     "availability": frozenset({
+        "send_room_photos",
         "search_availability", "get_stay_options", "get_room_types",
         # A guest who hears a room is free asks the price next, and being shown
         # the pricing tools here saves the whole turn that would otherwise be
@@ -80,10 +82,12 @@ BY_TASK: dict[str, frozenset[str]] = {
         "get_quote", "get_property_policies",
     }),
     "simple_quote": frozenset({
+        "send_room_photos",
         "search_availability", "get_stay_options", "get_quote", "get_room_types",
         "get_property_policies", "list_services", "create_booking_payment_link",
     }),
     "booking": frozenset({
+        "send_room_photos",
         "search_availability", "get_stay_options", "get_quote", "release_hold",
         "create_booking", "create_booking_payment_link", "get_booking_status",
         "get_property_policies", "get_room_types",
@@ -98,6 +102,7 @@ BY_TASK: dict[str, frozenset[str]] = {
         "get_property_policies", "get_folio", "create_task",
     }),
     "complex_negotiation": frozenset({
+        "send_room_photos",
         "get_negotiation_policy", "propose_rate_exception", "get_quote",
         "get_stay_options", "search_availability", "get_room_types",
         "create_booking_payment_link",

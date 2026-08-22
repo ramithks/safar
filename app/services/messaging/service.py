@@ -559,6 +559,7 @@ def _queue_outbound(conversation: dict, spec: dict) -> tuple[dict, bool]:
     """
     body = spec["body"]
     template = spec["template"]
+    image_url = spec.get("image_url")
     client_reference = spec["client_reference"]
     db = get_db()
 
@@ -586,8 +587,17 @@ def _queue_outbound(conversation: dict, spec: dict) -> tuple[dict, bool]:
         "author": spec["author"],
         "author_name": spec["author_name"],
         "author_member": spec["author_member"],
-        "message_type": "text",
+        "message_type": "image" if image_url else "text",
         "body": body,
+        # The picture itself, on the column the inbound path has always used for
+        # one. A photograph a hotel sent is evidence in the same way a
+        # photograph a guest sent is.
+        #
+        # Empty list, not null: the column is NOT NULL with a `{}` default, and
+        # writing an explicit null overrides the default rather than falling
+        # back to it — which is exactly how a text message started failing to
+        # persist the moment this key was added.
+        "media_urls": [image_url] if image_url else [],
         "template_name": template["provider_name"] if template else None,
         "client_reference": client_reference,
         "agent_action_id": spec["agent_action_id"],
@@ -627,9 +637,11 @@ async def send(
     client_reference: str | None = None,
     agent_id: str | None = None,
     run_id: str | None = None,
+    image_url: str | None = None,
 ) -> SentMessage:
     """
-    Send free text, or an approved template when the window has closed.
+    Send free text, a photograph, or an approved template when the window has
+    closed.
 
     `body` and `purpose` are alternatives. Give `body` for a normal reply;
     give `purpose` to send a template deliberately. Giving `body` outside the
@@ -679,8 +691,19 @@ async def send(
             + f"; free-form messages are not permitted until the guest writes again — {remedy}",
         )
 
-    if body is None and template is None:
+    if body is None and template is None and image_url is None:
         raise MessagingError(PROVIDER_FAILED, "nothing to send")
+
+    # A photograph goes through this function rather than beside it, and that is
+    # deliberate. `send` is the one choke point every outbound message passes:
+    # the window rule, the credit gate, the idempotent queue row and the meter
+    # all live here, and a parallel media path would miss all four — which is
+    # exactly how a receptionist's reply and the pipeline's fallback send once
+    # went unbilled.
+    if image_url is not None and template is not None:
+        raise MessagingError(
+            PROVIDER_FAILED, "a template and a photograph are different sends",
+        )
 
     # The credit gate on outbound, and it is deliberately narrow.
     #
@@ -712,6 +735,7 @@ async def send(
         "body": body, "template": template, "author": author,
         "author_name": author_name, "author_member": author_member,
         "agent_action_id": agent_action_id, "client_reference": reference,
+        "image_url": image_url,
     })
 
     # Already sent. A retry after a provider timeout lands here, which is the
@@ -730,6 +754,16 @@ async def send(
                 template_name=template["provider_name"],
                 language=template["language"],
                 parameters=templates_module.bind(template, template_values or {}),
+                client_reference=reference,
+            )
+        elif image_url is not None:
+            result = await adapter.send_image(
+                to=conversation.get("guest_phone") or conversation.get("guest_handle") or "",
+                image_url=image_url,
+                # Instagram ignores this and sends the words separately; WhatsApp
+                # carries it on the picture. Both are correct for their channel
+                # and neither is this caller's problem.
+                caption=body,
                 client_reference=reference,
             )
         else:
@@ -755,7 +789,8 @@ async def send(
         "sent_at": now,
         "metadata": result.raw,
     })
-    await run_db(_touch_outbound, conversation["id"], body or (template or {}).get("body_preview") or "", now)
+    preview = body or (template or {}).get("body_preview") or ("📷 Photo" if image_url else "")
+    await run_db(_touch_outbound, conversation["id"], preview, now)
 
     # Metered here rather than in the agent's tool, because this is the one
     # choke point every outbound message passes through — the same argument as

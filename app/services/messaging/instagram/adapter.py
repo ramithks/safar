@@ -178,6 +178,34 @@ class InstagramAdapter:
             client_reference=client_reference,
         )
 
+    async def send_image(self, *, to: str, image_url: str, caption: str | None,
+                         client_reference: str) -> SendResult:
+        """
+        A photograph, as an attachment rather than a link.
+
+        **Meta fetches the URL itself**, which is why the bucket these live in
+        has to be publicly readable and why nothing here uploads bytes. It also
+        means a URL we cannot serve is a failure Meta reports, not one we can
+        pre-empt — hence the ordinary error path below rather than a check.
+
+        `is_reusable` so a hotel sending the same room photograph to forty
+        guests uploads it to Meta once. Instagram carries no caption on an
+        attachment: the caller sends the words as their own message, which is
+        also the order a person would do it in.
+        """
+        return await self._post(
+            {
+                "recipient": {"id": to},
+                "message": {
+                    "attachment": {
+                        "type": "image",
+                        "payload": {"url": image_url, "is_reusable": True},
+                    }
+                },
+            },
+            client_reference=client_reference,
+        )
+
     async def send_template(self, *, to: str, template_name: str, language: str,
                             parameters: list[str], client_reference: str) -> SendResult:
         raise MessagingError(
