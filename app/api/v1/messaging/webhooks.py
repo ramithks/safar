@@ -36,6 +36,7 @@ from app.services.messaging import credentials as creds_module
 from app.services.messaging import pipeline
 from app.services.messaging import service as messaging
 from app.services.messaging.channels import MessagingError
+from app.services import trace
 from app.services.ai import usage as usage_mod
 from app.services.messaging import policy
 from app.services.messaging.instagram import webhook as ig
@@ -145,6 +146,13 @@ async def handle_payload(payload: dict, *, provider=None, channel: str = "whatsa
 
         accepted += 1
         touched.add(recorded.conversation["id"])
+        # Bound as soon as we know it, so every line from here down — including
+        # the ones libraries emit — carries the thread this message belongs to.
+        trace.bind(conversation_id=recorded.conversation["id"],
+                   hotel_id=recorded.conversation["property_id"],
+                   guest_id=recorded.conversation.get("guest_id"))
+        logger.info("inbound %s message accepted on conversation %s",
+                    channel, recorded.conversation["id"])
 
         # A channel Meta does not bill per conversation gets its conversation
         # charge opened here, on the message that actually opened the window.

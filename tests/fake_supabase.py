@@ -27,9 +27,10 @@ class _Result:
 
 
 class _Query:
-    def __init__(self, store: dict, table: str):
+    def __init__(self, store: dict, table: str, unique: dict | None = None):
         self._store = store
         self._table = table
+        self._unique = unique or {}
         self._filters: list = []
         self._op = "select"
         self._payload = None
@@ -134,6 +135,7 @@ class _Query:
             payload = self._payload if isinstance(self._payload, list) else [self._payload]
             written = []
             for item in payload:
+                self._enforce_unique(item, rows)
                 row = dict(item)
                 row.setdefault("id", str(uuid.uuid4()))
                 rows.append(row)
@@ -188,6 +190,34 @@ class _Query:
         return _Result([copy.deepcopy(r) for r in out], count=len(out))
 
 
+    # ── the one constraint this fake does model ──────────────────────────────
+    #
+    # Not a general check-constraint engine — see the module note, which is
+    # still true. But a *unique* index is different in kind from the rest,
+    # because two places in this codebase deliberately use "insert and catch the
+    # duplicate" as their concurrency control rather than as an error path:
+    # `webhook_log.claim` and `messaging.record_inbound`. The window between a
+    # select and an insert is exactly where a provider's near-simultaneous
+    # retries land, and the index is the only thing that closes it.
+    #
+    # A fake that silently accepts the second insert cannot test either of them,
+    # and both are money-bearing. So a test can declare the indexes it depends
+    # on and get the same 23505 the real database would raise.
+
+    def _enforce_unique(self, item: dict, rows: list) -> None:
+        for cols in self._unique.get(self._table, ()):
+            if any(item.get(c) is None for c in cols):
+                continue  # partial index: `where col is not null`
+            clash = any(
+                all(str(r.get(c)) == str(item.get(c)) for c in cols) for r in rows
+            )
+            if clash:
+                raise RuntimeError(
+                    'duplicate key value violates unique constraint '
+                    f'"{self._table}_{"_".join(cols)}_key" (23505)'
+                )
+
+
 class _Not:
     def __init__(self, query: _Query):
         self._q = query
@@ -205,10 +235,13 @@ class FakeDb:
     store: dict = field(default_factory=dict)
     rpcs: dict = field(default_factory=dict)
     rpc_calls: list = field(default_factory=list)
+    # table -> tuples of columns that are unique together. Declared per test:
+    # see `_enforce_unique`.
+    unique: dict = field(default_factory=dict)
     _codes: itertools.count = field(default_factory=lambda: itertools.count(1801))
 
     def table(self, name: str) -> _Query:
-        return _Query(self.store, name)
+        return _Query(self.store, name, self.unique)
 
     def rpc(self, name: str, params: dict | None = None):
         self.rpc_calls.append((name, params or {}))

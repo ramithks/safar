@@ -64,7 +64,65 @@ class ModelChoice:
 
     @property
     def timeout(self) -> float:
-        return settings.hotel_model_timeout_seconds
+        """
+        How long one model *step* may take.
+
+        Per tier, not one number for everything. A classification is a
+        sub-second call on the cheapest model and waiting forty-five seconds
+        for one is waiting for a call that is never coming back; a reasoning
+        turn on a disputed cancellation fee legitimately takes longer than a
+        greeting does.
+        """
+        return _STEP_TIMEOUTS.get(self.tier, settings.hotel_model_timeout_seconds)
+
+    @property
+    def budget(self) -> float:
+        """
+        How long the **whole turn** may take, tool calls included.
+
+        The thing that was missing, and the reason a real guest turn took 107
+        seconds. `hotel_model_timeout_seconds` is per request; a turn may make
+        `agent_max_tool_turns` of them, so the worst case was six times the
+        number anybody had looked at, plus the tools in between. Nothing
+        anywhere held a wall clock against the turn as a whole.
+
+        A guest on Instagram who has waited two minutes has gone. So the runtime
+        stops asking for another tool round once this is spent and lets the
+        model answer with what it has — which is a slower reply, not a lost one.
+        """
+        return _TURN_BUDGETS.get(self.tier, settings.hotel_turn_budget_seconds)
+
+
+# ── how long each tier is allowed ───────────────────────────────────────────
+#
+# Two clocks, and they answer different questions.
+#
+# `timeout` is one HTTP request to Vertex. `budget` is the guest sitting on
+# Instagram watching "typing…", and covers every step of the turn plus the tools
+# between them. Before this there was only the first, one value for everything,
+# and the second did not exist — which is how a turn reached 107 seconds without
+# anything being technically wrong.
+#
+# The numbers come from the measured distribution rather than from taste. Over
+# 1,000 real runs: a turn calling no tools averages 6.0 s, one tool 9.9 s, two
+# 13.1 s, three 20.7 s, four 21.0 s. So a 40-second budget on the conversation
+# tier is roughly twice the slowest ordinary turn — generous enough that nothing
+# real is cut off, tight enough that a guest is never left for two minutes.
+#
+# The reasoning tier keeps room, because the turns that reach it — a disputed
+# cancellation fee, a rate negotiation — are the ones where thinking longer is
+# the point and where a wrong fast answer costs money.
+_STEP_TIMEOUTS: dict[str, float] = {
+    CONVERSATION: 30.0,
+    REASONING: 60.0,
+    CLASSIFY: 10.0,
+}
+
+_TURN_BUDGETS: dict[str, float] = {
+    CONVERSATION: 40.0,
+    REASONING: 90.0,
+    CLASSIFY: 12.0,
+}
 
 
 # ── the table ────────────────────────────────────────────────────────────────

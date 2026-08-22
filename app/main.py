@@ -20,6 +20,7 @@ from app.config import settings
 from app.core.limiter import limiter
 from app.core.timeout import TimeoutMiddleware
 from app.observability import init_sentry
+from app.services import trace
 
 # ── Sentry — must init before FastAPI() to capture startup errors ───────────────
 init_sentry("api")
@@ -38,6 +39,13 @@ logging.basicConfig(
 # Keep WARNING+ (connection errors, timeouts) but drop the URL lines.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# Every line from here on carries whichever of request/conversation/hotel/
+# booking is known where it was emitted. Installed after basicConfig, on the
+# handlers it just made — see services/trace, and §29 for why "why didn't this
+# booking confirm?" has to be answerable from logs rather than from a hunch.
+trace.install()
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,6 +64,17 @@ async def lifespan(app: FastAPI):
         logger.info("Places API client initialized")
     except Exception as e:
         logger.warning(f"Places API client init failed (non-fatal): {e}")
+
+    # What StayOS needs, said out loud at boot.
+    #
+    # Same principle as the Redis line below and for the same reason: the
+    # failure that cost a day was `REVALIDATE_SECRET` being unset, which
+    # `seo_ping` handles correctly and reports at `debug`. The behaviour was
+    # right and the volume was wrong. See services/pms/preflight.
+    if settings.enable_hotel_os:
+        from app.services.pms import preflight
+
+        preflight.check()
 
     # Redis, said out loud at boot.
     #
@@ -111,6 +130,31 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # open forever. Added first → runs outermost (wraps every other middleware).
 if settings.request_timeout_seconds and settings.request_timeout_seconds > 0:
     app.add_middleware(TimeoutMiddleware, timeout_seconds=settings.request_timeout_seconds)
+
+
+@app.middleware("http")
+async def _correlate(request, call_next):
+    """
+    One id per request, on every log line the request produces.
+
+    Added after the timeout middleware, so it runs *inside* it: a request that
+    the backstop kills should still have had a trace while it was running,
+    which is the request you most want to be able to find.
+
+    An inbound `X-Request-Id` is honoured so a trace can start at the CDN, but
+    it is truncated and stripped rather than trusted — the value ends up in log
+    lines, and a header that a stranger writes must not be able to inject
+    newlines into them.
+    """
+    supplied = (request.headers.get("x-request-id") or "")[:64]
+    safe = "".join(c for c in supplied if c.isalnum() or c in "-_") or None
+    with trace.span(request_id=safe) as request_id:
+        response = await call_next(request)
+        # Echoed back so a hotelier reporting a problem can quote the id from
+        # their own network tab, which is the difference between "it broke this
+        # morning" and one grep.
+        response.headers["X-Request-Id"] = request_id
+        return response
 
 # CORS — driven by ALLOWED_ORIGINS (comma-separated). Mobile clients don't
 # enforce CORS, but the PMS is a browser app on a different origin to this API,

@@ -63,6 +63,13 @@ class ResolvedProperty:
     website: dict = field(default_factory=dict)
     template: str = "boutique"
 
+    # Seeded or test data. Carried through to the page so the template can
+    # force `noindex` regardless of how complete the hotel looks — a demo hotel
+    # that passes the quality gate is the worst case, not the safe one, because
+    # it is the one a crawler will happily index. See §36 and the `is_demo`
+    # column comment.
+    is_demo: bool = False
+
     # The facts a *page about this hotel* needs, as opposed to the facts a
     # booking needs. Added when the hotel website moved to server rendering:
     # an address, a map pin and a property type are what turn a booking form
@@ -86,7 +93,7 @@ def _read_published(slug: str) -> dict | None:
         db.table("properties")
         .select("id,partner_id,slug,name,city,currency,timezone,check_in_time,"
                 "check_out_time,policies,status,address,state,country,pincode,"
-                "lat,lon,property_type,total_rooms,updated_at")
+                "lat,lon,property_type,total_rooms,updated_at,is_demo")
         .ilike("slug", slug.strip())
         .limit(1).execute().data or []
     )
@@ -132,6 +139,7 @@ async def resolve_published(slug: str) -> ResolvedProperty:
         check_in_time=str(prop.get("check_in_time") or "")[:5],
         check_out_time=str(prop.get("check_out_time") or "")[:5],
         policies=prop.get("policies") or {},
+        is_demo=bool(prop.get("is_demo")),
         website=site.get("published") or {},
         template=site.get("template") or "boutique",
         address=prop.get("address"),

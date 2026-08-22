@@ -34,6 +34,7 @@ from app.services import billing
 from app.services.messaging import credentials as creds_module
 from app.services.messaging import language as language_module
 from app.services.messaging import policy
+from app.services.messaging import session as session_module
 from app.services.messaging import templates as templates_module
 from app.services.messaging.channels import (
     INSUFFICIENT_CREDITS,
@@ -408,25 +409,56 @@ def _record_inbound(inbound: InboundMessage, connection: dict) -> RecordedInboun
     opened_window = not window_open(conversation)
 
     sent_at = (inbound.sent_at or datetime.now(timezone.utc)).isoformat()
-    message = db.table("conversation_messages").insert({
-        "conversation_id": conversation["id"],
-        "property_id": conversation["property_id"],
-        "partner_id": conversation["partner_id"],
-        "channel": inbound.channel,
-        "direction": "inbound",
-        "author": "guest",
-        "author_name": inbound.sender_name or conversation.get("guest_name"),
-        "sender_external_id": inbound.sender_external_id,
-        "message_type": inbound.message_type,
-        "body": inbound.body,
-        "media_urls": list(inbound.media_urls),
-        "external_id": inbound.external_id,
-        # Inbound messages have no delivery lifecycle of their own: it is here,
-        # which is as delivered as it gets.
-        "delivery_status": "delivered",
-        "metadata": inbound.raw,
-        "sent_at": sent_at,
-    }).execute().data[0]
+    try:
+        message = db.table("conversation_messages").insert({
+            "conversation_id": conversation["id"],
+            "property_id": conversation["property_id"],
+            "partner_id": conversation["partner_id"],
+            "channel": inbound.channel,
+            "direction": "inbound",
+            "author": "guest",
+            "author_name": inbound.sender_name or conversation.get("guest_name"),
+            "sender_external_id": inbound.sender_external_id,
+            "message_type": inbound.message_type,
+            "body": inbound.body,
+            "media_urls": list(inbound.media_urls),
+            "external_id": inbound.external_id,
+            # Inbound messages have no delivery lifecycle of their own: it is here,
+            # which is as delivered as it gets.
+            "delivery_status": "delivered",
+            "metadata": inbound.raw,
+            "sent_at": sent_at,
+        }).execute().data[0]
+    except Exception as exc:  # noqa: BLE001
+        # Lost the race, which is not a failure.
+        #
+        # The select at the top of this function closes the window for
+        # redeliveries arriving seconds apart, which is almost all of them. It
+        # cannot close the window for two arriving in the same millisecond: both
+        # pass the select, both insert, and `conversation_messages_provider_idx`
+        # — UNIQUE on (channel, external_id) — refuses the second.
+        #
+        # That was a 500 back to Meta. Meta redelivers, the redelivery reads as
+        # a duplicate, and the guest is answered — so the design worked and left
+        # an exception in the log for something it handles. Worse, the 500 comes
+        # back for the *whole batch*, so one racing message could cost the other
+        # five in the same request their acknowledgement.
+        #
+        # The index is the real idempotency here and always was. This reads its
+        # answer rather than crashing on it.
+        if "duplicate key" not in str(exc) and "23505" not in str(exc):
+            raise
+        seen = (
+            db.table("conversation_messages").select("*")
+            .eq("channel", inbound.channel)
+            .eq("external_id", inbound.external_id)
+            .limit(1).execute().data or []
+        )
+        if not seen:
+            raise
+        logger.info("inbound %s %s was recorded by a concurrent delivery",
+                    inbound.channel, inbound.external_id)
+        return RecordedInbound(conversation=conversation, message=seen[0], duplicate=True)
 
     # The window opens here. Everything about whether we may reply freely for
     # the next 24 hours is this column.
@@ -1180,6 +1212,21 @@ async def announce_booking(reservation: dict) -> dict | None:
 
     language = language_module.of_conversation(conversation)
     body = _confirmation_body(reservation, language, booking_url(reservation))
+
+    # The sale is over, so the session describing it is too.
+    #
+    # `guest_profile` carried `stage: "booked"`, a spent `quote_id` and the
+    # dates of a stay that is now a row in `reservations`. Nothing cleared it,
+    # so a guest writing back six weeks later about different nights started
+    # inside the finished transaction — and `session.describe` put September's
+    # dates into the system prompt of an October conversation. What the guest
+    # is owed after this point is `get_booking_status`, which reads the
+    # reservation and needs none of it.
+    #
+    # Before the message rather than after: the message can legitimately fail
+    # (a closed window, a channel with no template) and the session is stale
+    # either way.
+    await run_db(session_module.close, conversation_id)
 
     try:
         sent = await send(

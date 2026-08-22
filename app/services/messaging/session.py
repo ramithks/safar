@@ -28,6 +28,7 @@ replaced, because a language write that dropped a live quote would be a worse
 bug than either one fixes.
 """
 import logging
+from datetime import datetime, timedelta, timezone
 
 from app.db.client import get_db
 
@@ -96,6 +97,67 @@ def patch_from(outcomes: list) -> dict:
     return patch
 
 
+# The fields that describe *one* stay being discussed, as opposed to what we
+# know about the guest. When the guest moves on to different nights, these go
+# with the old stay; `language` and anything else on the profile stays.
+_TRANSACTIONAL = _STAY_ARGS + ("stage", "quote_id", "room_type_id", "rate_plan_id")
+
+# How long a session may sit untouched before it stops being "where we are" and
+# becomes "what we were talking about last month". A guest who comes back after
+# this has almost certainly come back about something else, and the dates they
+# gave in September are not an answer to a question asked in November.
+STALE_AFTER_HOURS = 72
+
+
+def _superseded(profile: dict, patch: dict) -> bool:
+    """
+    Has the guest started talking about a different stay?
+
+    **The bug this exists for.** `merge` was `{**profile, **patch}` with no
+    eraser, so a session only ever accumulated. A guest who booked 10–14
+    September for 2 rooms and 4 adults, and came back in October asking about
+    20–22 October for 1 room and 2 adults, kept `units: 2` and `children` from
+    the first stay for any field the new tool call did not happen to set — and
+    kept `quote_id` and `room_type_id` pointing at a booking that was finished.
+    `describe()` then put the September dates into the system prompt of an
+    October conversation.
+
+    New dates are the signal, because dates are the one thing a guest always
+    restates when they mean a different trip. Changing the party size alone is
+    a correction to the stay being discussed, not a new one.
+    """
+    if not (patch.get("check_in") or patch.get("check_out")):
+        return False
+    for field in ("check_in", "check_out"):
+        old, new = profile.get(field), patch.get(field)
+        if old and new and str(old) != str(new):
+            return True
+    return False
+
+
+def _stale(profile: dict, now: datetime | None = None) -> bool:
+    """Old enough that carrying it forward would be guessing."""
+    touched = profile.get("touched_at")
+    if not touched:
+        return False
+    try:
+        at = datetime.fromisoformat(str(touched).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    return (now or datetime.now(timezone.utc)) - at > timedelta(hours=STALE_AFTER_HOURS)
+
+
+def clear_stay(profile: dict) -> dict:
+    """
+    Drop the current stay, keep what we know about the guest.
+
+    Deliberately a subtraction of a named list rather than "keep language and
+    throw away the rest": the profile is a shared column and the next thing
+    somebody stores on it should not be silently deleted by a booking ending.
+    """
+    return {k: v for k, v in (profile or {}).items() if k not in _TRANSACTIONAL}
+
+
 def merge(conversation_id: str, patch: dict) -> None:
     """
     Fold one turn's findings into the stored session. Best effort, never fatal.
@@ -104,6 +166,10 @@ def merge(conversation_id: str, patch: dict) -> None:
     shared with the language preference and PostgREST has no partial-object
     update. The race — two turns on one conversation writing at once — cannot
     happen: `pipeline.conversation_lock` is held for the whole drain.
+
+    **Merging is not always the right verb.** See `_superseded` and `_stale`:
+    a session that has moved to different nights, or that has been sitting for
+    three days, is replaced rather than added to.
     """
     if not patch:
         return
@@ -116,14 +182,56 @@ def merge(conversation_id: str, patch: dict) -> None:
         profile = (rows[0].get("guest_profile") if rows else None) or {}
         if not isinstance(profile, dict):
             profile = {}
+
+        if _superseded(profile, patch) or _stale(profile):
+            profile = clear_stay(profile)
+
         merged = {**profile, **patch}
         if merged == profile:
+            # Nothing new. Returning here rather than stamping `touched_at`
+            # anyway is what keeps the staleness clock honest: it should measure
+            # when the *stay* last moved, not when a turn last happened to run.
             return
+        merged["touched_at"] = datetime.now(timezone.utc).isoformat()
         db.table("conversations").update({"guest_profile": merged}).eq(
             "id", conversation_id
         ).execute()
     except Exception:  # noqa: BLE001
         logger.warning("could not store session state for conversation %s",
+                       conversation_id, exc_info=True)
+
+
+def close(conversation_id: str) -> None:
+    """
+    The stay under discussion is finished. Stop describing it as current.
+
+    Called when a booking reaches a terminal state — confirmed and announced,
+    or cancelled. Without this, `stage: "booked"` and a spent `quote_id` stay
+    on the thread forever, and a guest writing back next month starts inside
+    last month's transaction. What the guest is *actually* owed after a
+    confirmation is `get_booking_status`, which reads the reservation and does
+    not need any of this.
+
+    Never fatal: a session that failed to close is a stale sentence in a
+    prompt, and losing the guest's message over it would be worse.
+    """
+    try:
+        db = get_db()
+        rows = (
+            db.table("conversations").select("guest_profile")
+            .eq("id", conversation_id).limit(1).execute().data or []
+        )
+        profile = (rows[0].get("guest_profile") if rows else None) or {}
+        if not isinstance(profile, dict) or not profile:
+            return
+        remaining = clear_stay(profile)
+        if remaining == profile:
+            return
+        db.table("conversations").update({"guest_profile": remaining}).eq(
+            "id", conversation_id
+        ).execute()
+    except Exception:  # noqa: BLE001
+        logger.warning("could not close the session on conversation %s",
                        conversation_id, exc_info=True)
 
 

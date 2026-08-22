@@ -293,6 +293,21 @@ async def run_turn(
     status = "succeeded"
     error: str | None = None
 
+    # The wall clock the guest is actually watching.
+    #
+    # `choice.timeout` bounds one request to Vertex; nothing bounded the turn.
+    # Six tool rounds at forty-five seconds each is four and a half minutes, and
+    # a measured turn during this work took 107 seconds before failing — by
+    # which time the guest has closed Instagram. See `model_router.budget`.
+    #
+    # **Spending it is not an error.** It stops the loop asking for *another*
+    # round of tools; the model still gets its turn to answer with what it
+    # already has, which is the difference between a slower reply and no reply.
+    # A turn that has spent its budget and has nothing to say hands over to a
+    # person, which is the same ending as running out of tool turns.
+    deadline = started + choice.budget
+    out_of_time = False
+
     try:
         for _turn in range(settings.agent_max_tool_turns):
             step: ModelStep = await llm.step(
@@ -325,6 +340,33 @@ async def run_turn(
 
             if not step.wants_tools:
                 reply = (step.reply or "").strip() or None
+                break
+
+            if time.monotonic() > deadline:
+                # Out of time with tools still pending. Rather than run them and
+                # keep the guest waiting, the model is told plainly and given
+                # one last step to say something true with what it has.
+                out_of_time = True
+                logger.warning(
+                    "run %s spent its %.0fs budget with tools outstanding",
+                    run_id, choice.budget,
+                )
+                messages.append(step.raw or {"role": "assistant", "content": None})
+                for call in step.tool_calls:
+                    messages.append(llm.tool_result_message(call, json.dumps({
+                        "refused": True,
+                        "reason": (
+                            "This turn has taken too long and the guest is "
+                            "waiting. Do not call any more tools. Answer with "
+                            "what you already have, or say you are checking and "
+                            "call request_human_handoff."
+                        ),
+                    })))
+                final = await llm.step(
+                    model=choice.model, messages=messages, tools=[], params=params
+                )
+                turn_usage.add_tokens(final.tokens_in, final.tokens_out, final.tokens_thought)
+                reply = (final.reply or "").strip() or None
                 break
 
             messages.append(step.raw or {"role": "assistant", "content": None})
@@ -390,6 +432,13 @@ async def run_turn(
                 reply = prompts.handoff_reply(ctx)
                 handoff = True
                 error = f"guardrail: {verdict.reason}"
+
+        if out_of_time and reply is None:
+            # Nothing usable came back inside the budget. A person, rather than
+            # silence — which is the one outcome a hotel cannot explain.
+            handoff = True
+            reply = prompts.handoff_reply(ctx)
+            error = f"turn exceeded its {choice.budget:.0f}s budget"
 
         if handoff:
             status = "escalated"

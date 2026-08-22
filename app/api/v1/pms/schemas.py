@@ -16,6 +16,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.services.pms import money
+
 # The six values `quotes.discount_reason` will accept. This is a category, not
 # a sentence — "why the rate moved", so margin can be read by cause later. It
 # is spelled out here because the alternative is what happened in testing: the
@@ -149,9 +151,23 @@ class ReservationOut(BaseModel):
     createdAt: datetime
 
     @staticmethod
-    def from_row(row: dict, folio_balance: int | None = None) -> "ReservationOut":
+    def from_row(row: dict, folio: dict | None = None) -> "ReservationOut":
+        """
+        One reservation, with the same balance every other surface shows.
+
+        `balancePaise` was `total_paise - paid_paise`, computed right here — the
+        fifth independent answer to a question that should have had one. It is
+        wrong in both directions: negative when a guest overpays, and blind to
+        the extras an in-house guest has put on the folio, so the dashboard and
+        the desk disagreed about what to charge at check-out.
+
+        `folio` is a row from the `folio_states` RPC, or None where the caller
+        did not read one. None means "the folio has not been opened", which is
+        the correct reading for every booking before arrival.
+        """
+        purse = money.state(row, money.rows_from_state(folio))
         return ReservationOut(
-            folioBalancePaise=folio_balance,
+            folioBalancePaise=(folio or {}).get("balance_paise"),
             id=row["id"],
             ref=row["ref"],
             propertyId=row["property_id"],
@@ -175,7 +191,7 @@ class ReservationOut(BaseModel):
             paidPaise=row["paid_paise"],
             # Derived rather than stored: two numbers that must agree are one
             # number too many.
-            balancePaise=row["total_paise"] - row["paid_paise"],
+            balancePaise=purse.balance_due_paise,
             source=row["source"],
             status=row["status"],
             paymentStatus=row["payment_status"],
@@ -1653,6 +1669,13 @@ class PublicSiteOut(BaseModel):
     lon: float | None = None
     propertyType: str | None = None
     totalRooms: int | None = None
+    # Seeded or test data. The page renders and takes bookings exactly as
+    # before; what this does is let the template force `noindex` however
+    # complete the hotel looks. A demo hotel that passes the quality gate is
+    # the dangerous case rather than the safe one — Casa Mandala passed it, and
+    # was therefore the one fictional hotel Google was actually being asked to
+    # index. See §36.
+    isDemo: bool = False
     # When the *page* last changed — the website's publish time, not the
     # property row's. A rate edit is not a content change, and a lastmod that
     # moves for reasons a reader cannot see is one Google learns to ignore.

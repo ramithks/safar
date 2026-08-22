@@ -51,7 +51,14 @@ def _claim(event_id: str, name: str, payload: dict,
     except Exception as exc:  # noqa: BLE001
         message = str(exc)
         if "duplicate key" in message or "23505" in message:
-            return False
+            # Seen before — but "seen" and "finished" are not the same thing.
+            #
+            # A row this handler released after failing to fulfil is one
+            # Razorpay is *supposed* to send again, and answering "already
+            # seen" to that retry is what made `payments.release` unreachable.
+            # `_reclaim` is a conditional UPDATE, so of two simultaneous
+            # retries exactly one is handed the work. See `release` below.
+            return _reclaim(event_id)
         # Anything else — a dropped connection, a pool timeout — must not stop
         # the event being handled. Logged and treated as new: handling twice is
         # safe by construction, and not handling at all is not.
@@ -104,3 +111,54 @@ async def mark(event_id: str | None, status: str, error: str | None = None) -> N
         await run_db(_mark, event_id, status, error)
     except Exception:  # noqa: BLE001
         logger.debug("could not mark webhook %s as %s", event_id, status)
+
+
+# ── giving an event back ─────────────────────────────────────────────────────
+#
+# The gap this closes, found by reading the two halves together rather than
+# separately.
+#
+# `payments.release()` hands a claimed order back to 'created' when fulfilment
+# fails, and the handler then answers 500 so that Razorpay — which retries for
+# twenty-four hours — comes back and finishes the job. That is the whole
+# recovery story for "the guest paid and the room sold in the seconds between".
+#
+# It could not work. `claim()` above inserts the event id, and Razorpay's retry
+# carries **the same** `x-razorpay-event-id`. So the retry hit the unique index,
+# read as "already seen", and was answered 200. The order sat at 'created' with
+# a failure_reason and nobody ever came back for it: a guest charged, with no
+# booking, permanently, and a 200 in the log saying everything was fine.
+#
+# The dedup log has to be released alongside the order it guarded. Not deleted —
+# the row is the reconciliation record, and losing it is losing the only
+# evidence of what Razorpay actually sent — so it is marked `failed`, and
+# `_claim` treats a `failed` row as claimable again.
+#
+# The reclaim is a conditional UPDATE for the same reason `payments._claim` is:
+# two retries arriving together must produce one handler, and `where status =
+# 'failed'` is Postgres deciding rather than us hoping.
+
+RECLAIMABLE = "failed"
+
+
+def _reclaim(event_id: str) -> bool:
+    rows = (
+        get_db().table("razorpay_webhook_events")
+        .update({"status": "retrying"})
+        .eq("event_id", event_id).eq("status", RECLAIMABLE)
+        .execute().data or []
+    )
+    return bool(rows)
+
+
+async def release(event_id: str | None, reason: str) -> None:
+    """
+    Mark an event as needing Razorpay to send it again.
+
+    Called on exactly the paths that answer non-2xx. An event left `processed`
+    after a handler failed is an event that can never be retried, which is the
+    bug this exists for.
+    """
+    if not event_id:
+        return
+    await mark(event_id, RECLAIMABLE, reason)

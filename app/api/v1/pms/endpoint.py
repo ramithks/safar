@@ -183,6 +183,9 @@ from app.services.pms import onboarding as onboarding_service
 from app.services.pms import creators as creators_service
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
+from app.services import trace
+from app.services.pms import money
+from app.services.pms import uploads
 from app.services.pms import payments as payments_service
 from app.services.pms import stay_payment
 from app.services.pms import public_booking
@@ -598,21 +601,35 @@ async def extract_hotel_from_file(
     a hotel sends to have read is not a document they asked us to keep, and the
     only thing worth persisting out of it is the draft they approve.
     """
-    mime = (file.content_type or "").split(";")[0].strip().lower()
-    if mime not in _EXTRACT_TYPES:
-        raise HTTPException(
-            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            "Send a PDF, a photo of your rate card, or paste the text.",
-        )
-
+    # Sniffed for the same reason the gallery upload is — the client's header is
+    # a claim — with one difference: plain text has no signature to read, so it
+    # is decided by the declaration and nothing else. That is safe here because
+    # the *only* thing done with text is `decode` and a model call, whereas
+    # everything else is handed to a parser that cares what it is being given.
     data = await file.read()
-    if not data:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No file received.")
-    if len(data) > _EXTRACT_MAX_BYTES:
-        raise HTTPException(
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            "That file is over 12 MB. Please send a smaller one.",
-        )
+    claimed = (file.content_type or "").split(";")[0].strip().lower()
+    if claimed == "text/plain":
+        if not data:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "No file received.")
+        if len(data) > _EXTRACT_MAX_BYTES:
+            raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                                "That file is over 12 MB. Please send a smaller one.")
+        mime = "text/plain"
+    else:
+        try:
+            mime = uploads.sniff(
+                data,
+                allowed=_EXTRACT_TYPES - {"text/plain"},
+                claimed=file.content_type,
+                max_bytes=_EXTRACT_MAX_BYTES,
+            ).mime
+        except uploads.RejectedUpload as exc:
+            logger.info("[pms] extract upload refused for %s: %s", property_id, exc.reason)
+            raise HTTPException(
+                exc.status,
+                "Send a PDF, a photo of your rate card, or paste the text."
+                if exc.status == 415 else exc.message,
+            ) from None
 
     try:
         if mime == "text/plain":
@@ -633,11 +650,14 @@ async def extract_hotel_from_file(
 # Deliberately the same four types and the same 5 MB ceiling as the marketplace
 # uploader: a hotelier photographing a room on a phone produces a 3–4 MB JPEG,
 # and anything stricter would reject the ordinary case.
+# The extensions live in `services/pms/uploads`, keyed by what the bytes
+# actually say. This is now only the *allow list* — which of the formats that
+# module can recognise a hotel may put in its gallery.
 _MEDIA_TYPES = {
-    "image/jpeg": "jpg",
-    "image/png": "png",
-    "image/webp": "webp",
-    "image/avif": "avif",
+    uploads.JPEG: "jpg",
+    uploads.PNG: "png",
+    uploads.WEBP: "webp",
+    uploads.AVIF: "avif",
 }
 _MEDIA_MAX_BYTES = 5 * 1024 * 1024
 _MEDIA_CACHE_CONTROL = "public, max-age=31536000, immutable"
@@ -676,22 +696,30 @@ async def upload_property_media(
     climb out of this hotel's prefix — a hotel cannot write into another hotel's
     photos whatever it sends.
     """
-    mime = (file.content_type or "").split(";")[0].strip().lower()
-    ext = _MEDIA_TYPES.get(mime)
-    if not ext:
-        raise HTTPException(
-            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            "Please upload a JPG, PNG, WebP or AVIF image.",
-        )
-
+    # **The bytes decide, not the header.**
+    #
+    # This read `file.content_type` — written by whoever is uploading — and used
+    # it twice: to pick the stored extension, and as the `Content-Type` on a
+    # publicly readable object. So "this is a PNG" was a claim, believed without
+    # being checked, and served back out as if we had verified it. §32 of the
+    # brief is explicit about this, and "the attacker would have to be a hotel
+    # we onboarded" is a control that expires the day we onboard one.
+    #
+    # `sniff` also reads the dimensions, which the size check cannot stand in
+    # for: a 40,000-square PNG is a few hundred kilobytes on the wire and a
+    # memory exhaustion for anything that later decodes it.
     data = await file.read()
-    if not data:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No file received.")
-    if len(data) > _MEDIA_MAX_BYTES:
-        raise HTTPException(
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            "That image is over 5 MB. Please upload a smaller one.",
+    try:
+        found = uploads.sniff(
+            data,
+            allowed=set(_MEDIA_TYPES),
+            claimed=file.content_type,
+            max_bytes=_MEDIA_MAX_BYTES,
         )
+    except uploads.RejectedUpload as exc:
+        logger.info("[pms] media upload refused for %s: %s", property_id, exc.reason)
+        raise HTTPException(exc.status, exc.message) from None
+    mime, ext = found.mime, found.extension
 
     # Checked before the file is read rather than discovered inside the client.
     #
@@ -1065,7 +1093,7 @@ async def list_reservations(
     because a list that changes the moment a connection drops leaves the desk
     with no way to tell which version is right.
     """
-    rows, balances = await workspace_service.list_reservations(
+    rows, folios = await workspace_service.list_reservations(
         property_id,
         bucket=bucket,
         search=search,
@@ -1073,7 +1101,7 @@ async def list_reservations(
         date_to=date_to.isoformat() if date_to else None,
         limit=limit,
     )
-    return [ReservationOut.from_row(r, folio_balance=balances.get(r["id"], 0)) for r in rows]
+    return [ReservationOut.from_row(r, folio=folios.get(r["id"])) for r in rows]
 
 
 @router.post("/properties/{property_id}/reservations", response_model=ReservationOut)
@@ -1128,8 +1156,8 @@ async def get_reservation(
     found = await workspace_service.get_reservation(property_id, reservation_id)
     if found is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Reservation not found")
-    row, balance = found
-    return ReservationOut.from_row(row, folio_balance=balance)
+    row, folio = found
+    return ReservationOut.from_row(row, folio=folio)
 
 
 @router.post("/properties/{property_id}/reservations/{reservation_id}/check-in",
@@ -3227,29 +3255,18 @@ def _amount_due(stay: dict, folio: list[dict]) -> int:
     """
     What this guest still owes, in the sense a guest means it.
 
-    **Not `folio_balance`, which is what both public views used to show.** That
-    RPC sums the folio, and a booking that has not started yet has a folio
-    holding one thing: the deposit that was paid. Its balance is therefore
-    *negative* — a guest with ₹43,008 left to pay was shown "₹-10,752", and the
-    check-in page, which only renders a balance above zero, showed them nothing
-    at all. Both were found by rendering a real four-night booking rather than
-    by reading the code.
+    **The rule moved to `services/pms/money`; this is the name the two public
+    views already call it by.** It was defined here, correctly, and three other
+    surfaces — the booking-engine confirmation, the agent's `read_booking_state`
+    and the partner dashboard — each computed their own answer and got a
+    different one. A guest reading ₹28,672 on Instagram and ₹-10,752 on the
+    receipt for one booking cannot tell which is real.
 
-    So: once the folio has real charges on it the folio is the truth, because it
-    carries the extras a guest ordered after arriving and the reservation total
-    does not. Before then the reservation is the truth, and the sum that means
-    something is total minus paid.
-
-    A cancelled booking that was never charged owes nothing, whatever its total
-    says.
+    Kept as a thin alias rather than replaced at every call site, because
+    `tests/test_booking_page.py` pins the discriminating cases through this name
+    and those cases are the whole reason the rule is what it is.
     """
-    charges = sum(int(e.get("amount_paise") or 0) for e in folio
-                  if int(e.get("amount_paise") or 0) > 0)
-    if charges > 0:
-        return sum(int(e.get("amount_paise") or 0) for e in folio)
-    if (stay.get("status") or "") in ("cancelled", "no_show"):
-        return 0
-    return max(0, int(stay.get("total_paise") or 0) - int(stay.get("paid_paise") or 0))
+    return money.amount_due(stay, folio)
 
 
 @router.get("/public/stays/{ref}", response_model=PublicStayOut)
@@ -3643,6 +3660,7 @@ async def get_public_hotel(request: Request, slug: str):
         address=prop.address, state=prop.state, country=prop.country,
         pincode=prop.pincode, lat=prop.lat, lon=prop.lon,
         propertyType=prop.property_type, totalRooms=prop.total_rooms,
+        isDemo=prop.is_demo,
         updatedAt=prop.updated_at,
         # Only a *verified* domain. An unverified one is a hostname somebody
         # typed into a form, and pointing a canonical at it would hand the
@@ -3714,6 +3732,14 @@ async def list_public_hotels(request: Request):
             for p in (
                 db.table("properties")
                 .select("id,slug,name,city,status,lat,lon,address,policies,updated_at")
+                # **Demo hotels are absent from this list, and that is what
+                # keeps them out of Google.** This route is what the sitemap
+                # enumerates and what `/book` indexes, so a seeded showcase
+                # listed here is a fictional hotel submitted to a crawler as a
+                # real bookable business — which is exactly what was happening
+                # to Casa Mandala. Their own pages still render and still take
+                # bookings; see `is_demo` on the column comment, and §36.
+                .eq("is_demo", False)
                 .in_("id", ids).execute().data or []
             )
         }
@@ -3967,6 +3993,19 @@ async def _fulfil_booking(order: dict) -> dict:
     await public_booking.attach_addons(reservation, order.get("addons") or [])
     await payments_service.record_result(order["id"], reservation_id=reservation["id"])
 
+    trace.bind(booking_id=reservation["id"], hotel_id=reservation["property_id"],
+               conversation_id=order.get("conversation_id"))
+    # The line the whole trace exists for. Everything a person asking "did this
+    # confirm, and for how much" needs, and nothing a person asking it is not
+    # entitled to: no guest name, no phone, no card, no token.
+    logger.info(
+        "booking %s confirmed from order %s: %s, %s nights x %s rooms, "
+        "total=%s paid=%s paise",
+        reservation["ref"], order["razorpay_order_id"], reservation["status"],
+        reservation.get("nights"), reservation.get("units"),
+        reservation.get("total_paise"), reservation.get("paid_paise"),
+    )
+
     # Point the thread at the booking, and tell the guest.
     #
     # Both after the reservation exists and both best-effort, because a guest
@@ -3990,15 +4029,31 @@ async def _fulfil_booking(order: dict) -> dict:
 
 
 async def _public_booking_out(reservation: dict, hotel_name: str) -> PublicBookingOut:
+    """
+    What the browser is shown the moment a payment goes through.
+
+    **This read the `folio_balance` RPC and was the last surface still doing
+    it.** A booking that has not started has a folio holding one thing — the
+    deposit just paid — so its sum is negative, and the guest who had *just*
+    paid ₹10,752 was told their balance was ₹-10,752 on the confirmation screen
+    for it. The same bug was found and fixed on `/b/{token}` and the check-in
+    page; this page kept it because nobody re-rendered it.
+
+    Now it reads the folio rows rather than the RPC's sum, and hands them to the
+    one function every other surface asks. See `services/pms/money`.
+    """
     def _read():
         db = get_db()
         rt = (db.table("room_types").select("name")
               .eq("id", reservation["room_type_id"]).limit(1).execute().data or [{}])[0]
-        balance = db.rpc("folio_balance",
-                         {"p_reservation": reservation["id"]}).execute().data
-        return rt, int(balance or 0)
+        folio = (
+            db.table("folio_entries").select("kind,amount_paise")
+            .eq("reservation_id", reservation["id"]).execute().data or []
+        )
+        return rt, folio
 
-    room_type, balance = await run_db(_read)
+    room_type, folio = await run_db(_read)
+    balance = money.amount_due(reservation, folio)
     addons = await public_booking.list_for_reservation(reservation["id"])
     return PublicBookingOut(
         ref=reservation["ref"], status=reservation["status"], hotelName=hotel_name,
@@ -4284,6 +4339,10 @@ async def public_razorpay_webhook(
 
     name = event.get("event") or ""
     payload = event.get("payload") or {}
+    # The money path is the one §29 names: "why didn't this booking confirm?"
+    # has to be answerable from logs. Everything below carries the order, and
+    # the booking once it exists.
+    trace.bind(request_id=x_razorpay_event_id)
     payment = (payload.get("payment") or {}).get("entity") or {}
     order_id = payment.get("order_id") or (
         (payload.get("order") or {}).get("entity") or {}
@@ -4352,7 +4411,10 @@ async def public_razorpay_webhook(
             # 500 so Razorpay retries. Every handler above is idempotent, so a
             # redelivery is safe; swallowing a transient database error would
             # leave a hotel that has paid without its plan and without a trace.
-            await webhook_log.mark(x_razorpay_event_id, "failed", str(exc))
+            # `release` rather than `mark(…, "failed")`: the status is the same
+            # word, but going through the one function means the retry path and
+            # the reclaim rule can never drift apart.
+            await webhook_log.release(x_razorpay_event_id, str(exc))
             logger.exception("subscription webhook %s failed — asking for a retry", name)
             raise HTTPException(
                 status.HTTP_500_INTERNAL_SERVER_ERROR, "Handler failed; please retry.",
@@ -4365,23 +4427,33 @@ async def public_razorpay_webhook(
     order = await payments_service.get(order_id)
     if not order:
         # Not ours — the marketplace webhook handles its own orders.
+        await webhook_log.mark(x_razorpay_event_id, "ignored")
         return {"ok": True, "ignored": "unknown order"}
+
+    trace.bind(order_id=order_id, hotel_id=order.get("property_id"),
+               conversation_id=order.get("conversation_id"))
+    logger.info("razorpay %s on order %s (purpose=%s, %s paise)",
+                name, order_id, order.get("purpose"), order.get("amount_paise"))
 
     if name in ("payment.failed",):
         await payments_service.mark(order_id, "failed", payment.get("error_description"))
+        await webhook_log.mark(x_razorpay_event_id, "processed")
         return {"ok": True, "handled": "failed"}
 
     if name not in ("payment.captured", "order.paid"):
+        await webhook_log.mark(x_razorpay_event_id, "ignored")
         return {"ok": True, "ignored": name}
 
     payment_id = payment.get("id")
     if not payment_id:
+        await webhook_log.mark(x_razorpay_event_id, "ignored")
         return {"ok": True, "ignored": "no payment id"}
 
     settlement = await payments_service.claim(order_id, payment_id)
     if not settlement.won:
         # The browser got here first, or this is a duplicate delivery. Either
         # way there is nothing to do — and saying so is the whole point.
+        await webhook_log.mark(x_razorpay_event_id, "processed")
         return {"ok": True, "handled": "already settled"}
 
     purpose = settlement.order.get("purpose")
@@ -4400,6 +4472,11 @@ async def public_razorpay_webhook(
                      purpose, order_id)
         await payments_service.release(settlement.order["id"],
                                        f"unknown purpose {purpose!r}")
+        # Released in both places or in neither. The order goes back to
+        # 'created' and the event goes back to claimable — a retry that finds
+        # the order waiting and the event spent is a retry that answers 200 and
+        # leaves a paid guest with nothing.
+        await webhook_log.release(x_razorpay_event_id, f"unknown purpose {purpose!r}")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
                             "Could not fulfil the order.")
 
@@ -4407,12 +4484,15 @@ async def public_razorpay_webhook(
         await fulfil(settlement.order)
     except Exception as exc:  # noqa: BLE001
         await payments_service.release(settlement.order["id"], str(exc)[:200])
+        await webhook_log.release(x_razorpay_event_id, str(exc)[:200])
         logger.exception("webhook could not fulfil order %s", order_id)
         # The one deliberate non-2xx: Razorpay retries for 24 hours, and a
         # retry is exactly the recovery this needs.
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
                             "Could not fulfil the order.") from exc
 
+    await webhook_log.mark(x_razorpay_event_id, "processed")
+    logger.info("razorpay order %s fulfilled as %s", order_id, purpose)
     return {"ok": True, "handled": purpose}
 
 

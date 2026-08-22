@@ -28,6 +28,7 @@ from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
 from app.services.pms import availability as availability_service
 from app.services.pms import clock
+from app.services.pms import money
 from app.services.pms import workspace as workspace_service
 
 
@@ -508,7 +509,11 @@ async def get_reservation(args: ReservationArgs, ctx: AgentContext) -> dict:
             f"reservation {args.reservation_id} not found",
             "I can't find that booking — could you check the reference?",
         )
-    row, balance = found
+    row, folio = found
+    # `folio` is a grouped `folio_states` row, and the balance it produces is
+    # the one the guest's own receipt shows. It used to be the folio's raw sum,
+    # which before arrival is the deposit alone and therefore negative.
+    purse = money.state(row, money.rows_from_state(folio))
 
     return {
         "roomNumber": await room_number_for(row),
@@ -520,9 +525,9 @@ async def get_reservation(args: ReservationArgs, ctx: AgentContext) -> dict:
         "checkOut": row["check_out"],
         "nights": row["nights"],
         "rooms": row["units"],
-        "totalPaise": row.get("total_paise"),
-        "paidPaise": row.get("paid_paise"),
-        "balancePaise": balance,
+        "totalPaise": purse.total_paise,
+        "paidPaise": purse.paid_paise,
+        "balancePaise": purse.balance_due_paise,
         "paymentStatus": row.get("payment_status"),
         "checkInTimeNote": "Arrival time is the property's, see get_property.",
     }

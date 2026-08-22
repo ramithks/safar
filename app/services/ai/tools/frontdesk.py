@@ -49,6 +49,7 @@ from app.services.ai.registry import tool
 from app.services.ai.tools import ACTOR_TASK
 from app.services.pms import clock
 from app.services.pms import frontdesk as frontdesk_service
+from app.services.pms import money
 from app.services.pms import workspace as workspace_service
 
 HOUSEKEEPING_STATUSES = ("clean", "dirty", "inspected", "out_of_order")
@@ -127,7 +128,17 @@ async def _reservation_or_refuse(ctx: AgentContext, reservation_id: str) -> dict
     return found[0]
 
 
-def _stay(row: dict, balance: int | None = None, room_number: str | None = None) -> dict:
+def _stay(row: dict, folio: dict | None = None, room_number: str | None = None) -> dict:
+    """
+    One stay, as the front desk agent reads it.
+
+    `folio` is a grouped `folio_states` row, not a bare integer. It used to be
+    the folio's *sum*, which for a booking that has not arrived is negative —
+    the deposit and nothing else — and the agent would read "balancePaise:
+    -1075200" off an arrivals list and tell a receptionist the guest was owed
+    money. The rule that turns a folio into a number a person can act on lives
+    in `services/pms/money` and is the same one the guest's own receipt uses.
+    """
     out = {
         "reservationId": row["id"],
         "ref": row["ref"],
@@ -142,8 +153,8 @@ def _stay(row: dict, balance: int | None = None, room_number: str | None = None)
         "paidPaise": row.get("paid_paise"),
         "paymentStatus": row.get("payment_status"),
     }
-    if balance is not None:
-        out["balancePaise"] = balance
+    if folio is not None:
+        out["balancePaise"] = money.due_from_state(row, folio)
     return out
 
 
@@ -262,14 +273,14 @@ class FolioChargeArgs(BaseModel):
 )
 async def list_arrivals(_args: NoArgs, ctx: AgentContext) -> dict:
     _require_staff(ctx)
-    rows, balances = await workspace_service.list_reservations(ctx.property_id, bucket="arrivals")
+    rows, folios = await workspace_service.list_reservations(ctx.property_id, bucket="arrivals")
     numbers = await _room_numbers(ctx, rows)
 
     return {
         "businessDate": clock.business_date_iso(ctx.property_id),
         "count": len(rows),
         "arrivals": [
-            _stay(r, balances.get(r["id"], 0), numbers.get(r.get("room_id"))) for r in rows
+            _stay(r, folios.get(r["id"]) or {}, numbers.get(r.get("room_id"))) for r in rows
         ],
         "instruction": (
             "This is the complete list. If a guest is not on it they are not "
@@ -295,14 +306,14 @@ async def list_arrivals(_args: NoArgs, ctx: AgentContext) -> dict:
 )
 async def list_departures(_args: NoArgs, ctx: AgentContext) -> dict:
     _require_staff(ctx)
-    rows, balances = await workspace_service.list_reservations(ctx.property_id, bucket="departures")
+    rows, folios = await workspace_service.list_reservations(ctx.property_id, bucket="departures")
     numbers = await _room_numbers(ctx, rows)
 
     return {
         "businessDate": clock.business_date_iso(ctx.property_id),
         "count": len(rows),
         "departures": [
-            _stay(r, balances.get(r["id"], 0), numbers.get(r.get("room_id"))) for r in rows
+            _stay(r, folios.get(r["id"]) or {}, numbers.get(r.get("room_id"))) for r in rows
         ],
         "instruction": (
             "balancePaise above zero means the guest owes that much and cannot "
@@ -323,12 +334,12 @@ async def list_departures(_args: NoArgs, ctx: AgentContext) -> dict:
 )
 async def list_in_house(_args: NoArgs, ctx: AgentContext) -> dict:
     _require_staff(ctx)
-    rows, balances = await workspace_service.list_reservations(ctx.property_id, bucket="inhouse")
+    rows, folios = await workspace_service.list_reservations(ctx.property_id, bucket="inhouse")
     numbers = await _room_numbers(ctx, rows)
     return {
         "count": len(rows),
         "inHouse": [
-            _stay(r, balances.get(r["id"], 0), numbers.get(r.get("room_id"))) for r in rows
+            _stay(r, folios.get(r["id"]) or {}, numbers.get(r.get("room_id"))) for r in rows
         ],
     }
 
@@ -356,7 +367,7 @@ async def find_reservation(args: FindReservationArgs, ctx: AgentContext) -> dict
     because the query never looked anywhere it could have been found.
     """
     _require_staff(ctx)
-    rows, balances = await workspace_service.list_reservations(
+    rows, folios = await workspace_service.list_reservations(
         ctx.property_id, search=args.query, limit=10
     )
     numbers = await _room_numbers(ctx, rows)
@@ -365,7 +376,7 @@ async def find_reservation(args: FindReservationArgs, ctx: AgentContext) -> dict
         "query": args.query,
         "count": len(rows),
         "matches": [
-            _stay(r, balances.get(r["id"], 0), numbers.get(r.get("room_id"))) for r in rows
+            _stay(r, folios.get(r["id"]) or {}, numbers.get(r.get("room_id"))) for r in rows
         ],
         "instruction": (
             "No booking here matches that. Say so plainly — do not offer a "
@@ -468,12 +479,20 @@ async def get_room(args: RoomArgs, ctx: AgentContext) -> dict:
 )
 async def get_folio(args: ReservationArgs, ctx: AgentContext) -> dict:
     _require_staff(ctx)
-    await _reservation_or_refuse(ctx, args.reservation_id)
+    stay = await _reservation_or_refuse(ctx, args.reservation_id)
     folio = await frontdesk_service.get_folio(ctx.property_id, args.reservation_id)
 
     return {
         "reservationId": args.reservation_id,
-        "balancePaise": folio["balance_paise"],
+        # What the guest owes, not what the ledger sums to. Before arrival those
+        # are different numbers with opposite signs: the folio holds the deposit
+        # and nothing else, so its sum is negative, and a receptionist reading
+        # this tool was being told a guest with ₹43,008 outstanding was owed
+        # ₹10,752. `ledgerBalancePaise` keeps the accounting figure beside it,
+        # because a folio screen that cannot show its own running total is not
+        # a folio screen.
+        "balancePaise": money.amount_due(stay, folio["entries"]),
+        "ledgerBalancePaise": folio["balance_paise"],
         "entries": [
             {
                 "kind": e["kind"],
@@ -838,7 +857,7 @@ async def post_folio_charge(args: FolioChargeArgs, ctx: AgentContext) -> tuple[d
             "entryId": entry["id"],
             "description": entry["description"],
             "amountPaise": entry["amount_paise"],
-            "balancePaise": folio["balance_paise"],
+            "balancePaise": money.amount_due(stay, folio["entries"]),
             "instruction": (
                 "The charge is on the bill. Quote the new balance from "
                 "balancePaise — it is the system's figure, not a sum you should "

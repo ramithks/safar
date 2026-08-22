@@ -25,6 +25,7 @@ from app.services.ai.registry import tool
 from app.services.ai.tools import ACTOR_RESERVATION
 from app.services.pms import booking as booking_service
 from app.services.pms import creators as creators_service
+from app.services.pms import money
 
 
 class BookingArgs(BaseModel):
@@ -423,8 +424,22 @@ def read_booking_state(conversation_id: str, property_id: str) -> dict:
 
     if reservation:
         stay = reservation[0]
-        total = int(stay.get("total_paise") or 0)
-        paid = int(stay.get("paid_paise") or 0)
+        # The folio, not `total - paid`.
+        #
+        # This computed `max(0, total - paid)` of its own, which is right up
+        # until a guest checks in: from then on the extras they order live on
+        # the folio and the reservation total does not know about them. The
+        # agent would tell an in-house guest they owed ₹4,800 while the desk's
+        # screen said ₹6,000, and both would be reading the same booking.
+        #
+        # One read, one function, four surfaces. See `services/pms/money`.
+        folio = (
+            db.table("folio_entries").select("kind,amount_paise")
+            .eq("reservation_id", stay["id"]).execute().data or []
+        )
+        purse = money.state(stay, folio)
+        total = purse.total_paise
+        paid = purse.paid_paise
         state = {
             "confirmed": "CONFIRMED",
             "checked_in": "CHECKED_IN",
@@ -445,7 +460,8 @@ def read_booking_state(conversation_id: str, property_id: str) -> dict:
             "children": stay.get("children"),
             "totalPaise": total,
             "paidPaise": paid,
-            "balancePaise": max(0, total - paid),
+            "refundedPaise": purse.refunded_paise,
+            "balancePaise": purse.balance_due_paise,
             "paymentStatus": stay.get("payment_status"),
             # Consumed by `get_booking_status` to build the link and then
             # dropped. It is the guest's own token, but a field the model can

@@ -38,6 +38,7 @@ from app.services.ai import routing as ai_routing
 from app.services.ai import runtime
 from app.services.ai.errors import AgentError
 from app.services import billing
+from app.services import trace
 from app.services.messaging import language as language_module
 from app.services.messaging import session
 from app.services.messaging import service as messaging
@@ -208,6 +209,10 @@ async def process_conversation(conversation_id: str, *, provider=None, classifie
     if not conversation:
         return {"processed": 0, "reason": "conversation not found"}
 
+    trace.bind(conversation_id=conversation_id,
+               hotel_id=conversation.get("property_id"),
+               guest_id=conversation.get("guest_id"))
+
     if not messaging.agent_may_answer(conversation):
         # Checked before a run is opened, so a taken-over conversation costs
         # nothing and leaves no trace. This is the whole of "human takeover
@@ -335,6 +340,16 @@ async def process_conversation(conversation_id: str, *, provider=None, classifie
         # again — two replies to one guest sentence, which is exactly the
         # failure the idempotency work exists to prevent.
         await run_db(_mark_answered, message["id"], result.run_id)
+        # The run id joins the trace *after* the turn, which is the only moment
+        # it exists. Everything the turn itself logged already carries the
+        # conversation, which is what ties the two together.
+        trace.bind(run_id=result.run_id)
+        logger.info(
+            "turn %s finished: status=%s tools=%d handoff=%s latency=%dms "
+            "tokens_in=%d tokens_out=%d",
+            result.run_id, result.status, len(result.actions), result.handoff,
+            result.latency_ms, result.tokens_in, result.tokens_out,
+        )
 
         # What this turn established about the stay, from the tools rather than
         # from the reply. Empty on most turns and cheap when it is.
@@ -408,7 +423,11 @@ async def dispatch(conversation_id: str, *, provider=None, classifier=None) -> N
     try:
         from app.workers.messaging_tasks import process_conversation_task
 
-        process_conversation_task.delay(conversation_id)
+        # The webhook's id rides across the queue, so the worker's lines and
+        # the webhook's lines are one trace rather than two.
+        process_conversation_task.delay(
+            conversation_id, trace.current().get("request_id"),
+        )
     except Exception:  # noqa: BLE001
         # No broker. The message is already persisted and the conversation is
         # already in the inbox, so a person can still answer it — which is why

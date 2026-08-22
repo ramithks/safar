@@ -40,13 +40,17 @@ celery_app = Celery(
 @celeryd_init.connect
 def _sentry_celeryd_init(**_kwargs):
     from app.observability import init_sentry
+    from app.services import trace
     init_sentry("worker")
+    trace.install()
 
 
 @worker_process_init.connect
 def _sentry_worker_process_init(**_kwargs):
     from app.observability import init_sentry
+    from app.services import trace
     init_sentry("worker")
+    trace.install()
 
 celery_app.conf.update(
     task_serializer="json",

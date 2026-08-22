@@ -340,6 +340,14 @@ stay = sql(f"""select id, ref, status, payment_status, conversation_id, guest_id
                where quote_id = '{QUOTE['quoteId']}';""")
 check("a reservation exists", isinstance(stay, list) and len(stay) == 1, str(stay))
 STAY = stay[0]
+# Handed to the fixture the moment it exists.
+#
+# This stay was named by `_fulfil_booking`, not by this suite — a random
+# `TB-XXXXXX` like any live booking, which is exactly what makes testing the
+# real payment path worth doing and exactly why `prefixes` could never find it
+# afterwards. Two of ten rooms went every run and never came back; after five
+# runs the quote 409'd and it read like a pricing bug.
+FIXTURE.adopt(STAY["ref"])
 check("it is confirmed", STAY["status"] == "confirmed", str(STAY["status"]))
 check("the reservation records the conversation that sold it",
       STAY["conversation_id"] == CONVERSATION["id"], str(STAY["conversation_id"]))
@@ -373,8 +381,19 @@ if confirmations:
           "Aapki booking confirm ho gayi hai" in body_text, body_text[:160])
     check("and not in Devanagari, which is what the live agent kept reverting to",
           not any("ऀ" <= ch <= "ॿ" for ch in body_text), body_text[:120])
+    # `/b/{token}`, not `/checkin/{ref}` — this assertion was written in Phase 1
+    # and Phase 6.1 moved the confirmation link without updating it, so it has
+    # been failing ever since while the plan recorded the suite as green.
+    #
+    # Asserted as the security property rather than as a path, which is the
+    # point of the change: `ref` is six characters from a 32-symbol alphabet
+    # built to be read aloud over a phone, and a link that opens a stranger's
+    # booking must not be guessable. A confirmation that carried the reference
+    # in its URL would be one forwarded email away from being enumerable.
     check("it carries a link to the booking",
-          f"/checkin/{STAY['ref']}" in body_text, body_text[:200])
+          "/b/" in body_text and "/checkin/" not in body_text, body_text[:200])
+    check("and the link is a secret rather than the reference",
+          STAY["ref"] not in body_text.split("/b/")[-1], body_text[:200])
 
 # The webhook can be delivered again. It must not produce a second message.
 st, _ = http(f"{API}/public/razorpay/webhook", "POST", raw_body=body,
