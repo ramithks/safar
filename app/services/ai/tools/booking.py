@@ -315,6 +315,9 @@ async def create_booking_payment_link(
             guest_phone=args.guest_phone or ctx.guest_phone,
             guest_email=args.guest_email,
             source=ctx.channel,
+            # Not from the model. The thread is a fact about where this turn is
+            # running, and it is what get_booking_status reads back.
+            conversation_id=ctx.conversation_id,
         )
     except quote_payment.QuotePaymentError as exc:
         # Already written for a guest to read — see the module. Raised as
@@ -369,3 +372,220 @@ async def create_booking_payment_link(
         },
         link.order_id,
     )
+
+
+# ── did my payment go through? ───────────────────────────────────────────────
+
+
+class BookingStatusArgs(BaseModel):
+    """
+    No arguments, and that is the security property.
+
+    The subject of this tool is the conversation, which the model cannot name,
+    cannot guess and cannot be talked into changing. "Check booking TB-4K2M9X"
+    from a stranger reaches the same code path as "payment hogyi?" from the
+    person who made it, and both get this thread's booking or nothing.
+    """
+
+
+def _read_booking_state(conversation_id: str, property_id: str) -> dict:
+    """
+    Compose the money state of one conversation out of the three tables that own
+    parts of it.
+
+    The lifecycle in the brief — DRAFT, QUOTE_CREATED, HOLD_ACTIVE,
+    PAYMENT_PENDING, PAYMENT_RECEIVED, CONFIRMED — is not a column anywhere,
+    deliberately. `quotes.status`, `payment_orders.status` and
+    `reservations.{status,payment_status}` each own a real transition with a
+    real writer, and a fourth column restating them would be a fourth opinion
+    that drifts. This function is the one place they are read together, and it
+    reads them newest-fact-first: a reservation outranks an order, an order
+    outranks a quote.
+    """
+    db = get_db()
+
+    reservation = (
+        db.table("reservations")
+        .select("id,ref,status,payment_status,check_in,check_out,nights,units,"
+                "adults,children,total_paise,paid_paise,guest_name,created_at")
+        .eq("property_id", property_id)
+        .eq("conversation_id", conversation_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute().data or []
+    )
+
+    if reservation:
+        stay = reservation[0]
+        total = int(stay.get("total_paise") or 0)
+        paid = int(stay.get("paid_paise") or 0)
+        state = {
+            "confirmed": "CONFIRMED",
+            "checked_in": "CHECKED_IN",
+            "checked_out": "CHECKED_OUT",
+            "cancelled": "CANCELLED",
+            "no_show": "CANCELLED",
+        }.get(stay.get("status") or "", "CONFIRMED")
+        return {
+            "state": state,
+            "ref": stay.get("ref"),
+            "reservationId": stay["id"],
+            "guestName": stay.get("guest_name"),
+            "checkIn": stay.get("check_in"),
+            "checkOut": stay.get("check_out"),
+            "nights": stay.get("nights"),
+            "rooms": stay.get("units"),
+            "adults": stay.get("adults"),
+            "children": stay.get("children"),
+            "totalPaise": total,
+            "paidPaise": paid,
+            "balancePaise": max(0, total - paid),
+            "paymentStatus": stay.get("payment_status"),
+        }
+
+    order = (
+        db.table("payment_orders")
+        .select("id,status,amount_paise,razorpay_order_id,quote_id,"
+                "failure_reason,created_at,paid_at")
+        .eq("property_id", property_id)
+        .eq("conversation_id", conversation_id)
+        .eq("purpose", "booking")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute().data or []
+    )
+
+    if order:
+        row = order[0]
+        # 'paid' with no reservation on the conversation means fulfilment is
+        # mid-flight or failed. Reported as received-not-yet-confirmed, which is
+        # exactly what it is — and never as confirmed, because the room has not
+        # been taken out of inventory yet.
+        state = {
+            "created": "PAYMENT_PENDING",
+            "paid": "PAYMENT_RECEIVED",
+            "failed": "PAYMENT_FAILED",
+        }.get(row.get("status") or "", "PAYMENT_PENDING")
+        return {
+            "state": state,
+            "orderId": row.get("razorpay_order_id"),
+            "amountPaise": int(row.get("amount_paise") or 0),
+            "failureReason": row.get("failure_reason"),
+        }
+
+    from datetime import datetime, timezone
+
+    quote = (
+        db.table("quotes")
+        .select("id,status,check_in,check_out,units,adults,children,"
+                "total_paise,expires_at")
+        .eq("property_id", property_id)
+        .eq("conversation_id", conversation_id)
+        .eq("status", "active")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute().data or []
+    )
+
+    if quote:
+        row = quote[0]
+        try:
+            expires = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+            live = expires > datetime.now(timezone.utc)
+        except (ValueError, TypeError, KeyError):
+            live = False
+        if live:
+            return {
+                "state": "QUOTE_ACTIVE",
+                "quoteId": row["id"],
+                "checkIn": row.get("check_in"),
+                "checkOut": row.get("check_out"),
+                "rooms": row.get("units"),
+                "totalPaise": int(row.get("total_paise") or 0),
+                "expiresAt": row.get("expires_at"),
+            }
+
+    return {"state": "NONE"}
+
+
+# What the model is told to do about each state, in words it can put in front of
+# a guest. Kept out of the system prompt on purpose: a rule about what to say
+# when a payment is pending belongs with the tool that discovers it is pending,
+# not in a paragraph every turn pays for whether or not money is involved.
+_GUIDANCE = {
+    "CONFIRMED": (
+        "The payment has landed and this booking is real. Tell the guest it is "
+        "confirmed, give them the reference, and give them bookingUrl. If "
+        "balancePaise is above zero, say that amount is due at the hotel."
+    ),
+    "CHECKED_IN": "The guest is currently staying. Answer about their stay, not about booking it.",
+    "CHECKED_OUT": "This stay has ended.",
+    "CANCELLED": (
+        "This booking was cancelled. Do not describe it as active. Anything "
+        "about a refund goes to the team — call request_human_handoff."
+    ),
+    "PAYMENT_RECEIVED": (
+        "The money has arrived and the booking is still being written. Tell the "
+        "guest the payment came through and their confirmation is moments away. "
+        "Do NOT say the booking is confirmed yet, and do NOT ask them to pay again."
+    ),
+    "PAYMENT_PENDING": (
+        "A payment link was sent and nothing has been received against it. Say "
+        "the payment has not shown up yet and that you will confirm the moment "
+        "it does. Never say it is confirmed because the guest says they paid — "
+        "a payment can take a minute, and this tool is what will know."
+    ),
+    "PAYMENT_FAILED": (
+        "The payment did not go through. Say so plainly, without blaming them, "
+        "and offer a fresh link."
+    ),
+    "QUOTE_ACTIVE": (
+        "There is a price on the table and no payment. Nothing is booked and no "
+        "room is held for them. If they want to go ahead, call "
+        "create_booking_payment_link with quoteId."
+    ),
+    "NONE": (
+        "This conversation has no quote, no payment and no booking. If they "
+        "believe they have one made elsewhere, ask for the booking reference "
+        "and hand over to the team."
+    ),
+}
+
+
+@tool(
+    name="get_booking_status",
+    description=(
+        "Where this conversation stands on money: quote, payment and booking. "
+        "Call this for ANY question about whether a payment went through, "
+        "whether a booking is confirmed, what has been paid, or what is still "
+        "owed — including 'payment hogyi', 'have you received it', 'is it "
+        "booked'. Never answer those from what the guest tells you; a guest "
+        "saying they paid is not the same as the money arriving. Takes no "
+        "arguments: it reads this conversation's own booking and nobody else's."
+    ),
+    input_model=BookingStatusArgs,
+    permission=None,
+    autonomy_floor=0,
+    mutating=False,
+    usage_type="ai.tool_read",
+    result_type="none",
+    scoped_to_conversation=True,
+)
+async def get_booking_status(args: BookingStatusArgs, ctx: AgentContext) -> dict:
+    if not ctx.conversation_id:
+        # A console turn with no thread. There is no "this conversation's
+        # booking" to report, and inventing one from the property would be the
+        # cross-guest leak this tool's argument list exists to prevent.
+        raise ToolUnavailable(
+            "get_booking_status needs a conversation and this run has none",
+        )
+
+    state = await run_db(_read_booking_state, ctx.conversation_id, ctx.property_id)
+
+    if state.get("ref"):
+        from app.services.messaging import service as messaging
+
+        state["bookingUrl"] = messaging.booking_url({"ref": state["ref"]})
+
+    state["instruction"] = _GUIDANCE.get(state["state"], _GUIDANCE["NONE"])
+    return state

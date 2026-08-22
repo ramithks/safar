@@ -87,6 +87,10 @@ DEFINITION = AgentDefinition(
         "search_availability",
         "get_stay_options",
         "get_quote",
+        # After the money: what actually happened, rather than what the guest
+        # believes happened. Takes no arguments, so it can only ever read this
+        # conversation's own booking.
+        "get_booking_status",
         # Price, when the guest pushes back
         "get_negotiation_policy",
         "propose_rate_exception",

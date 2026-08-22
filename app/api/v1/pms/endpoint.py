@@ -3133,9 +3133,20 @@ async def _fulfil_booking(order: dict) -> dict:
         notes=guest.get("notes"),
         created_by="booking_engine",
         member_id=None, member_name=None,
+        conversation_id=order.get("conversation_id"),
     )
     await public_booking.attach_addons(reservation, order.get("addons") or [])
     await payments_service.record_result(order["id"], reservation_id=reservation["id"])
+
+    # Point the thread at the booking, and tell the guest.
+    #
+    # Both after the reservation exists and both best-effort, because a guest
+    # who has paid must end up with a booking whether or not we can message
+    # them about it. `announce_booking` is idempotent on the reservation, which
+    # is what makes it safe on the path the browser callback and the webhook
+    # both run.
+    await messaging_service.link_booking(reservation)
+    await messaging_service.announce_booking(reservation)
 
     # Who, if anyone, sent this guest. Best-effort and after the fact on
     # purpose: the booking is paid for and must exist whether or not a

@@ -69,6 +69,10 @@ DEFINITION = AgentDefinition(
         "get_guest",
         "list_guest_reservations",
         "get_reservation",
+        # After the money: what actually happened, rather than what the guest
+        # believes happened. Takes no arguments, so it can only ever read this
+        # conversation's own booking.
+        "get_booking_status",
         # Selling. Granted, and gated by autonomy rather than by absence, so a
         # property that raises the agent to level 3 gets the capability without
         # a code change.

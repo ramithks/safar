@@ -72,6 +72,7 @@ async def create(
     guest_details: dict | None = None,
     addons: list[dict] | None = None,
     attribution: dict | None = None,
+    conversation_id: str | None = None,
 ) -> dict:
     """
     Record an order before the browser is handed it.
@@ -92,6 +93,7 @@ async def create(
         "guest_details": guest_details or {},
         "addons": addons or [],
         "attribution": attribution or {},
+        "conversation_id": conversation_id,
         "status": "created",
     })
 

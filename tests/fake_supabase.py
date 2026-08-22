@@ -76,6 +76,17 @@ class _Query:
         self._filters.append(lambda r, c=col: str(r.get(c)) in wanted)
         return self
 
+    def is_(self, col, val):
+        """
+        PostgREST's null test. `is_("x", "null")` and nothing else — the real
+        client also takes true/false, and neither this codebase nor the fake
+        has a use for them yet.
+        """
+        if str(val).lower() != "null":
+            raise NotImplementedError(f"fake is_ only handles null, not {val!r}")
+        self._filters.append(lambda r, c=col: r.get(c) is None)
+        return self
+
     def ilike(self, col, val):
         needle = str(val).strip("%").lower()
         self._filters.append(lambda r, c=col: needle in str(r.get(c) or "").lower())
