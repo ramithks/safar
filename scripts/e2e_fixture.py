@@ -57,6 +57,7 @@ cannot mint them forever and hide a genuine runaway charge behind a fixture.
 The closing line then reports what the run actually spent, so a suite whose
 cost quietly doubles is visible rather than absorbed.
 """
+import asyncio
 import atexit
 import logging
 
@@ -117,6 +118,29 @@ class Fixture:
         self.account_id: str | None = None
         self.opening_credits: float | None = None
         self._closed = False
+        # Refs this run created that no prefix can match. See `adopt`.
+        self._adopted: list[str] = []
+
+    def adopt(self, ref: str | None) -> None:
+        """
+        Take responsibility for a reservation this suite caused but did not name.
+
+        **A prefix cannot sweep what the product named.** The suites that book
+        through `create_reservation` directly choose their own refs, so
+        `prefixes` finds them. The ones that go through the *real* payment path
+        do not: `_fulfil_booking` mints a random `TB-XXXXXX` like any live
+        booking would, which is the whole point of testing that path — and means
+        the fixture had no way to find the row afterwards.
+
+        `payment_status_e2e` books two rooms out of a ten-room type on every
+        run, and left them there. After five runs the room was full and every
+        subsequent run failed at "the quote executed" with a 409, which reads as
+        a pricing bug. It is not; it is five days of test bookings.
+
+        Ten stranded stays were released and deleted when this was found.
+        """
+        if ref:
+            self._adopted.append(ref)
 
     # ── identity ─────────────────────────────────────────────────────────────
 
@@ -143,8 +167,6 @@ class Fixture:
 
     def open(self) -> None:
         """Announce, fund, and clear what a previous run left behind."""
-        import asyncio
-
         from app.services import billing
 
         self.account_id = asyncio.run(billing.account_for_property(self.property_id))
@@ -176,13 +198,14 @@ class Fixture:
             return
         self._closed = True
 
-        import asyncio
-
         from app.services import billing
 
         try:
+            # Exact refs as well as prefixes. `sweep_reservations` matches on
+            # `like(ref, f"{prefix}%")`, so a whole ref is simply a prefix with
+            # nothing after it and needs no second code path.
             swept = e2e_sweep.sweep_reservations(
-                get_db(), self.properties, list(self.prefixes)
+                get_db(), self.properties, list(self.prefixes) + self._adopted,
             )
         except Exception:  # noqa: BLE001 — a failed sweep must not mask the result
             logger.warning("could not sweep %s fixtures", self.label, exc_info=True)
@@ -192,15 +215,26 @@ class Fixture:
         closing = None
         if self.account_id:
             try:
-                closing = asyncio.run(billing.wallet_state(self.account_id)).get("available")
+                # The **sync** reader, not `billing.wallet_state`.
+                #
+                # This runs from `atexit`, and `concurrent.futures.thread`
+                # registers its own shutdown through `threading._register_atexit`
+                # — which Python runs *before* ordinary atexit callbacks. So by
+                # the time this executes the executor behind `run_db` is always
+                # closed, and the async path always raised `cannot schedule new
+                # futures after shutdown`.
+                #
+                # The fixture caught that. `billing.wallet_state` logged it
+                # first, with a traceback, so **every green run of every suite
+                # ended in a stack trace** — and a suite that prints a traceback
+                # when it passes is a suite whose tracebacks nobody reads.
+                #
+                # The sweep above already uses the sync client for exactly this
+                # reason. This is the same fix applied to the other half.
+                closing = (billing._wallet_state(self.account_id) or {}).get("available")
                 if closing is not None and self.opening_credits is not None:
                     spent = float(self.opening_credits) - float(closing)
-            except Exception:  # noqa: BLE001
-                # Reached from `atexit` after a suite died mid-run, by which
-                # point the database executor has been shut down and every async
-                # call raises. The sweep above uses the sync client and still
-                # works, which is the half that matters — the spend line is
-                # reporting, and losing it must not cost the cleanup.
+            except Exception:  # noqa: BLE001 — reporting must not cost the cleanup
                 pass
 
         bits = [f"swept {swept} stays"] if swept else []
