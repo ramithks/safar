@@ -1431,6 +1431,54 @@ class GuestRegistrationOut(BaseModel):
         )
 
 
+class ConversationSessionOut(BaseModel):
+    """
+    Where one thread has got to, without reading it.
+
+    **This is the panel beside the transcript, and it is not a summary of the
+    transcript.** Every field is composed from rows: the dates and the ids from
+    `conversations.guest_profile`, which is written only from tool inputs and
+    outputs, and the money from `quotes` / `payment_orders` / `reservations` via
+    the same reader `get_booking_status` uses. Nothing here is derived from what
+    the model wrote, because a receptionist taking over a thread needs the facts
+    the guest is holding us to, not our own prose about them.
+
+    The transcript stays. It is how you find out *why*; this is how you find out
+    *where*, and forty messages is an expensive way to learn a check-in date.
+    """
+    conversationId: str
+    channel: str = ""
+    # 'ai' or 'human' — who is answering right now.
+    handler: str = ""
+    guestName: str = ""
+    guestHandle: str = ""
+    # en / hi / hinglish, as detected and stored. Empty when nobody has said
+    # enough for it to be worth guessing.
+    language: str = ""
+    # browsing → quoted → awaiting_payment → booked, or empty for a thread that
+    # has never reached one.
+    stage: str = ""
+    checkIn: date | None = None
+    checkOut: date | None = None
+    nights: int | None = None
+    units: int | None = None
+    adults: int | None = None
+    children: int | None = None
+    roomTypeName: str = ""
+    ratePlanName: str = ""
+    # The composed money state — NONE, QUOTE_ACTIVE, PAYMENT_PENDING,
+    # PAYMENT_RECEIVED, PAYMENT_FAILED, CONFIRMED, CHECKED_IN, CHECKED_OUT,
+    # CANCELLED. The same vocabulary the agent is given, so staff and AI cannot
+    # describe the same booking differently.
+    bookingState: str = "NONE"
+    ref: str = ""
+    totalPaise: int = 0
+    paidPaise: int = 0
+    balancePaise: int = 0
+    quoteExpiresAt: datetime | None = None
+    bookingUrl: str = ""
+
+
 class BookingLinkOut(BaseModel):
     """The booking's public link after a rotation. The old one is dead."""
     ref: str

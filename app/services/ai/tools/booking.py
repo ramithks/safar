@@ -388,10 +388,15 @@ class BookingStatusArgs(BaseModel):
     """
 
 
-def _read_booking_state(conversation_id: str, property_id: str) -> dict:
+def read_booking_state(conversation_id: str, property_id: str) -> dict:
     """
     Compose the money state of one conversation out of the three tables that own
     parts of it.
+
+    Public, and read by the inbox's session panel as well as by the tool below.
+    That is deliberate: if staff and the AI composed this state separately they
+    would eventually describe the same booking differently, and the guest would
+    be holding both descriptions.
 
     The lifecycle in the brief — DRAFT, QUOTE_CREATED, HOLD_ACTIVE,
     PAYMENT_PENDING, PAYMENT_RECEIVED, CONFIRMED — is not a column anywhere,
@@ -586,7 +591,7 @@ async def get_booking_status(args: BookingStatusArgs, ctx: AgentContext) -> dict
             "get_booking_status needs a conversation and this run has none",
         )
 
-    state = await run_db(_read_booking_state, ctx.conversation_id, ctx.property_id)
+    state = await run_db(read_booking_state, ctx.conversation_id, ctx.property_id)
 
     token = state.pop("_publicToken", None)
     if state.get("ref"):

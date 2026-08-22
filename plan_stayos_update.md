@@ -593,9 +593,43 @@ Suites green: 1,206 unit · onboarding 65 · golden 88 · pms 134 · sales 185.
       with a deposit and no charges yet, without which the folio answer and the
       right answer happen to agree — and 24 new assertions over real HTTP: 57
       total, including that the desk can revoke a link and a housekeeper cannot.
-- [ ] **6.3** Inbox: a session panel per conversation (guest, language, stage,
-      dates, quote, payment, booking) so staff do not read the transcript to
-      learn the state. Transcript stays for debugging.
+- [x] **6.3** Inbox session panel. ✅ DONE.
+
+      `GET /properties/{id}/conversations/{cid}/session` composes where one
+      thread has got to, and `SessionPanel` renders it beside the transcript.
+      The case it exists for is a receptionist taking over from the AI mid-sale:
+      until now the only way to learn that a guest had been quoted ₹53,760 for
+      four nights and paid a ₹10,752 deposit was to scroll up and reconstruct it
+      out of prose the model wrote, which is the least reliable copy of any of
+      it.
+
+      **It is not a summary of the transcript.** The dates, party and room come
+      from `conversations.guest_profile`, written only from tool inputs and
+      outputs; the money comes from `read_booking_state` — the same reader
+      behind `get_booking_status`, made public for exactly this reason. If staff
+      and the AI composed the state separately they would eventually describe
+      one booking two ways and the guest would be holding both. A thread where
+      the model *said* a booking was confirmed and no tool ever ran shows
+      "Nothing booked yet", which is a disagreement a person needs to see.
+
+      The panel also carries the guest's detected language with a note — a
+      receptionist who answers a Hinglish thread in formal English has changed
+      the voice mid-conversation — and a link to the guest's own `/b/{token}`
+      page.
+
+      **A second bug, found by looking at the screen rather than the code.**
+      109 of Casa Mandala's 378 threads have never had a message, and Postgres
+      reads `order by last_message_at desc` as `desc nulls first`. The inbox's
+      first hundred rows were therefore every empty thread in the database and
+      not one conversation a guest had actually had — a working-looking screen
+      full of silent guests, on the property with the most real traffic.
+      `nullsfirst=False` fixes it; `tests/fake_supabase.py` now models
+      Postgres's null ordering so a unit test could catch the next one.
+
+      Tests: `scripts/inbox_e2e.py` (28) — three seeded threads, one per shape
+      the panel must get right, plus the list-ordering assertions, plus
+      isolation: another hotel's path, another partner, and a housekeeper with
+      no messaging permission. Verified visually against the real API.
 - [ ] **6.4** Instagram → website handoff preserves the session (dates, guests,
       room) so nothing is re-entered.
 

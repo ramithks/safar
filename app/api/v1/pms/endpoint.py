@@ -85,6 +85,7 @@ from app.api.v1.pms.schemas import (
     ServiceUpsertRequest,
     GuestRegistrationOut,
     BookingLinkOut,
+    ConversationSessionOut,
     BookingPageOut,
     ReceiptLineOut,
     PublicStayOut,
@@ -200,6 +201,7 @@ from app.services.ai import approvals
 from app.services.ai.errors import AgentError
 from app.services.ai import console as ai_console
 from app.services.ai import model_router
+from app.services.ai.tools.booking import read_booking_state
 from app.services.messaging import service as messaging_service
 from app.services.messaging.channels import MessagingError
 from app.services.pms import workspace as workspace_service
@@ -1370,7 +1372,15 @@ async def list_conversations(
             db.table("conversations")
             .select("*")
             .eq("property_id", property_id)
-            .order("last_message_at", desc=True)
+            # `nullsfirst=False`, and it is not a detail.
+            #
+            # Postgres reads `order by x desc` as `desc nulls first`, and 109 of
+            # this property's 378 threads have never had a message and so have a
+            # null `last_message_at`. The inbox's first 100 rows were therefore
+            # every empty thread in the database, and not one conversation a
+            # guest had actually had. It looked like a working screen full of
+            # silent guests.
+            .order("last_message_at", desc=True, nullsfirst=False)
             .limit(limit)
         )
         if status_filter:
@@ -1403,6 +1413,108 @@ async def list_conversations(
         )
         for r in rows
     ]
+
+
+@router.get(
+    "/properties/{property_id}/conversations/{conversation_id}/session",
+    response_model=ConversationSessionOut,
+)
+@limiter.limit("240/minute")
+async def get_conversation_session(
+    request: Request,
+    property_id: str,
+    conversation_id: str,
+    member=Depends(require_member("messaging")),
+):
+    """
+    Where this thread has got to, so nobody has to read it to find out.
+
+    **A receptionist taking over from the AI mid-sale is the case this exists
+    for.** Until now the only way to learn that a guest had been quoted ₹53,760
+    for 11–15 September and had paid a ₹10,752 deposit was to scroll the
+    transcript and reconstruct it — from prose the model wrote, which is the
+    least reliable copy of any of it.
+
+    Every field here is composed from rows. The dates and the room the guest
+    settled on come from `conversations.guest_profile`, which is written only
+    from tool inputs and outputs; the money comes from
+    `read_booking_state` — the same reader behind `get_booking_status`, so the
+    panel a receptionist reads and the answer the AI gives a guest cannot
+    disagree about the same booking.
+
+    Scoped by property in the query. A conversation id from another hotel 404s
+    here exactly as it does everywhere else.
+    """
+    session = await run_db(_conversation_session, property_id, conversation_id)
+    if session is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")
+    return session
+
+
+def _conversation_session(property_id: str, conversation_id: str) -> ConversationSessionOut | None:
+    db = get_db()
+    rows = (
+        db.table("conversations")
+        .select("id,channel,handler,guest_name,guest_handle,guest_profile")
+        .eq("id", conversation_id).eq("property_id", property_id)
+        .limit(1).execute().data or []
+    )
+    if not rows:
+        return None
+    conversation = rows[0]
+    profile = conversation.get("guest_profile")
+    profile = profile if isinstance(profile, dict) else {}
+
+    state = read_booking_state(conversation_id, property_id)
+    token = state.pop("_publicToken", None)
+
+    # The stay the panel describes: the booking's own dates once there is a
+    # booking, and what the guest told us before that. A confirmed reservation
+    # for different nights than the guest last mentioned is not a contradiction
+    # to resolve here — the reservation is simply the later fact.
+    check_in = state.get("checkIn") or profile.get("check_in")
+    check_out = state.get("checkOut") or profile.get("check_out")
+
+    room_type_id = profile.get("room_type_id")
+    rate_plan_id = profile.get("rate_plan_id")
+    room_name = rate_name = ""
+    if room_type_id:
+        found = (db.table("room_types").select("name")
+                 .eq("id", room_type_id).eq("property_id", property_id)
+                 .limit(1).execute().data or [{}])[0]
+        room_name = found.get("name") or ""
+    if rate_plan_id:
+        found = (db.table("rate_plans").select("name")
+                 .eq("id", rate_plan_id).eq("property_id", property_id)
+                 .limit(1).execute().data or [{}])[0]
+        rate_name = found.get("name") or ""
+
+    total = int(state.get("totalPaise") or state.get("amountPaise") or 0)
+    paid = int(state.get("paidPaise") or 0)
+
+    return ConversationSessionOut(
+        conversationId=conversation_id,
+        channel=conversation.get("channel") or "",
+        handler=conversation.get("handler") or "",
+        guestName=state.get("guestName") or conversation.get("guest_name") or "",
+        guestHandle=conversation.get("guest_handle") or "",
+        language=str(profile.get("language") or ""),
+        stage=str(profile.get("stage") or ""),
+        checkIn=check_in, checkOut=check_out,
+        nights=state.get("nights"),
+        units=state.get("rooms") or profile.get("units"),
+        adults=state.get("adults") or profile.get("adults"),
+        children=state.get("children") or profile.get("children"),
+        roomTypeName=room_name, ratePlanName=rate_name,
+        bookingState=state.get("state") or "NONE",
+        ref=state.get("ref") or "",
+        totalPaise=total, paidPaise=paid,
+        balancePaise=int(state.get("balancePaise") or max(0, total - paid)),
+        quoteExpiresAt=state.get("expiresAt"),
+        bookingUrl=(messaging_service.booking_url(
+            {"ref": state["ref"], "public_token": token},
+        ) if state.get("ref") else ""),
+    )
 
 
 @router.get(
