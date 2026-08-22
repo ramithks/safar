@@ -184,6 +184,7 @@ from app.services.pms import creators as creators_service
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
 from app.services.pms import money
+from app.services.pms import uploads
 from app.services.pms import payments as payments_service
 from app.services.pms import stay_payment
 from app.services.pms import public_booking
@@ -599,21 +600,35 @@ async def extract_hotel_from_file(
     a hotel sends to have read is not a document they asked us to keep, and the
     only thing worth persisting out of it is the draft they approve.
     """
-    mime = (file.content_type or "").split(";")[0].strip().lower()
-    if mime not in _EXTRACT_TYPES:
-        raise HTTPException(
-            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            "Send a PDF, a photo of your rate card, or paste the text.",
-        )
-
+    # Sniffed for the same reason the gallery upload is — the client's header is
+    # a claim — with one difference: plain text has no signature to read, so it
+    # is decided by the declaration and nothing else. That is safe here because
+    # the *only* thing done with text is `decode` and a model call, whereas
+    # everything else is handed to a parser that cares what it is being given.
     data = await file.read()
-    if not data:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No file received.")
-    if len(data) > _EXTRACT_MAX_BYTES:
-        raise HTTPException(
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            "That file is over 12 MB. Please send a smaller one.",
-        )
+    claimed = (file.content_type or "").split(";")[0].strip().lower()
+    if claimed == "text/plain":
+        if not data:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "No file received.")
+        if len(data) > _EXTRACT_MAX_BYTES:
+            raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                                "That file is over 12 MB. Please send a smaller one.")
+        mime = "text/plain"
+    else:
+        try:
+            mime = uploads.sniff(
+                data,
+                allowed=_EXTRACT_TYPES - {"text/plain"},
+                claimed=file.content_type,
+                max_bytes=_EXTRACT_MAX_BYTES,
+            ).mime
+        except uploads.RejectedUpload as exc:
+            logger.info("[pms] extract upload refused for %s: %s", property_id, exc.reason)
+            raise HTTPException(
+                exc.status,
+                "Send a PDF, a photo of your rate card, or paste the text."
+                if exc.status == 415 else exc.message,
+            ) from None
 
     try:
         if mime == "text/plain":
@@ -634,11 +649,14 @@ async def extract_hotel_from_file(
 # Deliberately the same four types and the same 5 MB ceiling as the marketplace
 # uploader: a hotelier photographing a room on a phone produces a 3–4 MB JPEG,
 # and anything stricter would reject the ordinary case.
+# The extensions live in `services/pms/uploads`, keyed by what the bytes
+# actually say. This is now only the *allow list* — which of the formats that
+# module can recognise a hotel may put in its gallery.
 _MEDIA_TYPES = {
-    "image/jpeg": "jpg",
-    "image/png": "png",
-    "image/webp": "webp",
-    "image/avif": "avif",
+    uploads.JPEG: "jpg",
+    uploads.PNG: "png",
+    uploads.WEBP: "webp",
+    uploads.AVIF: "avif",
 }
 _MEDIA_MAX_BYTES = 5 * 1024 * 1024
 _MEDIA_CACHE_CONTROL = "public, max-age=31536000, immutable"
@@ -677,22 +695,30 @@ async def upload_property_media(
     climb out of this hotel's prefix — a hotel cannot write into another hotel's
     photos whatever it sends.
     """
-    mime = (file.content_type or "").split(";")[0].strip().lower()
-    ext = _MEDIA_TYPES.get(mime)
-    if not ext:
-        raise HTTPException(
-            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            "Please upload a JPG, PNG, WebP or AVIF image.",
-        )
-
+    # **The bytes decide, not the header.**
+    #
+    # This read `file.content_type` — written by whoever is uploading — and used
+    # it twice: to pick the stored extension, and as the `Content-Type` on a
+    # publicly readable object. So "this is a PNG" was a claim, believed without
+    # being checked, and served back out as if we had verified it. §32 of the
+    # brief is explicit about this, and "the attacker would have to be a hotel
+    # we onboarded" is a control that expires the day we onboard one.
+    #
+    # `sniff` also reads the dimensions, which the size check cannot stand in
+    # for: a 40,000-square PNG is a few hundred kilobytes on the wire and a
+    # memory exhaustion for anything that later decodes it.
     data = await file.read()
-    if not data:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No file received.")
-    if len(data) > _MEDIA_MAX_BYTES:
-        raise HTTPException(
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            "That image is over 5 MB. Please upload a smaller one.",
+    try:
+        found = uploads.sniff(
+            data,
+            allowed=set(_MEDIA_TYPES),
+            claimed=file.content_type,
+            max_bytes=_MEDIA_MAX_BYTES,
         )
+    except uploads.RejectedUpload as exc:
+        logger.info("[pms] media upload refused for %s: %s", property_id, exc.reason)
+        raise HTTPException(exc.status, exc.message) from None
+    mime, ext = found.mime, found.extension
 
     # Checked before the file is read rather than discovered inside the client.
     #

@@ -34,6 +34,7 @@ from app.services import billing
 from app.services.messaging import credentials as creds_module
 from app.services.messaging import language as language_module
 from app.services.messaging import policy
+from app.services.messaging import session as session_module
 from app.services.messaging import templates as templates_module
 from app.services.messaging.channels import (
     INSUFFICIENT_CREDITS,
@@ -1180,6 +1181,21 @@ async def announce_booking(reservation: dict) -> dict | None:
 
     language = language_module.of_conversation(conversation)
     body = _confirmation_body(reservation, language, booking_url(reservation))
+
+    # The sale is over, so the session describing it is too.
+    #
+    # `guest_profile` carried `stage: "booked"`, a spent `quote_id` and the
+    # dates of a stay that is now a row in `reservations`. Nothing cleared it,
+    # so a guest writing back six weeks later about different nights started
+    # inside the finished transaction — and `session.describe` put September's
+    # dates into the system prompt of an October conversation. What the guest
+    # is owed after this point is `get_booking_status`, which reads the
+    # reservation and needs none of it.
+    #
+    # Before the message rather than after: the message can legitimately fail
+    # (a closed window, a channel with no template) and the session is stale
+    # either way.
+    await run_db(session_module.close, conversation_id)
 
     try:
         sent = await send(
