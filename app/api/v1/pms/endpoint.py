@@ -183,6 +183,7 @@ from app.services.pms import onboarding as onboarding_service
 from app.services.pms import creators as creators_service
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
+from app.services.pms import money
 from app.services.pms import payments as payments_service
 from app.services.pms import stay_payment
 from app.services.pms import public_booking
@@ -1065,7 +1066,7 @@ async def list_reservations(
     because a list that changes the moment a connection drops leaves the desk
     with no way to tell which version is right.
     """
-    rows, balances = await workspace_service.list_reservations(
+    rows, folios = await workspace_service.list_reservations(
         property_id,
         bucket=bucket,
         search=search,
@@ -1073,7 +1074,7 @@ async def list_reservations(
         date_to=date_to.isoformat() if date_to else None,
         limit=limit,
     )
-    return [ReservationOut.from_row(r, folio_balance=balances.get(r["id"], 0)) for r in rows]
+    return [ReservationOut.from_row(r, folio=folios.get(r["id"])) for r in rows]
 
 
 @router.post("/properties/{property_id}/reservations", response_model=ReservationOut)
@@ -1128,8 +1129,8 @@ async def get_reservation(
     found = await workspace_service.get_reservation(property_id, reservation_id)
     if found is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Reservation not found")
-    row, balance = found
-    return ReservationOut.from_row(row, folio_balance=balance)
+    row, folio = found
+    return ReservationOut.from_row(row, folio=folio)
 
 
 @router.post("/properties/{property_id}/reservations/{reservation_id}/check-in",
@@ -3227,29 +3228,18 @@ def _amount_due(stay: dict, folio: list[dict]) -> int:
     """
     What this guest still owes, in the sense a guest means it.
 
-    **Not `folio_balance`, which is what both public views used to show.** That
-    RPC sums the folio, and a booking that has not started yet has a folio
-    holding one thing: the deposit that was paid. Its balance is therefore
-    *negative* — a guest with ₹43,008 left to pay was shown "₹-10,752", and the
-    check-in page, which only renders a balance above zero, showed them nothing
-    at all. Both were found by rendering a real four-night booking rather than
-    by reading the code.
+    **The rule moved to `services/pms/money`; this is the name the two public
+    views already call it by.** It was defined here, correctly, and three other
+    surfaces — the booking-engine confirmation, the agent's `read_booking_state`
+    and the partner dashboard — each computed their own answer and got a
+    different one. A guest reading ₹28,672 on Instagram and ₹-10,752 on the
+    receipt for one booking cannot tell which is real.
 
-    So: once the folio has real charges on it the folio is the truth, because it
-    carries the extras a guest ordered after arriving and the reservation total
-    does not. Before then the reservation is the truth, and the sum that means
-    something is total minus paid.
-
-    A cancelled booking that was never charged owes nothing, whatever its total
-    says.
+    Kept as a thin alias rather than replaced at every call site, because
+    `tests/test_booking_page.py` pins the discriminating cases through this name
+    and those cases are the whole reason the rule is what it is.
     """
-    charges = sum(int(e.get("amount_paise") or 0) for e in folio
-                  if int(e.get("amount_paise") or 0) > 0)
-    if charges > 0:
-        return sum(int(e.get("amount_paise") or 0) for e in folio)
-    if (stay.get("status") or "") in ("cancelled", "no_show"):
-        return 0
-    return max(0, int(stay.get("total_paise") or 0) - int(stay.get("paid_paise") or 0))
+    return money.amount_due(stay, folio)
 
 
 @router.get("/public/stays/{ref}", response_model=PublicStayOut)
@@ -3990,15 +3980,31 @@ async def _fulfil_booking(order: dict) -> dict:
 
 
 async def _public_booking_out(reservation: dict, hotel_name: str) -> PublicBookingOut:
+    """
+    What the browser is shown the moment a payment goes through.
+
+    **This read the `folio_balance` RPC and was the last surface still doing
+    it.** A booking that has not started has a folio holding one thing — the
+    deposit just paid — so its sum is negative, and the guest who had *just*
+    paid ₹10,752 was told their balance was ₹-10,752 on the confirmation screen
+    for it. The same bug was found and fixed on `/b/{token}` and the check-in
+    page; this page kept it because nobody re-rendered it.
+
+    Now it reads the folio rows rather than the RPC's sum, and hands them to the
+    one function every other surface asks. See `services/pms/money`.
+    """
     def _read():
         db = get_db()
         rt = (db.table("room_types").select("name")
               .eq("id", reservation["room_type_id"]).limit(1).execute().data or [{}])[0]
-        balance = db.rpc("folio_balance",
-                         {"p_reservation": reservation["id"]}).execute().data
-        return rt, int(balance or 0)
+        folio = (
+            db.table("folio_entries").select("kind,amount_paise")
+            .eq("reservation_id", reservation["id"]).execute().data or []
+        )
+        return rt, folio
 
-    room_type, balance = await run_db(_read)
+    room_type, folio = await run_db(_read)
+    balance = money.amount_due(reservation, folio)
     addons = await public_booking.list_for_reservation(reservation["id"])
     return PublicBookingOut(
         ref=reservation["ref"], status=reservation["status"], hotelName=hotel_name,
@@ -4352,7 +4358,10 @@ async def public_razorpay_webhook(
             # 500 so Razorpay retries. Every handler above is idempotent, so a
             # redelivery is safe; swallowing a transient database error would
             # leave a hotel that has paid without its plan and without a trace.
-            await webhook_log.mark(x_razorpay_event_id, "failed", str(exc))
+            # `release` rather than `mark(…, "failed")`: the status is the same
+            # word, but going through the one function means the retry path and
+            # the reclaim rule can never drift apart.
+            await webhook_log.release(x_razorpay_event_id, str(exc))
             logger.exception("subscription webhook %s failed — asking for a retry", name)
             raise HTTPException(
                 status.HTTP_500_INTERNAL_SERVER_ERROR, "Handler failed; please retry.",
@@ -4365,23 +4374,28 @@ async def public_razorpay_webhook(
     order = await payments_service.get(order_id)
     if not order:
         # Not ours — the marketplace webhook handles its own orders.
+        await webhook_log.mark(x_razorpay_event_id, "ignored")
         return {"ok": True, "ignored": "unknown order"}
 
     if name in ("payment.failed",):
         await payments_service.mark(order_id, "failed", payment.get("error_description"))
+        await webhook_log.mark(x_razorpay_event_id, "processed")
         return {"ok": True, "handled": "failed"}
 
     if name not in ("payment.captured", "order.paid"):
+        await webhook_log.mark(x_razorpay_event_id, "ignored")
         return {"ok": True, "ignored": name}
 
     payment_id = payment.get("id")
     if not payment_id:
+        await webhook_log.mark(x_razorpay_event_id, "ignored")
         return {"ok": True, "ignored": "no payment id"}
 
     settlement = await payments_service.claim(order_id, payment_id)
     if not settlement.won:
         # The browser got here first, or this is a duplicate delivery. Either
         # way there is nothing to do — and saying so is the whole point.
+        await webhook_log.mark(x_razorpay_event_id, "processed")
         return {"ok": True, "handled": "already settled"}
 
     purpose = settlement.order.get("purpose")
@@ -4400,6 +4414,11 @@ async def public_razorpay_webhook(
                      purpose, order_id)
         await payments_service.release(settlement.order["id"],
                                        f"unknown purpose {purpose!r}")
+        # Released in both places or in neither. The order goes back to
+        # 'created' and the event goes back to claimable — a retry that finds
+        # the order waiting and the event spent is a retry that answers 200 and
+        # leaves a paid guest with nothing.
+        await webhook_log.release(x_razorpay_event_id, f"unknown purpose {purpose!r}")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
                             "Could not fulfil the order.")
 
@@ -4407,12 +4426,14 @@ async def public_razorpay_webhook(
         await fulfil(settlement.order)
     except Exception as exc:  # noqa: BLE001
         await payments_service.release(settlement.order["id"], str(exc)[:200])
+        await webhook_log.release(x_razorpay_event_id, str(exc)[:200])
         logger.exception("webhook could not fulfil order %s", order_id)
         # The one deliberate non-2xx: Razorpay retries for 24 hours, and a
         # retry is exactly the recovery this needs.
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
                             "Could not fulfil the order.") from exc
 
+    await webhook_log.mark(x_razorpay_event_id, "processed")
     return {"ok": True, "handled": purpose}
 
 

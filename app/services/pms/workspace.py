@@ -265,11 +265,17 @@ async def list_reservations(
         # One grouped query for the whole property rather than one per row: the
         # arrivals list is the screen a receptionist reloads all shift, and
         # N+1 against the folio is how it gets slow enough to be worked around.
-        balances = {
-            b["reservation_id"]: b["balance_paise"]
-            for b in (db.rpc("folio_balances", {"p_property": property_id}).execute().data or [])
+        #
+        # `folio_states` rather than `folio_balances`, because a sum on its own
+        # cannot tell a pre-arrival deposit (negative, and the guest owes the
+        # rest) from a settled in-house guest (zero, and they owe nothing). That
+        # is what put "₹-10,752" on the dashboard for a booking with ₹43,008
+        # still to pay. See `services/pms/money`.
+        folios = {
+            b["reservation_id"]: b
+            for b in (db.rpc("folio_states", {"p_property": property_id}).execute().data or [])
         }
-        return rows, balances
+        return rows, folios
 
     return await run_db(_read)
 
@@ -348,8 +354,14 @@ async def get_reservation(property_id: str, reservation_id: str) -> tuple[dict, 
         )
         if not rows:
             return None
-        balance = db.rpc("folio_balance", {"p_reservation": reservation_id}).execute().data
-        return rows[0], int(balance or 0)
+        # The same shape the list returns, so the drawer and the row behind it
+        # cannot disagree about one booking's balance.
+        folio = next(
+            (b for b in (db.rpc("folio_states", {"p_property": property_id}).execute().data or [])
+             if b["reservation_id"] == reservation_id),
+            None,
+        )
+        return rows[0], folio
     return await run_db(_read)
 
 
