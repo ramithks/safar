@@ -400,10 +400,22 @@ and twenty-one room types, and two of twenty-one have a description.
       hundred rupees" → 4200), and a package price that must stay null. Route
       isolation checked: another hotel's path is 404, text under 20 characters
       is 422.
-- [ ] **4.2a** Extraction is offered for rooms; the hotel-level fields it
-      already returns — description, facilities, check-in/out, policies, meals
-      — are extracted and shown but not yet applied to `properties`. That is
-      Phase 5.1 and needs the same review-then-approve gate.
+- [x] **4.2a** The hotel-level half of the read is applied too. ✅ DONE —
+      delivered as Phase 5's "Also save what it read about the hotel" checkbox,
+      which writes check-in/out times and policies to `properties` and the
+      description and facilities to the website draft, behind the same
+      review-then-approve gate as the rooms.
+
+      **One field was still being dropped one line short of the column it
+      unlocks**, found while closing this item: `address`, `state` and
+      `pincode` were extracted, shown, and never sent. No address means no map
+      pin, which is exactly what the readiness report calls out and what nine of
+      ten live hotels are missing. Now applied, and named in the summary the
+      hotelier ticks.
+
+      Still unapplied on purpose: `meals`. The extractor reads breakfast, lunch
+      and dinner detail and nothing consumes it; its right home is
+      `property_knowledge`, which is a different write with a different shape.
 - [x] **4.3** Conversational correction of an extracted draft. ✅ DONE.
 
       `POST /properties/{id}/extract/correct` takes the draft on the hotelier's
