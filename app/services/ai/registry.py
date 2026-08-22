@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 from pydantic import BaseModel, ValidationError
 
-from app.services.ai import autonomy, permissions
+from app.services.ai import autonomy, permissions, toolsets
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import (
     AgentError,
@@ -116,8 +116,19 @@ def available_for(ctx: AgentContext) -> list[ToolSpec]:
     ]
 
 
-def describe_for_provider(ctx: AgentContext) -> list[dict]:
-    """The tool list in the shape a chat-completions API expects."""
+def describe_for_provider(ctx: AgentContext, task: str | None = None) -> list[dict]:
+    """
+    The tool list in the shape a chat-completions API expects.
+
+    `task` narrows *what is described*, never what is permitted — see
+    services/ai/toolsets.py. Left out, everything granted is described, which
+    is what every caller did before the narrowing existed and what the
+    unclassifiable case still gets.
+    """
+    specs = available_for(ctx)
+    if task:
+        shown = toolsets.for_task(task, frozenset(s.name for s in specs))
+        specs = [s for s in specs if s.name in shown]
     return [
         {
             "type": "function",
@@ -127,7 +138,7 @@ def describe_for_provider(ctx: AgentContext) -> list[dict]:
                 "parameters": spec.json_schema(),
             },
         }
-        for spec in available_for(ctx)
+        for spec in specs
     ]
 
 

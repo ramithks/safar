@@ -255,22 +255,83 @@ funnel they are — without re-reading the transcript.
 
 Suites green afterwards: 1,101 unit · instagram_e2e 70 · payment_status_e2e 29.
 
-## Phase 3 — Retrieval that matches the question
+## Phase 3 — Retrieval that matches the question ✅ DONE
 
-Targeted retrieval instead of one fat prompt.
+**The plan's hypothesis was wrong and the measurement says so.** This phase was
+written assuming the expensive turns were expensive because `get_stay_options`
+returned a fat matrix. It does not: measured over 119 real calls it averages
+1,188 characters and peaks at 1,948.
 
-- [ ] **3.1** `get_stay_options` returns a *narrowed* payload when the session
-      already names a room type — the current full matrix is what pushed turns
-      to 9–11k tokens.
-- [ ] **3.2** `property_knowledge` retrieval: keyword scoring already exists in
-      the column; wire a real ranked lookup (`get_property_knowledge` with a
-      query) and cap at the top 5 facts.
-- [ ] **3.3** Hotel semantic memory: only if 3.2 proves insufficient. Prefer
-      structured facts; if added, it is `property_knowledge` rows with an
-      embedding column, hotel-scoped, and structured data keeps authority.
-- [ ] **3.4** Cache `properties` identity/policy reads per property with a short
-      TTL (the identity cache pattern already in `prompts.py`).
-- [ ] **3.5** Measure: median tokens_in per turn before/after, recorded here.
+What the cost actually is, over 1,000 real Vertex runs:
+
+| tools called | runs | avg tokens_in | avg latency |
+| --- | --- | --- | --- |
+| 0 | 382 | 2,292 | 6.0 s |
+| 1 | 406 | 5,253 | 9.9 s |
+| 2 | 68 | 6,908 | 13.1 s |
+| 3 | 43 | 10,499 | 20.7 s |
+| 4 | 8 | 17,516 | 21.0 s |
+
+The floor is 2,292 tokens for a turn that calls nothing, and the guest agent's
+**23 tool schemas are 14.4 KB — about seventy per cent of the base prompt**.
+Every model step re-sends all of it, so a three-tool turn pays for the catalogue
+four times. The cost is the menu, not the meal.
+
+- [x] **3.1** ~~Narrow `get_stay_options`~~ — **measured and not needed.**
+      Recorded rather than deleted: the next person to assume this should find
+      the number.
+- [x] **3.1a** `services/ai/toolsets.py` — the classifier already decides what a
+      message is about, one cheap call before the run opens, and until now that
+      decision only picked a model tier. It now picks the menu as well.
+      `describe_for_provider(ctx, task=…)` intersects the task's set with the
+      agent's grants.
+
+      | task | tools | schema | saving |
+      | --- | --- | --- | --- |
+      | guest_faq | 6 | 2,719 | **−81%** |
+      | reservation_lookup | 9 | 4,594 | −68% |
+      | availability | 8 | 5,655 | −61% |
+      | payment_status | 10 | 6,522 | −55% |
+      | booking | 11 | 8,244 | −43% |
+      | guest_conversation | 23 | 14,406 | −0% (deliberate) |
+
+      **It cannot widen a permission.** Every set is intersected with
+      `agent_tools`, and narrowing changes only what is *described* — a tool the
+      model somehow names anyway still goes through `permissions.check()`
+      unchanged. That asymmetry is also the safety valve: a mistake in the table
+      costs tokens, never correctness.
+
+      `guest_conversation` narrows nothing on purpose. It is both the greeting
+      task and the fallback for a message the classifier could not read, and
+      under-equipping the turns we understand least is exactly backwards.
+- [x] **3.2** `get_property_knowledge` — **already correct, verified not
+      rebuilt.** Ranked keyword scoring over `keywords` and the fact's own
+      question, never over the answer prose (matching the answer is how "do you
+      have a helipad?" returned the check-in policy), stopword list, threshold
+      of 3, capped at 4 facts, and an explicit `found: false` that tells the
+      agent to say it does not know.
+- [x] **3.3** Hotel semantic memory — **not built, deliberately.** 3.2 answers
+      the question and can say "we have not written that down", which a
+      similarity score cannot. Revisit when a hotel has enough unstructured
+      material that keyword matching demonstrably misses; there is no such
+      hotel today.
+- [x] **3.4** Property identity is already cached with a 300 s TTL in
+      `prompts._identity`. Policies stay behind a tool on purpose — a stale
+      check-in time inside a prompt is worse than a tool call.
+- [x] **3.5** Measured above and in `tests/test_toolsets.py`, which asserts the
+      reduction rather than describing it.
+- [x] **2.6** History trimming, carried forward from Phase 2 — **not needed.**
+      Ten message bodies are a few hundred tokens against a 3,600-token
+      catalogue. Trimming them would have cost continuity to save the smaller
+      half.
+- [x] Tests — `tests/test_toolsets.py` (28): the never-widens invariant over
+      every task × every agent definition, every name in the table checked
+      against the registry (a typo silently removes the tool it meant to
+      include), handoff and knowledge always on the menu, and two runtime tests
+      proving `run_turn` passes the classification through.
+
+Suites green afterwards: 1,129 unit · ai_e2e 98 · sales_e2e 185 ·
+instagram_e2e 70.
 
 ## Phase 4 — Photos and rooms worth showing
 
