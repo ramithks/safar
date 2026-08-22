@@ -211,7 +211,16 @@ def _upsert_conversation(
                 or []
             )
         else:
-            digits = sender_external_id.lstrip("+")
+            # Digits only, not `lstrip("+")`.
+            #
+            # This value goes into an `ilike` pattern, where `%` and `_` are
+            # wildcards — and a sender id of `%%%%%%%%%%` would then match the
+            # first guest at this property, handing one guest another's name and
+            # booking history. It arrives inside a signature-verified Meta
+            # payload today, so this is not a live hole; it is one webhook
+            # change away from being one, and the fix costs a filter. The same
+            # class of bug already cost this codebase a coupon bypass.
+            digits = "".join(c for c in sender_external_id if c.isdigit())
             found = (
                 db.table("guests")
                 .select("id,name")
@@ -221,7 +230,7 @@ def _upsert_conversation(
                 .execute()
                 .data
                 or []
-            )
+            ) if len(digits) >= 8 else []
         if found:
             guest_id = found[0]["id"]
             sender_name = sender_name or found[0].get("name")

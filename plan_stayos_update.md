@@ -770,9 +770,41 @@ onboarding 65 · golden 88 · ai 98 · sales 185 · instagram 70 · payment stat
 - [x] **8.2** Booking/receipt tokens: unguessable, revocable, no sequential ids.
       ✅ DONE with 6.1/6.2 above — `reservations.public_token`, 128 bits from
       `gen_random_bytes`, rotated by a frontdesk-scoped route.
-- [ ] **8.3** Re-verify hotel isolation on every new tool and query added above.
-- [ ] **8.4** Confirm the new guest-identity path cannot join two guests across
-      properties.
+- [x] **8.3** Hotel isolation on every new tool and query. ✅ DONE.
+
+      `scripts/tenant_isolation_e2e.py` grew a section for every surface this
+      work added — the session panel, `rotate-link`, the property PATCH, the map
+      pin, the room-type PATCH, the readiness report, the public hotel index and
+      the booking token — and each one is asked *twice*: through the other
+      hotel's path, and through the attacker's own property with the victim's
+      id. The second is the shape that matters, because it is the one a handler
+      that fetched by id alone would pass. 49 assertions, all 404 rather than
+      403, so a property id is never confirmed to exist.
+
+      The new tools carry their isolation in unit tests instead, because the
+      property is on the principal rather than in a path: `send_room_photos` and
+      `get_hotel_page_link` both fall back rather than leak when handed another
+      hotel's id, and `get_booking_status` takes no arguments at all.
+
+- [x] **8.4** The guest-identity path cannot join two guests across properties.
+      ✅ DONE.
+
+      Both branches of the resolver are `.eq("property_id", property_id)`, and
+      `guests_property_instagram_idx` is unique on `(property_id, instagram_id)`
+      — so the same person at two hotels is two rows by construction, not by
+      convention. `tests/test_guest_identity_isolation.py` (11) pins it from
+      both directions, including the original bug: a 17-digit IGSID matched
+      against `phone` resolves nobody.
+
+      **One thing hardened while checking.** The WhatsApp branch built an
+      `ilike` from `sender_external_id.lstrip("+")`, which strips a plus and
+      nothing else — so a sender id of `%%%%%%%%%%` would have matched the first
+      guest at that property and opened the thread holding a stranger's name and
+      booking history. It arrives inside a signature-verified Meta payload, so
+      it was never live; it was one webhook change from being, and the same
+      class of bug has already cost this codebase a coupon bypass. Now digits
+      only, with a minimum length, and a real number written with spaces or
+      dashes still resolves.
 
 ## Phase 9 — Evidence
 

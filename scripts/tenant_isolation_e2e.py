@@ -92,6 +92,10 @@ for label, path in [
     ("members", f"/pms/properties/{CASA}/members"),
     ("tasks", f"/pms/properties/{CASA}/tasks"),
     ("services", f"/pms/properties/{CASA}/services"),
+    # Added by the Agent 2.0 work. Every new authenticated read goes in this
+    # list, because the list is the only thing that makes "we checked" true
+    # rather than remembered.
+    ("readiness", f"/pms/properties/{CASA}/readiness"),
 ]:
     st, _ = http(f"{API}{path}", headers=owner)
     check(f"{label} is 404, not a leak", st == 404, st)
@@ -105,6 +109,57 @@ for label, path, body in [
     method = "PUT" if "domain" in path else "POST"
     st, _ = http(f"{API}{path}", method, body if body is not None else {}, owner)
     check(f"{label} is refused", st in (404, 403, 422), st)
+
+print("\n── the surfaces added since ──")
+# A conversation and a reservation that really do belong to Casa Mandala. Asked
+# for by id through the *other* hotel's path, which is the shape of the attack:
+# a valid id the attacker learned somewhere, aimed at a property they hold.
+their_conversation = sql(f"""select id from conversations
+                              where property_id = '{CASA}' limit 1;""")
+their_reservation = sql(f"""select id from reservations
+                             where property_id = '{CASA}' limit 1;""")
+
+if their_conversation:
+    cid = their_conversation[0]["id"]
+    st, _ = http(f"{API}/pms/properties/{CASA}/conversations/{cid}/session", headers=owner)
+    check("another hotel's session panel is 404", st == 404, st)
+    st, _ = http(f"{API}/pms/properties/{ANANDI}/conversations/{cid}/session", headers=owner)
+    check("and their conversation id through my own property is 404 too",
+          st == 404, f"{st} — the panel read a thread by id alone")
+
+if their_reservation:
+    rid = their_reservation[0]["id"]
+    st, _ = http(f"{API}/pms/properties/{CASA}/reservations/{rid}/rotate-link",
+                 "POST", {}, owner)
+    check("another hotel's booking link cannot be revoked", st == 404, st)
+    st, _ = http(f"{API}/pms/properties/{ANANDI}/reservations/{rid}/rotate-link",
+                 "POST", {}, owner)
+    check("nor through my own property's path", st == 404,
+          f"{st} — a reservation was rotated by id alone")
+
+st, _ = http(f"{API}/pms/properties/{CASA}", "PATCH", {"address": "stolen"}, owner)
+check("another hotel's address cannot be edited", st == 404, st)
+st, _ = http(f"{API}/pms/properties/{CASA}/locate", "POST", {}, owner)
+check("nor its map pin", st in (404, 403), st)
+
+their_room = sql(f"""select id from room_types where property_id = '{CASA}' limit 1;""")
+if their_room:
+    st, _ = http(f"{API}/pms/room-types/{their_room[0]['id']}", "PATCH",
+                 {"name": "Stolen"}, owner)
+    check("another hotel's room type cannot be renamed", st == 404, st)
+
+print("\n── the booking link, which is the only credential a guest holds ──")
+# The token opens one booking and says nothing about any other. These ask the
+# unauthenticated route directly, because that is how a stranger would.
+st, _ = http(f"{API}/pms/public/bookings/{'0' * 32}")
+check("a token nobody was issued is 404", st == 404, st)
+st, _ = http(f"{API}/pms/public/bookings/{'%' * 32}")
+check("a wildcard is not a pattern", st == 404, st)
+if their_reservation:
+    their_ref = sql(f"""select ref from reservations where id = '{their_reservation[0]['id']}';""")
+    st, _ = http(f"{API}/pms/public/bookings/{their_ref[0]['ref']}")
+    check("the human-readable reference does not open the booking page",
+          st == 404, f"{st} — the guessable id is being accepted as the token")
 
 print("\n── no token at all ──")
 for path in [f"/pms/properties/{ANANDI}/today", f"/pms/properties/{ANANDI}/guests",
@@ -131,6 +186,12 @@ if recept:
     check("but can still work the front desk", st == 200, st)
 
 print("\n── the public surface ──")
+st, index = http(f"{API}/pms/public/hotels")
+check("the published-hotel index is public", st == 200, st)
+check("and lists nothing private about a hotel",
+      st == 200 and not any(k in json.dumps(index or []).lower()
+                            for k in ("partner_id", "public_token", "guest_", "@")),
+      json.dumps(index or [])[:200])
 st, d = http(f"{API}/pms/public/hotels/casa-mandala-anjuna")
 check("a published hotel is public", st == 200, st)
 check("and carries no owner, no email, no phone of the hotelier",
