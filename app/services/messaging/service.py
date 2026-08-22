@@ -1112,6 +1112,27 @@ def _confirmation_body(reservation: dict, language: str, url: str) -> str:
 
 
 def booking_url(reservation: dict) -> str:
+    """
+    The link a guest is sent when their money lands.
+
+    `/b/{public_token}` on the website, not `/checkin/{ref}` on the partner app.
+    Two reasons, and both were mistakes worth naming:
+
+      * **The reference is not a credential.** It is six characters from a
+        32-symbol alphabet produced by `random.choices` — built to be read
+        aloud, not to guard a page. `reservations.public_token` is 128 bits
+        from `gen_random_bytes`, and rotating it revokes the old link.
+      * **A confirmation is not a check-in form.** The guest who just paid wants
+        the reference, the dates, the money and the cancellation terms; the
+        check-in form is one link on from there, and the page carries it.
+
+    A reservation with no token — a row read through a projection that did not
+    select it — falls back to the old check-in URL rather than producing a link
+    to nowhere.
+    """
+    token = reservation.get("public_token")
+    if token:
+        return f"{settings.site_url.rstrip('/')}/b/{token}"
     base = (settings.pms_app_url or "").rstrip("/")
     return f"{base}/checkin/{reservation.get('ref')}"
 

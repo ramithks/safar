@@ -526,11 +526,73 @@ Suites green: 1,206 unit · onboarding 65 · golden 88 · pms 134 · sales 185.
 
 ## Phase 6 — Operator view and confirmation surfaces
 
-- [ ] **6.1** Booking page: tokenised, non-sequential URL
-      (`/b/{token}`) showing reference, hotel, dates, nights, rooms, guests,
-      room type, rate plan, the full price breakdown, paid/balance, cancellation
-      policy and status. Token stored on the reservation, not derived from the ref.
-- [ ] **6.2** Receipt on the same page.
+- [x] **6.1 / 6.2 / 8.2** Booking page at `/b/{token}`, with the receipt on it,
+      on a token that is unguessable and revocable. ✅ DONE.
+
+      **The link stops being the reference.** `reservations.ref` is `TB-` plus
+      six characters from a 32-symbol alphabet, produced by `random.choices` —
+      Mersenne Twister, not a CSPRNG. That is right for something read aloud
+      over a phone and typed by somebody who has just got off a flight, and
+      wrong for a URL that opens a stranger's booking. Migration
+      `a_booking_link_is_a_secret_not_a_reference` adds
+      `reservations.public_token`, 16 bytes of `gen_random_bytes` as hex, unique
+      and not null, defaulted **on the column** so no insert path can forget
+      one. All 66 existing reservations took the default; none share a token.
+
+      **Revocable, and that is a route rather than a claim.**
+      `POST /properties/{id}/reservations/{rid}/rotate-link` (frontdesk scope,
+      scoped by property in the update itself) issues a new token, and the
+      forwarded link 404s from that moment. The e2e proves exactly that
+      sequence.
+
+      **`GET /public/bookings/{token}`** returns what the reference view cannot
+      afford to: the price breakdown, every folio line, the cancellation terms,
+      when it was booked. Exact match, never `ilike` — a token nobody types has
+      no reason to be case-insensitive, and `ilike` reads `%` and `_` as
+      wildcards, which this codebase has already paid for once on coupon codes.
+
+      **The projection is the access control, in both directions.** The token
+      view says *more* than the reference view, and in one place deliberately
+      less: it never echoes back the registration a guest filed. A confirmation
+      gets forwarded to whoever is paying, and whoever is paying is not owed the
+      traveller's passport number. `PublicStayOut` and `BookingPageOut` are now
+      siblings over a shared `PublicStayCore` rather than one inheriting the
+      other, because they differ by subtraction as well as addition — a field
+      cannot be inherited and then un-inherited.
+
+      **A cancelled booking opens here rather than 404ing.** The reference route
+      hides one because confirming a stranger's cancelled travel is a free bit
+      of information; a caller holding that booking's own credential has more
+      right than anyone to read the page that says so.
+
+      **The bug found by rendering it.** `balancePaise` was `folio_balance`, and
+      a booking that has not started has a folio holding one thing — the
+      deposit. Its sum is *negative*. A guest with ₹43,008 left to pay was shown
+      "₹-10,752", and the check-in page, which renders a balance only when it is
+      above zero, showed them nothing at all. `_amount_due` now uses the folio
+      once the folio has real charges on it (it carries extras the reservation
+      total does not) and total-minus-paid before then, with a cancelled and
+      never-charged booking owing nothing. Both public surfaces were wrong and
+      both are fixed by the one function.
+
+      The page is `app/b/[token]/page.tsx` on the website: `force-dynamic`,
+      `no-store`, `noindex, nofollow`. It does no arithmetic — every figure is
+      read from the API, because a receipt that computes its own totals is one
+      that can disagree with the folio while the guest is standing at the desk.
+
+      `messaging.booking_url()` now returns `{site}/b/{token}`, falling back to
+      the old `/checkin/{ref}` for a row read through a projection that did not
+      select the column. The confirmation message a webhook sends, and
+      `get_booking_status`'s `bookingUrl`, both follow it.
+
+      Tests: `tests/test_booking_page.py` (22) on `_amount_due` (the discriminating
+      cases), the cancellation-terms fallback, the token shape including the
+      wildcards, exact-vs-`ilike` lookup, rotation scoping and entropy, and the
+      shape assertions that make the PII exclusion structural rather than
+      incidental. `scripts/checkin_e2e.py` grew a third seeded stay — a booking
+      with a deposit and no charges yet, without which the folio answer and the
+      right answer happen to agree — and 24 new assertions over real HTTP: 57
+      total, including that the desk can revoke a link and a housekeeper cannot.
 - [ ] **6.3** Inbox: a session panel per conversation (guest, language, stage,
       dates, quote, payment, booking) so staff do not read the transcript to
       learn the state. Transcript stays for debugging.
@@ -622,7 +684,9 @@ onboarding 65 · golden 88 · ai 98 · sales 185 · instagram 70 · payment stat
 ## Phase 8 — Security and hardening
 
 - [ ] **8.1** `razorpay_webhook_events` RLS (present the SQL, do not auto-apply).
-- [ ] **8.2** Booking/receipt tokens: unguessable, revocable, no sequential ids.
+- [x] **8.2** Booking/receipt tokens: unguessable, revocable, no sequential ids.
+      ✅ DONE with 6.1/6.2 above — `reservations.public_token`, 128 bits from
+      `gen_random_bytes`, rotated by a frontdesk-scoped route.
 - [ ] **8.3** Re-verify hotel isolation on every new tool and query added above.
 - [ ] **8.4** Confirm the new guest-identity path cannot join two guests across
       properties.

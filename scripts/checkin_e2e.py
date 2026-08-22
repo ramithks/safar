@@ -51,6 +51,10 @@ PREFIX = "TB-WCI"
 TAG = uuid.uuid4().hex[:6].upper()
 STAY_REF = f"{PREFIX}{TAG}"
 CANCELLED_REF = f"{PREFIX}{TAG}X"
+# A booking that has not started: a deposit on the folio and no charges yet.
+# This is the one that separates "what the folio sums" from "what the guest
+# owes", and without it both answers happen to agree.
+FUTURE_REF = f"{PREFIX}{TAG}F"
 
 # What a guest types. Only the last four may survive anywhere.
 FULL_ID = "P7742199831"
@@ -119,11 +123,15 @@ def sweep():
 
 
 def seed():
-    """Two stays: one to check into, one cancelled to prove it stays hidden."""
+    """
+    Three stays: one to check into, one cancelled to prove it stays hidden, and
+    one that has not started, whose folio holds only the deposit.
+    """
     check_in = date.today() + timedelta(days=40)
     check_out = check_in + timedelta(days=2)
     rows = []
-    for ref, status in ((STAY_REF, "confirmed"), (CANCELLED_REF, "cancelled")):
+    for ref, status in ((STAY_REF, "confirmed"), (CANCELLED_REF, "cancelled"),
+                        (FUTURE_REF, "confirmed")):
         rows.append(f"""
 insert into public.reservations
   (ref, property_id, partner_id, room_type_id, rate_plan_id, guest_name,
@@ -151,6 +159,17 @@ select r.id, '{PROP}', '{PARTNER}', v.kind, v.label, v.amount,
        (values ('room', 'Room charge', 896000),
                ('payment', 'Booking token', -200000)) as v(kind, label, amount)
  where r.ref = '{STAY_REF}';""")
+
+    # The future stay gets the deposit and nothing else — exactly the shape a
+    # real booking has between paying and arriving.
+    sql(f"""
+insert into public.folio_entries
+  (reservation_id, property_id, partner_id, kind, description, amount_paise,
+   posted_by_name, idempotency_key)
+select r.id, '{PROP}', '{PARTNER}', 'payment', 'Booking token', -200000,
+       'Web checkin e2e', 'wci:{TAG}:future'
+  from public.reservations r
+ where r.ref = '{FUTURE_REF}';""")
 
 
 def main() -> int:
@@ -317,6 +336,107 @@ def main() -> int:
                  headers=reception)
     check("a stay nobody registered for is 404, not an empty object",
           st == 404, str(st))
+
+    # ── the booking page ─────────────────────────────────────────────────────
+    #
+    # The other public view of the same reservation, and the one whose URL is a
+    # credential rather than a reference somebody reads aloud.
+    print("\n── the link, which is a secret ──")
+    tokens = sql(f"""select ref, public_token from public.reservations
+                      where ref in ('{STAY_REF}', '{CANCELLED_REF}',
+                                    '{FUTURE_REF}');""")
+    by_ref = {r["ref"]: r["public_token"] for r in tokens}
+    token = by_ref[STAY_REF]
+
+    check("every reservation was issued a token",
+          all(len(t or "") == 32 for t in by_ref.values()), str(by_ref))
+    check("and no two bookings share one",
+          len(set(by_ref.values())) == len(by_ref), str(by_ref))
+
+    st, page = http(f"{API}/public/bookings/{token}")
+    check("the link opens the booking", st == 200, f"{st} {str(page)[:200]}")
+    check("with the price broken down, which the reference view does not show",
+          st == 200 and page["grossPaise"] > 0 and page["taxPaise"] > 0,
+          str(page)[:200])
+    check("and the folio, line by line",
+          st == 200 and len(page["receipt"]) >= 2,
+          str(page.get("receipt"))[:200])
+
+    # The number this page exists to get right.
+    #
+    # On a stay whose room charges have been posted, the folio and the
+    # reservation happen to agree, so this alone would prove nothing. The
+    # discriminating case is `FUTURE_REF` below: a booking with a deposit on
+    # the folio and no charges yet, where `folio_balance` returns *minus* the
+    # deposit and the guest owes the rest of the total.
+    check("an in-house folio's own sum is what is owed",
+          st == 200 and page["balancePaise"] == 896000 - 200000,
+          str(page.get("balancePaise")))
+
+    st, future = http(f"{API}/public/bookings/{by_ref[FUTURE_REF]}")
+    check("a booking that has not started owes the rest of its total, "
+          "not minus its deposit",
+          st == 200 and future["balancePaise"] == 696000,
+          f"{future.get('balancePaise')} — the old answer here was -200000, "
+          f"which the check-in page rendered as nothing at all")
+    st, ref_view = http(f"{API}/public/stays/{FUTURE_REF}")
+    check("and the check-in page is told the same number, not zero",
+          st == 200 and ref_view["balancePaise"] == 696000,
+          str(ref_view.get("balancePaise")))
+
+    blob = json.dumps(page) if st == 200 else ""
+    check("the guest's own document details are not on the page they forward",
+          FULL_ID not in blob and FULL_ID[-4:] not in blob
+          and "guest@example.com" not in blob,
+          "a registration detail reached the booking page")
+    check("only that they filed them, and when",
+          st == 200 and page.get("registrationSubmittedAt"),
+          str(page.get("registrationSubmittedAt")))
+    check("the page does not reprint its own credential",
+          token not in blob, "the booking page echoed its token back")
+    check("no internal id either", stay_id not in blob and "propertyId" not in blob,
+          "an internal identifier reached the booking page")
+
+    # A cancelled booking behaves *differently* here on purpose.
+    st, killed = http(f"{API}/public/bookings/{by_ref[CANCELLED_REF]}")
+    check("a cancelled booking opens rather than 404s, because this caller "
+          "holds its own link",
+          st == 200 and killed["status"] == "cancelled", f"{st} {str(killed)[:120]}")
+    check("and it is not presented as owing anything",
+          st == 200 and killed["balancePaise"] == 0, str(killed.get("balancePaise")))
+
+    st, _ = http(f"{API}/public/bookings/{'0' * 32}")
+    check("a token nobody was issued is 404", st == 404, str(st))
+    st, _ = http(f"{API}/public/bookings/{token.upper()}")
+    check("and the token is not case-insensitive the way a reference is",
+          st == 404, str(st))
+    st, _ = http(f"{API}/public/bookings/{'%' * 32}")
+    check("a wildcard is not a pattern here", st == 404, str(st))
+    st, _ = http(f"{API}/public/bookings/{STAY_REF}")
+    check("the reference does not open the booking page", st == 404, str(st))
+
+    # ── revocation ───────────────────────────────────────────────────────────
+    print("\n── and it can be taken back ──")
+    st, rotated = http(f"{API}/properties/{PROP}/reservations/{stay_id}/rotate-link",
+                       "POST", {}, headers=reception)
+    check("the desk can reissue the link", st == 200, f"{st} {str(rotated)[:160]}")
+    fresh = (rotated or {}).get("url", "").rsplit("/", 1)[-1]
+    check("which is a different token", st == 200 and fresh and fresh != token,
+          f"{fresh} vs {token}")
+
+    st, _ = http(f"{API}/public/bookings/{token}")
+    check("the forwarded link stops working from that moment", st == 404, str(st))
+    st, _ = http(f"{API}/public/bookings/{fresh}")
+    check("and the new one works", st == 200, str(st))
+
+    st, _ = http(f"{API}/properties/{PROP}/reservations/{stay_id}/rotate-link",
+                 "POST", {}, headers=housekeeping)
+    check("a housekeeper cannot reissue somebody's booking link",
+          st == 403, str(st))
+    st, _ = http(f"{API}/properties/{OTHER_PROPERTY}/reservations/{stay_id}/rotate-link",
+                 "POST", {}, headers=reception)
+    check("and it cannot be rotated through another property's path",
+          st in (403, 404), str(st))
 
     sweep()
     print(f"\n  · swept {PREFIX}… — the registration went with the stay")

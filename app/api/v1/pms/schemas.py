@@ -1353,15 +1353,19 @@ class MarginRowOut(BaseModel):
 # The only shapes in this file a stranger can reach. Everything here is either
 # masked on the way out or write-only on the way in.
 
-class PublicStayOut(BaseModel):
+class PublicStayCore(BaseModel):
     """
-    A stay, as the person holding its reference may see it.
+    What both public views of a booking agree a stranger may see.
 
     **Masked deliberately.** The booking reference is the whole credential, so
     what it unlocks has to be worth less than the reference is hard to guess:
     enough for a guest to recognise their own booking, not enough to be worth
     guessing at. No email, no full phone, no guest id, no room number, no folio
     detail beyond the balance they will be asked for.
+
+    A base class rather than one view inheriting from the other, because the
+    two differ by *subtraction* as well as addition: the check-in form needs the
+    registration a guest filed and the booking page must not print it back.
     """
     ref: str
     propertyName: str
@@ -1384,6 +1388,10 @@ class PublicStayOut(BaseModel):
     paidPaise: int
     balancePaise: int
     status: str
+
+
+class PublicStayOut(PublicStayCore):
+    """The check-in view: adds back the registration this guest already filed."""
     registration: "GuestRegistrationOut | None" = None
 
 
@@ -1421,6 +1429,75 @@ class GuestRegistrationOut(BaseModel):
             specialRequests=r.get("special_requests"),
             submittedAt=r["submitted_at"],
         )
+
+
+class BookingLinkOut(BaseModel):
+    """The booking's public link after a rotation. The old one is dead."""
+    ref: str
+    url: str
+
+
+class ReceiptLineOut(BaseModel):
+    """
+    One line of a folio, as a guest may read it.
+
+    `postedByName` is deliberately absent. Which receptionist keyed a charge is
+    the hotel's business; the guest's business is what was charged and when.
+    """
+    postedAt: datetime
+    kind: str
+    description: str
+    method: str = ""
+    # Signed as the folio stores it: charges positive, payments negative. Kept
+    # signed rather than split into two lists because a receipt that does not
+    # add up to the balance is a receipt a guest will argue with.
+    amountPaise: int
+
+
+class BookingPageOut(PublicStayCore):
+    """
+    A booking as its confirmation link shows it — reference, money, receipt.
+
+    Not `PublicBookingOut`, which already exists further down this file for the
+    booking engine's confirm response. Python rebinds a duplicate class name
+    without a word, and the route kept validating against the wrong shape until
+    a live call complained about a field neither of us had written.
+
+    The parent shape is reached with a six-character reference and stays
+    correspondingly thin. This one is reached with a 128-bit token, so it can
+    afford to say more: the price breakdown behind the total, every folio line,
+    and the cancellation terms the guest agreed to.
+
+    It is still a projection, not a row. No guest id, no room number, no email,
+    no internal notes, no staff names, and no `public_token` echoed back — a
+    page that reprints its own credential is one screenshot away from sharing
+    it.
+    """
+    grossPaise: int = 0
+    discountPaise: int = 0
+    taxPaise: int = 0
+    bookedAt: datetime | None = None
+    # One sentence, not a rules object.
+    #
+    # `reservations.cancellation_policy` is a jsonb column that every row in
+    # production has left at `{}` — nothing has ever written it. The terms a
+    # guest is actually held to are the ones the hotelier wrote under
+    # `properties.policies.cancellation`, which is what the hotel's own page
+    # shows. This field prefers the reservation's snapshot when one exists,
+    # because terms at the time of booking beat terms as they stand today, and
+    # falls back to the property's. Empty means the hotel has not written any,
+    # and the page says exactly that rather than inventing a default.
+    cancellationTerms: str = ""
+    receipt: list[ReceiptLineOut] = []
+    # Absolute, because these two pages live on different hosts and the guest's
+    # browser should not have to guess which.
+    checkInUrl: str = ""
+    # So the page can link back to the hotel it is a booking at.
+    propertySlug: str = ""
+    # Whether the guest has filed their check-in details, and when — never what
+    # they wrote. A confirmation link may be forwarded to whoever is paying, and
+    # the passport details of whoever is travelling are not part of the receipt.
+    registrationSubmittedAt: datetime | None = None
 
 
 class WebCheckInRequest(BaseModel):

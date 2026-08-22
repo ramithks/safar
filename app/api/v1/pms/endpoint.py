@@ -23,6 +23,7 @@ marketplace/partner_ops.py.
 # api/v1/admin/endpoint.py.
 import asyncio
 import json
+import secrets
 import re
 import logging
 import uuid
@@ -83,6 +84,9 @@ from app.api.v1.pms.schemas import (
     ServiceOut,
     ServiceUpsertRequest,
     GuestRegistrationOut,
+    BookingLinkOut,
+    BookingPageOut,
+    ReceiptLineOut,
     PublicStayOut,
     WebCheckInRequest,
     CreditOrderOut,
@@ -90,6 +94,7 @@ from app.api.v1.pms.schemas import (
     CreditPurchaseOut,
     PaymentOrderOut,
     PublicAvailabilityOut,
+    BookingLinkOut,
     PublicBookingOut,
     PublicConfirmRequest,
     PublicOrderOut,
@@ -1197,6 +1202,45 @@ async def create_payment_link(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
     return PaymentLinkOut(**link.as_dict())
+
+
+@router.post("/properties/{property_id}/reservations/{reservation_id}/rotate-link",
+             response_model=BookingLinkOut)
+@limiter.limit("12/minute")
+async def rotate_booking_link(
+    request: Request,
+    property_id: str,
+    reservation_id: str,
+    member=Depends(require_member("frontdesk")),
+):
+    """
+    Invalidate a booking's public link and issue a new one.
+
+    This is what makes the token *revocable* rather than merely unguessable. A
+    confirmation forwarded to the wrong number, a screenshot posted in a group,
+    a phone lost between booking and arrival — in every one of those the old URL
+    has to stop working, and here it does, from the moment this returns.
+
+    Scoped by property in the update itself: a reservation id from another hotel
+    changes nothing and 404s, the same as it does on the read.
+
+    The guest is not told. Whoever rotated the link is the person who knows why,
+    and re-sending it is a decision rather than a side effect.
+    """
+    rotated = await run_db(_rotate_booking_token, property_id, reservation_id)
+    if not rotated:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Reservation not found")
+    return BookingLinkOut(ref=rotated["ref"], url=messaging_service.booking_url(rotated))
+
+
+def _rotate_booking_token(property_id: str, reservation_id: str) -> dict | None:
+    rows = (
+        get_db().table("reservations")
+        .update({"public_token": secrets.token_hex(16)})
+        .eq("id", reservation_id).eq("property_id", property_id)
+        .execute().data or []
+    )
+    return rows[0] if rows else None
 
 
 @router.post("/properties/{property_id}/night-audit", response_model=NightAuditOut)
@@ -2934,6 +2978,19 @@ def _mask_phone(phone: str | None) -> str:
     return f"••••{digits[-4:]}" if len(digits) >= 4 else ""
 
 
+# 16 bytes as hex, and nothing else gets as far as the database. A token that
+# is not this shape cannot match a row, so refusing it early costs a query
+# rather than changing an answer.
+_TOKEN_SHAPE = re.compile(r"[0-9a-f]{32}")
+
+_PUBLIC_STAY_COLUMNS = (
+    "id,ref,property_id,partner_id,guest_name,guest_phone,check_in,"
+    "check_out,nights,units,adults,children,gross_paise,discount_paise,"
+    "tax_paise,total_paise,paid_paise,status,room_type_id,rate_plan_id,"
+    "cancellation_policy,created_at"
+)
+
+
 def _load_public_stay(ref: str) -> dict | None:
     """
     One reservation by reference, with the names a guest would recognise.
@@ -2942,22 +2999,35 @@ def _load_public_stay(ref: str) -> dict | None:
     check RLS against — which is exactly why nothing here is selected that a
     guest should not see. The projection *is* the access control.
     """
+    return _load_public_reservation("ref", ref.strip(), case_insensitive=True)
+
+
+def _load_public_booking(token: str) -> dict | None:
+    """
+    The same reservation, reached by its link rather than by its reference.
+
+    Exact match, never `ilike`: a token is 32 hex characters that nobody types,
+    and `ilike` treats `%` and `_` as wildcards — a lesson this codebase has
+    already paid for once, on coupon codes.
+    """
+    return _load_public_reservation("public_token", token.strip(), with_receipt=True)
+
+
+def _load_public_reservation(
+    column: str, value: str, *, case_insensitive: bool = False,
+    with_receipt: bool = False,
+) -> dict | None:
     db = get_db()
-    rows = (
-        db.table("reservations")
-        .select("id,ref,property_id,partner_id,guest_name,guest_phone,check_in,"
-                "check_out,nights,units,adults,children,total_paise,paid_paise,"
-                "status,room_type_id,rate_plan_id")
-        .ilike("ref", ref.strip())
-        .limit(1).execute().data or []
-    )
+    query = db.table("reservations").select(_PUBLIC_STAY_COLUMNS)
+    query = query.ilike(column, value) if case_insensitive else query.eq(column, value)
+    rows = query.limit(1).execute().data or []
     if not rows:
         return None
     stay = rows[0]
 
     prop = (
         db.table("properties")
-        .select("name,city,check_in_time,check_out_time")
+        .select("name,city,slug,check_in_time,check_out_time,policies")
         .eq("id", stay["property_id"]).limit(1).execute().data or [{}]
     )[0]
     room_type = (
@@ -2968,16 +3038,57 @@ def _load_public_stay(ref: str) -> dict | None:
         db.table("rate_plans").select("name,inclusions")
         .eq("id", stay["rate_plan_id"]).limit(1).execute().data or [{}]
     )[0]
-    balance = db.rpc("folio_balance", {"p_reservation": stay["id"]}).execute().data
     registration = (
         db.table("guest_registrations").select("*")
         .eq("reservation_id", stay["id"]).limit(1).execute().data or []
     )
+    # Read rather than `rpc("folio_balance")`: both public views need to know
+    # not just the sum but whether the folio has been opened at all, and that is
+    # the difference between a number a guest can act on and one that reads as
+    # a mistake. See `_amount_due`.
+    folio = (
+        db.table("folio_entries")
+        .select("posted_at,kind,description,method,amount_paise")
+        .eq("reservation_id", stay["id"])
+        .order("posted_at")
+        .execute().data or []
+    )
     return {
         "stay": stay, "property": prop, "room_type": room_type,
-        "rate_plan": rate_plan, "balance": int(balance or 0),
+        "rate_plan": rate_plan,
+        "balance": _amount_due(stay, folio),
         "registration": registration[0] if registration else None,
+        "receipt": folio if with_receipt else [],
     }
+
+
+def _amount_due(stay: dict, folio: list[dict]) -> int:
+    """
+    What this guest still owes, in the sense a guest means it.
+
+    **Not `folio_balance`, which is what both public views used to show.** That
+    RPC sums the folio, and a booking that has not started yet has a folio
+    holding one thing: the deposit that was paid. Its balance is therefore
+    *negative* — a guest with ₹43,008 left to pay was shown "₹-10,752", and the
+    check-in page, which only renders a balance above zero, showed them nothing
+    at all. Both were found by rendering a real four-night booking rather than
+    by reading the code.
+
+    So: once the folio has real charges on it the folio is the truth, because it
+    carries the extras a guest ordered after arriving and the reservation total
+    does not. Before then the reservation is the truth, and the sum that means
+    something is total minus paid.
+
+    A cancelled booking that was never charged owes nothing, whatever its total
+    says.
+    """
+    charges = sum(int(e.get("amount_paise") or 0) for e in folio
+                  if int(e.get("amount_paise") or 0) > 0)
+    if charges > 0:
+        return sum(int(e.get("amount_paise") or 0) for e in folio)
+    if (stay.get("status") or "") in ("cancelled", "no_show"):
+        return 0
+    return max(0, int(stay.get("total_paise") or 0) - int(stay.get("paid_paise") or 0))
 
 
 @router.get("/public/stays/{ref}", response_model=PublicStayOut)
@@ -2998,28 +3109,114 @@ async def get_public_stay(request: Request, ref: str):
     if not loaded or loaded["stay"]["status"] in ("cancelled", "no_show"):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that booking.")
 
-    stay = loaded["stay"]
     return PublicStayOut(
-        ref=stay["ref"],
-        propertyName=loaded["property"].get("name") or "",
-        propertyCity=loaded["property"].get("city") or "",
-        checkInTime=str(loaded["property"].get("check_in_time") or "")[:5],
-        checkOutTime=str(loaded["property"].get("check_out_time") or "")[:5],
-        guestName=stay.get("guest_name") or "Guest",
-        guestPhoneMasked=_mask_phone(stay.get("guest_phone")),
-        checkIn=stay["check_in"], checkOut=stay["check_out"],
-        nights=stay["nights"], units=stay["units"],
-        adults=stay.get("adults") or 0, children=stay.get("children") or 0,
-        roomTypeName=loaded["room_type"].get("name") or "",
-        ratePlanName=loaded["rate_plan"].get("name") or "",
-        inclusions=loaded["rate_plan"].get("inclusions") or [],
-        totalPaise=stay.get("total_paise") or 0,
-        paidPaise=stay.get("paid_paise") or 0,
-        balancePaise=loaded["balance"],
-        status=stay["status"],
+        **_public_stay_fields(loaded),
         registration=(GuestRegistrationOut.from_row(loaded["registration"])
                       if loaded["registration"] else None),
     )
+
+
+def _public_stay_fields(loaded: dict) -> dict:
+    """
+    The projection both public views share.
+
+    One function so the thin view and the linked view cannot drift into
+    disagreeing about what a guest may see — the moment they do, the safe one
+    stops being the reference for the other.
+    """
+    stay = loaded["stay"]
+    return {
+        "ref": stay["ref"],
+        "propertyName": loaded["property"].get("name") or "",
+        "propertyCity": loaded["property"].get("city") or "",
+        "checkInTime": str(loaded["property"].get("check_in_time") or "")[:5],
+        "checkOutTime": str(loaded["property"].get("check_out_time") or "")[:5],
+        "guestName": stay.get("guest_name") or "Guest",
+        "guestPhoneMasked": _mask_phone(stay.get("guest_phone")),
+        "checkIn": stay["check_in"], "checkOut": stay["check_out"],
+        "nights": stay["nights"], "units": stay["units"],
+        "adults": stay.get("adults") or 0, "children": stay.get("children") or 0,
+        "roomTypeName": loaded["room_type"].get("name") or "",
+        "ratePlanName": loaded["rate_plan"].get("name") or "",
+        "inclusions": loaded["rate_plan"].get("inclusions") or [],
+        "totalPaise": stay.get("total_paise") or 0,
+        "paidPaise": stay.get("paid_paise") or 0,
+        "balancePaise": loaded["balance"],
+        "status": stay["status"],
+    }
+
+
+@router.get("/public/bookings/{token}", response_model=BookingPageOut)
+@limiter.limit("30/minute")
+async def get_public_booking(request: Request, token: str):
+    """
+    A booking, by the link that was sent to the person who paid for it.
+
+    **Why this exists next to `/public/stays/{ref}`.** The reference is six
+    characters from a 32-symbol alphabet, produced by `random.choices` — good
+    for reading aloud, wrong for a URL that opens somebody's booking. This path
+    takes a 128-bit token instead, so it can show the price breakdown, the folio
+    and the cancellation terms rather than the recognisably-thin projection a
+    guessable reference has to settle for.
+
+    **A cancelled booking is shown, not hidden.** The reference route 404s on
+    one because confirming a stranger's cancelled travel is a free bit of
+    information; here the caller is holding that booking's own credential, and
+    a guest whose booking was cancelled has more right than anyone to read the
+    page that says so.
+
+    A bad token is a flat 404 with no hint about which half was wrong.
+    """
+    if not _TOKEN_SHAPE.fullmatch(token or ""):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that booking.")
+
+    loaded = await run_db(_load_public_booking, token)
+    if not loaded:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that booking.")
+
+    stay = loaded["stay"]
+    return BookingPageOut(
+        **_public_stay_fields(loaded),
+        grossPaise=stay.get("gross_paise") or 0,
+        discountPaise=stay.get("discount_paise") or 0,
+        taxPaise=stay.get("tax_paise") or 0,
+        bookedAt=stay.get("created_at"),
+        cancellationTerms=_cancellation_terms(loaded),
+        propertySlug=loaded["property"].get("slug") or "",
+        receipt=[
+            ReceiptLineOut(
+                postedAt=line["posted_at"],
+                kind=line.get("kind") or "",
+                description=line.get("description") or "",
+                method=line.get("method") or "",
+                amountPaise=int(line.get("amount_paise") or 0),
+            )
+            for line in loaded["receipt"]
+        ],
+        checkInUrl=f"{(settings.pms_app_url or '').rstrip('/')}/checkin/{stay['ref']}",
+        registrationSubmittedAt=((loaded["registration"] or {}).get("submitted_at")),
+    )
+
+
+def _cancellation_terms(loaded: dict) -> str:
+    """
+    What this guest was told about cancelling, in one sentence.
+
+    The reservation's own `cancellation_policy` snapshot comes first — terms at
+    the time of booking beat terms as they stand today — but every row in
+    production has left it at `{}`, so in practice this reads the sentence the
+    hotelier wrote on the property. Nothing invents a default: a hotel that has
+    written no policy produces an empty string, and the page says so.
+    """
+    snapshot = loaded["stay"].get("cancellation_policy")
+    if isinstance(snapshot, dict):
+        text = str(snapshot.get("cancellation") or snapshot.get("text") or "").strip()
+        if text:
+            return text
+    policies = loaded["property"].get("policies")
+    if isinstance(policies, dict):
+        return str(policies.get("cancellation") or "").strip()
+    return ""
 
 
 @router.post("/public/stays/{ref}/check-in", response_model=GuestRegistrationOut)

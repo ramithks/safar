@@ -406,8 +406,9 @@ def _read_booking_state(conversation_id: str, property_id: str) -> dict:
 
     reservation = (
         db.table("reservations")
-        .select("id,ref,status,payment_status,check_in,check_out,nights,units,"
-                "adults,children,total_paise,paid_paise,guest_name,created_at")
+        .select("id,ref,public_token,status,payment_status,check_in,check_out,"
+                "nights,units,adults,children,total_paise,paid_paise,guest_name,"
+                "created_at")
         .eq("property_id", property_id)
         .eq("conversation_id", conversation_id)
         .order("created_at", desc=True)
@@ -441,6 +442,11 @@ def _read_booking_state(conversation_id: str, property_id: str) -> dict:
             "paidPaise": paid,
             "balancePaise": max(0, total - paid),
             "paymentStatus": stay.get("payment_status"),
+            # Consumed by `get_booking_status` to build the link and then
+            # dropped. It is the guest's own token, but a field the model can
+            # quote is a field the model will quote somewhere it does not
+            # belong, and the URL already carries everything the guest needs.
+            "_publicToken": stay.get("public_token"),
         }
 
     order = (
@@ -582,10 +588,13 @@ async def get_booking_status(args: BookingStatusArgs, ctx: AgentContext) -> dict
 
     state = await run_db(_read_booking_state, ctx.conversation_id, ctx.property_id)
 
+    token = state.pop("_publicToken", None)
     if state.get("ref"):
         from app.services.messaging import service as messaging
 
-        state["bookingUrl"] = messaging.booking_url({"ref": state["ref"]})
+        state["bookingUrl"] = messaging.booking_url(
+            {"ref": state["ref"], "public_token": token},
+        )
 
     state["instruction"] = _GUIDANCE.get(state["state"], _GUIDANCE["NONE"])
     return state
