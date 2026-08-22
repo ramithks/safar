@@ -1462,6 +1462,18 @@ class PublicRoomOptionOut(BaseModel):
     unitsLeft: int
     ratePlans: list[RatePlanOptionOut] = []
 
+    # What a *page* about this room needs. All optional, because this model is
+    # also the availability response, where a slug and a photo are noise.
+    slug: str | None = None
+    photos: list[str] = []
+    sizeSqft: int | None = None
+    standardOccupancy: int | None = None
+    # The cheapest public rate plan's base price. A "from" figure for a
+    # brochure page and an Offer's lowPrice — never a quote. Live money comes
+    # from /availability with dates, and only ever from a server-priced quote.
+    fromPricePaise: int | None = None
+    mealPlan: str | None = None
+
 
 class PublicAvailabilityOut(BaseModel):
     checkIn: date
@@ -1499,6 +1511,55 @@ class PublicSiteOut(BaseModel):
     content: dict = {}
     services: list[PublicServiceOut] = []
     roomTypes: list[PublicRoomOptionOut] = []
+
+    # ── the facts a page about this hotel needs ─────────────────────────────
+    #
+    # Added when the hotel website moved to server rendering. A booking widget
+    # needs a slug and a price; a *page* needs a postal address, a map pin and
+    # a sentence about the place — that is the difference between something a
+    # guest can transact on and something a search or answer engine can
+    # describe. None of it is new data: every field has been on `properties`
+    # since it was created.
+    address: str | None = None
+    state: str | None = None
+    country: str | None = None
+    pincode: str | None = None
+    lat: float | None = None
+    lon: float | None = None
+    propertyType: str | None = None
+    totalRooms: int | None = None
+    # When the *page* last changed — the website's publish time, not the
+    # property row's. A rate edit is not a content change, and a lastmod that
+    # moves for reasons a reader cannot see is one Google learns to ignore.
+    updatedAt: str | None = None
+    # The hotel's own custom domain, when it has one verified. The canonical
+    # lives there rather than on travbuddy.in — a hotel that connected its own
+    # address should not have us outranking it for its own name.
+    domain: str | None = None
+
+
+class PublicHotelIndexOut(BaseModel):
+    """
+    One published hotel, in the shape a sitemap and a quality gate need.
+
+    Deliberately not the full site: this list is read to decide *which* URLs to
+    submit, and the decision needs counts rather than content. Every field here
+    is a signal in `stayosHotelGate` on the website side, and the gate and the
+    sitemap must see the same numbers or they will disagree about the same
+    hotel.
+    """
+    slug: str
+    name: str
+    city: str | None = None
+    updatedAt: str | None = None
+    domain: str | None = None
+    roomTypes: int = 0
+    roomsWithPhotos: int = 0
+    photos: int = 0
+    hasDescription: bool = False
+    hasPolicies: bool = False
+    hasLocation: bool = False
+    amenities: int = 0
 
 
 class PublicQuoteRequest(BaseModel):

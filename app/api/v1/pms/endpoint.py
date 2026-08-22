@@ -144,6 +144,7 @@ from app.api.v1.pms.schemas import (
     HotelExtractOut,
     HotelExtractRequest,
     MediaUploadOut,
+    PublicHotelIndexOut,
     RoomTypeOut,
     RoomTypeUpdateRequest,
     SendMessageRequest,
@@ -185,6 +186,7 @@ from app.services.pms import domains as domains_service
 from app.services import razorpay
 from app.config import settings
 from app.services.pms import extract as pms_extract
+from app.services.pms import seo_ping
 from app.storage import gcs
 from app.services.ai import approvals
 from app.services.ai.errors import AgentError
@@ -374,7 +376,26 @@ async def update_room_type(
             for key, value in body.model_dump(exclude_unset=True).items()
         },
     )
+    # A room edit changes the hotel's public page, and adding the fourth
+    # photograph is the precise moment a hotel crosses the indexability gate.
+    # Best effort: a purge that fails must not fail the edit.
+    await seo_ping.hotel_changed(await _slug_of(property_id))
     return RoomTypeOut.from_row(row)
+
+
+async def _slug_of(property_id: str) -> str | None:
+    """This property's public slug, for the SEO purge. None rather than raising."""
+    def _read():
+        rows = (
+            get_db().table("properties").select("slug")
+            .eq("id", property_id).limit(1).execute().data or []
+        )
+        return rows[0].get("slug") if rows else None
+
+    try:
+        return await run_db(_read)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # What a hotel's own material may arrive as.
@@ -3142,7 +3163,8 @@ async def get_public_hotel(request: Request, slug: str):
         db = get_db()
         types = (
             db.table("room_types")
-            .select("id,code,name,description,max_occupancy,bed_type,amenities")
+            .select("id,code,name,description,max_occupancy,standard_occupancy,"
+                    "bed_type,amenities,photos,size_sqft")
             .eq("property_id", prop.id).eq("is_active", True)
             .order("sort_order").execute().data or []
         )
@@ -3152,14 +3174,45 @@ async def get_public_hotel(request: Request, slug: str):
             .eq("property_id", prop.id).eq("is_active", True)
             .order("sort_order").limit(50).execute().data or []
         )
-        return types, services
+        # The cheapest public rate per room type — a "from" figure for a
+        # brochure page, never a quote. `audience=public` matters: a b2b agent
+        # rate is cheaper by design and putting it on a page a guest reads
+        # would advertise a price no guest can have.
+        plans = (
+            db.table("rate_plans")
+            .select("room_type_id,base_price_paise,meal_plan")
+            .eq("property_id", prop.id).eq("is_active", True)
+            .eq("audience", "public").execute().data or []
+        )
+        domain = (
+            db.table("hotel_websites").select("domain,domain_status")
+            .eq("property_id", prop.id).limit(1).execute().data or []
+        )
+        return types, services, plans, (domain[0] if domain else {})
 
-    types, services = await run_db(_read)
+    types, services, plans, site = await run_db(_read)
+
+    cheapest: dict[str, dict] = {}
+    for plan in plans:
+        price = plan.get("base_price_paise")
+        if price is None:
+            continue
+        current = cheapest.get(plan["room_type_id"])
+        if current is None or price < current["base_price_paise"]:
+            cheapest[plan["room_type_id"]] = plan
     return PublicSiteOut(
         slug=prop.slug, name=prop.name, city=prop.city, template=prop.template,
         currency=prop.currency, timezone=prop.timezone,
         checkInTime=prop.check_in_time, checkOutTime=prop.check_out_time,
         policies=prop.policies, content=prop.website,
+        address=prop.address, state=prop.state, country=prop.country,
+        pincode=prop.pincode, lat=prop.lat, lon=prop.lon,
+        propertyType=prop.property_type, totalRooms=prop.total_rooms,
+        updatedAt=prop.updated_at,
+        # Only a *verified* domain. An unverified one is a hostname somebody
+        # typed into a form, and pointing a canonical at it would hand the
+        # page's ranking to an address that may not resolve.
+        domain=(site.get("domain") if site.get("domain_status") == "verified" else None),
         services=[
             PublicServiceOut(
                 id=s["id"], name=s["name"], description=s.get("description") or "",
@@ -3177,9 +3230,94 @@ async def get_public_hotel(request: Request, slug: str):
                 # Nothing is claimed about availability here. This is the
                 # brochure; the number comes from /availability with dates.
                 unitsLeft=0,
+                slug=onboarding_service.slugify(t["name"]) or t["code"].lower(),
+                photos=t.get("photos") or [],
+                sizeSqft=t.get("size_sqft"),
+                standardOccupancy=t.get("standard_occupancy"),
+                fromPricePaise=(cheapest.get(t["id"]) or {}).get("base_price_paise"),
+                mealPlan=(cheapest.get(t["id"]) or {}).get("meal_plan"),
             ) for t in types
         ],
     )
+
+
+@router.get("/public/hotels", response_model=list[PublicHotelIndexOut])
+@limiter.limit("30/minute")
+async def list_public_hotels(request: Request):
+    """
+    Every hotel whose website is published, with the counts a quality gate needs.
+
+    **This is what makes the hotel pages discoverable at all.** A sitemap cannot
+    enumerate URLs it has no way to list, and until this route existed the only
+    entry point was `/public/hotels/{slug}` — reachable if you already knew the
+    slug, which a crawler does not.
+
+    It returns counts rather than content on purpose. The caller is deciding
+    *which* hotels to submit for indexing, and that decision is "does this page
+    have enough on it to be worth a search result" — a number of photos, a
+    number of rooms, whether there is a description at all. Sending the content
+    itself would make this the heaviest route in the system to answer a question
+    that is really about volume.
+
+    Unpublished and suspended hotels are absent, for the same reason
+    `resolve_published` 404s them: a hotelier drafting a site has not agreed to
+    anybody seeing it.
+    """
+    def _read():
+        db = get_db()
+        sites = (
+            db.table("hotel_websites")
+            .select("property_id,published,published_at,domain,domain_status")
+            .eq("status", "published").limit(2000).execute().data or []
+        )
+        if not sites:
+            return []
+        ids = [s["property_id"] for s in sites]
+
+        props = {
+            p["id"]: p
+            for p in (
+                db.table("properties")
+                .select("id,slug,name,city,status,lat,lon,address,policies,updated_at")
+                .in_("id", ids).execute().data or []
+            )
+        }
+        rooms = (
+            db.table("room_types").select("property_id,photos,description")
+            .in_("property_id", ids).eq("is_active", True).execute().data or []
+        )
+
+        by_property: dict[str, list[dict]] = {}
+        for room in rooms:
+            by_property.setdefault(room["property_id"], []).append(room)
+
+        out = []
+        for site in sites:
+            prop = props.get(site["property_id"])
+            if not prop or prop.get("status") != "active" or not prop.get("slug"):
+                continue
+            published = site.get("published") or {}
+            mine = by_property.get(prop["id"], [])
+            photos = sum(len(r.get("photos") or []) for r in mine)
+            out.append({
+                "slug": prop["slug"],
+                "name": prop["name"],
+                "city": prop.get("city"),
+                "updatedAt": str(site.get("published_at") or prop.get("updated_at") or "") or None,
+                "domain": (site.get("domain")
+                           if site.get("domain_status") == "verified" else None),
+                "roomTypes": len(mine),
+                "roomsWithPhotos": sum(1 for r in mine if r.get("photos")),
+                "photos": photos,
+                "hasDescription": len(str(published.get("about") or "").strip()) >= 120,
+                "hasPolicies": bool(prop.get("policies")),
+                "hasLocation": prop.get("lat") is not None and prop.get("lon") is not None,
+                "amenities": len(published.get("amenities") or []),
+            })
+        return out
+
+    rows = await run_db(_read)
+    return [PublicHotelIndexOut(**r) for r in rows]
 
 
 @router.get("/public/hotels/{slug}/availability", response_model=PublicAvailabilityOut)

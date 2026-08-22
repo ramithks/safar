@@ -63,13 +63,30 @@ class ResolvedProperty:
     website: dict = field(default_factory=dict)
     template: str = "boutique"
 
+    # The facts a *page about this hotel* needs, as opposed to the facts a
+    # booking needs. Added when the hotel website moved to server rendering:
+    # an address, a map pin and a property type are what turn a booking form
+    # into something a search engine — or an answer engine — can describe.
+    # None of them is new data; every one has been on `properties` since it was
+    # created and simply never left the building.
+    address: str | None = None
+    state: str | None = None
+    country: str | None = None
+    pincode: str | None = None
+    lat: float | None = None
+    lon: float | None = None
+    property_type: str | None = None
+    total_rooms: int | None = None
+    updated_at: str | None = None
+
 
 def _read_published(slug: str) -> dict | None:
     db = get_db()
     rows = (
         db.table("properties")
         .select("id,partner_id,slug,name,city,currency,timezone,check_in_time,"
-                "check_out_time,policies,status")
+                "check_out_time,policies,status,address,state,country,pincode,"
+                "lat,lon,property_type,total_rooms,updated_at")
         .ilike("slug", slug.strip())
         .limit(1).execute().data or []
     )
@@ -79,7 +96,7 @@ def _read_published(slug: str) -> dict | None:
 
     site = (
         db.table("hotel_websites")
-        .select("template,status,published")
+        .select("template,status,published,published_at")
         .eq("property_id", prop["id"]).limit(1).execute().data or []
     )
     if not site or site[0].get("status") != "published" or not site[0].get("published"):
@@ -117,6 +134,19 @@ async def resolve_published(slug: str) -> ResolvedProperty:
         policies=prop.get("policies") or {},
         website=site.get("published") or {},
         template=site.get("template") or "boutique",
+        address=prop.get("address"),
+        state=prop.get("state"),
+        country=prop.get("country"),
+        pincode=prop.get("pincode"),
+        lat=prop.get("lat"),
+        lon=prop.get("lon"),
+        property_type=prop.get("property_type"),
+        total_rooms=prop.get("total_rooms"),
+        # The website's own publish time when there is one, because that is
+        # when the *page* last changed — a property row touched by a rate edit
+        # is not a content change, and a sitemap lastmod that moves for reasons
+        # a reader cannot see is one Google learns to ignore.
+        updated_at=str(site.get("published_at") or prop.get("updated_at") or "") or None,
     )
 
 

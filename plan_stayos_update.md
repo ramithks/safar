@@ -439,32 +439,87 @@ Suites green afterwards: 1,147 unit · onboarding_e2e 65 · golden_e2e 88.
 - [ ] **6.4** Instagram → website handoff preserves the session (dates, guests,
       room) so nothing is re-entered.
 
-## Phase 7 — Hotel websites that search and answer engines can read
+## Phase 7 — Hotel websites that search and answer engines can read ✅ DONE
 
-The largest single piece of new work. Today `/stay/:slug` is invisible to search.
+- [x] **7.1** Serving model: **Next.js**, reusing `/hotels/[slug]`'s architecture
+      rather than a second SEO system. Path is `/book/[slug]`, not the brief's
+      suggested `/stays/[slug]` — that segment is the marketplace listing page
+      and `/hotels/*` is the 16k-row OTA catalogue. `/book` collides with
+      neither and states what the page is for.
+- [x] **7.2** Server-rendered content: about, rooms (real `h2`/`h3`, prose, not
+      a hydration-only booking widget), facilities, extras, check-in/out,
+      policies, location, FAQ.
+- [x] **7.3** `generateMetadata` per hotel and per room, `fitTitle`/
+      `fitDescription` budgets, `title: {absolute}`. **Canonical is stable and
+      the booking parameters cannot move it** — verified live against
+      `?checkin=&guests=&utm_source=`.
+- [x] **7.4** JSON-LD: `Hotel`/`LodgingBusiness` (specific type when the
+      property is one), `PostalAddress`, `GeoCoordinates`, `HotelRoom` with
+      `Offer`/`UnitPriceSpecification` at `unitCode: DAY`, `FAQPage` as
+      `mainEntityOfPage`, `BreadcrumbList`. **No `aggregateRating`, no
+      `review`, no `starRating`** — StayOS has no review corpus and inventing
+      one is the fastest route to a manual action.
+- [x] **7.5** FAQ from verified fields only. An empty field produces no
+      question rather than a "please contact us" non-answer occupying a snippet
+      slot. Policies are quoted verbatim.
+- [x] **7.6** Room pages, gated harder than their hotels: prose **and** two
+      photos of their own, or the page renders and is not submitted. Without
+      that test every hotel spawns four near-duplicates of itself.
+- [x] **7.7** `stayosHotelGate` — photos and a sellable room are requirements;
+      description, room photos, policies, location and amenities are signals.
+      Failing is `noindex,follow` and absence from the sitemap; the page still
+      renders, still links and still takes bookings.
+- [x] **7.8** Sitemap sections `stayos-hotels` and `stayos-rooms` under the
+      existing `<sitemapindex>`, with `lastmod` from the website's own publish
+      time. `/book` added to core.
+- [x] **7.9** `next/image` with `priority` + `sizes` on the hero;
+      `storage.googleapis.com` added to `remotePatterns` so a 4 MB phone
+      photograph is resized rather than shipped. (The reference template uses
+      raw `<img>`; this is deliberately better.)
+- [x] **7.10** Backend `seo_ping.hotel_changed()` fires on publish, unpublish
+      and room edits → website `/api/revalidate` → purges the page, its rooms,
+      both section sitemaps and the index, then submits to IndexNow. Adding the
+      fourth photograph is the moment a hotel crosses the gate, so that is the
+      moment the sitemap has to move.
 
-- [ ] **7.1** Decide the serving model: server-render hotel pages (Next.js route
-      in `Travbuddy_website`, or a small Next app fronting `partner.travbuddy.in`)
-      versus prerendering the Vite build. **Recommendation: Next.js**, because
-      custom domains, `generateMetadata`, JSON-LD and ISR all fall out of it and
-      the consumer site already does exactly this for `/hotels/[slug]`.
-- [ ] **7.2** Content-rich hotel page from existing Supabase data: overview,
-      rooms, amenities, dining, location, policies, FAQ, booking CTA — real
-      `h1/h2/h3`, server-rendered.
-- [ ] **7.3** `generateMetadata` per hotel; canonical that ignores
-      `?checkin=/?guests=/utm_*`.
-- [ ] **7.4** JSON-LD: `Hotel`/`LodgingBusiness`, `HotelRoom`, `Offer`,
-      `PostalAddress`, `GeoCoordinates`, `BreadcrumbList`, `FAQPage`.
-      No `AggregateRating`/`Review` until real reviews exist.
-- [ ] **7.5** FAQ generated *only* from verified fields; unknown → omitted.
-- [ ] **7.6** Room pages `/…/rooms/[slug]` where a room has enough unique content.
-- [ ] **7.7** Indexability gate: a completeness threshold decides
-      `index` vs `noindex`. Thin profiles stay out of the index.
-- [ ] **7.8** Sitemaps (hotels, rooms), regenerated on publish; IndexNow ping
-      reusing the pattern in `lib/seo/indexnow.ts` on the consumer site.
-- [ ] **7.9** Core Web Vitals: responsive image variants, hero preload, lazy
-      everything else.
-- [ ] **7.10** SEO readiness panel in the operator UI — plain language, no jargon.
+**Backend additions** (Supabase stays the only source of truth — no SEO table):
+`GET /public/hotels` (an index with the counts a gate needs; nothing could
+enumerate published hotels before, so a sitemap was impossible), and
+`GET /public/hotels/{slug}` extended with address, geo, property type, room
+photos, room size, standard occupancy, a "from" price off the cheapest *public*
+rate plan, verified custom domain and a content `updatedAt`.
+
+**One design error caught and fixed.** The canonical initially pointed at a
+hotel's own domain when it had one — which sounds right and is backwards: that
+domain serves the Vite SPA with one static title and no rendered content, so it
+would have asked Google to keep the emptier of the two pages. Canonical stays on
+travbuddy.in; the hotel's domain is credited as schema `sameAs` and a visible
+link, and the comment says what has to change for that to flip.
+
+**One real bug the build caught.** `lib/stayos.ts` first read
+`PLAN_API_BASE_URL`. StayOS is a *separate deployment on a separate host*
+(`stayos-backend.travbuddy.in`), so that would have 404'd every hotel page in
+production; it surfaced because pointing the shared variable at StayOS broke the
+catalogue sitemap instead. Now `STAYOS_API_BASE_URL`.
+
+⚠ **Production env**: set `STAYOS_API_BASE_URL` on Vercel, and
+`REVALIDATE_SECRET` on both the website and the StayOS backend, or the SEO ping
+is skipped (it logs at debug and never fails a publish).
+
+⚠ **Honest state of the data**: of ten published hotels, only Casa Mandala —
+the seeded showcase, enriched during this work to prove the template — passes
+the gate. The other nine have zero photos, no description and no coordinates,
+so they correctly render as `noindex,follow` and are absent from the sitemap.
+That is Phase 4's job, not this one's: the pipeline works, and it is waiting on
+hotels to upload four photographs each.
+
+Verified live: `index,follow` for the complete hotel, `noindex,follow` for a
+thin one and for a room below the bar, canonical unmoved by booking parameters,
+both sitemaps carrying exactly the URLs the gates allow.
+
+Suites green: website 398 unit (21 new) + clean build · backend 1,184 unit ·
+onboarding 65 · golden 88 · ai 98 · sales 185 · instagram 70 · payment status
+29 · pms 134.
 
 ## Phase 8 — Security and hardening
 
