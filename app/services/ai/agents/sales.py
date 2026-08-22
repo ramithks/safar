@@ -85,6 +85,11 @@ DEFINITION = AgentDefinition(
         # Actual pictures, in the chat. "photos hain?" is one of the first
         # things a guest asks and a link to a gallery is not an answer to it.
         "send_room_photos",
+        # The hotel's own page, with this guest's dates already on it. A guest
+        # sent a bare URL after six messages about 11-15 September arrives at
+        # an empty date picker, and the usual thing to do with one is close the
+        # tab.
+        "get_hotel_page_link",
         "list_services",
         # What is free, and what it costs
         "search_availability",

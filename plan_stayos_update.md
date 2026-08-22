@@ -630,8 +630,37 @@ Suites green: 1,206 unit · onboarding 65 · golden 88 · pms 134 · sales 185.
       the panel must get right, plus the list-ordering assertions, plus
       isolation: another hotel's path, another partner, and a housekeeper with
       no messaging permission. Verified visually against the real API.
-- [ ] **6.4** Instagram → website handoff preserves the session (dates, guests,
-      room) so nothing is re-entered.
+- [x] **6.4** Instagram → website handoff preserves the session. ✅ DONE.
+
+      New tool `get_hotel_page_link` (no permission, autonomy 0, granted to
+      guest and sales agents by migration
+      `a_guest_can_carry_their_dates_onto_the_website`). It returns
+      `{site}/book/{slug}?checkin=…&checkout=…&adults=…&rooms=…`, optionally
+      deep-linked to one room.
+
+      **The failure it closes is retyping.** A guest who has spent six messages
+      settling on 11–15 September for four people, and is then sent a bare hotel
+      URL, arrives at an empty date picker — and the usual thing to do with an
+      empty date picker is close the tab.
+
+      **The model names a room; it never names a URL.** Same property as
+      `send_room_photos`, and the input model is the proof: one optional
+      `room_type_id` and nothing else. The origin comes from settings, the path
+      from this property's slug, the query from
+      `conversations.guest_profile` — which `session.patch_from` writes only
+      from tool inputs and outputs, so a link cannot carry dates the guest never
+      gave. Another hotel's room id, an inactive room and another hotel's
+      conversation all fall back to the plain page rather than leaking.
+
+      An unpublished website returns no link and an instruction not to invent
+      one — `resolve_published`'s rule applied one step earlier, because a link
+      to a 404 is worse than saying there is no page yet.
+
+      Verified end to end against the running website: the page renders with
+      the parameters, its canonical stays the bare hotel URL, and Book Now
+      carries the same dates on into the booking engine.
+
+      Tests: `tests/test_hotel_page_link.py` (14).
 
 ## Phase 7 — Hotel websites that search and answer engines can read ✅ DONE
 
