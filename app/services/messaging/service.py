@@ -185,23 +185,43 @@ def _upsert_conversation(
             )
             return adopted[0] if adopted else orphan[0]
 
-    # A returning guest is matched on the phone number the property already has
-    # for them. Scoped to the property — the same number at two hotels is two
-    # guest records, and joining them would be a cross-property leak dressed up
-    # as a convenience.
+    # A returning guest, matched on whatever this channel's sender id actually
+    # is. Scoped to the property — the same person at two hotels is two guest
+    # records, and joining them would be a cross-property leak dressed up as a
+    # convenience.
+    #
+    # **The column differs by channel and that is not cosmetic.** On WhatsApp
+    # the sender id is a phone number, so the phone column is the right one. On
+    # Instagram it is a 17-digit IGSID, which matched no phone number that has
+    # ever existed — so every returning Instagram guest arrived as a stranger,
+    # `guest_id` stayed null, `_link_reservation` never ran, and a guest who had
+    # booked through this same thread was told nothing was found.
     guest_id = None
     if sender_external_id:
-        digits = sender_external_id.lstrip("+")
-        found = (
-            db.table("guests")
-            .select("id,name")
-            .eq("property_id", property_id)
-            .ilike("phone", f"%{digits[-10:]}")
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
+        found = []
+        if channel == "instagram":
+            found = (
+                db.table("guests")
+                .select("id,name")
+                .eq("property_id", property_id)
+                .eq("instagram_id", sender_external_id)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+        else:
+            digits = sender_external_id.lstrip("+")
+            found = (
+                db.table("guests")
+                .select("id,name")
+                .eq("property_id", property_id)
+                .ilike("phone", f"%{digits[-10:]}")
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
         if found:
             guest_id = found[0]["id"]
             sender_name = sender_name or found[0].get("name")
@@ -945,13 +965,40 @@ def _link_booking(reservation: dict) -> dict | None:
     if reservation.get("guest_name"):
         patch["guest_name"] = reservation["guest_name"]
 
-    rows = (
+    updated = (
         db.table("conversations").update(patch)
         .eq("id", conversation_id)
         .is_("reservation_id", "null")
         .execute().data or []
     )
-    return rows[0] if rows else None
+    # Read rather than rely on the update's return: the guard above means a
+    # thread that already names an older booking updates nothing, and that
+    # guest still needs their handle recorded.
+    conversation = updated[0] if updated else _conversation_by_id(conversation_id)
+
+    # And the other direction: teach the guest record which Instagram account
+    # this is, so the *next* thread they open resolves to them.
+    #
+    # Here rather than in `_resolve_guest`, because that function is called from
+    # the booking service and has no idea a messaging channel exists — it is
+    # given a name, a phone and an email, and on Instagram two of those are
+    # null. This is the one moment where the handle and the guest record are
+    # both in scope: somebody has just stopped being a stranger.
+    handle = (conversation or {}).get("guest_handle")
+    if handle and reservation.get("guest_id")             and (conversation or {}).get("channel") == "instagram":
+        try:
+            db.table("guests").update({"instagram_id": handle}).eq(
+                "id", reservation["guest_id"]
+            ).is_("instagram_id", "null").execute()
+        except Exception:  # noqa: BLE001
+            # A unique-index collision means this IGSID already belongs to a
+            # guest row at this property — an earlier booking under a different
+            # name. Leaving the older row holding the handle is right: it has
+            # the stay history.
+            logger.info("could not claim instagram id for guest %s",
+                        reservation.get("guest_id"), exc_info=True)
+
+    return conversation
 
 
 async def link_booking(reservation: dict) -> dict | None:

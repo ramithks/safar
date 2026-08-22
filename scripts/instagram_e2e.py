@@ -588,7 +588,61 @@ check("an unsupported attachment is still persisted",
       any(m.get("message_type") == "story_mention" for m in messages()))
 
 
-# ── 12. what this proves ────────────────────────────────────────────────────
+# ── 12. the language the guest asked for ────────────────────────────────────
+#
+# The failure this section exists for, from a real hotel's real thread:
+#
+#     Guest  Okie 2 kamre karne h aaur hinglish m baat karo please
+#     Agent  Ok, good news! …                                        ← correct
+#     …two turns later…
+#     Agent  मुझे माफ़ करना, मुझे बुकिंग के लिए एक quote ID की ज़रूरत है
+#
+# "Reply in the language the guest wrote in" is an instruction about the
+# *current* message, and by then the request had scrolled out of the ten turns
+# `_history` carries. A preference is not a message; it needs a column.
+
+print("\n── language ──")
+
+sql(f"""update public.conversations set guest_profile = '{{}}'::jsonb
+        where id = '{conversation()["id"]}';""")
+
+hinglish, _ = inbound_payload("Okie 2 kamre karne h aaur hinglish m baat karo please")
+deliver(hinglish, script=["Bilkul, main Hinglish mein baat karta hoon."])
+
+stored = sql(f"""select guest_profile ->> 'language' as language
+                 from public.conversations where id = '{conversation()["id"]}';""")
+check("a Hinglish request is remembered on the conversation",
+      isinstance(stored, list) and stored and stored[0]["language"] == "hinglish",
+      str(stored))
+
+# The turn after it. What matters is not what the scripted model says — it says
+# whatever we tell it — but what the model was *told*, which is the prompt.
+from app.services.ai.providers import EchoProvider as _Echo  # noqa: E402
+
+from app.api.v1.messaging import webhooks as _webhooks  # noqa: E402
+
+probe = _Echo(["Theek hai."])
+later, _ = inbound_payload("aur breakfast?")
+run(_webhooks.handle_payload(later, provider=probe, channel="instagram"))
+system_prompt = probe.seen_messages[0][0]["content"] if probe.seen_messages else ""
+check("and the next turn's prompt carries the preference the model cannot see",
+      "Hinglish" in system_prompt, system_prompt[-400:])
+check("and tells it not to answer in Devanagari",
+      "Devanagari" in system_prompt, system_prompt[-400:])
+
+# An answer that carries no language signal must not overwrite it.
+sql(f"""update public.conversations set guest_profile = jsonb_build_object('language','hinglish')
+        where id = '{conversation()["id"]}';""")
+noise, _ = inbound_payload("Ok")
+deliver(noise, script=["👍"])
+after = sql(f"""select guest_profile ->> 'language' as language
+                from public.conversations where id = '{conversation()["id"]}';""")
+check("a two-letter reply does not overwrite the preference",
+      isinstance(after, list) and after and after[0]["language"] == "hinglish",
+      str(after))
+
+
+# ── 13. what this proves ────────────────────────────────────────────────────
 
 print("\n── summary ──")
 

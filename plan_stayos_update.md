@@ -213,33 +213,47 @@ template mechanism exists on that channel. The guest is not stranded;
 Suites green afterwards: 1,084 unit · sales_e2e 185 · booking_engine_e2e 65 ·
 instagram_e2e 66 · ai_e2e 98 · golden_e2e 88 · payment_status_e2e 29.
 
-## Phase 2 — Identity, session and language
+## Phase 2 — Identity, session and language ✅ DONE
 
 The agent should know who it is talking to, in what language, and where in the
 funnel they are — without re-reading the transcript.
 
-- [ ] **2.1** Migration: `guests.instagram_id text` + partial unique index on
-      `(property_id, instagram_id)`. Backfill nothing; it starts empty.
-- [ ] **2.2** `_upsert_conversation`: resolve an Instagram guest by
-      `instagram_id`, not by `ilike(phone, …)`. Create/attach the `guests` row
-      on first *committed* action (a quote, a booking, a name given), not on
-      "hi" — a guest record per drive-by DM is landfill.
-- [ ] **2.3** Session state in `conversations.guest_profile` (the unused
-      column), written by the runtime after each turn:
-      `{check_in, check_out, adults, children, units, room_type_id,
-      rate_plan_id, quote_id, order_id, reservation_id, stage}`.
-      Derived from tool outputs — never from model prose.
-- [ ] **2.4** Language: `guest_profile.language` + `tone`, detected on the cheap
-      tier only when the current message's language differs from the stored one,
-      persisted to `guests.preferences` once a guest record exists. Current
-      message always wins over the stored value.
-- [ ] **2.5** Prompt: one compact "where we are" block built from 2.3/2.4,
-      replacing part of what `_history` currently carries.
-- [ ] **2.6** `_history`: keep 10 turns but drop to 6 when a session block is
-      present, and truncate long bodies. Measure token delta.
-- [ ] **2.7** Tests: new IG user, returning IG user with no session, language
-      persists across a 90-minute gap, language switch mid-thread, an old
-      booking does not contaminate a new enquiry.
+- [x] **2.1** Migration `a_guest_who_only_ever_used_instagram_is_still_a_guest`:
+      `guests.instagram_id` + partial unique index on
+      `(property_id, instagram_id)`. Applied.
+- [x] **2.2** `_upsert_conversation` matches an Instagram guest on
+      `instagram_id` instead of `ilike(phone, …)` against a 17-digit IGSID,
+      which matched nothing that has ever existed. The handle is recorded on
+      the guest row at fulfilment, inside `link_booking` — the one moment where
+      the handle and the guest record are both in scope. A drive-by "hi" still
+      creates no guest record.
+- [x] **2.3** `services/messaging/session.py` — session state in
+      `conversations.guest_profile`, derived from `ToolOutcome` inputs and
+      outputs only. Stages `browsing → quoted → awaiting_payment → booked`.
+      `describe()` puts the dates in the prompt, but only when there is no live
+      quote: two descriptions of one stay is how a model quotes one and books
+      the other.
+- [x] **2.4** `services/messaging/language.py` — en/hi/**hinglish**, detected
+      from function words rather than content words, stored on the conversation,
+      merged into `guest_profile` so it cannot clobber the session. `detect()`
+      returns None for "ok"/"yes"/a name, which is what stops a two-letter reply
+      overwriting a real request.
+- [x] **2.5** `AgentContext.language` / `.session`, both set by the pipeline;
+      `prompts.build_system_prompt` adds the instruction only for a *remembered*
+      preference — what the guest just wrote is in the message already.
+- [x] **2.7** Tests — `tests/test_conversation_memory.py` (17), plus four new
+      assertions in `scripts/instagram_e2e.py` driving the real pipeline: the
+      request is remembered, the *next* turn's system prompt carries it, and
+      "Ok" does not erase it.
+
+- [ ] **2.6** History trimming — **deferred into Phase 3 with a reason.** The
+      measured token cost is not the ten message bodies; it is
+      `get_stay_options` returning every room type × every rate plan ×
+      per-night breakdown, which is what took turns from 3k to 11k tokens.
+      Trimming history first would be optimising the smaller half and losing
+      continuity for it. See 3.1.
+
+Suites green afterwards: 1,101 unit · instagram_e2e 70 · payment_status_e2e 29.
 
 ## Phase 3 — Retrieval that matches the question
 

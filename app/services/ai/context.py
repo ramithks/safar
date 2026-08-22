@@ -104,6 +104,18 @@ class AgentContext:
     reservation_id: str | None = None
     channel: str = "whatsapp"
 
+    # What this guest has asked to be spoken to in — 'en', 'hi' or 'hinglish',
+    # remembered across threads. Not a locale and not a detection of the current
+    # message: the model reads that perfectly well by itself. This is the
+    # request made forty minutes and one subject change ago, which it cannot
+    # see. See services/messaging/language.py.
+    language: str | None = None
+
+    # Where the booking flow has got to, from `conversations.guest_profile`.
+    # Tool-derived and advisory — see services/messaging/session.py. Nothing
+    # reads it to decide a price, a room or a payment.
+    session: dict = field(default_factory=dict)
+
     # 'guest' when a guest is on the other end, 'member' for a staff-facing
     # agent, 'system' for a scheduled run. Guest scoping applies to the first.
     actor: str = "guest"
@@ -279,6 +291,8 @@ async def load_context(
     actor: str = "guest",
     member_id: str | None = None,
     member_name: str | None = None,
+    language: str | None = None,
+    session: dict | None = None,
 ) -> AgentContext:
     loaded = await run_db(_load_agent, property_id, agent_type)
     if not loaded:
@@ -330,5 +344,7 @@ async def load_context(
         actor=actor,
         member_id=member_id,
         member_name=member_name,
+        language=language,
+        session=session or {},
         tool_grants={t["tool_name"]: t for t in loaded["tools"]},
     )

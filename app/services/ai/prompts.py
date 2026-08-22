@@ -342,6 +342,30 @@ def build_system_prompt(ctx: AgentContext) -> str:
     live = _live_quote(ctx)
     if live:
         parts.append(live)
+    elif ctx.guest_scoped and ctx.session:
+        # Only when there is no live quote. A quote already states the dates and
+        # the party, and two descriptions of the same stay in one prompt is how
+        # a model ends up quoting one and booking the other.
+        from app.services.messaging import session as session_module
+
+        told = session_module.describe({"guest_profile": ctx.session})
+        if told:
+            parts.append(told)
+
+    # A language the guest asked for, in an earlier message the model cannot
+    # see. `_history` carries ten turns; the request "hinglish m baat karo
+    # please" was turn eleven on the conversation this exists for, and the
+    # agent went back to Devanagari twice.
+    #
+    # Only a *remembered* preference reaches here. What the guest wrote a
+    # moment ago is in the message itself, and "reply in the language the guest
+    # wrote in" already covers it.
+    if ctx.guest_scoped and ctx.language:
+        from app.services.messaging import language as language_module
+
+        told = language_module.instruction(ctx.language)
+        if told:
+            situation.append(told)
 
     parts.append("\n".join(situation))
 
