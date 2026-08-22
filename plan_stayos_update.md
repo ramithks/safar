@@ -408,8 +408,8 @@ and twenty-one room types, and two of twenty-one have a description.
       included nahi hai") mapping to the structured field.
 - [ ] **4.4** Instagram media send: attach room photos as real IG attachments
       where the API allows; fall back to the room page link.
-- [ ] **4.5** Completeness score per property, extending the per-room gaps the
-      panel already shows.
+- [x] **4.5** Completeness — delivered as Phase 5's readiness report rather than
+      a score. See below.
 
 Tests: `tests/test_room_type_edit.py` (18) on the PATCH contract and its
 isolation, plus a new section in `scripts/onboarding_e2e.py` (65 total) proving
@@ -418,13 +418,60 @@ hotel's room cannot be edited or written to through its path.
 
 Suites green afterwards: 1,147 unit · onboarding_e2e 65 · golden_e2e 88.
 
-## Phase 5 — Hotel onboarding, AI-assisted
+## Phase 5 — Hotel onboarding, AI-assisted ✅ DONE
 
-- [ ] **5.1** Extend 4.2 to the whole property: name/address/description/
-      amenities/policies/meals from a brochure or an existing website.
-- [ ] **5.2** Geocode on create (fills the null `lat`/`lon`) — needed by Phase 7.
-- [ ] **5.3** Missing-information prompts driven by the completeness score.
-- [ ] **5.4** Owner approval gate before anything becomes agent-visible.
+- [x] **5.1** The extractor already read the hotel-level half — address, times,
+      house rules, a description, facilities — and **threw all of it away**.
+      There was no route that could write any of it: `properties.address`,
+      `lat`, `lon`, `policies` and the check-in times were editable only by
+      hand in Postgres. That is why nine of ten live hotels have no address, no
+      map pin and empty policies, and therefore why their AI hands
+      "what's your cancellation policy?" to a person and their website cannot be
+      indexed. New `PATCH /properties/{id}`; the description and facilities go
+      through the website draft route that already existed.
+
+      **`policies` merges key by key over a known set.** That column also
+      carries `token_pct` and `max_discount_pct`, which the pricing engine
+      reads — a screen that saved the whole object would delete a hotel's
+      deposit percentage the first time somebody wrote a pet policy. Tested in
+      both directions.
+- [x] **5.2** `POST /properties/{id}/locate` — geocodes from the address the
+      hotel has already given, through the Places client that already existed.
+      **Proposes, never writes**: one confident geocoding mistake puts a hotel
+      in the wrong town on its own website, in its own structured data and in
+      every distance its AI quotes afterwards. Degrades to `unavailable: true`
+      with no key configured, which is a different problem for a hotelier than
+      "no such place" and is said differently.
+- [x] **5.3** `GET /properties/{id}/readiness` + `ReadinessPanel` on Today —
+      **named gaps, not a percentage.** "You are at 62%" tells an owner nothing
+      they can act on; "Your AI can't tell guests where you are" is one tap from
+      being fixed. Every gap says whether it is holding up the AI, the website,
+      or both. Nine of ten live hotels are `noindex` on their own website and
+      until now nothing anywhere told them so.
+- [x] **5.4** The approval gate is the review screen the importer already had;
+      the hotel-level details are a tick beside the rooms.
+- [x] **The extractor had no `address` field**, found by running the chain end
+      to end rather than by reading it: a brochure carrying a full postal
+      address still left the hotel with no location, which blocks the map pin,
+      the distances and the indexability gate. Added, with `state`/`pincode` in
+      their own fields and a rule about what counts as a street address —
+      "near the lake" is a direction, not an address.
+
+**Verified live, twice, over HTTP as a hotelier would:** a brand-new hotel
+starts with 8 gaps; after one brochure paste and the applies it is down to 2 —
+photographs, which need a camera, and publishing, which needs a button press.
+The geocoder found the real coordinates on Gangaur Ghat Marg from the address in
+the brochure.
+
+**Still thrown away:** the extractor reads `meals` (breakfast/lunch/dinner
+timings and whether they are included) and nothing applies it. The right home is
+`property_knowledge`, which the agent already reads — noted rather than rushed.
+
+Tests: `tests/test_property_details.py` (20) on the PATCH contract, the
+policies-merge guarantee in both directions, and the readiness report;
+`tests/test_hotel_extract.py` grew two on the address.
+
+Suites green: 1,206 unit · onboarding 65 · golden 88 · pms 134 · sales 185.
 
 ## Phase 6 — Operator view and confirmation surfaces
 

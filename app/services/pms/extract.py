@@ -103,6 +103,11 @@ Hard rules:
   `property_amenities`, not into every room.
 - Policies are copied close to the hotel's own words. Do not summarise a
   cancellation policy into "flexible"; a guest will be held to what it says.
+- The address is the **street address**, as it would be written on an envelope
+  or given to a taxi: building, road, locality. "Near the lake" and "five
+  minutes from the station" are directions, not an address — leave it null
+  rather than putting them there. Put the city, the state and the postcode in
+  their own fields, not in the address.
 - `confidence` is how much of this material was genuinely readable as a hotel's
   room and rate information. An invoice, a menu or a blank scan scores below
   0.3.
@@ -121,7 +126,10 @@ EXTRACTION_SCHEMA: dict = {
     "properties": {
         "confidence": {"type": "NUMBER"},
         "hotel_name": {"type": "STRING", "nullable": True},
+        "address": {"type": "STRING", "nullable": True},
         "city": {"type": "STRING", "nullable": True},
+        "state": {"type": "STRING", "nullable": True},
+        "pincode": {"type": "STRING", "nullable": True},
         "description": {"type": "STRING", "nullable": True},
         "property_amenities": {"type": "ARRAY", "items": {"type": "STRING"}},
         "check_in_time": {"type": "STRING", "nullable": True},
@@ -320,7 +328,16 @@ def normalise(raw: dict) -> dict:
         "confidence": confidence,
         "hotel": {
             "name": _clean(raw.get("hotel_name")),
+            "address": _clean(raw.get("address")),
             "city": _clean(raw.get("city")),
+            "state": _clean(raw.get("state")),
+            # Six digits in India, and a model that returns "Goa" here should
+            # produce nothing rather than a postcode nobody can post to.
+            "pincode": (
+                _clean(raw.get("pincode"))
+                if re.fullmatch(r"\d{4,10}", str(raw.get("pincode") or "").strip())
+                else None
+            ),
             "description": _clean(raw.get("description")),
             "amenities": str_list(raw.get("property_amenities")),
             "checkInTime": _time(raw.get("check_in_time")),
@@ -366,6 +383,14 @@ def found_lines(draft: dict) -> list[str]:
         )
     if hotel.get("meals"):
         lines.append("Meals: " + ", ".join(hotel["meals"]))
+    if hotel.get("address"):
+        lines.append(
+            "Address: "
+            + ", ".join(
+                part for part in (hotel.get("address"), hotel.get("city"),
+                                  hotel.get("state"), hotel.get("pincode")) if part
+            )
+        )
     if hotel.get("checkInTime") or hotel.get("checkOutTime"):
         lines.append(
             f"Check-in {hotel.get('checkInTime') or '—'}, "

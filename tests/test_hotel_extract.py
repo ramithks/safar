@@ -169,6 +169,34 @@ def test_placeholders_a_model_reaches_for_become_nothing(placeholder):
 
 # ── the whole shape ──────────────────────────────────────────────────────────
 
+def test_an_address_is_read_into_its_own_fields():
+    """
+    The field that unlocks the map pin. Without it a brochure carrying a full
+    postal address still left the hotel with no location — which blocks the
+    website's indexability gate and every distance the AI could quote.
+    """
+    draft = extract.normalise({
+        "confidence": 0.9,
+        "address": "412 Ozran Beach Road, Vagator",
+        "city": "Anjuna", "state": "Goa", "pincode": "403509",
+        "room_types": [{"name": "Deluxe"}],
+    })
+    hotel = draft["hotel"]
+    assert hotel["address"] == "412 Ozran Beach Road, Vagator"
+    assert hotel["state"] == "Goa"
+    assert hotel["pincode"] == "403509"
+    assert any("Address:" in line for line in extract.found_lines(draft))
+
+
+def test_a_postcode_that_is_not_one_is_dropped():
+    """A model that answers "Goa" here should produce nothing, not a postcode
+    nobody can post to."""
+    draft = extract.normalise({
+        "confidence": 0.9, "pincode": "Goa", "room_types": [{"name": "Deluxe"}],
+    })
+    assert draft["hotel"]["pincode"] is None
+
+
 def test_a_realistic_brochure():
     draft = extract.normalise({
         "confidence": 0.86,

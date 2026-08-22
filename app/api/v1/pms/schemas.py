@@ -2162,7 +2162,15 @@ class ExtractedRoomType(BaseModel):
 
 class ExtractedHotel(BaseModel):
     name: str | None = None
+    # The street address is the field that unlocks the map pin: address →
+    # geocode → lat/lon → "how far are you from the station?" and a hotel page
+    # that can be placed on a map. It was missing from the first version of the
+    # extractor, which is how a brochure carrying a full postal address still
+    # left a hotel with no location.
+    address: str | None = None
     city: str | None = None
+    state: str | None = None
+    pincode: str | None = None
     description: str | None = None
     amenities: list[str] = []
     checkInTime: str | None = None
@@ -2190,6 +2198,78 @@ class HotelExtractOut(BaseModel):
 
 class HotelExtractRequest(BaseModel):
     text: str = Field(min_length=20, max_length=60_000)
+
+
+class PropertyUpdateRequest(BaseModel):
+    """
+    The hotel's own facts — where it is, when it opens, what its rules are.
+
+    Every one of these was reachable only by editing Postgres by hand. That is
+    why nine of ten live hotels have no address, no coordinates and empty
+    policies, and therefore why their AI cannot answer "where are you?" and
+    their website cannot be placed on a map.
+
+    Same PATCH contract as the room route: an absent key is unchanged, an empty
+    value clears. `policies` is the exception and it is worth stating — it is
+    merged key by key rather than replaced, because the object also carries
+    commercial settings (`token_pct`, `max_discount_pct`) that the pricing
+    engine reads and no policy screen has any business overwriting.
+    """
+
+    address: str | None = Field(default=None, max_length=300)
+    city: str | None = Field(default=None, max_length=120)
+    state: str | None = Field(default=None, max_length=120)
+    country: str | None = Field(default=None, max_length=2)
+    pincode: str | None = Field(default=None, max_length=12)
+    lat: float | None = Field(default=None, ge=-90, le=90)
+    lon: float | None = Field(default=None, ge=-180, le=180)
+    propertyType: Literal[
+        "hotel", "resort", "homestay", "hostel", "boutique", "guesthouse", "villa"
+    ] | None = None
+    totalRooms: int | None = Field(default=None, ge=1, le=5000)
+    checkInTime: str | None = Field(default=None, max_length=5)
+    checkOutTime: str | None = Field(default=None, max_length=5)
+    policies: dict[str, str] | None = None
+
+
+class PropertyLocationOut(BaseModel):
+    """
+    A map pin we think is this hotel — **proposed, not saved.**
+
+    Same discipline as the brochure importer: a geocoder that writes straight to
+    the row is a geocoder whose one confident mistake puts a hotel in the wrong
+    town on its own website, in its own structured data, and in every distance
+    the AI quotes. The owner sees the address we matched and agrees to it.
+    """
+    found: bool
+    lat: float | None = None
+    lon: float | None = None
+    formattedAddress: str | None = None
+    # Said plainly rather than left to a false `found`. "We could not look this
+    # up" and "there is no such place" are different problems for a hotelier.
+    unavailable: bool = False
+
+
+class ReadinessGap(BaseModel):
+    id: str
+    label: str
+    detail: str
+    # 'agent' — the AI cannot answer a question without it.
+    # 'website' — the page will not be submitted for indexing without it.
+    affects: list[str]
+
+
+class ReadinessOut(BaseModel):
+    """
+    What is missing, named — not scored.
+    
+    A percentage tells a hotelier they are at 62% and nothing about what to do
+    next. A sentence — "your AI can't tell guests where you are" — is one tap
+    from being fixed, which is the only number that matters.
+    """
+    agentReady: bool
+    websiteIndexable: bool
+    gaps: list[ReadinessGap] = []
 
 
 class MediaUploadOut(BaseModel):

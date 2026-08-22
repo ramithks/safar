@@ -829,3 +829,292 @@ def _activate(property_id: str) -> dict:
 
 async def activate(property_id: str) -> dict:
     return await run_db(_activate, property_id)
+
+
+# ── the hotel's own facts ────────────────────────────────────────────────────
+
+# Policy keys a hotelier edits. Everything else in `properties.policies` is
+# commercial configuration the pricing engine reads — `token_pct`,
+# `max_discount_pct` — and a policy screen must not be able to touch it.
+GUEST_POLICY_KEYS = frozenset({
+    "cancellation", "children", "extra_bed", "pets", "smoking",
+    "payment", "id_required", "check_in_note", "quiet_hours",
+})
+
+_TIME = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+
+def _update_property(property_id: str, fields: dict) -> dict:
+    """
+    Where the hotel is, when it opens, and what its rules are.
+
+    **None of this was editable.** `properties.address`, `lat`, `lon`,
+    `policies` and the check-in times were writable only by editing Postgres by
+    hand, which is why nine of ten live hotels have no address, no coordinates
+    and an empty policy object — and therefore why their AI cannot answer
+    "where are you?" and their website cannot be put on a map or submitted for
+    indexing.
+
+    `policies` merges key by key rather than replacing, and only over the keys
+    in `GUEST_POLICY_KEYS`. A screen that saved the whole object would drop the
+    hotel's discount ceiling the first time somebody wrote a pet policy.
+    """
+    db = get_db()
+
+    existing = (
+        db.table("properties").select("*")
+        .eq("id", property_id).limit(1).execute().data or []
+    )
+    if not existing:
+        raise _bad("That hotel is not one of yours.")
+    row = existing[0]
+
+    patch: dict = {}
+
+    for key, column, limit in (
+        ("address", "address", 300), ("city", "city", 120),
+        ("state", "state", 120), ("pincode", "pincode", 12),
+    ):
+        if key in fields:
+            patch[column] = (str(fields[key] or "").strip()[:limit] or None)
+
+    if "country" in fields:
+        patch["country"] = (str(fields["country"] or "").strip().upper()[:2] or None)
+
+    for key in ("lat", "lon"):
+        if key in fields:
+            patch[key] = fields[key]
+
+    if "property_type" in fields and fields["property_type"]:
+        patch["property_type"] = fields["property_type"]
+
+    if "total_rooms" in fields and fields["total_rooms"]:
+        patch["total_rooms"] = int(fields["total_rooms"])
+
+    for key, column in (("check_in_time", "check_in_time"),
+                        ("check_out_time", "check_out_time")):
+        if key not in fields:
+            continue
+        value = str(fields[key] or "").strip()
+        if not value:
+            continue
+        if not _TIME.match(value):
+            raise _bad("Give the time as HH:MM — for example 14:00.")
+        patch[column] = value
+
+    if "policies" in fields and isinstance(fields["policies"], dict):
+        merged = dict(row.get("policies") or {})
+        for key, value in fields["policies"].items():
+            if key not in GUEST_POLICY_KEYS:
+                # Silently ignored rather than refused: a caller sending an
+                # unknown key is a caller with a stale form, and failing their
+                # whole save over it helps nobody.
+                continue
+            text = str(value or "").strip()[:1000]
+            if text:
+                merged[key] = text
+            else:
+                merged.pop(key, None)
+        patch["policies"] = merged
+
+    if not patch:
+        return row
+
+    patch["updated_at"] = "now()"
+    updated = (
+        db.table("properties").update(patch).eq("id", property_id).execute().data or []
+    )
+    return updated[0] if updated else row
+
+
+async def update_property(*, property_id: str, fields: dict) -> dict:
+    """See `_update_property`. `fields` is already the set the caller sent."""
+    return await run_db(_update_property, property_id, fields)
+
+
+# ── what is still missing, named ─────────────────────────────────────────────
+
+# The photo floor the website's indexability gate uses. Duplicated as a number
+# rather than imported, because the gate lives in the other repository — and
+# stated here so the two are visibly the same decision rather than accidentally
+# the same number.
+MIN_WEBSITE_PHOTOS = 4
+
+
+def _readiness(property_id: str) -> dict:
+    """
+    What this hotel cannot do yet, in the words of the thing it cannot do.
+
+    Deliberately not a percentage. "You are at 62%" tells a hotelier nothing
+    they can act on; "your AI can't tell guests where you are" is one tap from
+    being fixed. Every gap names what it blocks — the AI, the website, or both
+    — because those are the two reasons an owner cares.
+    """
+    db = get_db()
+
+    prop = (
+        db.table("properties").select("*")
+        .eq("id", property_id).limit(1).execute().data or []
+    )
+    if not prop:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Property not found")
+    prop = prop[0]
+
+    rooms = (
+        db.table("room_types").select("id,name,photos,description")
+        .eq("property_id", property_id).eq("is_active", True).execute().data or []
+    )
+    site = (
+        db.table("hotel_websites").select("status,published,draft")
+        .eq("property_id", property_id).limit(1).execute().data or []
+    )
+    site = site[0] if site else {}
+    content = site.get("published") or site.get("draft") or {}
+
+    photos = sum(len(r.get("photos") or []) for r in rooms)
+    policies = {k for k in (prop.get("policies") or {}) if k in GUEST_POLICY_KEYS}
+    about = str(content.get("about") or "").strip()
+    amenities = content.get("amenities") or []
+
+    gaps: list[dict] = []
+
+    def gap(gap_id: str, label: str, detail: str, affects: list[str]) -> None:
+        gaps.append({"id": gap_id, "label": label, "detail": detail, "affects": affects})
+
+    if photos < MIN_WEBSITE_PHOTOS:
+        gap(
+            "photos",
+            "Photos of your rooms",
+            f"You have {photos}. Guests ask for photos before anything else, and "
+            f"your page will not be listed on Google until there are "
+            f"{MIN_WEBSITE_PHOTOS}.",
+            ["agent", "website"],
+        )
+    without_description = [r for r in rooms if not (r.get("description") or "").strip()]
+    if without_description:
+        gap(
+            "room_descriptions",
+            "What your rooms are like",
+            f"{len(without_description)} of {len(rooms)} rooms have no description, so "
+            "your AI cannot answer “what's in the Deluxe?”.",
+            ["agent", "website"],
+        )
+    if prop.get("lat") is None or prop.get("lon") is None:
+        gap(
+            "location",
+            "Your place on the map",
+            "Your AI cannot tell a guest how far you are from anything, and your "
+            "page cannot show where you are.",
+            ["agent", "website"],
+        )
+    if not (prop.get("address") or "").strip():
+        gap("address", "Your street address",
+            "Guests arriving by taxi ask for this.", ["agent", "website"])
+    if "cancellation" not in policies:
+        gap(
+            "cancellation",
+            "Your cancellation policy",
+            "Your AI will hand a guest to you rather than answer this, every time.",
+            ["agent", "website"],
+        )
+    missing_policies = sorted({"children", "pets", "smoking", "id_required"} - policies)
+    if missing_policies:
+        gap(
+            "policies",
+            "The rest of your house rules",
+            "Not written down yet: " + ", ".join(m.replace("_", " ") for m in missing_policies) + ".",
+            ["agent", "website"],
+        )
+    if len(about) < 120:
+        gap(
+            "about",
+            "A description of your hotel",
+            "A couple of sentences about the place. This is what Google shows "
+            "under your name and what your AI says when somebody asks what you "
+            "are like.",
+            ["website", "agent"],
+        )
+    if len(amenities) < 3:
+        gap("facilities", "What you offer",
+            "Parking, WiFi, a restaurant — the things a guest checks for.",
+            ["website", "agent"])
+    if site.get("status") != "published":
+        gap("publish", "Publishing your website",
+            "Your page is a draft, so nobody can see it.", ["website"])
+
+    blocking = {a for g in gaps for a in g["affects"]}
+    return {
+        # The AI can answer factual questions once it has rooms, policies and a
+        # location. It can sell without any of them, which is why "ready" here
+        # is about answering rather than about taking money.
+        "agentReady": "agent" not in blocking,
+        "websiteIndexable": "website" not in blocking,
+        "gaps": gaps,
+    }
+
+
+async def readiness(property_id: str) -> dict:
+    return await run_db(_readiness, property_id)
+
+
+async def locate(property_id: str) -> dict:
+    """
+    Find this hotel on a map from what it has told us about itself.
+
+    **Proposed, never written.** Same discipline as the brochure importer: a
+    geocoder that writes straight to the row is one whose single confident
+    mistake puts a hotel in the wrong town on its own website, in its own
+    structured data, and in every distance its AI quotes afterwards. The owner
+    sees the address we matched and agrees to it.
+
+    `unavailable` rather than `found: false` when there is no Places key
+    configured. "We could not look this up" and "there is no such place" are
+    different problems for a hotelier, and collapsing them would have somebody
+    retyping a perfectly good address.
+    """
+    from app.config import settings
+
+    def _read():
+        rows = (
+            get_db().table("properties").select("name,address,city,state,pincode,country")
+            .eq("id", property_id).limit(1).execute().data or []
+        )
+        return rows[0] if rows else None
+
+    prop = await run_db(_read)
+    if not prop:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Property not found")
+
+    if not settings.google_maps_api_key:
+        logger.info("no GOOGLE_MAPS_API_KEY; cannot locate property %s", property_id)
+        return {"found": False, "unavailable": True}
+
+    query = ", ".join(
+        part for part in (
+            prop.get("name"), prop.get("address"), prop.get("city"),
+            prop.get("state"), prop.get("pincode"),
+        ) if (part or "").strip()
+    )
+    if not query:
+        return {"found": False}
+
+    from app.services import places
+
+    try:
+        results = await places.search_places(query)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not geocode property %s", property_id, exc_info=True)
+        return {"found": False, "unavailable": True}
+
+    for result in results:
+        location = ((result.get("geometry") or {}).get("location") or {})
+        lat, lon = location.get("lat"), location.get("lng")
+        if lat is None or lon is None:
+            continue
+        return {
+            "found": True,
+            "lat": float(lat),
+            "lon": float(lon),
+            "formattedAddress": result.get("formatted_address"),
+        }
+    return {"found": False}

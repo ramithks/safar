@@ -144,7 +144,10 @@ from app.api.v1.pms.schemas import (
     HotelExtractOut,
     HotelExtractRequest,
     MediaUploadOut,
+    PropertyLocationOut,
+    PropertyUpdateRequest,
     PublicHotelIndexOut,
+    ReadinessOut,
     RoomTypeOut,
     RoomTypeUpdateRequest,
     SendMessageRequest,
@@ -396,6 +399,80 @@ async def _slug_of(property_id: str) -> str | None:
         return await run_db(_read)
     except Exception:  # noqa: BLE001
         return None
+
+
+@router.patch("/properties/{property_id}", response_model=PropertyOut)
+@limiter.limit("120/hour")
+async def update_property_details(
+    request: Request,
+    property_id: str,
+    body: PropertyUpdateRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    Where the hotel is, when it opens, and what its rules are.
+
+    **None of this was editable through any route.** Address, coordinates,
+    check-in times and the whole policy object were writable only by editing
+    Postgres by hand — which is why nine of ten live hotels have no address, no
+    map pin and empty policies, and therefore why their AI hands a guest over
+    rather than answering "what's your cancellation policy?" and their website
+    cannot be submitted for indexing.
+
+    `exclude_unset` again: absent means unchanged, empty means cleared. The
+    policy object is merged key by key over a known set — see
+    `GUEST_POLICY_KEYS` — because it also carries the commercial settings the
+    pricing engine reads, and a policies screen has no business dropping a
+    hotel's discount ceiling.
+    """
+    row = await onboarding_service.update_property(
+        property_id=property_id,
+        fields={
+            {
+                "propertyType": "property_type",
+                "totalRooms": "total_rooms",
+                "checkInTime": "check_in_time",
+                "checkOutTime": "check_out_time",
+            }.get(key, key): value
+            for key, value in body.model_dump(exclude_unset=True).items()
+        },
+    )
+    await seo_ping.hotel_changed(row.get("slug"))
+    return PropertyOut.from_row(row)
+
+
+@router.post("/properties/{property_id}/locate", response_model=PropertyLocationOut)
+@limiter.limit("30/hour")
+async def locate_property(
+    request: Request,
+    property_id: str,
+    member=Depends(require_member("rates")),
+):
+    """
+    Find this hotel on a map, from the address it has already given us.
+
+    Proposes; does not save. The owner accepts the match through the PATCH
+    above, which is the same review-then-approve shape the brochure importer
+    uses and for the same reason — one confident geocoding mistake would put a
+    hotel in the wrong town on its own website and in every distance its AI
+    quotes afterwards.
+    """
+    return PropertyLocationOut(**await onboarding_service.locate(property_id))
+
+
+@router.get("/properties/{property_id}/readiness", response_model=ReadinessOut)
+@limiter.limit("120/minute")
+async def get_readiness(
+    request: Request, property_id: str, member=Depends(require_member()),
+):
+    """
+    What this hotel cannot do yet, and why.
+
+    Named gaps rather than a score. "You are at 62%" tells an owner nothing
+    they can act on; "your AI can't tell guests where you are" is one tap from
+    being fixed.
+    """
+    return ReadinessOut(**await onboarding_service.readiness(property_id))
 
 
 # What a hotel's own material may arrive as.
