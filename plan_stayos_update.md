@@ -746,7 +746,27 @@ onboarding 65 · golden 88 · ai 98 · sales 185 · instagram 70 · payment stat
 
 ## Phase 8 — Security and hardening
 
-- [ ] **8.1** `razorpay_webhook_events` RLS (present the SQL, do not auto-apply).
+- [x] **8.1** `razorpay_webhook_events` was publicly readable. ✅ DONE —
+      presented first, then applied with the user's go-ahead.
+
+      **Confirmed live before touching anything:** the publishable anon key
+      returned 200 and every row, `payload` jsonb included, and could DELETE
+      them. It was the one table in the schema with `relrowsecurity = false`,
+      and `anon`/`authenticated` held SELECT/INSERT/UPDATE/DELETE/TRUNCATE. The
+      anon key is in every browser that loads the partner app. That log is the
+      only record of what Razorpay actually sent — by the time anybody needs it,
+      the event is gone from Razorpay's dashboard.
+
+      The fix is a revoke plus `enable`/`force row level security`, and no
+      policy: nobody reaching this table through PostgREST should see a row. It
+      cannot break the webhook path because the only writer is
+      `webhook_log.py` through the service-role client, which bypasses both.
+
+      Re-verified after applying: anon SELECT and DELETE are 401, and a real
+      claim/replay/mark/read cycle through the service role still works —
+      including the unique-index deduplication that stops a Razorpay retry being
+      processed twice. SQL and its undo are in
+      `migrations/2026-08-22_razorpay_webhook_events_rls.sql`.
 - [x] **8.2** Booking/receipt tokens: unguessable, revocable, no sequential ids.
       ✅ DONE with 6.1/6.2 above — `reservations.public_token`, 128 bits from
       `gen_random_bytes`, rotated by a frontdesk-scoped route.
