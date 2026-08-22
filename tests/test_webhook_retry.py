@@ -29,7 +29,7 @@ EVENT = "evt_QxK9mP2nL4"
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 @pytest.fixture
@@ -39,10 +39,15 @@ def db(monkeypatch):
     # test proves nothing — which is exactly how the bug survived.
     fake.unique = {"razorpay_webhook_events": (("event_id",),)}
     monkeypatch.setattr("app.services.pms.webhook_log.get_db", lambda: fake)
-    monkeypatch.setattr(
-        "app.db.client.run_db",
-        lambda fn, *a: asyncio.get_event_loop().run_in_executor(None, fn, *a),
-    )
+
+    # `webhook_log` binds `run_db` at import, so the patch has to land on the
+    # module that uses it rather than on the one that defines it. Straight
+    # through rather than into an executor: the fake is in-memory, and a thread
+    # pool here only adds a loop for the suite to interact with badly.
+    async def straight(fn, *args):
+        return fn(*args)
+
+    monkeypatch.setattr("app.services.pms.webhook_log.run_db", straight)
     return fake
 
 

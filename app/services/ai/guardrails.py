@@ -155,6 +155,98 @@ _CONFIRMED = re.compile(
 
 _URL = re.compile(r"""(?xi)\b(?:https?://|www\.)[^\s<>"'\)\]]+""")
 
+
+# ── what a guest is never shown ─────────────────────────────────────────────
+#
+# Everything above this line is about a reply being *false*. This is about a
+# reply being true and still wrong to send.
+#
+# The transcript that produced the rule. A guest gave their name and was
+# answered:
+#
+#     Sahil ji, booking aage badhane ke liye mujhe ek quote ID ki zarurat hai.
+#     ("to take the booking forward I need a quote ID")
+#
+# The guest does not have a quote ID. Nobody outside this system has ever had
+# one. The model was reading its own tool schema aloud, and a guest reading that
+# concludes either that they have lost something they were sent, or that they
+# are talking to a machine that has stopped working. Both end the sale.
+#
+# The other half is failure mode ⑥: an exception string reaching the guest
+# through the model's paraphrase. `registry.execute` no longer hands the model
+# a Python traceback, which is the fix; this is the backstop for the case where
+# a tool author writes one into a message themselves.
+#
+# **Deliberately narrow, and each pattern earned its place.** A guardrail that
+# fires on ordinary prose is one somebody switches off. So: no bare word lists,
+# no "id" on its own — "aapki booking ID TB-5CECKV hai" is exactly right and
+# must pass.
+
+_INTERNALS = (
+    # A raw uuid. Every internal identifier in this system is one, and none of
+    # them means anything to a guest. `TB-5CECKV` is not a uuid and is the
+    # reference a guest is *supposed* to be given.
+    ("an internal id",
+     re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)),
+
+    # Asking a guest for something only the system holds. The verb matters:
+    # *telling* someone their booking reference is right, asking them for a
+    # quote id is the failure. Hinglish and Hindi because the transcript was.
+    ("asked the guest for an internal identifier",
+     re.compile(r"""(?xi)
+        (?: (?:need|give\ me|provide|share|send\ me|what\ is|enter|tell\ me)
+            [^.!?\n]{0,40}
+          | (?:zarurat|chahiye|bhej|batao|de\ do) [^.!?\n]{0,40} )?
+        \b (?: quote | rate[\ -]?plan | room[\ -]?type | conversation | property
+              | reservation | agent | tool | session )
+        [\ _-]? id \b
+        """)),
+
+    # The names of things inside the machine. `send_room_photos` is a tool;
+    # `folio_entries` is a table. A guest should never learn either exists.
+    ("a tool or table name",
+     re.compile(r"(?xi) \b [a-z]{3,}(?:_[a-z]{2,}){1,3} \b (?! \.[a-z] )")),
+
+    # The stack, and the vendor.
+    ("an internal error",
+     re.compile(r"""(?xi)
+        \b (?: traceback | exception | stack\ trace | null\ pointer
+              | supabase | postgrest | postgres | psycopg | httpx | vertex
+              | gemini | celery | redis | 5\d{2}\ (?:error|internal)
+              | internal\ server\ error ) \b
+        """)),
+
+    # The instructions themselves. §38: the model must not be talkable into
+    # reciting them, and this is the deterministic half of that.
+    ("its own instructions",
+     re.compile(r"""(?xi)
+        \b (?: system\ (?:prompt|instruction|message)
+              | my\ instructions\ (?:are|say)
+              | ground\ rules
+              | you\ are\ a\ hotel's\ own\ assistant ) \b
+        """)),
+)
+
+# Snake_case that is allowed to appear, because it is a word a hotel uses rather
+# than a name from inside the system. Kept as an explicit list so that adding to
+# it is a decision somebody makes on purpose.
+_SNAKE_ALLOWED = frozenset({
+    "check_in", "check_out", "check_in_time", "check_out_time",
+    "wi_fi", "air_conditioning", "room_service", "bed_and_breakfast",
+})
+
+
+def _internal_leak(text: str) -> tuple[str, str] | None:
+    """The first thing in this reply a guest should not be reading, if any."""
+    for label, pattern in _INTERNALS:
+        for match in pattern.finditer(text):
+            found = match.group(0)
+            if label == "a tool or table name" and found.lower() in _SNAKE_ALLOWED:
+                continue
+            return label, found
+    return None
+
+
 # ₹1,234 / ₹ 1234.50 / Rs. 1,234 / INR 1234 / 1,234 rupees
 _MONEY = re.compile(
     r"""(?xi)
@@ -304,6 +396,16 @@ def check_reply(
             f"reply contained a placeholder instead of a real value "
             f"({stand_in.group(0)[:40]!r})",
         )
+
+    # ── the machine showing through ─────────────────────────────────────
+    #
+    # Checked before links and money because it is the one rule that fires on a
+    # reply which is entirely *true*. A guest asked for a quote id is being told
+    # something accurate about how the system works and useless to them.
+    leak = _internal_leak(text)
+    if leak:
+        label, found = leak
+        return Verdict(False, f"reply exposed {label} ({found[:40]!r})")
 
     # ── links ───────────────────────────────────────────────────────────
     urls = _URL.findall(text)

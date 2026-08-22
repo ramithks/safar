@@ -167,12 +167,16 @@ async def execute(
         return int((time.monotonic() - started) * 1000)
 
     def refusal(exc: AgentError, tool_name: str = name) -> ToolOutcome:
+        # `refusal_reason` keeps the whole truth for the audit row; the model
+        # gets `model_message`, which is the same sentence for every refusal
+        # somebody wrote deliberately and a safe one for the catch-all below.
+        # See `errors.AgentError` for why those had to stop being one field.
         return ToolOutcome(
             tool=tool_name,
             status=exc.action_status,
             input=arguments,
             refusal_reason=exc.reason,
-            model_message=exc.reason,
+            model_message=exc.model_message,
             guest_message=exc.guest_message,
             latency_ms=elapsed(),
             error=exc.reason if exc.action_status == "failed" else None,
@@ -257,8 +261,24 @@ async def execute(
         # A tool that breaks must never look like a tool that answered. The
         # model is told the system is unavailable, which routes to a human,
         # rather than being handed nothing and left to guess.
+        #
+        # **And it is told that in English, not in Python.** This used to hand
+        # the model `f"{spec.name} failed: {type(exc).__name__}: {exc}"` — a
+        # tool name, an exception class and whatever a Supabase client had to
+        # say about a schema cache. The model has no way to act on any of that
+        # and every incentive to relay it, which is how a paying guest came to
+        # be told *"quote generate karne mein takleef ho rahi hai"*. The whole
+        # string is still on the action row, where somebody can debug it.
         logger.exception("tool %s failed", spec.name)
-        return refusal(ToolUnavailable(f"{spec.name} failed: {type(exc).__name__}: {exc}"))
+        return refusal(ToolUnavailable(
+            f"{spec.name} failed: {type(exc).__name__}: {exc}",
+            model_message=(
+                "That lookup did not come back. This is our system, not "
+                "anything the guest did. Do not describe the error, do not "
+                "guess the answer and do not try again — tell them you are "
+                "checking and call request_human_handoff."
+            ),
+        ))
 
     # A tool may return (payload, result_id) when it created something the trace
     # should point at.

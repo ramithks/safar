@@ -26,12 +26,31 @@ class AgentError(Exception):
     # What the action row records.
     action_status = "refused"
 
-    def __init__(self, reason: str, guest_message: str | None = None):
+    def __init__(self, reason: str, guest_message: str | None = None,
+                 model_message: str | None = None):
         super().__init__(reason)
         self.reason = reason
         self.guest_message = guest_message or (
             "Let me put you through to the hotel team on that one."
         )
+        # **Three messages, not two, and the third is the one that leaked.**
+        #
+        # `reason` is written for the audit trail and is usually also the right
+        # thing to hand the model: "reservation X does not belong to this
+        # conversation" is a fact the agent can act on and would never repeat
+        # verbatim to a guest.
+        #
+        # It stopped being the right thing at exactly one place. When a tool
+        # raises something nobody anticipated, `registry.execute` builds the
+        # reason out of the Python exception — `get_quote failed: APIError:
+        # JSON object requested, multiple (or no) rows returned` — and hands it
+        # straight to the model, which paraphrases it at a guest. That is how a
+        # real guest was told *"quote generate karne mein takleef ho rahi hai"*.
+        #
+        # So the two are allowed to differ. The row keeps the exception; the
+        # model is told what kind of thing went wrong and what to do about it,
+        # which is all it can act on anyway.
+        self.model_message = model_message or reason
 
 
 class ToolNotFound(AgentError):
@@ -66,10 +85,12 @@ class ApprovalRequired(AgentError):
 
     action_status = "awaiting_approval"
 
-    def __init__(self, reason: str, guest_message: str | None = None):
+    def __init__(self, reason: str, guest_message: str | None = None,
+                 model_message: str | None = None):
         super().__init__(
             reason,
             guest_message or "I've asked the hotel team to confirm that — one moment.",
+            model_message,
         )
 
 
@@ -100,10 +121,12 @@ class ToolUnavailable(AgentError):
 
     action_status = "failed"
 
-    def __init__(self, reason: str, guest_message: str | None = None):
+    def __init__(self, reason: str, guest_message: str | None = None,
+                 model_message: str | None = None):
         super().__init__(
             reason,
             guest_message or "I can't reach our system right now — connecting you to the team.",
+            model_message,
         )
 
 

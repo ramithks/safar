@@ -88,7 +88,19 @@ class Settings(BaseSettings):
 
     # Per request, not per turn. A guest waiting on WhatsApp will forgive thirty
     # seconds; a hung socket holding a worker is a different problem.
+    #
+    # **The fallback, not the number.** `model_router` sets a real timeout per
+    # tier — a classification is not a negotiation — and this is what a tier
+    # nobody has listed falls back to. Left at 45 deliberately: a value that is
+    # only reached by a mistake should be forgiving.
     hotel_model_timeout_seconds: float = 45.0
+    # How long a whole turn may take, tool rounds included. The clock that did
+    # not exist: the timeout above is per HTTP request and a turn makes up to
+    # `agent_max_tool_turns` of them, so nothing bounded what a guest actually
+    # waits. One real turn took 107 seconds. Per tier in `model_router`; this is
+    # the fallback. See `runtime.run_turn`, which stops asking for another tool
+    # round once it is spent rather than cutting the guest off.
+    hotel_turn_budget_seconds: float = 60.0
     # How many times the model may call tools before the runtime stops it. Six
     # is generous for "look up the booking, raise a ticket, assign it"; a loop
     # that needs more is a loop that has stopped making progress.
