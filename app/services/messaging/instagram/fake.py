@@ -36,8 +36,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SentIg:
     to: str
-    kind: str = "text"
+    kind: str = "text"           # text · image
     body: str | None = None
+    image_url: str | None = None
     client_reference: str = ""
     external_id: str = ""
     tags: list[str] = field(default_factory=list)
@@ -87,6 +88,22 @@ class FakeInstagramAdapter:
         sent.external_id = f"ig_mid.FAKE{uuid.uuid4().hex[:18]}"
         type(self).outbox.append(sent)
         logger.debug("fake instagram → %s: %s", to, body)
+        return SendResult(external_id=sent.external_id, status="sent",
+                          raw={"sandbox": True, "clientReference": client_reference})
+
+    async def send_image(self, *, to: str, image_url: str, caption: str | None,
+                         client_reference: str) -> SendResult:
+        """
+        The real one carries no caption on an attachment, so neither does this
+        — a fake that accepted one would let a test pass on a path production
+        does not have.
+        """
+        self._check_failures()
+        sent = SentIg(to=to, kind="image", image_url=image_url,
+                      client_reference=client_reference)
+        sent.external_id = f"ig_mid.FAKE{uuid.uuid4().hex[:18]}"
+        type(self).outbox.append(sent)
+        logger.debug("fake instagram image → %s: %s", to, image_url)
         return SendResult(external_id=sent.external_id, status="sent",
                           raw={"sandbox": True, "clientReference": client_reference})
 

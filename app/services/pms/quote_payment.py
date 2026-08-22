@@ -121,6 +121,17 @@ def _open_order_for_quote(quote_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
+def _claim_conversation(order_id: str, conversation_id: str) -> None:
+    """Stamp the thread on an order that has none. Best effort by design."""
+    try:
+        get_db().table("payment_orders").update(
+            {"conversation_id": conversation_id}
+        ).eq("id", order_id).is_("conversation_id", "null").execute()
+    except Exception:  # noqa: BLE001
+        # A link the guest can pay matters more than a link we can trace.
+        logger.warning("could not stamp conversation on order %s", order_id, exc_info=True)
+
+
 async def create_link(
     *,
     property_id: str,
@@ -130,6 +141,7 @@ async def create_link(
     guest_phone: str | None,
     guest_email: str | None,
     source: str | None = None,
+    conversation_id: str | None = None,
 ) -> QuotePaymentLink:
     """
     Turn a live quote into something a guest can pay.
@@ -189,6 +201,13 @@ async def create_link(
 
     existing = await run_db(_open_order_for_quote, quote_id)
     if existing and int(existing["amount_paise"]) == amount:
+        # An order raised before we started recording the thread — or raised on
+        # the booking page and now being paid through a chat. Claimed once,
+        # never reassigned: an order that already names a conversation belongs
+        # to that one, and a second thread asking for the same link does not
+        # get to take the answer with it.
+        if conversation_id and not existing.get("conversation_id"):
+            await run_db(_claim_conversation, existing["id"], conversation_id)
         return QuotePaymentLink(
             quote_id=quote_id,
             order_id=existing["id"],
@@ -222,6 +241,16 @@ async def create_link(
         },
         addons=[],
         attribution={"source": source} if source else {},
+        # The thread this sale happened in.
+        #
+        # Written here rather than worked out later, because later is after the
+        # webhook and there is nothing left to work it out from: an order knows
+        # its quote and a quote knows its conversation, but the guest asking
+        # "payment hogyi?" is on the conversation and needs to get to the order.
+        # A guest paid a real hotel and was told his booking would be confirmed
+        # when the payment went through — it already had, ninety seconds
+        # earlier. This column is the whole of that fix.
+        conversation_id=conversation_id,
     )
 
     logger.info("quote payment link raised: quote=%s order=%s", quote_id, rzp["id"])

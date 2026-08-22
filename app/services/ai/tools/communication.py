@@ -23,11 +23,14 @@ back as a refusal with an instruction attached, so the agent's next move is to
 send an approved template or hand off — and no phrasing in a guest's message can
 change the answer, because the model was never asked.
 """
+import logging
+
 from pydantic import BaseModel, Field
 
 from app.db.client import get_db, run_db
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import OutOfScope, ToolUnavailable
+from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
 from app.services.messaging import service as messaging
 from app.services.messaging.channels import (
@@ -36,6 +39,8 @@ from app.services.messaging.channels import (
     WINDOW_CLOSED,
     MessagingError,
 )
+
+logger = logging.getLogger(__name__)
 
 REASONS = (
     "guest_asked", "no_knowledge", "low_confidence", "complaint",
@@ -273,3 +278,150 @@ async def _conversation(ctx: AgentContext) -> dict:
             "Let me get someone from the hotel to you.",
         )
     return conversation
+
+
+# ── "photos hain?" ───────────────────────────────────────────────────────────
+
+
+class RoomPhotosArgs(BaseModel):
+    room_type_id: ResourceId | None = Field(
+        default=None,
+        description=(
+            "The room to show, from get_room_types or get_stay_options. Leave "
+            "empty to send one photo of each room the hotel has."
+        ),
+    )
+    caption: str | None = Field(
+        default=None, max_length=300,
+        description="One short line to send with them, in the guest's language.",
+    )
+
+
+# How many pictures a guest gets at once.
+#
+# Four is a room, not a slideshow. Each one is a separate provider call and a
+# separate row, and a guest whose phone fills with eleven photographs of a
+# bathroom has been sent a problem rather than an answer.
+MAX_PHOTOS = 4
+
+
+def _photo_sources(property_id: str, room_type_id: str | None) -> list[dict]:
+    rows = (
+        get_db().table("room_types")
+        .select("id,name,photos,sort_order")
+        .eq("property_id", property_id).eq("is_active", True)
+        .order("sort_order").execute().data or []
+    )
+    if room_type_id:
+        rows = [r for r in rows if str(r["id"]) == str(room_type_id)]
+    return [r for r in rows if r.get("photos")]
+
+
+@tool(
+    name="send_room_photos",
+    description=(
+        "Send the guest actual photographs of a room, as pictures in the chat. "
+        "Use this whenever they ask to see a room — 'photos?', 'photos hain?', "
+        "'can I see it' — and after describing a room they are choosing between. "
+        "Do not paste image links into your reply; this sends them properly. If "
+        "it reports the hotel has no photos, say so plainly and offer to ask the "
+        "team, and never claim you are unable to show photos."
+    ),
+    input_model=RoomPhotosArgs,
+    permission="messaging",
+    # Level 2: sending a guest a picture the hotel uploaded of its own room is
+    # not a decision anybody needs to approve. It moves no money and takes no
+    # inventory, and the URLs are read from the database rather than chosen by
+    # the model — see below.
+    autonomy_floor=2,
+    mutating=True,
+    usage_type="ai.tool_write",
+    result_type="none",
+    scoped_to_conversation=True,
+)
+async def send_room_photos(args: RoomPhotosArgs, ctx: AgentContext) -> dict:
+    """
+    **The model names a room; it never names a URL.**
+
+    That is the whole safety property. The photographs are read from
+    `room_types.photos` for this property, so there is no argument through
+    which a model — or a guest talking to one — can make the hotel send an
+    arbitrary image. The guardrail that stops invented links in prose has no
+    equivalent for attachments, and this is why it does not need one.
+
+    Answering "the hotel has not put photos up yet" is a real answer and the
+    important one: for months every room in production had an empty list, and
+    the agent's reply was "main aapko rooms ki photos nahi dikha sakta" — which
+    reads as the product being unable rather than the hotel being unfinished.
+    """
+    if not ctx.conversation_id:
+        raise ToolUnavailable("send_room_photos needs a conversation and this run has none")
+
+    rooms = await run_db(_photo_sources, ctx.property_id, args.room_type_id)
+    if not rooms:
+        return {
+            "sent": 0,
+            "instruction": (
+                "This hotel has not uploaded photos of that room yet. Tell the "
+                "guest plainly that there are none up yet and offer to ask the "
+                "team for some. Do NOT say you are unable to show photos — that "
+                "is not true and it reads as a limitation of the hotel."
+            ),
+        }
+
+    # One room: up to four of it. Several rooms: the first photo of each, which
+    # is a menu rather than a gallery and is what "show me the rooms" means.
+    if args.room_type_id:
+        picks = [(rooms[0]["name"], url) for url in rooms[0]["photos"][:MAX_PHOTOS]]
+    else:
+        picks = [(r["name"], r["photos"][0]) for r in rooms[:MAX_PHOTOS]]
+
+    def _conversation():
+        rows = (
+            get_db().table("conversations").select("*")
+            .eq("id", ctx.conversation_id).limit(1).execute().data or []
+        )
+        return rows[0] if rows else None
+
+    conversation = await run_db(_conversation)
+    if not conversation:
+        raise ToolUnavailable("this conversation could not be read")
+
+    sent = 0
+    failures: list[str] = []
+    for index, (room_name, url) in enumerate(picks):
+        try:
+            await messaging.send(
+                conversation,
+                image_url=url,
+                # The caption rides on the first picture only. WhatsApp shows it
+                # under the image; Instagram drops it and the agent's own reply
+                # carries the words instead.
+                body=(args.caption or room_name) if index == 0 else None,
+                author="agent",
+                author_name="Agent",
+                # Keyed on the run and the picture, so a retried turn cannot
+                # send a guest the same photograph twice.
+                client_reference=f"photo:{ctx.run_id}:{index}",
+            )
+            sent += 1
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"{room_name}: {type(exc).__name__}")
+            # Keep going. Three photographs and one failure is a better answer
+            # than nothing, and the guest can see what arrived.
+            logger.warning("could not send room photo %s", url, exc_info=True)
+
+    if sent == 0:
+        raise ToolUnavailable(
+            f"no photo could be sent ({', '.join(failures) or 'unknown'})",
+            "I couldn't send the photos just now — let me get someone to help.",
+        )
+
+    return {
+        "sent": sent,
+        "rooms": sorted({name for name, _ in picks}),
+        "instruction": (
+            "The photos are now in the chat. Say one short line about them — do "
+            "not describe each picture, and do not paste any links."
+        ),
+    }

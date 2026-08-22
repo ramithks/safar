@@ -32,6 +32,7 @@ from app.config import settings
 from app.db.client import get_db, run_db
 from app.services import billing
 from app.services.messaging import credentials as creds_module
+from app.services.messaging import language as language_module
 from app.services.messaging import policy
 from app.services.messaging import templates as templates_module
 from app.services.messaging.channels import (
@@ -184,23 +185,52 @@ def _upsert_conversation(
             )
             return adopted[0] if adopted else orphan[0]
 
-    # A returning guest is matched on the phone number the property already has
-    # for them. Scoped to the property — the same number at two hotels is two
-    # guest records, and joining them would be a cross-property leak dressed up
-    # as a convenience.
+    # A returning guest, matched on whatever this channel's sender id actually
+    # is. Scoped to the property — the same person at two hotels is two guest
+    # records, and joining them would be a cross-property leak dressed up as a
+    # convenience.
+    #
+    # **The column differs by channel and that is not cosmetic.** On WhatsApp
+    # the sender id is a phone number, so the phone column is the right one. On
+    # Instagram it is a 17-digit IGSID, which matched no phone number that has
+    # ever existed — so every returning Instagram guest arrived as a stranger,
+    # `guest_id` stayed null, `_link_reservation` never ran, and a guest who had
+    # booked through this same thread was told nothing was found.
     guest_id = None
     if sender_external_id:
-        digits = sender_external_id.lstrip("+")
-        found = (
-            db.table("guests")
-            .select("id,name")
-            .eq("property_id", property_id)
-            .ilike("phone", f"%{digits[-10:]}")
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
+        found = []
+        if channel == "instagram":
+            found = (
+                db.table("guests")
+                .select("id,name")
+                .eq("property_id", property_id)
+                .eq("instagram_id", sender_external_id)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+        else:
+            # Digits only, not `lstrip("+")`.
+            #
+            # This value goes into an `ilike` pattern, where `%` and `_` are
+            # wildcards — and a sender id of `%%%%%%%%%%` would then match the
+            # first guest at this property, handing one guest another's name and
+            # booking history. It arrives inside a signature-verified Meta
+            # payload today, so this is not a live hole; it is one webhook
+            # change away from being one, and the fix costs a filter. The same
+            # class of bug already cost this codebase a coupon bypass.
+            digits = "".join(c for c in sender_external_id if c.isdigit())
+            found = (
+                db.table("guests")
+                .select("id,name")
+                .eq("property_id", property_id)
+                .ilike("phone", f"%{digits[-10:]}")
+                .limit(1)
+                .execute()
+                .data
+                or []
+            ) if len(digits) >= 8 else []
         if found:
             guest_id = found[0]["id"]
             sender_name = sender_name or found[0].get("name")
@@ -538,6 +568,7 @@ def _queue_outbound(conversation: dict, spec: dict) -> tuple[dict, bool]:
     """
     body = spec["body"]
     template = spec["template"]
+    image_url = spec.get("image_url")
     client_reference = spec["client_reference"]
     db = get_db()
 
@@ -565,8 +596,17 @@ def _queue_outbound(conversation: dict, spec: dict) -> tuple[dict, bool]:
         "author": spec["author"],
         "author_name": spec["author_name"],
         "author_member": spec["author_member"],
-        "message_type": "text",
+        "message_type": "image" if image_url else "text",
         "body": body,
+        # The picture itself, on the column the inbound path has always used for
+        # one. A photograph a hotel sent is evidence in the same way a
+        # photograph a guest sent is.
+        #
+        # Empty list, not null: the column is NOT NULL with a `{}` default, and
+        # writing an explicit null overrides the default rather than falling
+        # back to it — which is exactly how a text message started failing to
+        # persist the moment this key was added.
+        "media_urls": [image_url] if image_url else [],
         "template_name": template["provider_name"] if template else None,
         "client_reference": client_reference,
         "agent_action_id": spec["agent_action_id"],
@@ -606,9 +646,11 @@ async def send(
     client_reference: str | None = None,
     agent_id: str | None = None,
     run_id: str | None = None,
+    image_url: str | None = None,
 ) -> SentMessage:
     """
-    Send free text, or an approved template when the window has closed.
+    Send free text, a photograph, or an approved template when the window has
+    closed.
 
     `body` and `purpose` are alternatives. Give `body` for a normal reply;
     give `purpose` to send a template deliberately. Giving `body` outside the
@@ -658,8 +700,19 @@ async def send(
             + f"; free-form messages are not permitted until the guest writes again — {remedy}",
         )
 
-    if body is None and template is None:
+    if body is None and template is None and image_url is None:
         raise MessagingError(PROVIDER_FAILED, "nothing to send")
+
+    # A photograph goes through this function rather than beside it, and that is
+    # deliberate. `send` is the one choke point every outbound message passes:
+    # the window rule, the credit gate, the idempotent queue row and the meter
+    # all live here, and a parallel media path would miss all four — which is
+    # exactly how a receptionist's reply and the pipeline's fallback send once
+    # went unbilled.
+    if image_url is not None and template is not None:
+        raise MessagingError(
+            PROVIDER_FAILED, "a template and a photograph are different sends",
+        )
 
     # The credit gate on outbound, and it is deliberately narrow.
     #
@@ -691,6 +744,7 @@ async def send(
         "body": body, "template": template, "author": author,
         "author_name": author_name, "author_member": author_member,
         "agent_action_id": agent_action_id, "client_reference": reference,
+        "image_url": image_url,
     })
 
     # Already sent. A retry after a provider timeout lands here, which is the
@@ -709,6 +763,16 @@ async def send(
                 template_name=template["provider_name"],
                 language=template["language"],
                 parameters=templates_module.bind(template, template_values or {}),
+                client_reference=reference,
+            )
+        elif image_url is not None:
+            result = await adapter.send_image(
+                to=conversation.get("guest_phone") or conversation.get("guest_handle") or "",
+                image_url=image_url,
+                # Instagram ignores this and sends the words separately; WhatsApp
+                # carries it on the picture. Both are correct for their channel
+                # and neither is this caller's problem.
+                caption=body,
                 client_reference=reference,
             )
         else:
@@ -734,7 +798,8 @@ async def send(
         "sent_at": now,
         "metadata": result.raw,
     })
-    await run_db(_touch_outbound, conversation["id"], body or (template or {}).get("body_preview") or "", now)
+    preview = body or (template or {}).get("body_preview") or ("📷 Photo" if image_url else "")
+    await run_db(_touch_outbound, conversation["id"], preview, now)
 
     # Metered here rather than in the agent's tool, because this is the one
     # choke point every outbound message passes through — the same argument as
@@ -908,3 +973,251 @@ def agent_may_answer(conversation: dict) -> bool:
         conversation.get("ai_enabled", True) is not False
         and (conversation.get("handler") or "ai") == "ai"
     )
+
+
+# ── a paid booking, and the guest who is waiting to hear about it ────────────
+#
+# Both of these run from `_fulfil_booking`, after a signed payment has produced
+# a reservation, and both are best-effort by construction. A guest who has paid
+# ends up with a booking whether or not we can message them about it; the
+# reverse — a message claiming a booking that does not exist — is the failure
+# the guardrails were written for.
+
+
+def _link_booking(reservation: dict) -> dict | None:
+    """
+    Point the thread at the stay it produced, and at the guest who made it.
+
+    Three writes that are really one fact: this conversation now has a booking.
+    Without it `get_booking_status` has to search, `ctx.reservation_id` stays
+    empty, and `list_guest_reservations` — which starts from `guest_id` —
+    returns nothing to a guest who booked ninety seconds ago.
+
+    Guarded on emptiness rather than overwritten. A thread that already names a
+    reservation is a guest with two bookings, and the older one is the one they
+    are more likely to be asking about; the newer is reachable through the
+    guest record either way.
+    """
+    conversation_id = reservation.get("conversation_id")
+    if not conversation_id:
+        return None
+
+    db = get_db()
+    patch: dict = {"reservation_id": reservation["id"]}
+    if reservation.get("guest_id"):
+        patch["guest_id"] = reservation["guest_id"]
+    if reservation.get("guest_name"):
+        patch["guest_name"] = reservation["guest_name"]
+
+    updated = (
+        db.table("conversations").update(patch)
+        .eq("id", conversation_id)
+        .is_("reservation_id", "null")
+        .execute().data or []
+    )
+    # Read rather than rely on the update's return: the guard above means a
+    # thread that already names an older booking updates nothing, and that
+    # guest still needs their handle recorded.
+    conversation = updated[0] if updated else _conversation_by_id(conversation_id)
+
+    # And the other direction: teach the guest record which Instagram account
+    # this is, so the *next* thread they open resolves to them.
+    #
+    # Here rather than in `_resolve_guest`, because that function is called from
+    # the booking service and has no idea a messaging channel exists — it is
+    # given a name, a phone and an email, and on Instagram two of those are
+    # null. This is the one moment where the handle and the guest record are
+    # both in scope: somebody has just stopped being a stranger.
+    handle = (conversation or {}).get("guest_handle")
+    if handle and reservation.get("guest_id")             and (conversation or {}).get("channel") == "instagram":
+        try:
+            db.table("guests").update({"instagram_id": handle}).eq(
+                "id", reservation["guest_id"]
+            ).is_("instagram_id", "null").execute()
+        except Exception:  # noqa: BLE001
+            # A unique-index collision means this IGSID already belongs to a
+            # guest row at this property — an earlier booking under a different
+            # name. Leaving the older row holding the handle is right: it has
+            # the stay history.
+            logger.info("could not claim instagram id for guest %s",
+                        reservation.get("guest_id"), exc_info=True)
+
+    return conversation
+
+
+async def link_booking(reservation: dict) -> dict | None:
+    """See `_link_booking`. Swallows its own failures: the booking is real either way."""
+    try:
+        return await run_db(_link_booking, reservation)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not link reservation %s to its conversation",
+                       reservation.get("id"), exc_info=True)
+        return None
+
+
+def _confirmation_body(reservation: dict, language: str, url: str) -> str:
+    """
+    What a guest reads when their money lands.
+
+    Written here, in three languages, rather than generated. This message is
+    sent by a webhook with no model on the path and no guest turn to answer —
+    and it is the one message in the product that must be exactly true, because
+    a guest acts on it by travelling. Composing it from a template means the
+    reference, the dates and the amounts come from the reservation row and
+    cannot be anything else.
+    """
+    ref = reservation.get("ref") or ""
+    check_in = str(reservation.get("check_in") or "")
+    check_out = str(reservation.get("check_out") or "")
+    units = int(reservation.get("units") or 1)
+    paid = int(reservation.get("paid_paise") or 0)
+    total = int(reservation.get("total_paise") or 0)
+    balance = max(0, total - paid)
+
+    def rupees(paise: int) -> str:
+        return f"₹{paise / 100:,.0f}"
+
+    room_word = {"en": "room" if units == 1 else "rooms",
+                 "hi": "कमरा" if units == 1 else "कमरे",
+                 "hinglish": "room" if units == 1 else "rooms"}[language]
+
+    if language == "hi":
+        lines = [
+            "पेमेंट मिल गया ✅ आपकी बुकिंग कन्फर्म हो गई है 🎉",
+            f"बुकिंग नंबर: {ref}",
+            f"{check_in} से {check_out} तक, {units} {room_word}",
+        ]
+        if balance:
+            lines.append(f"अभी दिया: {rupees(paid)} · होटल में देना है: {rupees(balance)}")
+        else:
+            lines.append(f"पूरा भुगतान हो गया: {rupees(paid)}")
+        lines.append(f"पूरी डिटेल यहाँ देखें: {url}")
+        return "\n".join(lines)
+
+    if language == "hinglish":
+        lines = [
+            "Payment mil gaya ✅ Aapki booking confirm ho gayi hai 🎉",
+            f"Booking number: {ref}",
+            f"{check_in} se {check_out} tak, {units} {room_word}",
+        ]
+        if balance:
+            lines.append(f"Abhi diya: {rupees(paid)} · Hotel par dena hai: {rupees(balance)}")
+        else:
+            lines.append(f"Poora payment ho gaya: {rupees(paid)}")
+        lines.append(f"Poori detail yahan dekhein: {url}")
+        return "\n".join(lines)
+
+    lines = [
+        "Payment received ✅ Your booking is confirmed 🎉",
+        f"Booking reference: {ref}",
+        f"{check_in} to {check_out}, {units} {room_word}",
+    ]
+    if balance:
+        lines.append(f"Paid now: {rupees(paid)} · Due at the hotel: {rupees(balance)}")
+    else:
+        lines.append(f"Paid in full: {rupees(paid)}")
+    lines.append(f"Your booking and receipt: {url}")
+    return "\n".join(lines)
+
+
+def booking_url(reservation: dict) -> str:
+    """
+    The link a guest is sent when their money lands.
+
+    `/b/{public_token}` on the website, not `/checkin/{ref}` on the partner app.
+    Two reasons, and both were mistakes worth naming:
+
+      * **The reference is not a credential.** It is six characters from a
+        32-symbol alphabet produced by `random.choices` — built to be read
+        aloud, not to guard a page. `reservations.public_token` is 128 bits
+        from `gen_random_bytes`, and rotating it revokes the old link.
+      * **A confirmation is not a check-in form.** The guest who just paid wants
+        the reference, the dates, the money and the cancellation terms; the
+        check-in form is one link on from there, and the page carries it.
+
+    A reservation with no token — a row read through a projection that did not
+    select it — falls back to the old check-in URL rather than producing a link
+    to nowhere.
+    """
+    token = reservation.get("public_token")
+    if token:
+        return f"{settings.site_url.rstrip('/')}/b/{token}"
+    base = (settings.pms_app_url or "").rstrip("/")
+    return f"{base}/checkin/{reservation.get('ref')}"
+
+
+def _conversation_by_id(conversation_id: str) -> dict | None:
+    rows = (
+        get_db().table("conversations").select("*")
+        .eq("id", conversation_id).limit(1).execute().data or []
+    )
+    return rows[0] if rows else None
+
+
+async def announce_booking(reservation: dict) -> dict | None:
+    """
+    Tell the guest their payment landed, on the thread they paid from.
+
+    **This is the message whose absence broke a real sale.** A guest paid at
+    19:58:52; at 19:59:18 he asked whether it had gone through, and the agent —
+    which had no way to know — told him it would be confirmed once the payment
+    processed. It already had. Nothing in the system was going to volunteer
+    that, because nothing in the system had a reason to speak unprompted.
+
+    Idempotent on the reservation: `client_reference` is the booking, so the
+    browser callback and the webhook racing to fulfil the same order produce
+    one message. A window that has closed, a channel with no template, a
+    provider that is down — all of them are logged and none of them raise. The
+    guest can still ask, and `get_booking_status` will now have the answer.
+    """
+    conversation_id = reservation.get("conversation_id")
+    if not conversation_id:
+        return None
+
+    conversation = await run_db(_conversation_by_id, conversation_id)
+    if not conversation:
+        return None
+
+    language = language_module.of_conversation(conversation)
+    body = _confirmation_body(reservation, language, booking_url(reservation))
+
+    try:
+        sent = await send(
+            conversation,
+            body=body,
+            author="system",
+            author_name="Booking",
+            client_reference=f"booking:{reservation['id']}",
+        )
+    except MessagingError as exc:
+        if exc.code == WINDOW_CLOSED:
+            # Outside the window free text is not allowed. On WhatsApp an
+            # approved template still is, and a booking confirmation is exactly
+            # what templates are for; on Instagram there is no such mechanism
+            # and the guest will be told when they next write.
+            pol = policy.for_channel(conversation.get("channel") or policy.WHATSAPP)
+            if pol.supports_templates:
+                try:
+                    return (await send(
+                        conversation,
+                        purpose="booking_confirmation",
+                        language=language if language != "hinglish" else "en",
+                        author="system",
+                        author_name="Booking",
+                        client_reference=f"booking:{reservation['id']}",
+                        template_values={
+                            "ref": reservation.get("ref") or "",
+                            "check_in": str(reservation.get("check_in") or ""),
+                            "check_out": str(reservation.get("check_out") or ""),
+                        },
+                    )).message
+                except MessagingError as template_exc:
+                    logger.info("no booking confirmation template: %s", template_exc.code)
+                    return None
+        logger.info("could not announce booking %s: %s", reservation.get("ref"), exc.code)
+        return None
+    except Exception:  # noqa: BLE001
+        logger.warning("could not announce booking %s", reservation.get("ref"), exc_info=True)
+        return None
+
+    return sent.message

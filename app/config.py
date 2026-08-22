@@ -299,6 +299,11 @@ class Settings(BaseSettings):
     resend_from: str = "TravBuddy <hello@travbuddy.in>"
     site_url: str = "https://travbuddy.in"
 
+    # Shared with the website's /api/revalidate route. Unset means the SEO ping
+    # is skipped, which is the right default for a development box and for any
+    # deployment with no website in front of it — see services/pms/seo_ping.py.
+    revalidate_secret: Optional[str] = None
+
     # Rotating proxy — Instagram requests go through this FIRST so Instagram
     # never sees (and blocks) the server's own IP. Direct is the fallback.
     # Format: http://user:pass@host:port/

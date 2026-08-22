@@ -329,3 +329,145 @@ async def order_service(args: OrderServiceArgs, ctx: AgentContext) -> tuple[dict
         },
         (written[0]["id"] if written else reservation_id),
     )
+
+
+# ── carrying a conversation onto the website ─────────────────────────────────
+
+class HotelPageArgs(BaseModel):
+    """
+    A room to open on, and nothing else.
+
+    **There is no field for a date, a party size or a URL**, and that is the
+    whole design. The dates go on the link because the *server* reads them off
+    this conversation's session — which was written from tool results, not from
+    what the model believed — so a link cannot carry dates the guest never gave.
+    """
+    room_type_id: ResourceId | None = Field(
+        default=None,
+        description=(
+            "Optional. Open the page for one room type instead of the hotel's "
+            "main page. Use the id from get_room_types, never a room name."
+        ),
+    )
+
+
+# The booking parameters `/book/[slug]` reads. Kept as a closed list here for
+# the same reason the page keeps one: an open query string on an indexable
+# template is an unbounded set of duplicate URLs.
+_PAGE_PARAMS = (
+    ("check_in", "checkin"),
+    ("check_out", "checkout"),
+    ("adults", "adults"),
+    ("children", "children"),
+    ("units", "rooms"),
+)
+
+
+def _hotel_page(property_id: str, conversation_id: str | None,
+                room_type_id: str | None) -> dict:
+    from urllib.parse import urlencode
+
+    from app.config import settings
+
+    db = get_db()
+    prop = (
+        db.table("properties").select("slug,name,status")
+        .eq("id", property_id).limit(1).execute().data or [{}]
+    )[0]
+    site = (
+        db.table("hotel_websites").select("status,published")
+        .eq("property_id", property_id).limit(1).execute().data or []
+    )
+    live = (
+        prop.get("status") == "active"
+        and prop.get("slug")
+        and site and site[0].get("status") == "published" and site[0].get("published")
+    )
+    if not live:
+        # The same rule `resolve_published` enforces, applied one step earlier.
+        # A hotelier drafting a site has not agreed to anybody seeing it, and a
+        # link to a 404 is worse than saying there is no page yet.
+        return {"url": "", "instruction": (
+            "This hotel has no published page yet. Do NOT invent a website "
+            "address or send one. Answer the guest here instead."
+        )}
+
+    path = f"/book/{prop['slug']}"
+    if room_type_id:
+        room = (
+            db.table("room_types").select("slug,code,name,is_active")
+            .eq("id", room_type_id).eq("property_id", property_id)
+            .limit(1).execute().data or []
+        )
+        # Another hotel's room id, or one that is off sale, silently falls back
+        # to the hotel's own page rather than producing a link to nothing.
+        if room and room[0].get("is_active"):
+            leaf = room[0].get("slug") or (room[0].get("code") or "").lower()
+            if leaf:
+                path = f"{path}/rooms/{leaf}"
+
+    query: dict[str, str] = {}
+    if conversation_id:
+        rows = (
+            db.table("conversations").select("guest_profile")
+            .eq("id", conversation_id).eq("property_id", property_id)
+            .limit(1).execute().data or []
+        )
+        profile = (rows[0].get("guest_profile") if rows else None) or {}
+        if isinstance(profile, dict):
+            for stored, param in _PAGE_PARAMS:
+                value = profile.get(stored)
+                if value not in (None, "", 0):
+                    query[param] = str(value)
+
+    url = f"{settings.site_url.rstrip('/')}{path}"
+    if query:
+        url = f"{url}?{urlencode(query)}"
+    return {
+        "url": url,
+        "prefilled": sorted(query),
+        "instruction": (
+            "Share this url as it is written. It opens this hotel's own page "
+            + ("with the guest's dates and party already filled in, so they do "
+               "not retype anything. " if query else "")
+            + "Do not edit the link and do not add anything to it."
+        ),
+    }
+
+
+@tool(
+    name="get_hotel_page_link",
+    description=(
+        "Get a link to this hotel's own web page, with the dates and party "
+        "this guest has already given filled in. Use when a guest wants to "
+        "see photos, rooms, facilities or prices laid out, or says they will "
+        "book later. Takes no dates: it reads them from this conversation."
+    ),
+    input_model=HotelPageArgs,
+    permission=None,
+    # A link to a public page. Nothing moves and nothing is spent.
+    autonomy_floor=0,
+    mutating=False,
+    usage_type="ai.tool_read",
+    result_type="none",
+    scoped_to_conversation=True,
+)
+async def get_hotel_page_link(args: HotelPageArgs, ctx: AgentContext) -> dict:
+    """
+    Carry the conversation onto the website instead of restarting it there.
+
+    **The failure this closes is retyping.** A guest who has spent six messages
+    settling on 11–15 September for four people, and is then sent a bare hotel
+    URL, arrives at an empty date picker — and the most common thing to do with
+    an empty date picker is close the tab.
+
+    **The model names a room; it never names a URL.** Same property as
+    `send_room_photos`, and for the same reason: every part of this link is
+    composed here, from this property's slug and this conversation's session.
+    There is no argument through which a model — or a guest talking to one —
+    can put a different address in front of somebody.
+    """
+    return await run_db(
+        _hotel_page, ctx.property_id, ctx.conversation_id,
+        str(args.room_type_id) if args.room_type_id else None,
+    )

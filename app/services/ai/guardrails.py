@@ -97,6 +97,33 @@ CONFIRMING_TOOLS = frozenset({
     "check_in",
 })
 
+# Reading a booking is not making one — unless what was read *is* a booking.
+#
+# `get_booking_status` cannot be in the set above. It runs on every "payment
+# hogyi?", and most of the time the honest answer is that nothing has arrived
+# yet; a blanket grant would license "aapki booking confirm ho gayi hai" on
+# exactly the turn where it is false, which is the sentence this whole rule
+# exists to stop.
+#
+# So the licence comes from the tool's *output* rather than from its name. The
+# states below are the ones where a reservation exists and the money for it
+# arrived — where "you are booked" is a report, not a promise.
+_STATUS_TOOL = "get_booking_status"
+_SECURED_STATES = frozenset({"CONFIRMED", "CHECKED_IN", "CHECKED_OUT"})
+
+
+def _read_a_real_booking(tool_outputs: list) -> bool:
+    """Did anything on this run come back holding an actual confirmed stay?"""
+    for outcome in tool_outputs or []:
+        if getattr(outcome, "tool", "") != _STATUS_TOOL:
+            continue
+        if not getattr(outcome, "ok", False):
+            continue
+        output = getattr(outcome, "output", None)
+        if isinstance(output, dict) and output.get("state") in _SECURED_STATES:
+            return True
+    return False
+
 # Saying a stay is secured when it is not.
 #
 # The reply this exists for, sent to a real guest on Instagram after a run
@@ -299,7 +326,8 @@ def check_reply(
     # believes a wrong price argues at the desk, and a guest who believes a
     # wrong booking arrives with luggage.
     confirmed = _CONFIRMED.search(text)
-    if confirmed and not (tools_run & CONFIRMING_TOOLS):
+    if confirmed and not (tools_run & CONFIRMING_TOOLS) \
+            and not _read_a_real_booking(tool_outputs):
         return Verdict(
             False,
             f"reply said a stay was secured ({confirmed.group(0)[:40]!r}) "

@@ -38,6 +38,8 @@ from app.services.ai import routing as ai_routing
 from app.services.ai import runtime
 from app.services.ai.errors import AgentError
 from app.services import billing
+from app.services.messaging import language as language_module
+from app.services.messaging import session
 from app.services.messaging import service as messaging
 
 logger = logging.getLogger(__name__)
@@ -275,6 +277,26 @@ async def process_conversation(conversation_id: str, *, provider=None, classifie
             break
 
         message = pending[0]
+
+        # What language to answer in, before the turn rather than after it.
+        #
+        # A preference is not a message. This guest asked for Hinglish and was
+        # answered in Devanagari two turns later and again an hour later,
+        # because "reply in the language the guest wrote in" is an instruction
+        # about the *current* message and the request had scrolled out of the
+        # ten turns `_history` carries.
+        #
+        # The current message still wins: `detect` returns the language of what
+        # was just written, which is what gets stored and what the prompt is
+        # built from. A guest who switches to English gets English and the
+        # stored value follows them. `detect` returning None — "ok", "yes", a
+        # name — leaves the preference alone, which is the whole reason it is
+        # allowed to return None at all.
+        spoken = language_module.detect(message.get("body"))
+        if spoken:
+            await run_db(language_module.remember, conversation["id"], spoken)
+        language = spoken or language_module.of_conversation(conversation)
+
         try:
             ctx = await ai_context.load_context(
                 property_id=conversation["property_id"],
@@ -287,6 +309,8 @@ async def process_conversation(conversation_id: str, *, provider=None, classifie
                 reservation_id=conversation.get("reservation_id"),
                 channel=conversation["channel"],
                 actor=actor,
+                language=language,
+                session=conversation.get("guest_profile") or {},
             )
         except AgentError as exc:
             # No agent configured for this property. Not a failure of this
@@ -311,6 +335,10 @@ async def process_conversation(conversation_id: str, *, provider=None, classifie
         # again — two replies to one guest sentence, which is exactly the
         # failure the idempotency work exists to prevent.
         await run_db(_mark_answered, message["id"], result.run_id)
+
+        # What this turn established about the stay, from the tools rather than
+        # from the reply. Empty on most turns and cheap when it is.
+        await run_db(session.merge, conversation["id"], session.patch_from(result.actions))
         runs.append(result.run_id)
         processed += 1
 

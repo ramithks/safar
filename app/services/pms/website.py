@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException, status
 
 from app.db.client import get_db, run_db
+from app.services.pms import seo_ping
 
 logger = logging.getLogger(__name__)
 
@@ -232,7 +233,12 @@ def _publish(property_id: str, profile_id: str | None) -> dict:
 
 
 async def publish(property_id: str, profile_id: str | None) -> dict:
-    return await run_db(_publish, property_id, profile_id)
+    row = await run_db(_publish, property_id, profile_id)
+    # The page is live on travbuddy.in a minute later without this; with it, the
+    # sitemap moves too, which is the half a crawler actually reads. Best
+    # effort — see services/pms/seo_ping.
+    await seo_ping.hotel_changed(row.get("property_slug"))
+    return row
 
 
 def _unpublish(property_id: str) -> dict:
@@ -251,7 +257,11 @@ def _unpublish(property_id: str) -> dict:
 
 
 async def unpublish(property_id: str) -> dict:
-    return await run_db(_unpublish, property_id)
+    row = await run_db(_unpublish, property_id)
+    # Taking a site down matters more urgently than putting one up: the page
+    # now 404s and the sitemap must stop asserting it exists.
+    await seo_ping.hotel_changed(row.get("property_slug"))
+    return row
 
 
 def project(row: dict, *, slug: str | None = None) -> dict:

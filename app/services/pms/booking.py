@@ -411,6 +411,7 @@ async def create_reservation(
     created_by: str,
     member_id: str | None,
     member_name: str | None,
+    conversation_id: str | None = None,
 ) -> dict:
     """
     Turn a quote into a reservation.
@@ -517,6 +518,12 @@ async def create_reservation(
                             "payment_status": _payment_status(paid, q["total_paise"]),
                             "notes": notes,
                             "created_by": created_by,
+                            # The thread it was sold in, if it was sold in one.
+                            # Falls back to the quote's own thread: an order
+                            # raised on the booking page for a quote the AI
+                            # made still belongs to that conversation, and the
+                            # guest asking about it is on that conversation.
+                            "conversation_id": conversation_id or q.get("conversation_id"),
                         }
                     )
                     .execute()

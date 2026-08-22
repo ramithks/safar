@@ -146,6 +146,28 @@ class WhatsAppAdapter:
             "text": {"preview_url": False, "body": body},
         })
 
+    async def send_image(self, *, to: str, image_url: str, caption: str | None,
+                         client_reference: str) -> SendResult:
+        """
+        A photograph by link. Meta fetches it, so the bucket must serve it
+        publicly and nothing here uploads bytes.
+
+        Unlike Instagram, WhatsApp carries a caption on the image itself, which
+        is one message rather than two and reads better in a thread.
+        """
+        image: dict = {"link": image_url}
+        if caption:
+            # Meta's limit is 1024; anything longer is a paragraph that belongs
+            # in its own message rather than under a picture.
+            image["caption"] = caption[:1024]
+        return await self._post({
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "image",
+            "image": image,
+        })
+
     async def send_template(
         self,
         *,

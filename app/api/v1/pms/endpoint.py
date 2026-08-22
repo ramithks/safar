@@ -21,12 +21,18 @@ marketplace/partner_ops.py.
 # NOTE: deliberately no `from __future__ import annotations` — PEP 563 breaks
 # FastAPI body resolution through slowapi's wrapper. Same note as
 # api/v1/admin/endpoint.py.
+import asyncio
 import json
+import secrets
 import re
 import logging
+import uuid
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter, Depends, File, Form, Header, HTTPException, Query, Request,
+    UploadFile, status,
+)
 
 from app.api.v1.pms.schemas import (
     PaymentLinkOut,
@@ -78,6 +84,10 @@ from app.api.v1.pms.schemas import (
     ServiceOut,
     ServiceUpsertRequest,
     GuestRegistrationOut,
+    BookingLinkOut,
+    ConversationSessionOut,
+    BookingPageOut,
+    ReceiptLineOut,
     PublicStayOut,
     WebCheckInRequest,
     CreditOrderOut,
@@ -85,6 +95,7 @@ from app.api.v1.pms.schemas import (
     CreditPurchaseOut,
     PaymentOrderOut,
     PublicAvailabilityOut,
+    BookingLinkOut,
     PublicBookingOut,
     PublicConfirmRequest,
     PublicOrderOut,
@@ -134,7 +145,19 @@ from app.api.v1.pms.schemas import (
     ReservationOut,
     RoomOut,
     RoomStatusRequest,
+    ExtractedHotel,
+    ExtractedRoomType,
+    HotelExtractOut,
+    HotelCorrectionOut,
+    HotelCorrectionRequest,
+    HotelExtractRequest,
+    MediaUploadOut,
+    PropertyLocationOut,
+    PropertyUpdateRequest,
+    PublicHotelIndexOut,
+    ReadinessOut,
     RoomTypeOut,
+    RoomTypeUpdateRequest,
     SendMessageRequest,
     StayOptionOut,
     SyncOut,
@@ -172,10 +195,15 @@ from app.services.pms import sync as sync_service
 from app.services.pms import website as website_service
 from app.services.pms import domains as domains_service
 from app.services import razorpay
+from app.config import settings
+from app.services.pms import extract as pms_extract
+from app.services.pms import seo_ping
+from app.storage import gcs
 from app.services.ai import approvals
 from app.services.ai.errors import AgentError
 from app.services.ai import console as ai_console
 from app.services.ai import model_router
+from app.services.ai.tools.booking import read_booking_state
 from app.services.messaging import service as messaging_service
 from app.services.messaging.channels import MessagingError
 from app.services.pms import workspace as workspace_service
@@ -320,6 +348,388 @@ async def create_room_type(
         photos=body.photos,
     )
     return RoomTypeOut.from_row(room_type)
+
+
+@router.patch(
+    "/properties/{property_id}/room-types/{room_type_id}", response_model=RoomTypeOut
+)
+@limiter.limit("120/hour")
+async def update_room_type(
+    request: Request,
+    property_id: str,
+    room_type_id: str,
+    body: RoomTypeUpdateRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    Change a room that already exists — including adding the photos it never had.
+
+    **There was no route for this**, and that is why every room type in
+    production carried a null description, no amenities and no photos: they were
+    all created before the form asked, and the only way to "fix" one was to
+    delete it and lose its inventory, its rate plans and its history.
+
+    `exclude_unset` is the whole contract. A field the client did not send is
+    left alone; a field sent empty is cleared. Without that distinction, a screen
+    that renames a room would silently empty its description, which is the exact
+    shape of bug that produced the state this route exists to repair.
+    """
+    row = await onboarding_service.update_room_type(
+        property_id=property_id,
+        room_type_id=room_type_id,
+        fields={
+            {
+                "totalUnits": "total_units",
+                "maxOccupancy": "max_occupancy",
+                "bedType": "bed_type",
+                "sizeSqft": "size_sqft",
+                "isActive": "is_active",
+            }.get(key, key): value
+            for key, value in body.model_dump(exclude_unset=True).items()
+        },
+    )
+    # A room edit changes the hotel's public page, and adding the fourth
+    # photograph is the precise moment a hotel crosses the indexability gate.
+    # Best effort: a purge that fails must not fail the edit.
+    await seo_ping.hotel_changed(await _slug_of(property_id))
+    return RoomTypeOut.from_row(row)
+
+
+async def _slug_of(property_id: str) -> str | None:
+    """This property's public slug, for the SEO purge. None rather than raising."""
+    def _read():
+        rows = (
+            get_db().table("properties").select("slug")
+            .eq("id", property_id).limit(1).execute().data or []
+        )
+        return rows[0].get("slug") if rows else None
+
+    try:
+        return await run_db(_read)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@router.patch("/properties/{property_id}", response_model=PropertyOut)
+@limiter.limit("120/hour")
+async def update_property_details(
+    request: Request,
+    property_id: str,
+    body: PropertyUpdateRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    Where the hotel is, when it opens, and what its rules are.
+
+    **None of this was editable through any route.** Address, coordinates,
+    check-in times and the whole policy object were writable only by editing
+    Postgres by hand — which is why nine of ten live hotels have no address, no
+    map pin and empty policies, and therefore why their AI hands a guest over
+    rather than answering "what's your cancellation policy?" and their website
+    cannot be submitted for indexing.
+
+    `exclude_unset` again: absent means unchanged, empty means cleared. The
+    policy object is merged key by key over a known set — see
+    `GUEST_POLICY_KEYS` — because it also carries the commercial settings the
+    pricing engine reads, and a policies screen has no business dropping a
+    hotel's discount ceiling.
+    """
+    row = await onboarding_service.update_property(
+        property_id=property_id,
+        fields={
+            {
+                "propertyType": "property_type",
+                "totalRooms": "total_rooms",
+                "checkInTime": "check_in_time",
+                "checkOutTime": "check_out_time",
+            }.get(key, key): value
+            for key, value in body.model_dump(exclude_unset=True).items()
+        },
+    )
+    await seo_ping.hotel_changed(row.get("slug"))
+    return PropertyOut.from_row(row)
+
+
+@router.post("/properties/{property_id}/locate", response_model=PropertyLocationOut)
+@limiter.limit("30/hour")
+async def locate_property(
+    request: Request,
+    property_id: str,
+    member=Depends(require_member("rates")),
+):
+    """
+    Find this hotel on a map, from the address it has already given us.
+
+    Proposes; does not save. The owner accepts the match through the PATCH
+    above, which is the same review-then-approve shape the brochure importer
+    uses and for the same reason — one confident geocoding mistake would put a
+    hotel in the wrong town on its own website and in every distance its AI
+    quotes afterwards.
+    """
+    return PropertyLocationOut(**await onboarding_service.locate(property_id))
+
+
+@router.get("/properties/{property_id}/readiness", response_model=ReadinessOut)
+@limiter.limit("120/minute")
+async def get_readiness(
+    request: Request, property_id: str, member=Depends(require_member()),
+):
+    """
+    What this hotel cannot do yet, and why.
+
+    Named gaps rather than a score. "You are at 62%" tells an owner nothing
+    they can act on; "your AI can't tell guests where you are" is one tap from
+    being fixed.
+    """
+    return ReadinessOut(**await onboarding_service.readiness(property_id))
+
+
+# What a hotel's own material may arrive as.
+#
+# PDFs and images both, because a hotel's rate sheet is whichever of the two
+# somebody had to hand — a designed brochure or a photograph of a laminated
+# card at the desk. Gemini reads both natively, so neither needs converting.
+_EXTRACT_TYPES = {
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "text/plain",
+}
+_EXTRACT_MAX_BYTES = 12 * 1024 * 1024
+
+
+def _extract_out(draft: dict) -> HotelExtractOut:
+    return HotelExtractOut(
+        confidence=draft["confidence"],
+        hotel=ExtractedHotel(**draft["hotel"]),
+        roomTypes=[ExtractedRoomType(**r) for r in draft["roomTypes"]],
+        found=draft.get("found") or [],
+        droppedRooms=draft.get("droppedRooms") or 0,
+    )
+
+
+@router.post("/properties/{property_id}/extract/text", response_model=HotelExtractOut)
+@limiter.limit("30/hour")
+async def extract_hotel_from_text(
+    request: Request,
+    property_id: str,
+    body: HotelExtractRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    Read pasted material — a website page, a rate email — into a draft.
+
+    **Writes nothing.** The owner reads what it found, corrects what is wrong,
+    and creates the rooms they approve through the ordinary route. That
+    separation is the whole safety argument: a model that misreads "₹4,200 for
+    two nights" as a nightly rate has proposed a mistake, not made one.
+    """
+    try:
+        draft = await pms_extract.extract_hotel(text=body.text)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[pms] extraction failed for %s", property_id)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "We couldn't read that just now. Please try again, or add the rooms yourself.",
+        ) from exc
+    return _extract_out(draft)
+
+
+@router.post("/properties/{property_id}/extract/correct",
+             response_model=HotelCorrectionOut)
+@limiter.limit("60/hour")
+async def correct_extracted_draft(
+    request: Request,
+    property_id: str,
+    body: HotelCorrectionRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    "isme breakfast included nahi hai" — and the draft changes.
+
+    **The step this saves is the one people abandon.** A hotelier reading a
+    draft knows what is wrong with it in one sentence. Making them find the
+    field, click it, clear it and retype it is how a review screen becomes the
+    thing nobody finishes, and an unfinished review is a hotel with two room
+    descriptions and no amenities, which is what production actually looks like.
+
+    **The model proposes edits; Python applies them.** It returns
+    `{room, field, value}` against a closed field list, matched to rooms already
+    in the draft, and every value goes through the same bounds `normalise`
+    enforces. So a correction cannot add a room, delete one, or set a price of
+    ₹9,000,000 — a model that misreads the sentence proposes a wrong edit, which
+    the hotelier sees in `changes`, rather than making one.
+
+    **Still writes nothing.** The corrected draft goes back to the same review
+    screen and the same approval. A correction must not become the back door
+    around the step whose entire purpose is that a person agreed.
+    """
+    try:
+        result = await pms_extract.correct_draft(
+            body.draft.model_dump(), body.correction,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[pms] correction failed for %s", property_id)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "We couldn't apply that just now. Please edit the field directly.",
+        ) from exc
+
+    return HotelCorrectionOut(
+        **_extract_out(result).model_dump(),
+        changes=result.get("changes") or [],
+        unclear=result.get("unclear"),
+    )
+
+
+@router.post("/properties/{property_id}/extract/file", response_model=HotelExtractOut)
+@limiter.limit("30/hour")
+async def extract_hotel_from_file(
+    request: Request,
+    property_id: str,
+    file: UploadFile = File(...),
+    member=Depends(require_member("rates")),
+):
+    """
+    The same, from a brochure or a photograph of a rate card.
+
+    Not stored. The bytes are read into the model call and dropped — a document
+    a hotel sends to have read is not a document they asked us to keep, and the
+    only thing worth persisting out of it is the draft they approve.
+    """
+    mime = (file.content_type or "").split(";")[0].strip().lower()
+    if mime not in _EXTRACT_TYPES:
+        raise HTTPException(
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            "Send a PDF, a photo of your rate card, or paste the text.",
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No file received.")
+    if len(data) > _EXTRACT_MAX_BYTES:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            "That file is over 12 MB. Please send a smaller one.",
+        )
+
+    try:
+        if mime == "text/plain":
+            draft = await pms_extract.extract_hotel(text=data.decode("utf-8", "replace"))
+        else:
+            draft = await pms_extract.extract_hotel(file_bytes=data, mime_type=mime)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[pms] extraction failed for %s", property_id)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "We couldn't read that just now. Please try again, or add the rooms yourself.",
+        ) from exc
+    return _extract_out(draft)
+
+
+# What a hotel may upload, and how much of it.
+#
+# Deliberately the same four types and the same 5 MB ceiling as the marketplace
+# uploader: a hotelier photographing a room on a phone produces a 3–4 MB JPEG,
+# and anything stricter would reject the ordinary case.
+_MEDIA_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/avif": "avif",
+}
+_MEDIA_MAX_BYTES = 5 * 1024 * 1024
+_MEDIA_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+
+@router.post(
+    "/properties/{property_id}/media", response_model=MediaUploadOut, status_code=201
+)
+@limiter.limit("240/hour")
+async def upload_property_media(
+    request: Request,
+    property_id: str,
+    file: UploadFile = File(...),
+    folder: str = Form(default="rooms"),
+    member=Depends(require_member("rates")),
+):
+    """
+    A photo, stored, and a URL that works.
+
+    **Why this had to exist before the photo tool could be useful.** The room
+    form asked for photo *links* — "paste them from your website, or Instagram"
+    — because StayOS had no image storage, and every hotel on it responded by
+    entering none. Zero photos across ten properties. An AI employee that has
+    been taught to send room photos and has none to send is the same product it
+    was before, with a better excuse.
+
+    Server-side rather than a browser→bucket upload, for the reason the
+    partner-media incident established: Storage did not honour the project's
+    ES256 JWT and fell back to `anon`, 403-ing authenticated uploads. Routing
+    through here removes that failure mode and keeps the storage credential in
+    the backend, which is the point of having one.
+
+    **The path is built here and the property id comes from the verified
+    membership path parameter, never from the body.** `folder` is a label
+    inside a path we construct, stripped of anything that could add a segment or
+    climb out of this hotel's prefix — a hotel cannot write into another hotel's
+    photos whatever it sends.
+    """
+    mime = (file.content_type or "").split(";")[0].strip().lower()
+    ext = _MEDIA_TYPES.get(mime)
+    if not ext:
+        raise HTTPException(
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            "Please upload a JPG, PNG, WebP or AVIF image.",
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No file received.")
+    if len(data) > _MEDIA_MAX_BYTES:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            "That image is over 5 MB. Please upload a smaller one.",
+        )
+
+    # Checked before the file is read rather than discovered inside the client.
+    #
+    # StayOS is a separate deployment from the marketplace and does not inherit
+    # its environment: `GCS_BUCKET_NAME` and the service account are set on one
+    # and were not on the other. Without this, a hotelier uploading their first
+    # room photo got "that upload did not go through" — which reads as their
+    # connection, sends them to try again, and never mentions the one fact that
+    # would let anybody fix it.
+    if not settings.gcs_bucket_name:
+        logger.error(
+            "[pms] photo upload attempted with no GCS_BUCKET_NAME configured; "
+            "StayOS needs GCS_BUCKET_NAME and GOOGLE_SERVICE_ACCOUNT_JSON in "
+            "its environment",
+        )
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Photo uploads are not switched on for this hotel yet. "
+            "We have been told — please try again shortly.",
+        )
+
+    safe_folder = re.sub(r"[^a-z0-9-]", "", folder or "", flags=re.I)[:32] or "rooms"
+    path = f"stayos/{property_id}/{safe_folder}/{uuid.uuid4()}.{ext}"
+
+    try:
+        # to_thread: the GCS client is blocking and a 5 MB PUT would otherwise
+        # sit on the event loop for the duration of the upload.
+        public = await asyncio.to_thread(
+            gcs.upload_bytes, path, data, mime, True, _MEDIA_CACHE_CONTROL
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[pms] media upload failed for %s", property_id)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "That upload did not go through. Please try again.",
+        ) from exc
+
+    return MediaUploadOut(url=public, path=path)
 
 
 @router.post("/properties/{property_id}/rate-plans", response_model=RatePlanOut, status_code=201)
@@ -845,6 +1255,45 @@ async def create_payment_link(
     return PaymentLinkOut(**link.as_dict())
 
 
+@router.post("/properties/{property_id}/reservations/{reservation_id}/rotate-link",
+             response_model=BookingLinkOut)
+@limiter.limit("12/minute")
+async def rotate_booking_link(
+    request: Request,
+    property_id: str,
+    reservation_id: str,
+    member=Depends(require_member("frontdesk")),
+):
+    """
+    Invalidate a booking's public link and issue a new one.
+
+    This is what makes the token *revocable* rather than merely unguessable. A
+    confirmation forwarded to the wrong number, a screenshot posted in a group,
+    a phone lost between booking and arrival — in every one of those the old URL
+    has to stop working, and here it does, from the moment this returns.
+
+    Scoped by property in the update itself: a reservation id from another hotel
+    changes nothing and 404s, the same as it does on the read.
+
+    The guest is not told. Whoever rotated the link is the person who knows why,
+    and re-sending it is a decision rather than a side effect.
+    """
+    rotated = await run_db(_rotate_booking_token, property_id, reservation_id)
+    if not rotated:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Reservation not found")
+    return BookingLinkOut(ref=rotated["ref"], url=messaging_service.booking_url(rotated))
+
+
+def _rotate_booking_token(property_id: str, reservation_id: str) -> dict | None:
+    rows = (
+        get_db().table("reservations")
+        .update({"public_token": secrets.token_hex(16)})
+        .eq("id", reservation_id).eq("property_id", property_id)
+        .execute().data or []
+    )
+    return rows[0] if rows else None
+
+
 @router.post("/properties/{property_id}/night-audit", response_model=NightAuditOut)
 @limiter.limit("6/minute")
 async def run_night_audit(
@@ -972,7 +1421,15 @@ async def list_conversations(
             db.table("conversations")
             .select("*")
             .eq("property_id", property_id)
-            .order("last_message_at", desc=True)
+            # `nullsfirst=False`, and it is not a detail.
+            #
+            # Postgres reads `order by x desc` as `desc nulls first`, and 109 of
+            # this property's 378 threads have never had a message and so have a
+            # null `last_message_at`. The inbox's first 100 rows were therefore
+            # every empty thread in the database, and not one conversation a
+            # guest had actually had. It looked like a working screen full of
+            # silent guests.
+            .order("last_message_at", desc=True, nullsfirst=False)
             .limit(limit)
         )
         if status_filter:
@@ -1005,6 +1462,108 @@ async def list_conversations(
         )
         for r in rows
     ]
+
+
+@router.get(
+    "/properties/{property_id}/conversations/{conversation_id}/session",
+    response_model=ConversationSessionOut,
+)
+@limiter.limit("240/minute")
+async def get_conversation_session(
+    request: Request,
+    property_id: str,
+    conversation_id: str,
+    member=Depends(require_member("messaging")),
+):
+    """
+    Where this thread has got to, so nobody has to read it to find out.
+
+    **A receptionist taking over from the AI mid-sale is the case this exists
+    for.** Until now the only way to learn that a guest had been quoted ₹53,760
+    for 11–15 September and had paid a ₹10,752 deposit was to scroll the
+    transcript and reconstruct it — from prose the model wrote, which is the
+    least reliable copy of any of it.
+
+    Every field here is composed from rows. The dates and the room the guest
+    settled on come from `conversations.guest_profile`, which is written only
+    from tool inputs and outputs; the money comes from
+    `read_booking_state` — the same reader behind `get_booking_status`, so the
+    panel a receptionist reads and the answer the AI gives a guest cannot
+    disagree about the same booking.
+
+    Scoped by property in the query. A conversation id from another hotel 404s
+    here exactly as it does everywhere else.
+    """
+    session = await run_db(_conversation_session, property_id, conversation_id)
+    if session is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")
+    return session
+
+
+def _conversation_session(property_id: str, conversation_id: str) -> ConversationSessionOut | None:
+    db = get_db()
+    rows = (
+        db.table("conversations")
+        .select("id,channel,handler,guest_name,guest_handle,guest_profile")
+        .eq("id", conversation_id).eq("property_id", property_id)
+        .limit(1).execute().data or []
+    )
+    if not rows:
+        return None
+    conversation = rows[0]
+    profile = conversation.get("guest_profile")
+    profile = profile if isinstance(profile, dict) else {}
+
+    state = read_booking_state(conversation_id, property_id)
+    token = state.pop("_publicToken", None)
+
+    # The stay the panel describes: the booking's own dates once there is a
+    # booking, and what the guest told us before that. A confirmed reservation
+    # for different nights than the guest last mentioned is not a contradiction
+    # to resolve here — the reservation is simply the later fact.
+    check_in = state.get("checkIn") or profile.get("check_in")
+    check_out = state.get("checkOut") or profile.get("check_out")
+
+    room_type_id = profile.get("room_type_id")
+    rate_plan_id = profile.get("rate_plan_id")
+    room_name = rate_name = ""
+    if room_type_id:
+        found = (db.table("room_types").select("name")
+                 .eq("id", room_type_id).eq("property_id", property_id)
+                 .limit(1).execute().data or [{}])[0]
+        room_name = found.get("name") or ""
+    if rate_plan_id:
+        found = (db.table("rate_plans").select("name")
+                 .eq("id", rate_plan_id).eq("property_id", property_id)
+                 .limit(1).execute().data or [{}])[0]
+        rate_name = found.get("name") or ""
+
+    total = int(state.get("totalPaise") or state.get("amountPaise") or 0)
+    paid = int(state.get("paidPaise") or 0)
+
+    return ConversationSessionOut(
+        conversationId=conversation_id,
+        channel=conversation.get("channel") or "",
+        handler=conversation.get("handler") or "",
+        guestName=state.get("guestName") or conversation.get("guest_name") or "",
+        guestHandle=conversation.get("guest_handle") or "",
+        language=str(profile.get("language") or ""),
+        stage=str(profile.get("stage") or ""),
+        checkIn=check_in, checkOut=check_out,
+        nights=state.get("nights"),
+        units=state.get("rooms") or profile.get("units"),
+        adults=state.get("adults") or profile.get("adults"),
+        children=state.get("children") or profile.get("children"),
+        roomTypeName=room_name, ratePlanName=rate_name,
+        bookingState=state.get("state") or "NONE",
+        ref=state.get("ref") or "",
+        totalPaise=total, paidPaise=paid,
+        balancePaise=int(state.get("balancePaise") or max(0, total - paid)),
+        quoteExpiresAt=state.get("expiresAt"),
+        bookingUrl=(messaging_service.booking_url(
+            {"ref": state["ref"], "public_token": token},
+        ) if state.get("ref") else ""),
+    )
 
 
 @router.get(
@@ -2580,6 +3139,19 @@ def _mask_phone(phone: str | None) -> str:
     return f"••••{digits[-4:]}" if len(digits) >= 4 else ""
 
 
+# 16 bytes as hex, and nothing else gets as far as the database. A token that
+# is not this shape cannot match a row, so refusing it early costs a query
+# rather than changing an answer.
+_TOKEN_SHAPE = re.compile(r"[0-9a-f]{32}")
+
+_PUBLIC_STAY_COLUMNS = (
+    "id,ref,property_id,partner_id,guest_name,guest_phone,check_in,"
+    "check_out,nights,units,adults,children,gross_paise,discount_paise,"
+    "tax_paise,total_paise,paid_paise,status,room_type_id,rate_plan_id,"
+    "cancellation_policy,created_at"
+)
+
+
 def _load_public_stay(ref: str) -> dict | None:
     """
     One reservation by reference, with the names a guest would recognise.
@@ -2588,22 +3160,35 @@ def _load_public_stay(ref: str) -> dict | None:
     check RLS against — which is exactly why nothing here is selected that a
     guest should not see. The projection *is* the access control.
     """
+    return _load_public_reservation("ref", ref.strip(), case_insensitive=True)
+
+
+def _load_public_booking(token: str) -> dict | None:
+    """
+    The same reservation, reached by its link rather than by its reference.
+
+    Exact match, never `ilike`: a token is 32 hex characters that nobody types,
+    and `ilike` treats `%` and `_` as wildcards — a lesson this codebase has
+    already paid for once, on coupon codes.
+    """
+    return _load_public_reservation("public_token", token.strip(), with_receipt=True)
+
+
+def _load_public_reservation(
+    column: str, value: str, *, case_insensitive: bool = False,
+    with_receipt: bool = False,
+) -> dict | None:
     db = get_db()
-    rows = (
-        db.table("reservations")
-        .select("id,ref,property_id,partner_id,guest_name,guest_phone,check_in,"
-                "check_out,nights,units,adults,children,total_paise,paid_paise,"
-                "status,room_type_id,rate_plan_id")
-        .ilike("ref", ref.strip())
-        .limit(1).execute().data or []
-    )
+    query = db.table("reservations").select(_PUBLIC_STAY_COLUMNS)
+    query = query.ilike(column, value) if case_insensitive else query.eq(column, value)
+    rows = query.limit(1).execute().data or []
     if not rows:
         return None
     stay = rows[0]
 
     prop = (
         db.table("properties")
-        .select("name,city,check_in_time,check_out_time")
+        .select("name,city,slug,check_in_time,check_out_time,policies")
         .eq("id", stay["property_id"]).limit(1).execute().data or [{}]
     )[0]
     room_type = (
@@ -2614,16 +3199,57 @@ def _load_public_stay(ref: str) -> dict | None:
         db.table("rate_plans").select("name,inclusions")
         .eq("id", stay["rate_plan_id"]).limit(1).execute().data or [{}]
     )[0]
-    balance = db.rpc("folio_balance", {"p_reservation": stay["id"]}).execute().data
     registration = (
         db.table("guest_registrations").select("*")
         .eq("reservation_id", stay["id"]).limit(1).execute().data or []
     )
+    # Read rather than `rpc("folio_balance")`: both public views need to know
+    # not just the sum but whether the folio has been opened at all, and that is
+    # the difference between a number a guest can act on and one that reads as
+    # a mistake. See `_amount_due`.
+    folio = (
+        db.table("folio_entries")
+        .select("posted_at,kind,description,method,amount_paise")
+        .eq("reservation_id", stay["id"])
+        .order("posted_at")
+        .execute().data or []
+    )
     return {
         "stay": stay, "property": prop, "room_type": room_type,
-        "rate_plan": rate_plan, "balance": int(balance or 0),
+        "rate_plan": rate_plan,
+        "balance": _amount_due(stay, folio),
         "registration": registration[0] if registration else None,
+        "receipt": folio if with_receipt else [],
     }
+
+
+def _amount_due(stay: dict, folio: list[dict]) -> int:
+    """
+    What this guest still owes, in the sense a guest means it.
+
+    **Not `folio_balance`, which is what both public views used to show.** That
+    RPC sums the folio, and a booking that has not started yet has a folio
+    holding one thing: the deposit that was paid. Its balance is therefore
+    *negative* — a guest with ₹43,008 left to pay was shown "₹-10,752", and the
+    check-in page, which only renders a balance above zero, showed them nothing
+    at all. Both were found by rendering a real four-night booking rather than
+    by reading the code.
+
+    So: once the folio has real charges on it the folio is the truth, because it
+    carries the extras a guest ordered after arriving and the reservation total
+    does not. Before then the reservation is the truth, and the sum that means
+    something is total minus paid.
+
+    A cancelled booking that was never charged owes nothing, whatever its total
+    says.
+    """
+    charges = sum(int(e.get("amount_paise") or 0) for e in folio
+                  if int(e.get("amount_paise") or 0) > 0)
+    if charges > 0:
+        return sum(int(e.get("amount_paise") or 0) for e in folio)
+    if (stay.get("status") or "") in ("cancelled", "no_show"):
+        return 0
+    return max(0, int(stay.get("total_paise") or 0) - int(stay.get("paid_paise") or 0))
 
 
 @router.get("/public/stays/{ref}", response_model=PublicStayOut)
@@ -2644,28 +3270,114 @@ async def get_public_stay(request: Request, ref: str):
     if not loaded or loaded["stay"]["status"] in ("cancelled", "no_show"):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that booking.")
 
-    stay = loaded["stay"]
     return PublicStayOut(
-        ref=stay["ref"],
-        propertyName=loaded["property"].get("name") or "",
-        propertyCity=loaded["property"].get("city") or "",
-        checkInTime=str(loaded["property"].get("check_in_time") or "")[:5],
-        checkOutTime=str(loaded["property"].get("check_out_time") or "")[:5],
-        guestName=stay.get("guest_name") or "Guest",
-        guestPhoneMasked=_mask_phone(stay.get("guest_phone")),
-        checkIn=stay["check_in"], checkOut=stay["check_out"],
-        nights=stay["nights"], units=stay["units"],
-        adults=stay.get("adults") or 0, children=stay.get("children") or 0,
-        roomTypeName=loaded["room_type"].get("name") or "",
-        ratePlanName=loaded["rate_plan"].get("name") or "",
-        inclusions=loaded["rate_plan"].get("inclusions") or [],
-        totalPaise=stay.get("total_paise") or 0,
-        paidPaise=stay.get("paid_paise") or 0,
-        balancePaise=loaded["balance"],
-        status=stay["status"],
+        **_public_stay_fields(loaded),
         registration=(GuestRegistrationOut.from_row(loaded["registration"])
                       if loaded["registration"] else None),
     )
+
+
+def _public_stay_fields(loaded: dict) -> dict:
+    """
+    The projection both public views share.
+
+    One function so the thin view and the linked view cannot drift into
+    disagreeing about what a guest may see — the moment they do, the safe one
+    stops being the reference for the other.
+    """
+    stay = loaded["stay"]
+    return {
+        "ref": stay["ref"],
+        "propertyName": loaded["property"].get("name") or "",
+        "propertyCity": loaded["property"].get("city") or "",
+        "checkInTime": str(loaded["property"].get("check_in_time") or "")[:5],
+        "checkOutTime": str(loaded["property"].get("check_out_time") or "")[:5],
+        "guestName": stay.get("guest_name") or "Guest",
+        "guestPhoneMasked": _mask_phone(stay.get("guest_phone")),
+        "checkIn": stay["check_in"], "checkOut": stay["check_out"],
+        "nights": stay["nights"], "units": stay["units"],
+        "adults": stay.get("adults") or 0, "children": stay.get("children") or 0,
+        "roomTypeName": loaded["room_type"].get("name") or "",
+        "ratePlanName": loaded["rate_plan"].get("name") or "",
+        "inclusions": loaded["rate_plan"].get("inclusions") or [],
+        "totalPaise": stay.get("total_paise") or 0,
+        "paidPaise": stay.get("paid_paise") or 0,
+        "balancePaise": loaded["balance"],
+        "status": stay["status"],
+    }
+
+
+@router.get("/public/bookings/{token}", response_model=BookingPageOut)
+@limiter.limit("30/minute")
+async def get_public_booking(request: Request, token: str):
+    """
+    A booking, by the link that was sent to the person who paid for it.
+
+    **Why this exists next to `/public/stays/{ref}`.** The reference is six
+    characters from a 32-symbol alphabet, produced by `random.choices` — good
+    for reading aloud, wrong for a URL that opens somebody's booking. This path
+    takes a 128-bit token instead, so it can show the price breakdown, the folio
+    and the cancellation terms rather than the recognisably-thin projection a
+    guessable reference has to settle for.
+
+    **A cancelled booking is shown, not hidden.** The reference route 404s on
+    one because confirming a stranger's cancelled travel is a free bit of
+    information; here the caller is holding that booking's own credential, and
+    a guest whose booking was cancelled has more right than anyone to read the
+    page that says so.
+
+    A bad token is a flat 404 with no hint about which half was wrong.
+    """
+    if not _TOKEN_SHAPE.fullmatch(token or ""):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that booking.")
+
+    loaded = await run_db(_load_public_booking, token)
+    if not loaded:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "We could not find that booking.")
+
+    stay = loaded["stay"]
+    return BookingPageOut(
+        **_public_stay_fields(loaded),
+        grossPaise=stay.get("gross_paise") or 0,
+        discountPaise=stay.get("discount_paise") or 0,
+        taxPaise=stay.get("tax_paise") or 0,
+        bookedAt=stay.get("created_at"),
+        cancellationTerms=_cancellation_terms(loaded),
+        propertySlug=loaded["property"].get("slug") or "",
+        receipt=[
+            ReceiptLineOut(
+                postedAt=line["posted_at"],
+                kind=line.get("kind") or "",
+                description=line.get("description") or "",
+                method=line.get("method") or "",
+                amountPaise=int(line.get("amount_paise") or 0),
+            )
+            for line in loaded["receipt"]
+        ],
+        checkInUrl=f"{(settings.pms_app_url or '').rstrip('/')}/checkin/{stay['ref']}",
+        registrationSubmittedAt=((loaded["registration"] or {}).get("submitted_at")),
+    )
+
+
+def _cancellation_terms(loaded: dict) -> str:
+    """
+    What this guest was told about cancelling, in one sentence.
+
+    The reservation's own `cancellation_policy` snapshot comes first — terms at
+    the time of booking beat terms as they stand today — but every row in
+    production has left it at `{}`, so in practice this reads the sentence the
+    hotelier wrote on the property. Nothing invents a default: a hotel that has
+    written no policy produces an empty string, and the page says so.
+    """
+    snapshot = loaded["stay"].get("cancellation_policy")
+    if isinstance(snapshot, dict):
+        text = str(snapshot.get("cancellation") or snapshot.get("text") or "").strip()
+        if text:
+            return text
+    policies = loaded["property"].get("policies")
+    if isinstance(policies, dict):
+        return str(policies.get("cancellation") or "").strip()
+    return ""
 
 
 @router.post("/public/stays/{ref}/check-in", response_model=GuestRegistrationOut)
@@ -2886,7 +3598,8 @@ async def get_public_hotel(request: Request, slug: str):
         db = get_db()
         types = (
             db.table("room_types")
-            .select("id,code,name,description,max_occupancy,bed_type,amenities")
+            .select("id,code,name,description,max_occupancy,standard_occupancy,"
+                    "bed_type,amenities,photos,size_sqft")
             .eq("property_id", prop.id).eq("is_active", True)
             .order("sort_order").execute().data or []
         )
@@ -2896,14 +3609,45 @@ async def get_public_hotel(request: Request, slug: str):
             .eq("property_id", prop.id).eq("is_active", True)
             .order("sort_order").limit(50).execute().data or []
         )
-        return types, services
+        # The cheapest public rate per room type — a "from" figure for a
+        # brochure page, never a quote. `audience=public` matters: a b2b agent
+        # rate is cheaper by design and putting it on a page a guest reads
+        # would advertise a price no guest can have.
+        plans = (
+            db.table("rate_plans")
+            .select("room_type_id,base_price_paise,meal_plan")
+            .eq("property_id", prop.id).eq("is_active", True)
+            .eq("audience", "public").execute().data or []
+        )
+        domain = (
+            db.table("hotel_websites").select("domain,domain_status")
+            .eq("property_id", prop.id).limit(1).execute().data or []
+        )
+        return types, services, plans, (domain[0] if domain else {})
 
-    types, services = await run_db(_read)
+    types, services, plans, site = await run_db(_read)
+
+    cheapest: dict[str, dict] = {}
+    for plan in plans:
+        price = plan.get("base_price_paise")
+        if price is None:
+            continue
+        current = cheapest.get(plan["room_type_id"])
+        if current is None or price < current["base_price_paise"]:
+            cheapest[plan["room_type_id"]] = plan
     return PublicSiteOut(
         slug=prop.slug, name=prop.name, city=prop.city, template=prop.template,
         currency=prop.currency, timezone=prop.timezone,
         checkInTime=prop.check_in_time, checkOutTime=prop.check_out_time,
         policies=prop.policies, content=prop.website,
+        address=prop.address, state=prop.state, country=prop.country,
+        pincode=prop.pincode, lat=prop.lat, lon=prop.lon,
+        propertyType=prop.property_type, totalRooms=prop.total_rooms,
+        updatedAt=prop.updated_at,
+        # Only a *verified* domain. An unverified one is a hostname somebody
+        # typed into a form, and pointing a canonical at it would hand the
+        # page's ranking to an address that may not resolve.
+        domain=(site.get("domain") if site.get("domain_status") == "verified" else None),
         services=[
             PublicServiceOut(
                 id=s["id"], name=s["name"], description=s.get("description") or "",
@@ -2921,9 +3665,94 @@ async def get_public_hotel(request: Request, slug: str):
                 # Nothing is claimed about availability here. This is the
                 # brochure; the number comes from /availability with dates.
                 unitsLeft=0,
+                slug=onboarding_service.slugify(t["name"]) or t["code"].lower(),
+                photos=t.get("photos") or [],
+                sizeSqft=t.get("size_sqft"),
+                standardOccupancy=t.get("standard_occupancy"),
+                fromPricePaise=(cheapest.get(t["id"]) or {}).get("base_price_paise"),
+                mealPlan=(cheapest.get(t["id"]) or {}).get("meal_plan"),
             ) for t in types
         ],
     )
+
+
+@router.get("/public/hotels", response_model=list[PublicHotelIndexOut])
+@limiter.limit("30/minute")
+async def list_public_hotels(request: Request):
+    """
+    Every hotel whose website is published, with the counts a quality gate needs.
+
+    **This is what makes the hotel pages discoverable at all.** A sitemap cannot
+    enumerate URLs it has no way to list, and until this route existed the only
+    entry point was `/public/hotels/{slug}` — reachable if you already knew the
+    slug, which a crawler does not.
+
+    It returns counts rather than content on purpose. The caller is deciding
+    *which* hotels to submit for indexing, and that decision is "does this page
+    have enough on it to be worth a search result" — a number of photos, a
+    number of rooms, whether there is a description at all. Sending the content
+    itself would make this the heaviest route in the system to answer a question
+    that is really about volume.
+
+    Unpublished and suspended hotels are absent, for the same reason
+    `resolve_published` 404s them: a hotelier drafting a site has not agreed to
+    anybody seeing it.
+    """
+    def _read():
+        db = get_db()
+        sites = (
+            db.table("hotel_websites")
+            .select("property_id,published,published_at,domain,domain_status")
+            .eq("status", "published").limit(2000).execute().data or []
+        )
+        if not sites:
+            return []
+        ids = [s["property_id"] for s in sites]
+
+        props = {
+            p["id"]: p
+            for p in (
+                db.table("properties")
+                .select("id,slug,name,city,status,lat,lon,address,policies,updated_at")
+                .in_("id", ids).execute().data or []
+            )
+        }
+        rooms = (
+            db.table("room_types").select("property_id,photos,description")
+            .in_("property_id", ids).eq("is_active", True).execute().data or []
+        )
+
+        by_property: dict[str, list[dict]] = {}
+        for room in rooms:
+            by_property.setdefault(room["property_id"], []).append(room)
+
+        out = []
+        for site in sites:
+            prop = props.get(site["property_id"])
+            if not prop or prop.get("status") != "active" or not prop.get("slug"):
+                continue
+            published = site.get("published") or {}
+            mine = by_property.get(prop["id"], [])
+            photos = sum(len(r.get("photos") or []) for r in mine)
+            out.append({
+                "slug": prop["slug"],
+                "name": prop["name"],
+                "city": prop.get("city"),
+                "updatedAt": str(site.get("published_at") or prop.get("updated_at") or "") or None,
+                "domain": (site.get("domain")
+                           if site.get("domain_status") == "verified" else None),
+                "roomTypes": len(mine),
+                "roomsWithPhotos": sum(1 for r in mine if r.get("photos")),
+                "photos": photos,
+                "hasDescription": len(str(published.get("about") or "").strip()) >= 120,
+                "hasPolicies": bool(prop.get("policies")),
+                "hasLocation": prop.get("lat") is not None and prop.get("lon") is not None,
+                "amenities": len(published.get("amenities") or []),
+            })
+        return out
+
+    rows = await run_db(_read)
+    return [PublicHotelIndexOut(**r) for r in rows]
 
 
 @router.get("/public/hotels/{slug}/availability", response_model=PublicAvailabilityOut)
@@ -3133,9 +3962,20 @@ async def _fulfil_booking(order: dict) -> dict:
         notes=guest.get("notes"),
         created_by="booking_engine",
         member_id=None, member_name=None,
+        conversation_id=order.get("conversation_id"),
     )
     await public_booking.attach_addons(reservation, order.get("addons") or [])
     await payments_service.record_result(order["id"], reservation_id=reservation["id"])
+
+    # Point the thread at the booking, and tell the guest.
+    #
+    # Both after the reservation exists and both best-effort, because a guest
+    # who has paid must end up with a booking whether or not we can message
+    # them about it. `announce_booking` is idempotent on the reservation, which
+    # is what makes it safe on the path the browser callback and the webhook
+    # both run.
+    await messaging_service.link_booking(reservation)
+    await messaging_service.announce_booking(reservation)
 
     # Who, if anyone, sent this guest. Best-effort and after the fact on
     # purpose: the booking is paid for and must exist whether or not a

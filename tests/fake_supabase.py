@@ -33,7 +33,7 @@ class _Query:
         self._filters: list = []
         self._op = "select"
         self._payload = None
-        self._order: tuple[str, bool] | None = None
+        self._order: tuple[str, bool, bool | None] | None = None
         self._limit: int | None = None
         self._conflict: str | None = None
         self._ignore_duplicates = False
@@ -76,6 +76,17 @@ class _Query:
         self._filters.append(lambda r, c=col: str(r.get(c)) in wanted)
         return self
 
+    def is_(self, col, val):
+        """
+        PostgREST's null test. `is_("x", "null")` and nothing else — the real
+        client also takes true/false, and neither this codebase nor the fake
+        has a use for them yet.
+        """
+        if str(val).lower() != "null":
+            raise NotImplementedError(f"fake is_ only handles null, not {val!r}")
+        self._filters.append(lambda r, c=col: r.get(c) is None)
+        return self
+
     def ilike(self, col, val):
         needle = str(val).strip("%").lower()
         self._filters.append(lambda r, c=col: needle in str(r.get(c) or "").lower())
@@ -93,8 +104,11 @@ class _Query:
         self._filters.append(lambda r, c=col, v=val: str(r.get(c) or "") <= str(v))
         return self
 
-    def order(self, col, desc=False):
-        self._order = (col, desc)
+    def order(self, col, desc=False, nullsfirst=None, foreign_table=None):
+        # `nullsfirst` is accepted because real callers pass it: Postgres reads
+        # `order by x desc` as `desc nulls first`, which once filled an inbox
+        # with every thread that had never had a message.
+        self._order = (col, desc, nullsfirst)
         return self
 
     def limit(self, n):
@@ -160,8 +174,15 @@ class _Query:
 
         out = self._matching()
         if self._order:
-            col, desc = self._order
-            out = sorted(out, key=lambda r: str(r.get(col) or ""), reverse=desc)
+            col, desc, nullsfirst = self._order
+            # Postgres's own default: nulls last ascending, nulls first
+            # descending. Modelled rather than ignored, because the bug this
+            # exists to catch is exactly a caller who forgot it.
+            nulls_first = desc if nullsfirst is None else nullsfirst
+            present = [r for r in out if r.get(col) is not None]
+            missing = [r for r in out if r.get(col) is None]
+            present = sorted(present, key=lambda r: str(r.get(col)), reverse=desc)
+            out = missing + present if nulls_first else present + missing
         if self._limit is not None:
             out = out[: self._limit]
         return _Result([copy.deepcopy(r) for r in out], count=len(out))

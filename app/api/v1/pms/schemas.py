@@ -1353,15 +1353,19 @@ class MarginRowOut(BaseModel):
 # The only shapes in this file a stranger can reach. Everything here is either
 # masked on the way out or write-only on the way in.
 
-class PublicStayOut(BaseModel):
+class PublicStayCore(BaseModel):
     """
-    A stay, as the person holding its reference may see it.
+    What both public views of a booking agree a stranger may see.
 
     **Masked deliberately.** The booking reference is the whole credential, so
     what it unlocks has to be worth less than the reference is hard to guess:
     enough for a guest to recognise their own booking, not enough to be worth
     guessing at. No email, no full phone, no guest id, no room number, no folio
     detail beyond the balance they will be asked for.
+
+    A base class rather than one view inheriting from the other, because the
+    two differ by *subtraction* as well as addition: the check-in form needs the
+    registration a guest filed and the booking page must not print it back.
     """
     ref: str
     propertyName: str
@@ -1384,6 +1388,10 @@ class PublicStayOut(BaseModel):
     paidPaise: int
     balancePaise: int
     status: str
+
+
+class PublicStayOut(PublicStayCore):
+    """The check-in view: adds back the registration this guest already filed."""
     registration: "GuestRegistrationOut | None" = None
 
 
@@ -1421,6 +1429,123 @@ class GuestRegistrationOut(BaseModel):
             specialRequests=r.get("special_requests"),
             submittedAt=r["submitted_at"],
         )
+
+
+class ConversationSessionOut(BaseModel):
+    """
+    Where one thread has got to, without reading it.
+
+    **This is the panel beside the transcript, and it is not a summary of the
+    transcript.** Every field is composed from rows: the dates and the ids from
+    `conversations.guest_profile`, which is written only from tool inputs and
+    outputs, and the money from `quotes` / `payment_orders` / `reservations` via
+    the same reader `get_booking_status` uses. Nothing here is derived from what
+    the model wrote, because a receptionist taking over a thread needs the facts
+    the guest is holding us to, not our own prose about them.
+
+    The transcript stays. It is how you find out *why*; this is how you find out
+    *where*, and forty messages is an expensive way to learn a check-in date.
+    """
+    conversationId: str
+    channel: str = ""
+    # 'ai' or 'human' — who is answering right now.
+    handler: str = ""
+    guestName: str = ""
+    guestHandle: str = ""
+    # en / hi / hinglish, as detected and stored. Empty when nobody has said
+    # enough for it to be worth guessing.
+    language: str = ""
+    # browsing → quoted → awaiting_payment → booked, or empty for a thread that
+    # has never reached one.
+    stage: str = ""
+    checkIn: date | None = None
+    checkOut: date | None = None
+    nights: int | None = None
+    units: int | None = None
+    adults: int | None = None
+    children: int | None = None
+    roomTypeName: str = ""
+    ratePlanName: str = ""
+    # The composed money state — NONE, QUOTE_ACTIVE, PAYMENT_PENDING,
+    # PAYMENT_RECEIVED, PAYMENT_FAILED, CONFIRMED, CHECKED_IN, CHECKED_OUT,
+    # CANCELLED. The same vocabulary the agent is given, so staff and AI cannot
+    # describe the same booking differently.
+    bookingState: str = "NONE"
+    ref: str = ""
+    totalPaise: int = 0
+    paidPaise: int = 0
+    balancePaise: int = 0
+    quoteExpiresAt: datetime | None = None
+    bookingUrl: str = ""
+
+
+class BookingLinkOut(BaseModel):
+    """The booking's public link after a rotation. The old one is dead."""
+    ref: str
+    url: str
+
+
+class ReceiptLineOut(BaseModel):
+    """
+    One line of a folio, as a guest may read it.
+
+    `postedByName` is deliberately absent. Which receptionist keyed a charge is
+    the hotel's business; the guest's business is what was charged and when.
+    """
+    postedAt: datetime
+    kind: str
+    description: str
+    method: str = ""
+    # Signed as the folio stores it: charges positive, payments negative. Kept
+    # signed rather than split into two lists because a receipt that does not
+    # add up to the balance is a receipt a guest will argue with.
+    amountPaise: int
+
+
+class BookingPageOut(PublicStayCore):
+    """
+    A booking as its confirmation link shows it — reference, money, receipt.
+
+    Not `PublicBookingOut`, which already exists further down this file for the
+    booking engine's confirm response. Python rebinds a duplicate class name
+    without a word, and the route kept validating against the wrong shape until
+    a live call complained about a field neither of us had written.
+
+    The parent shape is reached with a six-character reference and stays
+    correspondingly thin. This one is reached with a 128-bit token, so it can
+    afford to say more: the price breakdown behind the total, every folio line,
+    and the cancellation terms the guest agreed to.
+
+    It is still a projection, not a row. No guest id, no room number, no email,
+    no internal notes, no staff names, and no `public_token` echoed back — a
+    page that reprints its own credential is one screenshot away from sharing
+    it.
+    """
+    grossPaise: int = 0
+    discountPaise: int = 0
+    taxPaise: int = 0
+    bookedAt: datetime | None = None
+    # One sentence, not a rules object.
+    #
+    # `reservations.cancellation_policy` is a jsonb column that every row in
+    # production has left at `{}` — nothing has ever written it. The terms a
+    # guest is actually held to are the ones the hotelier wrote under
+    # `properties.policies.cancellation`, which is what the hotel's own page
+    # shows. This field prefers the reservation's snapshot when one exists,
+    # because terms at the time of booking beat terms as they stand today, and
+    # falls back to the property's. Empty means the hotel has not written any,
+    # and the page says exactly that rather than inventing a default.
+    cancellationTerms: str = ""
+    receipt: list[ReceiptLineOut] = []
+    # Absolute, because these two pages live on different hosts and the guest's
+    # browser should not have to guess which.
+    checkInUrl: str = ""
+    # So the page can link back to the hotel it is a booking at.
+    propertySlug: str = ""
+    # Whether the guest has filed their check-in details, and when — never what
+    # they wrote. A confirmation link may be forwarded to whoever is paying, and
+    # the passport details of whoever is travelling are not part of the receipt.
+    registrationSubmittedAt: datetime | None = None
 
 
 class WebCheckInRequest(BaseModel):
@@ -1462,6 +1587,18 @@ class PublicRoomOptionOut(BaseModel):
     unitsLeft: int
     ratePlans: list[RatePlanOptionOut] = []
 
+    # What a *page* about this room needs. All optional, because this model is
+    # also the availability response, where a slug and a photo are noise.
+    slug: str | None = None
+    photos: list[str] = []
+    sizeSqft: int | None = None
+    standardOccupancy: int | None = None
+    # The cheapest public rate plan's base price. A "from" figure for a
+    # brochure page and an Offer's lowPrice — never a quote. Live money comes
+    # from /availability with dates, and only ever from a server-priced quote.
+    fromPricePaise: int | None = None
+    mealPlan: str | None = None
+
 
 class PublicAvailabilityOut(BaseModel):
     checkIn: date
@@ -1499,6 +1636,55 @@ class PublicSiteOut(BaseModel):
     content: dict = {}
     services: list[PublicServiceOut] = []
     roomTypes: list[PublicRoomOptionOut] = []
+
+    # ── the facts a page about this hotel needs ─────────────────────────────
+    #
+    # Added when the hotel website moved to server rendering. A booking widget
+    # needs a slug and a price; a *page* needs a postal address, a map pin and
+    # a sentence about the place — that is the difference between something a
+    # guest can transact on and something a search or answer engine can
+    # describe. None of it is new data: every field has been on `properties`
+    # since it was created.
+    address: str | None = None
+    state: str | None = None
+    country: str | None = None
+    pincode: str | None = None
+    lat: float | None = None
+    lon: float | None = None
+    propertyType: str | None = None
+    totalRooms: int | None = None
+    # When the *page* last changed — the website's publish time, not the
+    # property row's. A rate edit is not a content change, and a lastmod that
+    # moves for reasons a reader cannot see is one Google learns to ignore.
+    updatedAt: str | None = None
+    # The hotel's own custom domain, when it has one verified. The canonical
+    # lives there rather than on travbuddy.in — a hotel that connected its own
+    # address should not have us outranking it for its own name.
+    domain: str | None = None
+
+
+class PublicHotelIndexOut(BaseModel):
+    """
+    One published hotel, in the shape a sitemap and a quality gate need.
+
+    Deliberately not the full site: this list is read to decide *which* URLs to
+    submit, and the decision needs counts rather than content. Every field here
+    is a signal in `stayosHotelGate` on the website side, and the gate and the
+    sitemap must see the same numbers or they will disagree about the same
+    hotel.
+    """
+    slug: str
+    name: str
+    city: str | None = None
+    updatedAt: str | None = None
+    domain: str | None = None
+    roomTypes: int = 0
+    roomsWithPhotos: int = 0
+    photos: int = 0
+    hasDescription: bool = False
+    hasPolicies: bool = False
+    hasLocation: bool = False
+    amenities: int = 0
 
 
 class PublicQuoteRequest(BaseModel):
@@ -2051,6 +2237,198 @@ class RoomTypeCreateRequest(BaseModel):
     # chance to stop halfway.
     priceRupees: int | None = Field(default=None, ge=1, le=1_000_000)
     mealPlan: Literal["EP", "CP", "MAP", "AP"] = "CP"
+
+
+class RoomTypeUpdateRequest(BaseModel):
+    """
+    Editing a room that already exists.
+
+    **There was no way to do this at all**, and the consequence was not
+    theoretical: every one of the 21 room types in production was created
+    before the form asked for a description, amenities or photos, so every one
+    of them had none — and no route existed that could add them. The AI
+    employee that now knows how to send room photos had nothing to send, and
+    the hotel had no way to fix that short of deleting the room and losing its
+    inventory with it.
+
+    Every field is optional and `None` means "leave it alone", which is what
+    makes this safe to call from a screen that edits one thing. Clearing a
+    field is an explicit empty value — `[]` for a list, `""` for text — because
+    a PATCH that could not distinguish "unchanged" from "cleared" would empty a
+    hotel's description the first time somebody renamed a room.
+    """
+
+    name: str | None = Field(default=None, min_length=2, max_length=80)
+    totalUnits: int | None = Field(default=None, ge=1, le=999)
+    maxOccupancy: int | None = Field(default=None, ge=1, le=30)
+    description: str | None = Field(default=None, max_length=2000)
+    bedType: str | None = Field(default=None, max_length=60)
+    sizeSqft: int | None = Field(default=None, ge=30, le=20_000)
+    amenities: list[str] | None = Field(default=None)
+    photos: list[str] | None = Field(default=None)
+    isActive: bool | None = Field(default=None)
+
+
+class ExtractedRoomType(BaseModel):
+    """One room a model read out of a hotel's own material. Nothing is required
+    except a name — "the brochure does not say" is the answer this whole flow
+    most needs to be able to carry."""
+
+    name: str
+    totalUnits: int | None = None
+    maxOccupancy: int | None = None
+    bedType: str | None = None
+    sizeSqft: int | None = None
+    description: str | None = None
+    amenities: list[str] = []
+    priceRupees: int | None = None
+    mealPlan: str | None = None
+
+
+class ExtractedHotel(BaseModel):
+    name: str | None = None
+    # The street address is the field that unlocks the map pin: address →
+    # geocode → lat/lon → "how far are you from the station?" and a hotel page
+    # that can be placed on a map. It was missing from the first version of the
+    # extractor, which is how a brochure carrying a full postal address still
+    # left a hotel with no location.
+    address: str | None = None
+    city: str | None = None
+    state: str | None = None
+    pincode: str | None = None
+    description: str | None = None
+    amenities: list[str] = []
+    checkInTime: str | None = None
+    checkOutTime: str | None = None
+    policies: dict = {}
+    meals: dict = {}
+
+
+class HotelExtractOut(BaseModel):
+    """
+    A draft, and what to tell the owner it found.
+
+    **This is not saved.** The extractor writes nothing; a person reads `found`,
+    edits what is wrong, and posts the rooms they approve back through the
+    ordinary creation route. A model that misreads "₹4,200 for two nights" as a
+    nightly rate has proposed a mistake rather than made one.
+    """
+
+    confidence: float
+    hotel: ExtractedHotel
+    roomTypes: list[ExtractedRoomType]
+    found: list[str]
+    droppedRooms: int = 0
+
+
+class HotelCorrectionOut(HotelExtractOut):
+    """
+    The same draft, corrected, plus what actually moved.
+
+    `changes` is not decoration. A hotelier who says "isme breakfast included
+    nahi hai" and is handed back a silently different draft has been asked to
+    trust a model twice; a line saying *Deluxe Balcony: meal plan breakfast →
+    room only* is a thing they can check in a second. `unclear` appears only
+    when nothing moved — a question beside a visible change is noise.
+    """
+    changes: list[str] = []
+    unclear: str | None = None
+
+
+class HotelCorrectionRequest(BaseModel):
+    """
+    The draft on the hotelier's screen, and their sentence about it.
+
+    The draft comes back from the client rather than from a server-side session
+    because nothing about the extraction is stored — that is the safety
+    argument, and keeping a draft on the server to make this route tidier would
+    quietly undo it. Anything a client sends here is bounded and re-normalised
+    on the way out, so a tampered draft can only produce a draft the same
+    hotelier must still approve.
+    """
+    draft: HotelExtractOut
+    correction: str = Field(min_length=2, max_length=2000)
+
+
+class HotelExtractRequest(BaseModel):
+    text: str = Field(min_length=20, max_length=60_000)
+
+
+class PropertyUpdateRequest(BaseModel):
+    """
+    The hotel's own facts — where it is, when it opens, what its rules are.
+
+    Every one of these was reachable only by editing Postgres by hand. That is
+    why nine of ten live hotels have no address, no coordinates and empty
+    policies, and therefore why their AI cannot answer "where are you?" and
+    their website cannot be placed on a map.
+
+    Same PATCH contract as the room route: an absent key is unchanged, an empty
+    value clears. `policies` is the exception and it is worth stating — it is
+    merged key by key rather than replaced, because the object also carries
+    commercial settings (`token_pct`, `max_discount_pct`) that the pricing
+    engine reads and no policy screen has any business overwriting.
+    """
+
+    address: str | None = Field(default=None, max_length=300)
+    city: str | None = Field(default=None, max_length=120)
+    state: str | None = Field(default=None, max_length=120)
+    country: str | None = Field(default=None, max_length=2)
+    pincode: str | None = Field(default=None, max_length=12)
+    lat: float | None = Field(default=None, ge=-90, le=90)
+    lon: float | None = Field(default=None, ge=-180, le=180)
+    propertyType: Literal[
+        "hotel", "resort", "homestay", "hostel", "boutique", "guesthouse", "villa"
+    ] | None = None
+    totalRooms: int | None = Field(default=None, ge=1, le=5000)
+    checkInTime: str | None = Field(default=None, max_length=5)
+    checkOutTime: str | None = Field(default=None, max_length=5)
+    policies: dict[str, str] | None = None
+
+
+class PropertyLocationOut(BaseModel):
+    """
+    A map pin we think is this hotel — **proposed, not saved.**
+
+    Same discipline as the brochure importer: a geocoder that writes straight to
+    the row is a geocoder whose one confident mistake puts a hotel in the wrong
+    town on its own website, in its own structured data, and in every distance
+    the AI quotes. The owner sees the address we matched and agrees to it.
+    """
+    found: bool
+    lat: float | None = None
+    lon: float | None = None
+    formattedAddress: str | None = None
+    # Said plainly rather than left to a false `found`. "We could not look this
+    # up" and "there is no such place" are different problems for a hotelier.
+    unavailable: bool = False
+
+
+class ReadinessGap(BaseModel):
+    id: str
+    label: str
+    detail: str
+    # 'agent' — the AI cannot answer a question without it.
+    # 'website' — the page will not be submitted for indexing without it.
+    affects: list[str]
+
+
+class ReadinessOut(BaseModel):
+    """
+    What is missing, named — not scored.
+    
+    A percentage tells a hotelier they are at 62% and nothing about what to do
+    next. A sentence — "your AI can't tell guests where you are" — is one tap
+    from being fixed, which is the only number that matters.
+    """
+    agentReady: bool
+    websiteIndexable: bool
+    gaps: list[ReadinessGap] = []
+
+
+class MediaUploadOut(BaseModel):
+    url: str
+    path: str
 
 
 class RatePlanCreateRequest(BaseModel):

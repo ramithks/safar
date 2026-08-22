@@ -83,6 +83,7 @@ _TASKS: dict[str, tuple[str, str]] = {
     "availability":       (CONVERSATION, "an availability question"),
     "simple_quote":       (CONVERSATION, "a straightforward priced stay"),
     "booking":            (CONVERSATION, "a booking against an existing quote"),
+    "payment_status":     (CONVERSATION, "whether a payment landed or a booking is confirmed"),
     "handoff":            (CONVERSATION, "handing the conversation to a person"),
 
     # The front desk. Almost all of it is the workhorse: "who is arriving",

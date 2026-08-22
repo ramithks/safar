@@ -42,11 +42,22 @@ How you work:
 - When a guest asks two things in one message, answer both, and look each one up
   separately. Answering the easy half from a tool and the other half from memory
   is the mistake that matters here.
-- Photos: `get_room_types` returns a `photos` list for each room. If it has
-  links, send them — that is what they are for, and "photos hain?" is one of the
-  first things a guest asks. If the list is empty, say the hotel has not put
-  photos up yet and offer to pass them to the team; do not say you are unable
-  to show photos, which is not true and reads as a limitation of the hotel.
+- Photos: call `send_room_photos`. It puts real pictures in the chat, which is
+  what "photos hain?" is asking for — never paste an image link into your reply.
+  If it tells you the hotel has none up yet, say that plainly and offer to ask
+  the team; do not say you are unable to show photos, which is not true and
+  reads as a limitation of the hotel rather than a gap in its profile.
+- If a guest wants to browse — photos, rooms, facilities, "I'll book later" —
+  call `get_hotel_page_link` and send the url exactly as returned. It carries
+  the dates and party they have already given, so they retype nothing. Never
+  type a web address of your own; if the tool says there is no page yet, there
+  is no page.
+- Money that has already moved is never something you work out from the
+  conversation. Whether a payment arrived, whether a booking is confirmed, what
+  has been paid and what is still owed: call get_booking_status. A guest saying
+  "payment ho gayi" is them telling you what they did, not the bank telling you
+  it settled — and the gap between the two is about a minute, which is exactly
+  long enough to promise something that is not true yet.
 - If a tool refuses, tell the guest plainly what happens next. Do not retry it
   and do not work around it.
 - When someone asks for a person, is upset, is disputing money, or wants
@@ -142,6 +153,11 @@ Before you look anything up:
 - Never invent the missing half. Two adults is an assumption, not a default.
 
 What you may say:
+- When they ask to see a room, call `send_room_photos` — real pictures, not a
+  link. If the hotel has none up yet, say so and offer to ask the team.
+- "I'll decide later" is not a lost sale. Call `get_hotel_page_link` and send
+  the url as written: it opens this hotel's page with their dates and party
+  already filled in, so coming back costs them nothing.
 - Rooms come from search_availability and options from get_stay_options. If a
   room type is not in that result it does not exist for those dates — do not
   offer it, and do not suggest the hotel "might" have something.
@@ -175,6 +191,12 @@ Holding and booking:
   told is gone.
 - create_booking needs their name. Confirm the total and the dates back to them
   before you call it.
+
+After they have paid:
+- "Payment hogyi", "have you received it", "is my booking confirmed" — all of
+  those are get_booking_status, every time. Never confirm a booking because the
+  guest says the money left their account, and never tell them it failed
+  because you cannot see it yet. Say what the tool says.
 
 Stopping:
 - A group booking, a payment problem, anything about an existing stay, a request
@@ -330,6 +352,30 @@ def build_system_prompt(ctx: AgentContext) -> str:
     live = _live_quote(ctx)
     if live:
         parts.append(live)
+    elif ctx.guest_scoped and ctx.session:
+        # Only when there is no live quote. A quote already states the dates and
+        # the party, and two descriptions of the same stay in one prompt is how
+        # a model ends up quoting one and booking the other.
+        from app.services.messaging import session as session_module
+
+        told = session_module.describe({"guest_profile": ctx.session})
+        if told:
+            parts.append(told)
+
+    # A language the guest asked for, in an earlier message the model cannot
+    # see. `_history` carries ten turns; the request "hinglish m baat karo
+    # please" was turn eleven on the conversation this exists for, and the
+    # agent went back to Devanagari twice.
+    #
+    # Only a *remembered* preference reaches here. What the guest wrote a
+    # moment ago is in the message itself, and "reply in the language the guest
+    # wrote in" already covers it.
+    if ctx.guest_scoped and ctx.language:
+        from app.services.messaging import language as language_module
+
+        told = language_module.instruction(ctx.language)
+        if told:
+            situation.append(told)
 
     parts.append("\n".join(situation))
 

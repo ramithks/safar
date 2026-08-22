@@ -82,11 +82,23 @@ DEFINITION = AgentDefinition(
         "get_property_policies",
         "get_property_knowledge",
         "get_room_types",
+        # Actual pictures, in the chat. "photos hain?" is one of the first
+        # things a guest asks and a link to a gallery is not an answer to it.
+        "send_room_photos",
+        # The hotel's own page, with this guest's dates already on it. A guest
+        # sent a bare URL after six messages about 11-15 September arrives at
+        # an empty date picker, and the usual thing to do with one is close the
+        # tab.
+        "get_hotel_page_link",
         "list_services",
         # What is free, and what it costs
         "search_availability",
         "get_stay_options",
         "get_quote",
+        # After the money: what actually happened, rather than what the guest
+        # believes happened. Takes no arguments, so it can only ever read this
+        # conversation's own booking.
+        "get_booking_status",
         # Price, when the guest pushes back
         "get_negotiation_policy",
         "propose_rate_exception",

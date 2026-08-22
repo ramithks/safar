@@ -274,7 +274,14 @@ async def run_turn(
     messages += history or []
     messages.append({"role": "user", "content": message})
 
-    tools = registry.describe_for_provider(ctx)
+    # Narrowed by what the classifier already decided this message is about.
+    #
+    # The classification happens above whatever else it is used for, and until
+    # now it only picked a model tier. The catalogue is about seventy per cent
+    # of the base prompt and every step re-sends it, so letting one decision do
+    # both jobs is the cheapest optimisation available here. It cannot widen a
+    # permission: see services/ai/toolsets.py.
+    tools = registry.describe_for_provider(ctx, task=task)
     outcomes: list[ToolOutcome] = []
     # usage_type -> the action rows that produced it, so a usage event can point
     # at the action rather than only at the run.
