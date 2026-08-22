@@ -2083,6 +2083,54 @@ class RoomTypeUpdateRequest(BaseModel):
     isActive: bool | None = Field(default=None)
 
 
+class ExtractedRoomType(BaseModel):
+    """One room a model read out of a hotel's own material. Nothing is required
+    except a name — "the brochure does not say" is the answer this whole flow
+    most needs to be able to carry."""
+
+    name: str
+    totalUnits: int | None = None
+    maxOccupancy: int | None = None
+    bedType: str | None = None
+    sizeSqft: int | None = None
+    description: str | None = None
+    amenities: list[str] = []
+    priceRupees: int | None = None
+    mealPlan: str | None = None
+
+
+class ExtractedHotel(BaseModel):
+    name: str | None = None
+    city: str | None = None
+    description: str | None = None
+    amenities: list[str] = []
+    checkInTime: str | None = None
+    checkOutTime: str | None = None
+    policies: dict = {}
+    meals: dict = {}
+
+
+class HotelExtractOut(BaseModel):
+    """
+    A draft, and what to tell the owner it found.
+
+    **This is not saved.** The extractor writes nothing; a person reads `found`,
+    edits what is wrong, and posts the rooms they approve back through the
+    ordinary creation route. A model that misreads "₹4,200 for two nights" as a
+    nightly rate has proposed a mistake rather than made one.
+    """
+
+    confidence: float
+    hotel: ExtractedHotel
+    roomTypes: list[ExtractedRoomType]
+    found: list[str]
+    droppedRooms: int = 0
+
+
+class HotelExtractRequest(BaseModel):
+    text: str = Field(min_length=20, max_length=60_000)
+
+
 class MediaUploadOut(BaseModel):
     url: str
     path: str

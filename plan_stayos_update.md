@@ -373,10 +373,37 @@ and twenty-one room types, and two of twenty-one have a description.
       from inside the GCS client. ⚠ **Still to do on the production
       environment**: add `GCS_BUCKET_NAME=travbuddy-media-2` in Coolify.
 
-- [ ] **4.2** AI room import: brochure/PDF/photos/website URL → Gemini
-      extraction → **draft** room types the owner reviews and approves. Reuses
-      `services/vertex.py`; writes through `onboarding.add_room_type` /
-      `update_room_type`. No second extraction pipeline, no direct writes.
+- [x] **4.2** AI room import — `services/pms/extract.py`, plus
+      `POST /properties/{id}/extract/{text,file}`.
+
+      Same gateway as the marketplace importer (`vertex.generate_json`:
+      structured output, muscle→brain ladder, region rotation, shared circuit
+      breaker) and a different target schema, because a *listing* and a *room
+      type* are different things — one has a summary and an itinerary, the
+      other has unit counts and nightly rates the availability and pricing
+      engines read. One schema pretending to be both would serve neither.
+
+      **Nothing is written.** The server reads and proposes; the owner strikes
+      out what is wrong; the approved rooms are created through the ordinary
+      `add_room_type` route. A model that misreads "₹4,200 for two nights" as a
+      nightly rate has made a proposal somebody declined, not quoted a guest.
+
+      **One real prompt bug, found by testing it rather than assuming.** The
+      first live run read a full brochure perfectly and then returned *null for
+      every price* on a short tariff table — three times out of three. The model
+      was reading each row in isolation and refusing to carry the table's own
+      header ("per room per night, breakfast included") down to its rows. One
+      rule about how to read a table fixed it, and the whole-stay case still
+      correctly returns null.
+
+      Verified live: a table, the same content as prose ("four thousand two
+      hundred rupees" → 4200), and a package price that must stay null. Route
+      isolation checked: another hotel's path is 404, text under 20 characters
+      is 422.
+- [ ] **4.2a** Extraction is offered for rooms; the hotel-level fields it
+      already returns — description, facilities, check-in/out, policies, meals
+      — are extracted and shown but not yet applied to `properties`. That is
+      Phase 5.1 and needs the same review-then-approve gate.
 - [ ] **4.3** Conversational correction of an extracted draft ("isme breakfast
       included nahi hai") mapping to the structured field.
 - [ ] **4.4** Instagram media send: attach room photos as real IG attachments

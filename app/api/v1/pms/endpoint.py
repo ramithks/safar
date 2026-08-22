@@ -139,6 +139,10 @@ from app.api.v1.pms.schemas import (
     ReservationOut,
     RoomOut,
     RoomStatusRequest,
+    ExtractedHotel,
+    ExtractedRoomType,
+    HotelExtractOut,
+    HotelExtractRequest,
     MediaUploadOut,
     RoomTypeOut,
     RoomTypeUpdateRequest,
@@ -180,6 +184,7 @@ from app.services.pms import website as website_service
 from app.services.pms import domains as domains_service
 from app.services import razorpay
 from app.config import settings
+from app.services.pms import extract as pms_extract
 from app.storage import gcs
 from app.services.ai import approvals
 from app.services.ai.errors import AgentError
@@ -370,6 +375,103 @@ async def update_room_type(
         },
     )
     return RoomTypeOut.from_row(row)
+
+
+# What a hotel's own material may arrive as.
+#
+# PDFs and images both, because a hotel's rate sheet is whichever of the two
+# somebody had to hand — a designed brochure or a photograph of a laminated
+# card at the desk. Gemini reads both natively, so neither needs converting.
+_EXTRACT_TYPES = {
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "text/plain",
+}
+_EXTRACT_MAX_BYTES = 12 * 1024 * 1024
+
+
+def _extract_out(draft: dict) -> HotelExtractOut:
+    return HotelExtractOut(
+        confidence=draft["confidence"],
+        hotel=ExtractedHotel(**draft["hotel"]),
+        roomTypes=[ExtractedRoomType(**r) for r in draft["roomTypes"]],
+        found=draft.get("found") or [],
+        droppedRooms=draft.get("droppedRooms") or 0,
+    )
+
+
+@router.post("/properties/{property_id}/extract/text", response_model=HotelExtractOut)
+@limiter.limit("30/hour")
+async def extract_hotel_from_text(
+    request: Request,
+    property_id: str,
+    body: HotelExtractRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    Read pasted material — a website page, a rate email — into a draft.
+
+    **Writes nothing.** The owner reads what it found, corrects what is wrong,
+    and creates the rooms they approve through the ordinary route. That
+    separation is the whole safety argument: a model that misreads "₹4,200 for
+    two nights" as a nightly rate has proposed a mistake, not made one.
+    """
+    try:
+        draft = await pms_extract.extract_hotel(text=body.text)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[pms] extraction failed for %s", property_id)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "We couldn't read that just now. Please try again, or add the rooms yourself.",
+        ) from exc
+    return _extract_out(draft)
+
+
+@router.post("/properties/{property_id}/extract/file", response_model=HotelExtractOut)
+@limiter.limit("30/hour")
+async def extract_hotel_from_file(
+    request: Request,
+    property_id: str,
+    file: UploadFile = File(...),
+    member=Depends(require_member("rates")),
+):
+    """
+    The same, from a brochure or a photograph of a rate card.
+
+    Not stored. The bytes are read into the model call and dropped — a document
+    a hotel sends to have read is not a document they asked us to keep, and the
+    only thing worth persisting out of it is the draft they approve.
+    """
+    mime = (file.content_type or "").split(";")[0].strip().lower()
+    if mime not in _EXTRACT_TYPES:
+        raise HTTPException(
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            "Send a PDF, a photo of your rate card, or paste the text.",
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No file received.")
+    if len(data) > _EXTRACT_MAX_BYTES:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            "That file is over 12 MB. Please send a smaller one.",
+        )
+
+    try:
+        if mime == "text/plain":
+            draft = await pms_extract.extract_hotel(text=data.decode("utf-8", "replace"))
+        else:
+            draft = await pms_extract.extract_hotel(file_bytes=data, mime_type=mime)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[pms] extraction failed for %s", property_id)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "We couldn't read that just now. Please try again, or add the rooms yourself.",
+        ) from exc
+    return _extract_out(draft)
 
 
 # What a hotel may upload, and how much of it.
