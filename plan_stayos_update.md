@@ -949,6 +949,46 @@ onboarding 65 · golden 88 · ai 98 · sales 185 · instagram 70 · payment stat
 
 ---
 
+## Deployment, verified against production 2026-08-23
+
+Checked by calling the live hosts, not by reading a dashboard.
+
+**Live and correct**
+
+- StayOS backend (Coolify): `/public/hotels` 200, `/public/bookings/{token}` 200
+  on a real token and 404 on an unknown one, `readiness`, `extract/correct`, the
+  session panel, and photo upload straight through to
+  `travbuddy-media-2` with a publicly readable URL.
+- Website (Vercel): `/book`, `/book/{slug}`, `/book/{slug}/rooms/{room}`, and
+  `/b/{token}` all render. Robots match the gate per hotel — Casa Mandala
+  `index, follow`, the three hotels with no photos `noindex`. `/b/` is
+  `noindex, nofollow, nocache`. The canonical stays the bare hotel URL under
+  `?checkin=&checkout=&adults=&rooms=`. JSON-LD carries LodgingBusiness,
+  HotelRoom, Offer + UnitPriceSpecification, FAQPage and BreadcrumbList. Both
+  StayOS sitemap sections are in the index and `/api/revalidate` refuses a
+  wrong secret and purges all five paths with the right one.
+
+**Two things still outstanding**
+
+- [ ] **The partner app has not been redeployed.** The bundle at
+      partner.travbuddy.in contains Phase 5's readiness panel and none of this
+      work — no session panel, no draft correction. The commits are pushed;
+      the Vercel project just has not rebuilt.
+- [ ] **`REVALIDATE_SECRET` is not set on the StayOS backend.** Proven rather
+      than assumed: re-publishing Casa Mandala moved the backend's `updatedAt`
+      to 19:47:54 and left the website's sitemap on 09:31:02; a manual purge
+      with the same payload moved it immediately. The receiver works and the
+      sender is silent. Consequence is staleness up to an hour after a
+      hotelier publishes, not a break — `seo_ping` never raises.
+
+**Not a deployment problem, but the thing standing between this and traffic:**
+three of the four live hotels have **zero photos**, so they are `noindex` by
+the gate and will stay that way. That is exactly what the readiness panel
+exists to tell them — and the readiness panel is in the app that has not been
+redeployed.
+
+---
+
 ## Decisions taken
 
 - **No new booking, payment, memory or pricing system.** Everything below hangs
