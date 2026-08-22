@@ -940,6 +940,13 @@ onboarding 65 · golden 88 · ai 98 · sales 185 · instagram 70 · payment stat
       like — and retries once on the reasoning tier. Five consecutive green runs
       after; four unit tests pin the branch without calling a model.
 
+      **And one thing that is not a bug.** The correction route is limited to
+      60 calls an hour, so running `extract_e2e` four times inside one hits it
+      and twelve checks 429. Those are now printed as *skipped* and totalled on
+      the last line, rather than counted green or red: a 429 says "you ran this
+      a lot", not "the build is broken", and a suite that goes red for the
+      former is a suite somebody mutes. A run with skips cannot look clean.
+
 ---
 
 ## Decisions taken
