@@ -287,6 +287,61 @@ def main():
                  {"roomTypeId": rt_id, "numbers": ["101"]}, auth)
     check("and room 101 cannot be created a second time", st == 422, f"{st} {str(r)[:160]}")
 
+    # ── 7b. the room they already made, given photos ─────────────────────────
+    #
+    # Every room type in production was created before the form asked for a
+    # description, amenities or photos, and there was no route that could add
+    # them afterwards — so every one of them had none, and the AI employee that
+    # had just been taught to send room photos had nothing to send. A guest
+    # mid-purchase asked "photos hain?" and was told the hotel had not put any
+    # up.
+    print("\n── 7b. adding what a room was missing, after the fact ──")
+
+    st, before = http(f"{API}/properties/{prop_id}/room-types", headers=auth)
+    made = next((r for r in before if r["id"] == rt_id), {})
+    check("the room starts with nothing to show a guest",
+          made.get("photos") == [] and not made.get("description"),
+          str({k: made.get(k) for k in ("photos", "description")}))
+
+    st, edited = http(
+        f"{API}/properties/{prop_id}/room-types/{rt_id}", "PATCH",
+        {"photos": ["https://cdn.example/garden-1.jpg",
+                    "https://cdn.example/garden-2.jpg"],
+         "description": "A stone cottage in the garden, with its own veranda.",
+         "amenities": ["AC", "ac", " WiFi ", ""],
+         "bedType": "1 king bed"},
+        auth,
+    )
+    check("the room can be edited after it exists", st == 200, f"{st} {str(edited)[:200]}")
+    check("its photos are stored", len(edited.get("photos") or []) == 2,
+          str(edited.get("photos")))
+    check("its description is stored", bool(edited.get("description")),
+          str(edited.get("description"))[:80])
+    check("amenities a person typed are cleaned up",
+          edited.get("amenities") == ["AC", "WiFi"], str(edited.get("amenities")))
+
+    # The contract that makes this safe to call from a screen editing one field.
+    st, renamed = http(f"{API}/properties/{prop_id}/room-types/{rt_id}", "PATCH",
+                       {"name": "Garden Cottage"}, auth)
+    check("a field nobody sent is left alone",
+          st == 200 and renamed.get("description") == edited.get("description")
+          and len(renamed.get("photos") or []) == 2,
+          f"{st} {str(renamed)[:200]}")
+
+    st, cleared = http(f"{API}/properties/{prop_id}/room-types/{rt_id}", "PATCH",
+                       {"photos": []}, auth)
+    check("and a field sent empty is cleared",
+          st == 200 and cleared.get("photos") == [], f"{st} {str(cleared)[:160]}")
+
+    # Put them back: section 10 sells this room, and a hotel selling a room with
+    # no photos is the state this whole section exists to end.
+    http(f"{API}/properties/{prop_id}/room-types/{rt_id}", "PATCH",
+         {"photos": ["https://cdn.example/garden-1.jpg"]}, auth)
+
+    st, r = http(f"{API}/properties/{prop_id}/room-types/{rt_id}", "PATCH",
+                 {"maxOccupancy": 99}, auth)
+    check("the same limits apply as when creating one", st == 422, f"{st} {str(r)[:160]}")
+
     # ── 8. cross-tenant ──────────────────────────────────────────────────────
     print("\n── 8. none of this reaches another hotel ──")
     st, r = http(f"{API}/properties/{OTHER_PROPERTY}/room-types", "POST",
@@ -295,6 +350,12 @@ def main():
     st, r = http(f"{API}/properties/{OTHER_PROPERTY}/rate-plans", "POST",
                  {"roomTypeId": rt_id, "priceRupees": 1}, auth)
     check("nor a rate", st == 404, f"{st} {str(r)[:120]}")
+    st, r = http(f"{API}/properties/{OTHER_PROPERTY}/room-types/{rt_id}", "PATCH",
+                 {"name": "Mine now"}, auth)
+    check("nor edit a room through another hotel's path", st == 404, f"{st} {str(r)[:120]}")
+    st, r = http(f"{API}/properties/{OTHER_PROPERTY}/media", "POST", {}, auth)
+    check("nor upload a photo into another hotel's folder",
+          st in (404, 422), f"{st} {str(r)[:120]}")
     st, r = http(f"{API}/properties/{OTHER_PROPERTY}/activate", "POST", {}, auth)
     check("nor take it live", st == 404, f"{st} {str(r)[:120]}")
     st, r = http(f"{API}/properties/{OTHER_PROPERTY}/onboarding", headers=auth)

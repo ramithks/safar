@@ -335,20 +335,61 @@ instagram_e2e 70.
 
 ## Phase 4 — Photos and rooms worth showing
 
-The photo tool works; the shelves are empty.
+The photo tool works. The shelves are empty: zero photos across ten properties
+and twenty-one room types, and two of twenty-one have a description.
 
-- [ ] **4.1** `add-room.tsx`: photo upload (multi), description, bed type,
-      size, amenities, occupancy. Store to the existing media path.
+- [x] **4.1** — done, and it turned out to be three missing things rather than
+      one form field.
+
+      * **There was no way to edit a room at all.** Only `GET` and `POST`
+        existed on `/room-types`. Every room type in production was created
+        before the form asked for a description, amenities or photos, so every
+        one had none — and the only "fix" was to delete the room, which takes
+        its inventory, its rate plans and its history with it. New:
+        `PATCH /properties/{id}/room-types/{room_type_id}`, where an absent key
+        means unchanged and an empty value means cleared. Without that
+        distinction, renaming a room would silently empty its description.
+      * **There was nowhere to put a file.** The form asked for photo *links*
+        — "paste them from your website, or Instagram" — because StayOS had no
+        image storage. Every hotel answered it with nothing. New:
+        `POST /properties/{id}/media`, multipart, property-scoped prefix built
+        server-side, 5 MB, JPG/PNG/WebP/AVIF, straight to the GCS bucket the
+        marketplace already uses. Proven live: 201, public URL fetched back
+        byte-identical, prefix correct, SVG refused 415.
+      * **No screen showed what was missing.** The Rooms page was a
+        housekeeping board; room types appeared only as a lookup. New
+        `RoomTypesPanel` — a card per room type with its cover photo, and where
+        a room is incomplete, a sentence rather than a progress bar: *"Your AI
+        can't tell guests about photos or a description yet."* Editing is
+        inline, on the screen an owner already opens.
+      * `PhotoPicker` uploads as each file is chosen, not on submit: the
+        slowest part of the form should not run at the moment the owner thinks
+        they are finished, on a connection that may not survive it.
+
+      **Deployment change, recorded in `DEPLOYING_STAYOS.md`:** `GCS_BUCKET_NAME`
+      was on that document's *"must NOT be set"* list — correct until StayOS
+      grew an uploader. It is now required, and its absence answers 503 with a
+      readable sentence and a log line naming the variable, rather than a 500
+      from inside the GCS client. ⚠ **Still to do on the production
+      environment**: add `GCS_BUCKET_NAME=travbuddy-media-2` in Coolify.
+
 - [ ] **4.2** AI room import: brochure/PDF/photos/website URL → Gemini
       extraction → **draft** room types the owner reviews and approves. Reuses
-      `services/vertex.py`; writes through `onboarding.add_room_type`.
-      No second extraction pipeline, no direct writes.
+      `services/vertex.py`; writes through `onboarding.add_room_type` /
+      `update_room_type`. No second extraction pipeline, no direct writes.
 - [ ] **4.3** Conversational correction of an extracted draft ("isme breakfast
       included nahi hai") mapping to the structured field.
 - [ ] **4.4** Instagram media send: attach room photos as real IG attachments
       where the API allows; fall back to the room page link.
-- [ ] **4.5** Completeness score per property (rooms, photos, policies, meals,
-      location) shown on the setup checklist.
+- [ ] **4.5** Completeness score per property, extending the per-room gaps the
+      panel already shows.
+
+Tests: `tests/test_room_type_edit.py` (18) on the PATCH contract and its
+isolation, plus a new section in `scripts/onboarding_e2e.py` (65 total) proving
+it over real HTTP with a real token and real RLS — including that another
+hotel's room cannot be edited or written to through its path.
+
+Suites green afterwards: 1,147 unit · onboarding_e2e 65 · golden_e2e 88.
 
 ## Phase 5 — Hotel onboarding, AI-assisted
 

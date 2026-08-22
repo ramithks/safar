@@ -21,12 +21,17 @@ marketplace/partner_ops.py.
 # NOTE: deliberately no `from __future__ import annotations` — PEP 563 breaks
 # FastAPI body resolution through slowapi's wrapper. Same note as
 # api/v1/admin/endpoint.py.
+import asyncio
 import json
 import re
 import logging
+import uuid
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter, Depends, File, Form, Header, HTTPException, Query, Request,
+    UploadFile, status,
+)
 
 from app.api.v1.pms.schemas import (
     PaymentLinkOut,
@@ -134,7 +139,9 @@ from app.api.v1.pms.schemas import (
     ReservationOut,
     RoomOut,
     RoomStatusRequest,
+    MediaUploadOut,
     RoomTypeOut,
+    RoomTypeUpdateRequest,
     SendMessageRequest,
     StayOptionOut,
     SyncOut,
@@ -172,6 +179,8 @@ from app.services.pms import sync as sync_service
 from app.services.pms import website as website_service
 from app.services.pms import domains as domains_service
 from app.services import razorpay
+from app.config import settings
+from app.storage import gcs
 from app.services.ai import approvals
 from app.services.ai.errors import AgentError
 from app.services.ai import console as ai_console
@@ -320,6 +329,151 @@ async def create_room_type(
         photos=body.photos,
     )
     return RoomTypeOut.from_row(room_type)
+
+
+@router.patch(
+    "/properties/{property_id}/room-types/{room_type_id}", response_model=RoomTypeOut
+)
+@limiter.limit("120/hour")
+async def update_room_type(
+    request: Request,
+    property_id: str,
+    room_type_id: str,
+    body: RoomTypeUpdateRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    Change a room that already exists — including adding the photos it never had.
+
+    **There was no route for this**, and that is why every room type in
+    production carried a null description, no amenities and no photos: they were
+    all created before the form asked, and the only way to "fix" one was to
+    delete it and lose its inventory, its rate plans and its history.
+
+    `exclude_unset` is the whole contract. A field the client did not send is
+    left alone; a field sent empty is cleared. Without that distinction, a screen
+    that renames a room would silently empty its description, which is the exact
+    shape of bug that produced the state this route exists to repair.
+    """
+    row = await onboarding_service.update_room_type(
+        property_id=property_id,
+        room_type_id=room_type_id,
+        fields={
+            {
+                "totalUnits": "total_units",
+                "maxOccupancy": "max_occupancy",
+                "bedType": "bed_type",
+                "sizeSqft": "size_sqft",
+                "isActive": "is_active",
+            }.get(key, key): value
+            for key, value in body.model_dump(exclude_unset=True).items()
+        },
+    )
+    return RoomTypeOut.from_row(row)
+
+
+# What a hotel may upload, and how much of it.
+#
+# Deliberately the same four types and the same 5 MB ceiling as the marketplace
+# uploader: a hotelier photographing a room on a phone produces a 3–4 MB JPEG,
+# and anything stricter would reject the ordinary case.
+_MEDIA_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/avif": "avif",
+}
+_MEDIA_MAX_BYTES = 5 * 1024 * 1024
+_MEDIA_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+
+@router.post(
+    "/properties/{property_id}/media", response_model=MediaUploadOut, status_code=201
+)
+@limiter.limit("240/hour")
+async def upload_property_media(
+    request: Request,
+    property_id: str,
+    file: UploadFile = File(...),
+    folder: str = Form(default="rooms"),
+    member=Depends(require_member("rates")),
+):
+    """
+    A photo, stored, and a URL that works.
+
+    **Why this had to exist before the photo tool could be useful.** The room
+    form asked for photo *links* — "paste them from your website, or Instagram"
+    — because StayOS had no image storage, and every hotel on it responded by
+    entering none. Zero photos across ten properties. An AI employee that has
+    been taught to send room photos and has none to send is the same product it
+    was before, with a better excuse.
+
+    Server-side rather than a browser→bucket upload, for the reason the
+    partner-media incident established: Storage did not honour the project's
+    ES256 JWT and fell back to `anon`, 403-ing authenticated uploads. Routing
+    through here removes that failure mode and keeps the storage credential in
+    the backend, which is the point of having one.
+
+    **The path is built here and the property id comes from the verified
+    membership path parameter, never from the body.** `folder` is a label
+    inside a path we construct, stripped of anything that could add a segment or
+    climb out of this hotel's prefix — a hotel cannot write into another hotel's
+    photos whatever it sends.
+    """
+    mime = (file.content_type or "").split(";")[0].strip().lower()
+    ext = _MEDIA_TYPES.get(mime)
+    if not ext:
+        raise HTTPException(
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            "Please upload a JPG, PNG, WebP or AVIF image.",
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No file received.")
+    if len(data) > _MEDIA_MAX_BYTES:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            "That image is over 5 MB. Please upload a smaller one.",
+        )
+
+    # Checked before the file is read rather than discovered inside the client.
+    #
+    # StayOS is a separate deployment from the marketplace and does not inherit
+    # its environment: `GCS_BUCKET_NAME` and the service account are set on one
+    # and were not on the other. Without this, a hotelier uploading their first
+    # room photo got "that upload did not go through" — which reads as their
+    # connection, sends them to try again, and never mentions the one fact that
+    # would let anybody fix it.
+    if not settings.gcs_bucket_name:
+        logger.error(
+            "[pms] photo upload attempted with no GCS_BUCKET_NAME configured; "
+            "StayOS needs GCS_BUCKET_NAME and GOOGLE_SERVICE_ACCOUNT_JSON in "
+            "its environment",
+        )
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Photo uploads are not switched on for this hotel yet. "
+            "We have been told — please try again shortly.",
+        )
+
+    safe_folder = re.sub(r"[^a-z0-9-]", "", folder or "", flags=re.I)[:32] or "rooms"
+    path = f"stayos/{property_id}/{safe_folder}/{uuid.uuid4()}.{ext}"
+
+    try:
+        # to_thread: the GCS client is blocking and a 5 MB PUT would otherwise
+        # sit on the event loop for the duration of the upload.
+        public = await asyncio.to_thread(
+            gcs.upload_bytes, path, data, mime, True, _MEDIA_CACHE_CONTROL
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[pms] media upload failed for %s", property_id)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "That upload did not go through. Please try again.",
+        ) from exc
+
+    return MediaUploadOut(url=public, path=path)
 
 
 @router.post("/properties/{property_id}/rate-plans", response_model=RatePlanOut, status_code=201)

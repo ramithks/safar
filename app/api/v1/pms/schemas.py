@@ -2053,6 +2053,41 @@ class RoomTypeCreateRequest(BaseModel):
     mealPlan: Literal["EP", "CP", "MAP", "AP"] = "CP"
 
 
+class RoomTypeUpdateRequest(BaseModel):
+    """
+    Editing a room that already exists.
+
+    **There was no way to do this at all**, and the consequence was not
+    theoretical: every one of the 21 room types in production was created
+    before the form asked for a description, amenities or photos, so every one
+    of them had none — and no route existed that could add them. The AI
+    employee that now knows how to send room photos had nothing to send, and
+    the hotel had no way to fix that short of deleting the room and losing its
+    inventory with it.
+
+    Every field is optional and `None` means "leave it alone", which is what
+    makes this safe to call from a screen that edits one thing. Clearing a
+    field is an explicit empty value — `[]` for a list, `""` for text — because
+    a PATCH that could not distinguish "unchanged" from "cleared" would empty a
+    hotel's description the first time somebody renamed a room.
+    """
+
+    name: str | None = Field(default=None, min_length=2, max_length=80)
+    totalUnits: int | None = Field(default=None, ge=1, le=999)
+    maxOccupancy: int | None = Field(default=None, ge=1, le=30)
+    description: str | None = Field(default=None, max_length=2000)
+    bedType: str | None = Field(default=None, max_length=60)
+    sizeSqft: int | None = Field(default=None, ge=30, le=20_000)
+    amenities: list[str] | None = Field(default=None)
+    photos: list[str] | None = Field(default=None)
+    isActive: bool | None = Field(default=None)
+
+
+class MediaUploadOut(BaseModel):
+    url: str
+    path: str
+
+
 class RatePlanCreateRequest(BaseModel):
     roomTypeId: str
     priceRupees: int = Field(ge=1, le=1_000_000)

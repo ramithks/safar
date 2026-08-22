@@ -429,6 +429,98 @@ async def add_room_type(
     )
 
 
+def _update_room_type(property_id: str, room_type_id: str, fields: dict) -> dict:
+    """
+    Change a room that already exists.
+
+    **The gap this closes.** Every one of the 21 room types in production was
+    created before the form asked for a description, amenities or photos — and
+    there was no route that could add them afterwards. The AI employee that had
+    just been taught to send room photos had nothing to send, and a hotelier
+    who wanted to fix that could only delete the room, which takes its
+    inventory, its rate plans and its history with it.
+
+    `fields` has already been reduced to what the caller actually set: a PATCH
+    that could not tell "unchanged" from "cleared" would empty a hotel's
+    description the first time somebody renamed a room.
+    """
+    db = get_db()
+
+    existing = (
+        db.table("room_types").select("*")
+        .eq("id", room_type_id).eq("property_id", property_id)
+        .limit(1).execute().data or []
+    )
+    if not existing:
+        raise _bad("That room type is not one of yours.")
+    row = existing[0]
+
+    patch: dict = {}
+
+    if "name" in fields:
+        name = str(fields["name"] or "").strip()
+        if len(name) < 2:
+            raise _bad("Give this room a name — what your guests would call it.")
+        clash = [
+            r for r in (
+                db.table("room_types").select("id,name")
+                .eq("property_id", property_id).execute().data or []
+            )
+            if (r["name"] or "").strip().lower() == name.lower() and r["id"] != room_type_id
+        ]
+        if clash:
+            raise _bad(f"You already have a room type called \u201c{name}\u201d.")
+        patch["name"] = name
+
+    if "total_units" in fields:
+        units = int(fields["total_units"])
+        if units < 1 or units > 999:
+            raise _bad("How many of these rooms do you have? Enter a number between 1 and 999.")
+        patch["total_units"] = units
+
+    if "max_occupancy" in fields:
+        occupancy = int(fields["max_occupancy"])
+        if occupancy < 1 or occupancy > 30:
+            raise _bad("How many people sleep in this room? Enter a number between 1 and 30.")
+        patch["max_occupancy"] = occupancy
+        # Kept consistent rather than left behind: a room whose maximum drops to
+        # 1 must not still claim a standard occupancy of 2, which is what every
+        # indicative price is computed from.
+        patch["standard_occupancy"] = min(row.get("standard_occupancy") or 2, occupancy)
+
+    for key, column in (("description", "description"), ("bed_type", "bed_type")):
+        if key in fields:
+            patch[column] = (str(fields[key] or "").strip() or None)
+
+    if "size_sqft" in fields:
+        patch["size_sqft"] = fields["size_sqft"]
+
+    if "amenities" in fields:
+        patch["amenities"] = _clean_list(fields["amenities"], limit=30, length=60)
+
+    if "photos" in fields:
+        patch["photos"] = _clean_list(fields["photos"], limit=12, length=500)
+
+    if "is_active" in fields:
+        patch["is_active"] = bool(fields["is_active"])
+
+    if not patch:
+        return row
+
+    patch["updated_at"] = "now()"
+    updated = (
+        db.table("room_types").update(patch)
+        .eq("id", room_type_id).eq("property_id", property_id)
+        .execute().data or []
+    )
+    return updated[0] if updated else row
+
+
+async def update_room_type(*, property_id: str, room_type_id: str, fields: dict) -> dict:
+    """See `_update_room_type`. `fields` is already the set the caller sent."""
+    return await run_db(_update_room_type, property_id, room_type_id, fields)
+
+
 def _delete_room_type(property_id: str, room_type_id: str) -> None:
     db = get_db()
     db.table("room_types").delete().eq("id", room_type_id) \

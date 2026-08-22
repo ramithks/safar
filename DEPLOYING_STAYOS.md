@@ -69,13 +69,31 @@ changing.
 > code. Verified: with it set, `stayos_backend_check.py` goes 20/20; without it
 > and with `.env` present, `/docs` answers 200.
 
+### Required for room photos
+
+| Variable | Value | Why |
+| --- | --- | --- |
+| `GCS_BUCKET_NAME` | `travbuddy-media-2` | Where a hotel's room photos are stored. **This used to be on the "must not be set" list**, on the reasoning that GCS belonged to the reels pipeline and the marketplace — true until StayOS grew an uploader. |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | the same service account the marketplace uses | Credentials for the bucket above. Already required by the Vertex client, so on a working StayOS deployment it is present. |
+
+Without the bucket name, `POST /properties/{id}/media` answers **503** with a
+sentence a hotelier can read and a log line naming the missing variable — rather
+than the 500 it would otherwise throw from inside the GCS client. That is on
+purpose: a hotelier uploading their first room photo and being told "that upload
+did not go through" reads it as their own connection, tries again, and never
+mentions the one fact that would let anybody fix it.
+
+Photos matter more than they sound. Every room type in production carried no
+photos for months; a guest mid-purchase asked "photos hain?" and was told the
+hotel had not put any up.
+
 ### Must NOT be set at all
 
 | Variable | Why |
 | --- | --- |
 | `SUPABASE_JWT_SECRET` | The marketplace's HS256 secret. StayOS tokens are ES256 and verify through JWKS. Copying it means an HS256 token would be checked against the wrong key; leaving it unset makes `app/deps/auth.py` refuse one loudly. |
 | `GOOGLE_MAPS_API_KEY` | The Places client init is wrapped in a try/except and logs "non-fatal" on failure, and no PMS route touches it. A secret a service does not use should not be on it. |
-| `GCS_BUCKET_NAME`, `INSTAGRAM_PROXY_URL` | The reels pipeline and its scraper — marketplace only. `INSTAGRAM_PROXY_URL` is not the Instagram inbox; that is `INSTAGRAM_ACCESS_TOKEN`. |
+| `INSTAGRAM_PROXY_URL` | The reels scraper — marketplace only. Not the Instagram inbox; that is `INSTAGRAM_ACCESS_TOKEN`. |
 | `WHATSAPP_TEST_RECIPIENT`, `WHATSAPP_TEST_PHONE_NUMBER_ID` | Only `scripts/meta_smoke.py` reads them, and it sends a real message. |
 
 > ⚠ Do not paste `.env.hotelos` into Coolify. It is a **development** file:
