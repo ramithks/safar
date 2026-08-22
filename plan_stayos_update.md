@@ -1002,3 +1002,161 @@ redeployed.
   is the one place that composes them into the vocabulary the brief asks for.
 - **Backend decides booking status; the model reports it.** Unchanged, and
   Phase 1.5 keeps the guardrail honest rather than loosening it.
+
+---
+
+# Phase 10 — Production hardening ✅ DONE
+
+Written 2026-08-23. The brief for this phase was different from every phase
+above it: *make what exists safe to point at real hotels*, not build anything
+new. So the audit came first and the rule was that nothing gets rebuilt.
+
+**What the audit found that the phases above had not.** Most of the brief's
+forty-four sections were already satisfied — RLS on all 72 tables through
+`owns_partner`/`has_partner_perm`, every public route rate-limited on a
+verified key, both webhooks HMAC'd over raw bytes, the settlement race decided
+by Postgres rather than by a lock, tools scoped to the conversation. What was
+wrong was narrower and worse.
+
+## 10.1 The money path
+
+- [x] **Razorpay's retry could never reach the order it was meant to save.**
+      `payments.release()` puts a claimed order back to `created` when
+      fulfilment fails and the handler 500s so Razorpay comes back — the whole
+      recovery story for "the guest paid and the room sold in the seconds
+      between". It could not work: `razorpay_webhook_events.status` defaults to
+      `processed` at insert, the retry carries the same `x-razorpay-event-id`,
+      and `claim` refused it. The order sat at `created` with a
+      `failure_reason` and nobody ever came back for it.
+
+      Latent — `orders_paid_no_reservation` was 0 — because fulfilment has
+      never failed in production. It is the one failure the entire payment
+      design exists to survive.
+
+      `webhook_log.release()` marks the row reclaimable rather than deleting it
+      (that table is the only record of what Razorpay actually sent), and
+      `_claim` reclaims through a conditional UPDATE so two simultaneous
+      retries produce one handler. The order branch now marks its outcomes,
+      which it never did.
+
+- [x] **Four surfaces, four different balances.** `_amount_due` was written in
+      Phase 6 because a folio's raw sum is negative before arrival — a guest
+      with ₹43,008 to pay was shown "₹-10,752". It landed on two of the four
+      places that answer the question. Still wrong: the booking-engine
+      confirmation (raw `folio_balance`), the agent and inbox panel
+      (`max(0, total-paid)`, blind to an in-house guest's extras), and
+      `ReservationOut` (`total - paid`, unclamped) — a fifth nobody had counted.
+
+      `services/pms/money` is the only one now. Two things fell out of doing it:
+      an `adjustment` was being counted as the guest paying (it is the hotel
+      writing money off), and a refund as something they were charged for.
+      `folio_states` replaces `folio_balances` on the grouped reads, because a
+      sum alone cannot tell a pre-arrival deposit from a settled guest.
+
+## 10.2 The agent
+
+- [x] **Python exception text was reaching the model.** `registry.execute` built
+      the refusal reason out of the exception — `get_quote failed: APIError:
+      JSON object requested, multiple (or no) rows returned` — and handed it
+      over, which is how a guest was told *"quote generate karne mein takleef ho
+      rahi hai"*. `AgentError` carries three messages now; the row keeps the
+      exception.
+- [x] **A guardrail for the machine showing through.** The first rule here that
+      fires on a reply which is entirely *true*: "mujhe ek quote ID ki zarurat
+      hai" is accurate and useless. Also raw uuids, tool and table names, vendor
+      and stack words, and the model reciting its own instructions. Validated
+      against every distinct reply this system has ever sent — one matched, and
+      it was that sentence.
+- [x] **Tiered timeouts and a turn budget.** ⑨.2 recorded that a turn took 107
+      seconds and left the decision to somebody. `hotel_model_timeout_seconds`
+      is per *request* and a turn makes up to six of them, so nothing bounded
+      what a guest waits. Per-tier timeouts, plus `budget` over the whole turn:
+      spending it stops the loop asking for another tool round and gives the
+      model one last step to answer with what it has. Numbers from the measured
+      distribution, not from taste.
+- [x] **Session lifecycle.** `merge` was `{**profile, **patch}` with no eraser,
+      so a booked September stay stayed on the thread for ever and `describe()`
+      put its dates into an October prompt. New dates supersede, a confirmation
+      closes, 72 hours retires. Language never goes.
+- [x] Prompt-injection ground rule, worded without naming permissions or
+      autonomy — `test_the_system_prompt_states_no_rule_the_tables_enforce` is
+      right that a fence described in a prompt is one somebody can argue with.
+
+## 10.3 Security
+
+- [x] `is_admin()` was SECURITY DEFINER with **no `search_path`** and callable
+      by `anon`. Every other definer in the schema pins `public, pg_temp`. Pinned
+      and revoked; 14 trigger functions pinned alongside it, and three trigger
+      functions PostgREST was exposing as anon-callable RPCs revoked. Zero
+      mutable search paths remain.
+- [x] Uploads trusted `file.content_type` — a client-written header — for both
+      the stored extension and the `Content-Type` on a publicly readable object.
+      `services/pms/uploads` reads the bytes, on both the gallery and the
+      extractor, and refuses a contradiction rather than correcting it. Also
+      reads dimensions, which a size limit cannot stand in for: a 40,000-square
+      PNG is a few hundred kilobytes and 6.4 GB decoded.
+- [x] Two Instagram deliveries in the same millisecond both passed the select and
+      the second hit the unique index — a 500 for the **whole batch**, so one
+      racing message cost the other five their acknowledgement. Reads the
+      index's answer now.
+- [x] `/api/revalidate` compared its secret with `!==`.
+
+## 10.4 Operations
+
+- [x] **One correlation id** from the webhook, across Celery, through the turn,
+      to the booking. A ContextVar (it survives `await` and the executor
+      `run_db` uses) and a logging Filter on the root (so library records get it
+      too). Closed field list — an open dict is how a phone number ends up in a
+      log aggregator for a year.
+- [x] **A preflight that says what is missing, at boot, at WARNING.**
+      `REVALIDATE_SECRET` was unset and `seo_ping` reported it at `debug`; the
+      behaviour was right and the volume was wrong, and it cost a day of stale
+      pages. Never logs a value.
+- [x] **Demo data stops being a production signal.** `Casa Mandala` is a
+      fictional hotel in Anjuna and was the **only** StayOS hotel in the sitemap
+      and submitted to IndexNow — it passed the quality gate, which made it the
+      dangerous case rather than the safe one. `properties.is_demo` on the six
+      seeded properties; the four real ones untouched.
+
+## 10.5 The suites, which were not as green as this file said
+
+- [x] `payment_status_e2e` books through the *real* payment path, so
+      `_fulfil_booking` names the reservation — a random `TB-XXXXXX`, which is
+      the point, and which `prefixes` could never sweep. Two of ten rooms went
+      every run and stayed gone; ten stranded stays were sitting on the sales
+      property and the eleventh run 409'd at "the quote executed", which reads
+      as a pricing bug. `Fixture.adopt(ref)`, and the ten released through
+      `release_booking` rather than deleted out from under the counter.
+- [x] One of its assertions had been **failing since Phase 6.1** moved the
+      confirmation link from `/checkin/{ref}` to `/b/{token}`. Phase 9.3
+      recorded the suite as green at 29.
+- [x] Every green run of every suite ended in a stack trace: `Fixture.close`
+      runs from `atexit`, and `concurrent.futures.thread` registers its shutdown
+      through `threading._register_atexit`, which Python runs *first*. A suite
+      that prints a traceback when it passes is one whose tracebacks nobody
+      reads.
+
+**Verified:** 1,465 unit · replay 16 · payment_status 30 (four consecutive runs,
+zero rows left behind) · instagram 70 · checkin 57 · inbox 28 ·
+tenant_isolation 49 · ai 98 · sales 185 · golden 88 · onboarding 65 · website
+402. Ten threads racing for one room night: one won, nine lost, nothing
+oversold.
+
+**Deployment note.** The backend auto-deploys from a push to this repository —
+pushing `stayos-production-hardening` built and restarted it, with about 45
+seconds of 502s. That was not intended and is worth knowing before the next
+branch push.
+
+## Still open after this phase
+
+- [ ] **`REVALIDATE_SECRET` on the StayOS backend.** The preflight now says so
+      at boot on every start; the variable still has to be set in Coolify.
+- [ ] **The website has not deployed.** It is on a feature branch, so the demo
+      gate is not live there. The backend change alone drops Casa Mandala from
+      the sitemap when the 24-hour ISR window turns; the deploy makes it
+      immediate and explicit.
+- [ ] **`rotate-link` has no screen.** The route exists, is scoped to frontdesk
+      and is proven by `checkin_e2e` — but nothing in the partner app calls it,
+      so revoking a forwarded booking link is an API-only capability.
+- [ ] **Three of four real hotels have no photographs**, so they are correctly
+      `noindex`. That is Phase 4's job and it is waiting on hotels, not on code.
