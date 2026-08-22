@@ -55,10 +55,22 @@ BUSY_MAX_RETRIES = 24
     max_retries=BUSY_MAX_RETRIES,
     acks_late=True,
 )
-def process_conversation_task(self, conversation_id: str) -> dict:
+def process_conversation_task(self, conversation_id: str, request_id: str | None = None) -> dict:
+    """
+    `request_id` is the webhook's, handed across the queue.
+
+    Without it the two halves of one guest message live in different processes
+    with no shared id, and "why didn't this booking confirm?" needs a timestamp
+    range and the hope that no other hotel was busy. `span` restores the
+    previous context on exit, which matters here: one worker handles many
+    conversations, and a leaked id would label the next hotel's lines with the
+    last one's.
+    """
+    from app.services import trace
     from app.services.messaging.pipeline import conversation_lock, process_conversation
 
-    with conversation_lock(conversation_id) as acquired:
+    with trace.span(request_id=request_id, conversation_id=conversation_id), \
+            conversation_lock(conversation_id) as acquired:
         if not acquired:
             # Somebody else is answering this conversation. Come back rather
             # than give up.

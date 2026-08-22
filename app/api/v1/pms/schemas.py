@@ -1669,6 +1669,13 @@ class PublicSiteOut(BaseModel):
     lon: float | None = None
     propertyType: str | None = None
     totalRooms: int | None = None
+    # Seeded or test data. The page renders and takes bookings exactly as
+    # before; what this does is let the template force `noindex` however
+    # complete the hotel looks. A demo hotel that passes the quality gate is
+    # the dangerous case rather than the safe one — Casa Mandala passed it, and
+    # was therefore the one fictional hotel Google was actually being asked to
+    # index. See §36.
+    isDemo: bool = False
     # When the *page* last changed — the website's publish time, not the
     # property row's. A rate edit is not a content change, and a lastmod that
     # moves for reasons a reader cannot see is one Google learns to ignore.

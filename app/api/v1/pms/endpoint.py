@@ -183,6 +183,7 @@ from app.services.pms import onboarding as onboarding_service
 from app.services.pms import creators as creators_service
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
+from app.services import trace
 from app.services.pms import money
 from app.services.pms import uploads
 from app.services.pms import payments as payments_service
@@ -3659,6 +3660,7 @@ async def get_public_hotel(request: Request, slug: str):
         address=prop.address, state=prop.state, country=prop.country,
         pincode=prop.pincode, lat=prop.lat, lon=prop.lon,
         propertyType=prop.property_type, totalRooms=prop.total_rooms,
+        isDemo=prop.is_demo,
         updatedAt=prop.updated_at,
         # Only a *verified* domain. An unverified one is a hostname somebody
         # typed into a form, and pointing a canonical at it would hand the
@@ -3730,6 +3732,14 @@ async def list_public_hotels(request: Request):
             for p in (
                 db.table("properties")
                 .select("id,slug,name,city,status,lat,lon,address,policies,updated_at")
+                # **Demo hotels are absent from this list, and that is what
+                # keeps them out of Google.** This route is what the sitemap
+                # enumerates and what `/book` indexes, so a seeded showcase
+                # listed here is a fictional hotel submitted to a crawler as a
+                # real bookable business — which is exactly what was happening
+                # to Casa Mandala. Their own pages still render and still take
+                # bookings; see `is_demo` on the column comment, and §36.
+                .eq("is_demo", False)
                 .in_("id", ids).execute().data or []
             )
         }
@@ -3982,6 +3992,19 @@ async def _fulfil_booking(order: dict) -> dict:
     )
     await public_booking.attach_addons(reservation, order.get("addons") or [])
     await payments_service.record_result(order["id"], reservation_id=reservation["id"])
+
+    trace.bind(booking_id=reservation["id"], hotel_id=reservation["property_id"],
+               conversation_id=order.get("conversation_id"))
+    # The line the whole trace exists for. Everything a person asking "did this
+    # confirm, and for how much" needs, and nothing a person asking it is not
+    # entitled to: no guest name, no phone, no card, no token.
+    logger.info(
+        "booking %s confirmed from order %s: %s, %s nights x %s rooms, "
+        "total=%s paid=%s paise",
+        reservation["ref"], order["razorpay_order_id"], reservation["status"],
+        reservation.get("nights"), reservation.get("units"),
+        reservation.get("total_paise"), reservation.get("paid_paise"),
+    )
 
     # Point the thread at the booking, and tell the guest.
     #
@@ -4316,6 +4339,10 @@ async def public_razorpay_webhook(
 
     name = event.get("event") or ""
     payload = event.get("payload") or {}
+    # The money path is the one §29 names: "why didn't this booking confirm?"
+    # has to be answerable from logs. Everything below carries the order, and
+    # the booking once it exists.
+    trace.bind(request_id=x_razorpay_event_id)
     payment = (payload.get("payment") or {}).get("entity") or {}
     order_id = payment.get("order_id") or (
         (payload.get("order") or {}).get("entity") or {}
@@ -4403,6 +4430,11 @@ async def public_razorpay_webhook(
         await webhook_log.mark(x_razorpay_event_id, "ignored")
         return {"ok": True, "ignored": "unknown order"}
 
+    trace.bind(order_id=order_id, hotel_id=order.get("property_id"),
+               conversation_id=order.get("conversation_id"))
+    logger.info("razorpay %s on order %s (purpose=%s, %s paise)",
+                name, order_id, order.get("purpose"), order.get("amount_paise"))
+
     if name in ("payment.failed",):
         await payments_service.mark(order_id, "failed", payment.get("error_description"))
         await webhook_log.mark(x_razorpay_event_id, "processed")
@@ -4460,6 +4492,7 @@ async def public_razorpay_webhook(
                             "Could not fulfil the order.") from exc
 
     await webhook_log.mark(x_razorpay_event_id, "processed")
+    logger.info("razorpay order %s fulfilled as %s", order_id, purpose)
     return {"ok": True, "handled": purpose}
 
 
