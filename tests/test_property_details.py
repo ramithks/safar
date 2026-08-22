@@ -222,3 +222,68 @@ def test_a_room_without_a_description_is_named(db):
         if g["id"] == "room_descriptions"
     )
     assert "1 of 2" in gap["detail"]
+
+
+# ── the two definitions of "ready for Google" ────────────────────────────────
+#
+# There are two, and they must be the same decision. `stayosHotelGate` in the
+# website decides what actually gets indexed; `readiness` decides what a
+# hotelier is told. They had drifted, and the drift told hoteliers the opposite
+# of the truth: Casa Mandala was live in the sitemap with `index, follow` on the
+# page and read "Google ✗" on its own dashboard, because two of its four rooms
+# had no description.
+
+def test_a_hotel_google_is_indexing_is_not_told_it_is_invisible(db):
+    """
+    The exact shape that was wrong: every requirement met, three signals
+    present, and one *signal-level* gap outstanding. The gate indexes this. The
+    dashboard used to say it would not.
+    """
+    complete(db)
+    db.seed("room_types", {
+        "id": "rt-2", "property_id": PROPERTY, "is_active": True,
+        "name": "Suite", "description": None, "photos": ["e.jpg"],
+    })
+    report = run(onboarding.readiness(PROPERTY))
+
+    assert report["websiteIndexable"] is True
+    # And the gap is still reported, because it is still worth fixing — it is
+    # what stops the AI answering "what's in the Suite?".
+    assert "room_descriptions" in {g["id"] for g in report["gaps"]}
+    assert report["agentReady"] is False
+
+
+def test_too_few_photos_is_a_requirement_and_does_block(db):
+    complete(db)
+    db.rows("room_types")[0]["photos"] = ["a.jpg"]
+    assert run(onboarding.readiness(PROPERTY))["websiteIndexable"] is False
+
+
+def test_no_rooms_at_all_blocks(db):
+    complete(db)
+    db.rows("room_types").clear()
+    assert run(onboarding.readiness(PROPERTY))["websiteIndexable"] is False
+
+
+def test_an_unpublished_page_blocks_whatever_else_is_true(db):
+    complete(db)
+    db.rows("hotel_websites")[0]["status"] = "draft"
+    assert run(onboarding.readiness(PROPERTY))["websiteIndexable"] is False
+
+
+def test_two_signals_are_not_enough(db):
+    """Three of five, the same as the gate. Two is a page that loses to the OTA
+    result above it."""
+    complete(db)
+    # Strip it back to room photos + policies: two signals.
+    db.rows("hotel_websites")[0]["published"] = {"about": "Short.", "amenities": []}
+    db.rows("properties")[0].update({"lat": None, "lon": None})
+    report = run(onboarding.readiness(PROPERTY))
+    assert report["websiteIndexable"] is False
+
+
+def test_three_signals_are(db):
+    complete(db)
+    db.rows("hotel_websites")[0]["published"] = {"about": "Short.", "amenities": []}
+    # description gone, amenities gone → room photos, policies, map pin = three.
+    assert run(onboarding.readiness(PROPERTY))["websiteIndexable"] is True

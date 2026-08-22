@@ -940,6 +940,9 @@ async def update_property(*, property_id: str, fields: dict) -> dict:
 # the same number.
 MIN_WEBSITE_PHOTOS = 4
 
+# …and three of the five quality signals, which is `stayosHotelGate` again.
+MIN_WEBSITE_SIGNALS = 3
+
 
 def _readiness(property_id: str) -> dict:
     """
@@ -1043,12 +1046,44 @@ def _readiness(property_id: str) -> dict:
             "Your page is a draft, so nobody can see it.", ["website"])
 
     blocking = {a for g in gaps for a in g["affects"]}
+
+    # `websiteIndexable` is the *website's* rule, restated — not "no gap
+    # touches the website".
+    #
+    # The two had drifted, and the drift told hoteliers the opposite of the
+    # truth. `stayosHotelGate` asks for two requirements and three of five
+    # signals; this asked for a hotel with nothing missing at all. So Casa
+    # Mandala — live in the sitemap, `index, follow` on the page, four photos,
+    # a description, policies, a map pin — read "Google ✗" on its own dashboard
+    # because two of its four rooms have no description. A room description is
+    # a signal on that gate, not a requirement, and it is genuinely blocking
+    # for the AI, which is why it still counts against `agentReady`.
+    #
+    # Kept as an explicit mirror of `lib/seo/gates.ts` rather than derived from
+    # the gap list, because the gap list is a to-do and the gate is a decision,
+    # and reading one off the other is what produced the drift. The two are the
+    # same *numbers* on purpose: MIN_WEBSITE_PHOTOS here, MIN_STAYOS_PHOTOS
+    # there, and three signals in both.
+    signals = sum((
+        len(about) >= 120,
+        sum(1 for r in rooms if r.get("photos")) >= 1,
+        bool(prop.get("policies")),
+        prop.get("lat") is not None and prop.get("lon") is not None,
+        len(amenities) >= 3,
+    ))
+    website_indexable = (
+        site.get("status") == "published"
+        and len(rooms) >= 1
+        and photos >= MIN_WEBSITE_PHOTOS
+        and signals >= MIN_WEBSITE_SIGNALS
+    )
+
     return {
         # The AI can answer factual questions once it has rooms, policies and a
         # location. It can sell without any of them, which is why "ready" here
         # is about answering rather than about taking money.
         "agentReady": "agent" not in blocking,
-        "websiteIndexable": "website" not in blocking,
+        "websiteIndexable": website_indexable,
         "gaps": gaps,
     }
 
