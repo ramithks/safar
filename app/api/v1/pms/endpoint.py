@@ -148,6 +148,8 @@ from app.api.v1.pms.schemas import (
     ExtractedHotel,
     ExtractedRoomType,
     HotelExtractOut,
+    HotelCorrectionOut,
+    HotelCorrectionRequest,
     HotelExtractRequest,
     MediaUploadOut,
     PropertyLocationOut,
@@ -532,6 +534,53 @@ async def extract_hotel_from_text(
             "We couldn't read that just now. Please try again, or add the rooms yourself.",
         ) from exc
     return _extract_out(draft)
+
+
+@router.post("/properties/{property_id}/extract/correct",
+             response_model=HotelCorrectionOut)
+@limiter.limit("60/hour")
+async def correct_extracted_draft(
+    request: Request,
+    property_id: str,
+    body: HotelCorrectionRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    "isme breakfast included nahi hai" — and the draft changes.
+
+    **The step this saves is the one people abandon.** A hotelier reading a
+    draft knows what is wrong with it in one sentence. Making them find the
+    field, click it, clear it and retype it is how a review screen becomes the
+    thing nobody finishes, and an unfinished review is a hotel with two room
+    descriptions and no amenities, which is what production actually looks like.
+
+    **The model proposes edits; Python applies them.** It returns
+    `{room, field, value}` against a closed field list, matched to rooms already
+    in the draft, and every value goes through the same bounds `normalise`
+    enforces. So a correction cannot add a room, delete one, or set a price of
+    ₹9,000,000 — a model that misreads the sentence proposes a wrong edit, which
+    the hotelier sees in `changes`, rather than making one.
+
+    **Still writes nothing.** The corrected draft goes back to the same review
+    screen and the same approval. A correction must not become the back door
+    around the step whose entire purpose is that a person agreed.
+    """
+    try:
+        result = await pms_extract.correct_draft(
+            body.draft.model_dump(), body.correction,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[pms] correction failed for %s", property_id)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "We couldn't apply that just now. Please edit the field directly.",
+        ) from exc
+
+    return HotelCorrectionOut(
+        **_extract_out(result).model_dump(),
+        changes=result.get("changes") or [],
+        unclear=result.get("unclear"),
+    )
 
 
 @router.post("/properties/{property_id}/extract/file", response_model=HotelExtractOut)

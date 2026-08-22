@@ -2321,6 +2321,35 @@ class HotelExtractOut(BaseModel):
     droppedRooms: int = 0
 
 
+class HotelCorrectionOut(HotelExtractOut):
+    """
+    The same draft, corrected, plus what actually moved.
+
+    `changes` is not decoration. A hotelier who says "isme breakfast included
+    nahi hai" and is handed back a silently different draft has been asked to
+    trust a model twice; a line saying *Deluxe Balcony: meal plan breakfast →
+    room only* is a thing they can check in a second. `unclear` appears only
+    when nothing moved — a question beside a visible change is noise.
+    """
+    changes: list[str] = []
+    unclear: str | None = None
+
+
+class HotelCorrectionRequest(BaseModel):
+    """
+    The draft on the hotelier's screen, and their sentence about it.
+
+    The draft comes back from the client rather than from a server-side session
+    because nothing about the extraction is stored — that is the safety
+    argument, and keeping a draft on the server to make this route tidier would
+    quietly undo it. Anything a client sends here is bounded and re-normalised
+    on the way out, so a tampered draft can only produce a draft the same
+    hotelier must still approve.
+    """
+    draft: HotelExtractOut
+    correction: str = Field(min_length=2, max_length=2000)
+
+
 class HotelExtractRequest(BaseModel):
     text: str = Field(min_length=20, max_length=60_000)
 
