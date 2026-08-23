@@ -23,6 +23,7 @@ from app.api.v1.metrics import router as metrics_router
 from app.api.v1.onboarding.endpoint import router as onboarding_router
 from app.api.v1.plan_trip.endpoint import router as plan_trip_router
 from app.api.v1.pms.endpoint import router as pms_router
+from app.api.v1.pms.hotel_os import router as hotel_os_router
 from app.api.v1.recommend.endpoint import router as recommend_router
 from app.api.v1.reels.analyze import router as reels_analyze_router
 from app.api.v1.reels.endpoint import router as reels_router
@@ -77,6 +78,10 @@ router.include_router(marketplace_payments_router)
 # on every PMS route, which is diagnosable, rather than as a 500 storm.
 if settings.enable_hotel_os:
     router.include_router(pms_router)
+    # The hotel's own configuration — rooms in full, rules, team, readiness.
+    # A second router on the same prefix rather than more of endpoint.py,
+    # which is already 5,500 lines. Same flag, same limiter, same dependency.
+    router.include_router(hotel_os_router)
     router.include_router(messaging_webhooks_router)
     router.include_router(messaging_oauth_router)
     # Google Business Profile: hotel-OS *and* switched on.

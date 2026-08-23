@@ -2990,6 +2990,16 @@ async def upsert_service(
         "is_active": body.isActive,
         "daily_capacity": body.dailyCapacity,
         "lead_time_hours": body.leadTimeHours,
+        "price_unit": body.priceUnit,
+        "availability": body.availability,
+        "opens_at": body.opensAt or None,
+        "closes_at": body.closesAt or None,
+        "max_quantity": body.maxQuantity,
+        "available_from": body.availableFrom or None,
+        "available_to": body.availableTo or None,
+        "photo_url": body.photoUrl or None,
+        "terms": body.terms or None,
+        "advance_required": body.advanceRequired,
     }
 
     def _write():
