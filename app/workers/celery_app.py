@@ -110,6 +110,18 @@ celery_app.conf.update(
         # Hourly, not nightly: an intro rate ends at a wall-clock moment, and a
         # partner who watches their dashboard flip a rate the morning after it
         # expired asks why. Cheap — it touches only rows that have lapsed.
+        # The one scheduled entry that is *not* a marketplace task, and the
+        # comment above explains why that is safe: `travbuddy.messaging.*` is
+        # routed to the `hotelos` queue, so beat enqueues it here and only the
+        # StayOS worker — the one with StayOS's `SUPABASE_URL` — ever runs it.
+        #
+        # Every five minutes rather than every minute: `WAITING_AFTER_MINUTES`
+        # is ten, so five bounds the worst case at fifteen minutes from a
+        # guest's message to a manager's phone, and a sweep that found nothing
+        # is one indexed query.
+        "stayos-waiting-guests": {
+            "task": "travbuddy.messaging.sweep_waiting_guests", "schedule": 300,
+        },
         "partner-intro-commission-hourly": {
             "task": "travbuddy.partners.revert_intro_commission", "schedule": 3600,
         },

@@ -125,3 +125,38 @@ async def _hand_to_human(conversation_id: str) -> None:
             await messaging.request_human(conversation_id, property_id)
     except Exception:  # noqa: BLE001 — a failed handoff must not mask the cause
         logger.exception("could not hand conversation %s to a human", conversation_id)
+
+
+@celery_app.task(
+    name="travbuddy.messaging.sweep_waiting_guests",
+    bind=True,
+    # No retry. This runs again on its own in a few minutes and the next run
+    # sees the same waiting guests — a retry would only bring the notification
+    # forward by less than the sweep interval, at the cost of a second pass over
+    # every hotel while the first one's failure is still being logged.
+    max_retries=0,
+    acks_late=True,
+)
+def sweep_waiting_guests_task(self) -> dict:
+    """
+    Tell each hotel about the guests nobody came back to.
+
+    Routed to the `hotelos` queue by `travbuddy.messaging.*`, which is what
+    makes it read the right database: this is enqueued by the marketplace's
+    beat — the only deployment that runs one — and must never be executed by
+    the marketplace's worker, which has no `conversations` table.
+    """
+    import asyncio
+
+    from app.services import trace
+    from app.services.pms import waiting
+
+    with trace.span(request_id=f"sweep-{self.request.id}"):
+        try:
+            return asyncio.run(waiting.sweep())
+        except Exception:  # noqa: BLE001 — a scheduled task that raises is a
+            # red task in a dashboard nobody watches. A logged failure is one
+            # somebody can search for, and the next sweep is five minutes away.
+            logger.exception("the waiting-guest sweep failed")
+            return {"examined": 0, "waiting": 0, "raised": 0, "notified": 0,
+                    "error": "sweep failed"}

@@ -45,36 +45,80 @@ SOURCES = (
 # Meta's own reserved keywords plus the phrases people actually type. English
 # and Hindi, because this hotel's guests write in both and an opt-out the system
 # does not recognise is worse than one it over-recognises.
+# Phrases that mean this and nothing else, wherever they appear in a message.
+# "please unsubscribe me from these" is an opt-out; there is no other reading.
 _STOP_PHRASES = (
-    "stop", "unsubscribe", "unsub", "opt out", "optout", "opt-out",
+    "unsubscribe", "unsub", "opt out", "optout", "opt-out",
     "remove me", "delete me", "cancel subscription", "no more messages",
-    "don't message me", "dont message me", "do not message me",
-    "don't text me", "dont text me", "stop messaging", "stop messages",
-    "leave me alone", "band karo", "message mat bhejo", "mat bhejo",
-    "hata do", "band kar do",
+    "dont message me", "do not message me",
+    "dont text me", "stop messaging", "stop messages",
+    "leave me alone", "message mat bhejo",
 )
+
+# Phrases that mean this **only when they are the whole message**.
+#
+# The length bound alone was not enough, and a hotel is the place where that
+# shows. Every one of these is an ordinary thing a guest says to a hotel about
+# something other than marketing:
+#
+#     "AC band kar do"           turn the air conditioning off
+#     "extra bed hata do"        take the extra bed out
+#     "is there a bus stop nearby?"
+#     "we had to stop at the airport, reaching late"
+#     "photo mat bhejo"
+#
+# All five opted the guest out permanently, because each is under sixty
+# characters and contains one of these words. The docstring of this function
+# used the fourth of them as its example of a message that was *safe*.
+#
+# Alone, they are unambiguous: nobody types "band karo" by itself to a hotel
+# meaning anything except stop writing to me.
+_STOP_ALONE = (
+    "stop", "band karo", "band kar do", "mat bhejo", "hata do",
+)
+
+# Words that can surround a bare "stop" without making it prose. A guest who
+# writes "please stop" or "stop bhai" has said the same four letters politely,
+# and requiring a bare match would miss both.
+_FILLER = frozenset({
+    "please", "pls", "plz", "kindly", "kripya", "bhai", "sir", "madam", "maam",
+    "ji", "now", "abhi", "just", "ok", "okay", "thanks", "thank", "you",
+})
 
 # A message this long is prose, not a command. "STOP" is four characters;
 # "please stop sending me these offers" is thirty-five. Past that, somebody is
-# telling a story that happens to contain the word.
+# telling a story that happens to contain the phrase.
 _MAX_STOP_CHARS = 60
 
 _PUNCT = re.compile(r"[^\w\s]+", re.UNICODE)
 
+# Apostrophes close up; everything else becomes a space.
+#
+# They were being replaced with a space along with the rest of the punctuation,
+# which turned "don't message me" into "don t message me" and matched neither
+# spelling in the list — so the apostrophe form, which is how most people type
+# it, was never an opt-out at all. Both spellings normalise to "dont" now and
+# the list carries one of them.
+_APOSTROPHE = re.compile(r"['’ʼ]", re.UNICODE)
+
 
 def _normalise(body: str) -> str:
-    return _PUNCT.sub(" ", (body or "").lower()).strip()
+    text = _APOSTROPHE.sub("", (body or "").lower())
+    return _PUNCT.sub(" ", text).strip()
 
 
 def is_stop_request(body: str | None) -> bool:
     """
     Whether this message is a withdrawal of marketing consent.
 
-    Exact match first — "STOP", "unsubscribe" — then a containment pass bounded
-    by length. The bound is what stops "we had to stop at the airport" from
-    unsubscribing a guest who was making conversation, and the exact pass is
-    what guarantees the single word always works however the containment rule
-    changes.
+    Two vocabularies, because one rule cannot serve both. A phrase that can only
+    ever mean "stop writing to me" is matched anywhere in a short message; a
+    word that a guest also uses to ask for the air conditioning to be turned off
+    is matched only when it is the entire message.
+
+    Deliberately still generous in one direction: an opt-out the system does not
+    recognise is worse than one it over-recognises, so the bare word always
+    works, in any case, with politeness around it.
     """
     if not body:
         return False
@@ -82,8 +126,11 @@ def is_stop_request(body: str | None) -> bool:
     if not text:
         return False
 
-    if text in _STOP_PHRASES:
+    # The whole message, once "please" and "bhai" are set aside.
+    bare = " ".join(w for w in text.split() if w not in _FILLER)
+    if bare in _STOP_ALONE or text in _STOP_ALONE:
         return True
+
     if len(text) > _MAX_STOP_CHARS:
         return False
     return any(phrase in text for phrase in _STOP_PHRASES)

@@ -347,6 +347,24 @@ def open_from(message: str, outcomes: list, previous: dict | None = None) -> dic
     return aged
 
 
+def topics_open(profile: dict | None) -> list[str]:
+    """
+    What this guest is still waiting to hear about, oldest ask first.
+
+    The guest's words rather than the schema's — these labels are read by a
+    manager on a phone as often as by a model, so "airport pickup" and not
+    "transfer_request". Returns a list rather than a sentence because the two
+    readers want different sentences; see `describe` for the prompt's.
+    """
+    obligations = (profile or {}).get("obligations")
+    if not isinstance(obligations, dict) or not obligations:
+        return []
+    return [
+        _BY_KEY[key].label for key in sorted(obligations, key=lambda k: obligations[k])
+        if key in _BY_KEY
+    ]
+
+
 def describe(profile: dict | None) -> str | None:
     """
     The open obligations as a prompt line, or None when there are none.
@@ -361,14 +379,7 @@ def describe(profile: dict | None) -> str | None:
     and letting it decide the order is the difference between a helpful nudge
     and a checklist it recites at the guest.
     """
-    obligations = (profile or {}).get("obligations")
-    if not isinstance(obligations, dict) or not obligations:
-        return None
-
-    labels = [
-        _BY_KEY[key].label for key in sorted(obligations, key=lambda k: obligations[k])
-        if key in _BY_KEY
-    ]
+    labels = topics_open(profile)
     if not labels:
         return None
 
