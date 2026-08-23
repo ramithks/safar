@@ -244,12 +244,40 @@ def test_the_window_is_stable_across_a_conversation():
     """
     Every turn has to compute the same key, or the second message in a thread
     is a second charge. Two calls a moment apart are the same window.
+
+    **Pinned to the middle of a window, not to `now`.** Written against the
+    wall clock, this test failed for one hour in every twenty-four: the windows
+    are absolute buckets, so between 23:00 and midnight UTC "an hour later" is
+    genuinely the next one. It was asserting a property the design does not
+    claim, and passing anyway twenty-three hours a day — which is worse than
+    failing, because a suite that goes red at midnight is one people learn to
+    re-run rather than read.
     """
-    now = datetime.now(timezone.utc)
-    assert billing.conversation_window(now) == billing.conversation_window(
-        now + timedelta(minutes=30))
-    assert billing.conversation_window(now) == billing.conversation_window(
-        now + timedelta(hours=1))
+    midpoint = datetime.fromtimestamp(
+        billing.CONVERSATION_WINDOW_SECONDS * 20_000 + billing.CONVERSATION_WINDOW_SECONDS // 2,
+        tz=timezone.utc,
+    )
+    assert billing.conversation_window(midpoint) == billing.conversation_window(
+        midpoint + timedelta(minutes=30))
+    assert billing.conversation_window(midpoint) == billing.conversation_window(
+        midpoint + timedelta(hours=1))
+
+
+def test_a_conversation_that_straddles_a_window_boundary_is_charged_twice():
+    """
+    The cost of absolute buckets, stated rather than discovered.
+
+    `conversation_window` is deliberately derived from the clock alone so any
+    retry in any process computes the same key without reading the conversation
+    row. The price of that is this: a thread still going at the boundary starts
+    a second window and is billed again. It is once a day at most, it errs
+    towards the hotel far less than per-turn pricing did, and it is the reason
+    the test above cannot use `now`.
+    """
+    boundary = datetime.fromtimestamp(
+        billing.CONVERSATION_WINDOW_SECONDS * 20_000, tz=timezone.utc)
+    assert billing.conversation_window(boundary - timedelta(minutes=1)) != \
+        billing.conversation_window(boundary + timedelta(minutes=1))
 
 
 def test_a_thread_that_wakes_a_week_later_is_a_new_conversation():

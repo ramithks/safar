@@ -242,3 +242,68 @@ def test_only_a_remembered_preference_reaches_the_prompt():
 def test_an_unrecognised_stored_value_is_ignored():
     assert language.of_conversation({"guest_profile": {"language": "klingon"}}) == "en"
     assert language.normalise("KLINGON") is None
+
+
+# ── the room they already chose ─────────────────────────────────────────────
+#
+# It was on the session and never in the prompt. A guest who picked a room and
+# then changed the number of rooms was asked which room they wanted — a
+# question they had answered two turns earlier, and one of the nine failures
+# the reference transcript opened with.
+
+def test_the_room_this_turn_was_about_is_remembered_whichever_tool_was_asked():
+    """
+    Not only `get_quote`. The model naming a room to `search_availability` or
+    `send_room_photos` is the same fact arriving earlier, and the turns between
+    choosing a room and pricing it are exactly where the choice was lost.
+    """
+    patch = session.patch_from([
+        ok("search_availability", {"room_type_id": "rt-1", "check_in": "2026-09-13"}),
+    ])
+    assert patch["room_type_id"] == "rt-1"
+
+
+def test_a_priced_room_outranks_a_discussed_one():
+    patch = session.patch_from([
+        ok("send_room_photos", {"room_type_id": "rt-1"}),
+        ok("get_quote", {"room_type_id": "rt-2", "rate_plan_id": "rp-9"},
+           {"quoteId": "q-1", "roomName": "Deluxe Balcony"}),
+    ])
+    assert patch["room_type_id"] == "rt-2"
+    assert patch["rate_plan_id"] == "rp-9"
+    assert patch["room_name"] == "Deluxe Balcony"
+
+
+def test_the_prompt_names_the_room_and_carries_the_id():
+    """
+    Both, and for different readers. The name is what the reply says back to the
+    guest; the id is what a tool takes — without it the model either asks again
+    or invents one from a room name, which is how it once produced
+    `rate_plan_id = "breakfast_included"`.
+    """
+    told = session.describe({"guest_profile": {
+        "check_in": "2026-09-13", "check_out": "2026-09-17", "adults": 3, "units": 2,
+        "room_type_id": "rt-2", "rate_plan_id": "rp-9", "room_name": "Deluxe Balcony",
+    }})
+    assert "Deluxe Balcony" in told
+    assert "rt-2" in told and "rp-9" in told
+    assert "do not ask which room again" in told
+
+
+def test_a_guest_who_has_chosen_nothing_is_described_without_a_room():
+    told = session.describe({"guest_profile": {
+        "check_in": "2026-09-13", "check_out": "2026-09-17", "adults": 3, "units": 2,
+    }})
+    assert "room_type_id" not in told
+    assert "2026-09-13 to 2026-09-17" in told
+
+
+def test_new_dates_take_the_chosen_room_with_them():
+    """
+    A guest who comes back in October about different nights has not chosen
+    October's room. `room_name` has to be transactional for the same reason
+    `room_type_id` is — a name left behind is worse than an id, because the
+    agent says it out loud.
+    """
+    assert "room_name" in session._TRANSACTIONAL
+    assert "room_type_id" in session._TRANSACTIONAL

@@ -15,16 +15,21 @@ it against the property's floor server-side. So an agent that is talked into
 clamp is in Python and Postgres, not in the prompt. The agent is told what it
 was clamped to, so it can be honest about it.
 """
+import logging
 from datetime import date
 
 from pydantic import BaseModel, Field
 
+from app.db.client import get_db, run_db
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import OutOfScope, ToolUnavailable
 from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
 from app.services.ai.tools import ACTOR_QUOTE
 from app.services.pms import booking as booking_service
+from app.services.pms import money
+
+logger = logging.getLogger(__name__)
 
 
 class QuoteArgs(BaseModel):
@@ -85,6 +90,27 @@ async def _revalidate_quote(args: "QuoteArgs", ctx: AgentContext) -> None:
             f"proposed and {left} are free now",
             "Those rooms have gone since we spoke — the team will find you an alternative.",
         )
+
+
+async def _room_name(property_id: str, room_type_id: str) -> str | None:
+    """
+    What this room is called. One indexed read on a tool that already writes a
+    quote and takes a hold, and the difference between a reply that says
+    "Deluxe Balcony" and one that says "the room you chose".
+    """
+    def _read():
+        rows = (
+            get_db().table("room_types").select("name")
+            .eq("id", room_type_id).eq("property_id", property_id)
+            .limit(1).execute().data or []
+        )
+        return rows[0]["name"] if rows else None
+
+    try:
+        return await run_db(_read)
+    except Exception:  # noqa: BLE001 — a name is never worth failing a quote
+        logger.warning("could not read the name of room type %s", room_type_id)
+        return None
 
 
 @tool(
@@ -154,6 +180,13 @@ async def get_quote(args: QuoteArgs, ctx: AgentContext) -> tuple[dict, str]:
     priced = quote.priced
     payload = {
         "quoteId": quote.id,
+        # The room, by the name the guest used. Carried so the reply can say
+        # "Deluxe Balcony" and so the *session* can — the choice was on the
+        # conversation as a uuid and invisible to the next turn's prompt, which
+        # is how a guest who picked a room and then changed the number of rooms
+        # got asked which room they wanted.
+        "roomTypeId": str(args.room_type_id),
+        "roomName": await _room_name(ctx.property_id, str(args.room_type_id)),
         "holdId": quote.hold_id,
         "expiresAt": quote.expires_at.isoformat(),
         "checkIn": str(quote.check_in),
@@ -164,11 +197,15 @@ async def get_quote(args: QuoteArgs, ctx: AgentContext) -> tuple[dict, str]:
         "discountPaise": priced.discount_paise,
         "taxPaise": priced.tax_paise,
         "totalPaise": priced.total_paise,
+        # The same figure already written the way a guest reads it, so the
+        # model quotes rather than calculates. See `money.display`.
+        "total": money.display(priced.total_paise),
         "currency": "INR",
         "discountPctApplied": priced.discount_pct_applied,
         "discountPctRequested": args.discount_pct,
         "instruction": (
-            "Quote totalPaise and nothing else. Say the hold lasts 15 minutes. "
+            "Quote `total` exactly as written and nothing else — never convert "
+            "a paise figure yourself. Say the hold lasts 15 minutes. "
             + (
                 f"The discount was set to {priced.discount_pct_applied}% rather than the "
                 f"{args.discount_pct}% requested — be straightforward about that "

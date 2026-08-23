@@ -90,6 +90,31 @@ class Money:
         }
 
 
+def display(paise) -> str:
+    """
+    Money as somebody reads it. `716800` → `₹7,168`.
+
+    Here, in the module that owns money, because the interesting caller is the
+    AI employee. Tool results speak paise and a guest reads rupees, and until
+    this existed the conversion happened *in the model*: `totalPaise: 1920000`
+    went into the context and the model was left to divide by a hundred. On a
+    live replay it divided by a thousand and told a guest ₹1,920 for a stay
+    costing ₹19,200. The reply guardrail caught it — the number was backed by
+    nothing — so the cost was a handoff rather than a ruinous quote, which is
+    the guardrail working and not a reason to keep asking a language model to
+    do arithmetic on money.
+
+    Rounded to the rupee, because a hotel quotes in rupees and "₹7,168.00" on
+    Instagram reads like a machine. Anything unreadable comes back as an em
+    dash rather than raising: a formatter is never the right place to fail a
+    turn.
+    """
+    try:
+        return f"₹{int(paise) / 100:,.0f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
 def _charges(folio: list[dict]) -> int:
     """
     Every positive line. The switch `amount_due` turns on, kept exactly as the

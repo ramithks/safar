@@ -44,6 +44,7 @@ from app.services.ai.registry import tool
 from app.services.ai.tools import ACTOR_QUOTE
 from app.services.pms import booking as booking_service
 from app.services.pms import escalation as escalation_service
+from app.services.pms import money
 from app.services.pms import negotiation, policies, rates
 
 logger = logging.getLogger(__name__)
@@ -796,6 +797,11 @@ async def negotiate_rate(args: NegotiateArgs, ctx: AgentContext) -> tuple[dict, 
         "taxPaise": priced.tax_paise,
         "tokenPaise": priced.token_paise,
         "balancePaise": priced.balance_paise,
+        # Written out, so the one number a haggling guest is waiting for is
+        # never the output of the model dividing by a hundred.
+        "total": money.display(priced.total_paise),
+        "token": money.display(priced.token_paise),
+        "balance": money.display(priced.balance_paise),
         "nights": len(priced.nights),
         "rooms": args.units,
         # What the quote actually came to per room per night, which is the number
@@ -805,6 +811,7 @@ async def negotiate_rate(args: NegotiateArgs, ctx: AgentContext) -> tuple[dict, 
             if priced.nights and args.units else None
         ),
     })
+    payload["agreedNightly"] = money.display(payload["agreedNightlyPaise"])
     payload["instruction"] = _sentence(decision, quote)
     return payload, quote.id
 

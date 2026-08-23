@@ -30,13 +30,14 @@ from app.services.ai.context import AgentContext
 from app.services.ai.errors import OutOfScope, ToolUnavailable
 from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
-from app.services.pms import public_booking, stay_payment
+from app.services.pms import money, public_booking, stay_payment
 
 logger = logging.getLogger(__name__)
 
 
 def _rupees(paise: int) -> str:
-    return f"₹{paise / 100:,.0f}"
+    """One spelling of money, shared with every other surface. See money.display."""
+    return money.display(paise)
 
 
 async def _this_stay(ctx: AgentContext, reservation_id: str | None) -> str:

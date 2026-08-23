@@ -41,6 +41,7 @@ import logging
 from app.db.client import get_db, run_db
 from app.services.messaging import credentials as creds_module
 from app.services.messaging import service as messaging_service
+from app.services.pms import money
 
 logger = logging.getLogger(__name__)
 
@@ -106,10 +107,8 @@ def dedupe_key(kind: str, facts: dict) -> str:
 
 
 def _rupees(paise) -> str:
-    try:
-        return f"₹{int(paise) / 100:,.0f}"
-    except (TypeError, ValueError):
-        return "—"
+    """One spelling of money, shared with every other surface."""
+    return money.display(paise)
 
 
 def compose(kind: str, *, hotel: str, facts: dict, reason: str | None) -> str:

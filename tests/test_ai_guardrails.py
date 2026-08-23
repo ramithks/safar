@@ -407,3 +407,94 @@ class TestInventedConfirmations:
             "create_payment_link",
             "check_in",
         }
+
+
+# ── the payment link, which the guardrail was refusing ──────────────────────
+
+def test_a_payment_link_is_not_a_leaked_table_name():
+    """
+    The most expensive false positive found in this system.
+
+    Every payment link StayOS issues is `/pay/order_TTNlZOqsCGlaWH` — a
+    Razorpay order id, `order_` and all — and the snake-case rule that keeps
+    `folio_entries` away from guests matches it exactly. So the one message
+    that takes the money was refused, and the guest asking to pay was handed to
+    a person.
+
+    It survived because the conversation replay raises the link itself when the
+    model does not, so the suite kept driving the money path around the bug it
+    was written to find.
+    """
+    reply = ("Aap ₹8,602 abhi pay kar sakte hain.\n\n"
+             "Payment link: https://travbuddy.in/pay/order_TTNlZOqsCGlaWH")
+    outcome = FakeOutcome(
+        tool="create_booking_payment_link",
+        output={"payUrl": "https://travbuddy.in/pay/order_TTNlZOqsCGlaWH",
+                "tokenPaise": 860200},
+    )
+
+    verdict = guardrails.check_reply(reply, tool_outputs=[outcome])
+    assert verdict.ok, verdict.reason
+
+
+def test_masking_links_does_not_let_a_table_name_through_in_prose():
+    """
+    The mask covers URLs and nothing else. A tool name in a sentence is still a
+    tool name in a sentence.
+    """
+    reply = ("Maine folio_entries check kiya. "
+             "Link: https://travbuddy.in/pay/order_ABC123")
+    outcome = FakeOutcome(tool="get_booking_status", output={"state": "PENDING"})
+
+    verdict = guardrails.check_reply(reply, tool_outputs=[outcome])
+    assert not verdict.ok
+    assert "folio_entries" in (verdict.reason or "")
+
+
+def test_an_unverified_link_is_still_refused_however_its_path_reads():
+    """
+    Masking moves the question to the links rule rather than dropping it. An
+    address no tool produced is refused there.
+    """
+    reply = "Yahan pay kijiye: https://not-our-domain.example/pay/order_ABC123"
+    outcome = FakeOutcome(tool="get_booking_status", output={"state": "PENDING"})
+
+    verdict = guardrails.check_reply(reply, tool_outputs=[outcome])
+    assert not verdict.ok
+    assert "unverified link" in (verdict.reason or "")
+
+
+# ── "confirm karne ke liye" is a request, not a claim ───────────────────────
+
+@pytest.mark.parametrize("reply", [
+    "Aapki booking confirm karne ke liye kripya apna email address bataiye.",
+    "Booking confirm karna hai to payment kar dijiye.",
+    "Booking confirm karne ke liye token amount dena hoga.",
+])
+def test_an_infinitive_is_not_a_claim_that_the_stay_is_secured(reply):
+    """
+    Hindi builds a purpose clause with the infinitive — "booking confirm *karne
+    ke liye*" is "in order to confirm the booking" — and the rule read its
+    first two words as the claim. It fired at the last step of the sale, on the
+    turn where the agent asks for what it needs to take the money.
+    """
+    outcome = FakeOutcome(tool="get_stay_options", output={"options": []})
+    verdict = guardrails.check_reply(reply, tool_outputs=[outcome])
+    assert verdict.ok, verdict.reason
+
+
+@pytest.mark.parametrize("reply", [
+    "Maine aapki booking confirm kar di hai.",
+    "Aapki booking confirm ho gayi hai.",
+    "Aapke rooms book ho gaye hain.",
+])
+def test_the_perfective_is_still_a_claim(reply):
+    """
+    The other half, and the reason the exclusion is narrow. "kar di", "kar
+    diya", "ho gayi" all say it has happened — which is the sentence the
+    reference transcript sent to a guest who had paid nothing.
+    """
+    outcome = FakeOutcome(tool="get_stay_options", output={"options": []})
+    verdict = guardrails.check_reply(reply, tool_outputs=[outcome])
+    assert not verdict.ok
+    assert "secured" in (verdict.reason or "")
