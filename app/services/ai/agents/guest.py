@@ -72,6 +72,16 @@ DEFINITION = AgentDefinition(
         # tab.
         "get_hotel_page_link",
         "list_services",
+        # The five questions that arrive constantly and had no structured
+        # answer until the hotel-OS work: what a room actually is, whether
+        # breakfast is included, whether they can arrive at ten, what happens
+        # if they cancel, and what there is to do here. Each one used to be
+        # answered from prose somebody had remembered to write, or not at all.
+        "get_room_details",
+        "get_meal_info",
+        "get_checkin_options",
+        "get_cancellation_terms",
+        "get_experiences",
         # Knowing this guest — all scoped to the conversation, none of them
         # taking a guest id the model could be talked into changing.
         "get_guest",
