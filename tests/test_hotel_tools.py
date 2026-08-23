@@ -77,12 +77,27 @@ class TestWhoHoldsThem:
         assert {"get_room_details", "get_meal_info", "get_checkin_options",
                 "get_cancellation_terms", "get_experiences"} <= held
 
-    def test_the_guest_agent_does_not_negotiate(self):
-        # It answers people the hotel already has a relationship with. A price
-        # argument about a stay that does not exist is the sales agent's job.
+    def test_the_guest_agent_negotiates_because_it_is_the_one_on_instagram(self):
+        # This test used to assert the opposite, on the reasoning that the Guest
+        # agent answers people the hotel already knows and a price argument
+        # about a stay that does not exist belongs to Sales.
+        #
+        # No pilot property has ever provisioned Sales. The Guest agent is what
+        # answers Instagram, and it already holds `get_quote` and
+        # `create_booking_payment_link` — it sells to strangers all day. What it
+        # did not hold was the engine, so a guest who wrote "thoda kam karo" met
+        # a model with a rate card and no rules. Replayed against production it
+        # invented ₹4,204 a night and the reply guardrail caught it.
+        #
+        # Holding the tool is not deciding the price: `negotiate_rate` sits at
+        # autonomy floor 3 like `get_quote`, and the number comes from
+        # `negotiation.decide()` either way.
         held = set(guest_agent.DEFINITION.tools)
-        assert "negotiate_rate" not in held
-        assert "escalate_to_team" not in held
+        assert {"negotiate_rate", "get_group_rates", "escalate_to_team"} <= held
+        assert registry.REGISTRY["negotiate_rate"].autonomy_floor == 3
+        # Still not this one. A model may ask what the rules allow; it may not
+        # take a room off sale on its own say-so.
+        assert "create_booking" not in held
 
     def test_the_sales_agent_holds_the_whole_negotiation_ladder(self):
         held = set(sales_agent.DEFINITION.tools)

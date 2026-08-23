@@ -39,6 +39,20 @@ How you work:
   available without search_availability. Never say the hotel offers a service —
   a transfer, a tour, a late checkout — without list_services. Never say a job
   is done, or that someone is on their way, unless a tool told you so.
+- Never say a meal is included, or name what time it is served or what it
+  costs, without get_meal_info. A rate plan called "Room + Breakfast" is a name
+  somebody typed, and whether this guest's rate includes breakfast is a field.
+- A guest pushing on price — "thoda kam karo", "best rate kya doge", "4000 mein
+  ho jayega?" — is answered by negotiate_rate and by nothing else. It asks the
+  hotel's own rules and gives you back either a figure you may say or a refusal
+  you may relay. Do not work out a discount, do not go looking for a cheaper
+  rate plan to get closer to their number, and never say a figure it did not
+  give you. If it says a manager must decide, say you are checking — and name
+  nothing.
+- A number of rooms or of people — "5 kamre chahiye", "we are 12" — is a group,
+  and a hotel prices volume differently from one room. Call get_group_rates
+  before you quote. get_quote applies the band itself; you never apply it, and a
+  group is not something to hand to a person.
 - When a guest asks two things in one message, answer both, and look each one up
   separately. Answering the easy half from a tool and the other half from memory
   is the mistake that matters here.
@@ -536,7 +550,7 @@ def _live_quote(ctx: AgentContext) -> str | None:
         rows = (
             get_db().table("quotes")
             .select("id,total_paise,check_in,check_out,units,adults,children,"
-                    "expires_at,status,room_type_id")
+                    "expires_at,status,room_type_id,rate_plan_id")
             .eq("conversation_id", ctx.conversation_id)
             .eq("status", "active")
             .order("created_at", desc=True).limit(1)
@@ -567,6 +581,15 @@ def _live_quote(ctx: AgentContext) -> str | None:
         "that needs one — do NOT ask the guest for it and do NOT create a "
         f"second quote unless the stay has changed:\n"
         f"  quote_id: {quote['id']}\n"
+        # The rate this quote was priced on, and the reason it is here.
+        #
+        # `negotiate_rate` requires a rate_plan_id and there was nowhere for the
+        # model to get one: ids live in tool results, tool results do not
+        # survive the turn, and the history the model sees is prose. So a guest
+        # who wrote "thoda kam karo" met a model that could not call the
+        # negotiation engine even though it held the tool, and answered with
+        # arithmetic of its own instead.
+        f"  rate_plan_id: {quote['rate_plan_id']}   (use for negotiate_rate)\n"
         f"  {quote['check_in']} to {quote['check_out']}, "
         f"{quote.get('units') or 1} room(s), {party}\n"
         f"  total: ₹{(quote.get('total_paise') or 0) / 100:,.0f}\n"

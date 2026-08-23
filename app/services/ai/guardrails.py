@@ -153,6 +153,40 @@ _CONFIRMED = re.compile(
     r")"
 )
 
+# "Not yet", and "once your payment arrives".
+#
+# `_CONFIRMED` matches the phrase, not the claim, so it fires on the two most
+# common *correct* replies to "payment hogyi?" — "aapki booking confirm nahi
+# hui hai" and "payment aate hi booking confirm ho jayegi". Both were refused,
+# and a refusal is a handoff: the guest asked whether their money arrived and
+# was told a person would come. That is the §16 failure the rule exists to
+# prevent, produced by the rule itself.
+#
+# Allowed only when a status tool ran this turn and reported a stay that is not
+# secured — see `check_reply`. With no lookup behind it, or with a confirmed
+# booking behind it, "ho jayegi" is still the sentence from the reference
+# transcript and is still refused.
+_NOT_YET = re.compile(
+    r"(?xi)"
+    r"( nahi | nahin | not\b | n't\b"
+    r"| ho\s+ja+yeg | ho\s+jaeg | will\s+be | once\b | jaise\s+hi | ke\s+baad"
+    r"| \u0928\u0939\u0940\u0902 )"
+)
+
+
+def _reported_unsecured(tool_outputs: list) -> bool:
+    """Did a status lookup this turn come back saying the stay is not secured?"""
+    for outcome in tool_outputs or []:
+        if getattr(outcome, "tool", "") != _STATUS_TOOL:
+            continue
+        if not getattr(outcome, "ok", False):
+            continue
+        output = getattr(outcome, "output", None)
+        if isinstance(output, dict) and output.get("state") not in _SECURED_STATES:
+            return True
+    return False
+
+
 _URL = re.compile(r"""(?xi)\b(?:https?://|www\.)[^\s<>"'\)\]]+""")
 
 
@@ -428,6 +462,14 @@ def check_reply(
     # believes a wrong price argues at the desk, and a guest who believes a
     # wrong booking arrives with luggage.
     confirmed = _CONFIRMED.search(text)
+    if confirmed and _reported_unsecured(tool_outputs):
+        # The agent looked, found nothing secured, and is saying so. Whether it
+        # phrased that as a negation or as what happens next, it is answering
+        # the question rather than claiming an outcome.
+        window = text[max(0, confirmed.start() - 30):confirmed.end() + 60]
+        if _NOT_YET.search(window):
+            confirmed = None
+
     if confirmed and not (tools_run & CONFIRMING_TOOLS) \
             and not _read_a_real_booking(tool_outputs):
         return Verdict(

@@ -32,15 +32,32 @@ after a guest asked for Hinglish, and internal vocabulary in front of a guest.
       8  "payment hogyi" answered with a guess
       9  "check karo" answered with a handover
 
+And then the half of the journey he actually completed, which nothing has
+replayed since: the questions every hotel is asked before a booking, the
+group, the haggle, the money, and the confirmation.
+
+    THE REST OF THE SALE
+      · breakfast and an airport pickup, priced from the hotel's own tables
+      · five rooms, priced by the group band rather than by the model
+      · "thoda kam karo", answered by the engine twice with the same number
+      · the floor, which must appear nowhere in the transcript
+      · a real Razorpay order, a signed webhook, a confirmed reservation
+      · the confirmation nobody had to ask for, and its receipt link
+      · "check karo payment hui?" — with, this time, something to find
+
     cd travbuddy_backend
     set -a; . ./.env.hotelos; set +a
+    ./venv/bin/uvicorn app.main:app --port 8010 &     # the webhook is HTTP
     ./venv/bin/python scripts/replay_e2e.py
 
-⚠ Real model, real database, real credits. About twenty turns; give it a few
-minutes. Runs on Casa Mandala and sweeps its own conversation.
+⚠ Real model, real database, real credits, a real Razorpay order. About thirty
+turns; give it a few minutes. Runs on Casa Mandala, seeds two group bands and
+sweeps both them and its own conversation.
 """
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import os
 import pathlib
@@ -61,14 +78,17 @@ os.environ.setdefault("INSTAGRAM_VERIFY_TOKEN", "replay-e2e-verify-token")
 
 import e2e_fixture  # noqa: E402
 
+from app.config import settings  # noqa: E402
 from app.db.client import get_db  # noqa: E402
 from app.services.ai import registry  # noqa: E402
+from app.services.pms import negotiation, rates  # noqa: E402
 from app.services.messaging.instagram.fake import FakeInstagramAdapter  # noqa: E402
 
 REF = "rdlozqvuywtgsodunait"
 PROPERTY = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 PARTNER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 IG_ACCOUNT = "17841400000000001"
+API = os.environ.get("STAYOS_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
 
 registry.load_all()
 db = get_db()
@@ -243,15 +263,118 @@ def messages() -> list[dict]:
             .eq("conversation_id", conv["id"]).order("sent_at").execute().data or [])
 
 
-def tools_used() -> list[str]:
+def actions() -> list[dict]:
+    """Every tool call on this thread, in order, with what went in and out."""
     conv = conversation()
     if not conv:
         return []
-    rows = sql(f"""select a.tool from public.agent_actions a
+    rows = sql(f"""select a.tool, a.input, a.output, a.status
+                     from public.agent_actions a
                      join public.agent_runs r on r.id = a.run_id
                     where r.conversation_id = '{conv['id']}'
                     order by a.created_at;""")
-    return [r["tool"] for r in rows] if isinstance(rows, list) else []
+    return rows if isinstance(rows, list) else []
+
+
+def tools_used() -> list[str]:
+    return [a["tool"] for a in actions()]
+
+
+# ── did it name a number nobody gave it? ─────────────────────────────────────
+#
+# The §20 rule stated as an assertion rather than as a prompt line: the backend
+# is the source of financial truth, so every rupee figure in front of a guest
+# has to be traceable to something a tool returned. A model that is 95% right
+# about arithmetic is a model that quotes the wrong price one conversation in
+# twenty, and that conversation is a booking somebody has to honour.
+
+RUPEES = re.compile(r"(?:₹|rs\.?|inr)\s*([\d][\d,]*)", re.I)
+
+
+def figures_in(text: str) -> set[int]:
+    """Every rupee amount said out loud, in paise."""
+    return {int(m.replace(",", "")) * 100 for m in RUPEES.findall(text)}
+
+
+def tool_numbers(rows: list[dict]) -> set[int]:
+    """
+    Every number those calls returned, read both as paise and as rupees.
+
+    Both, because tools return paise and prose says rupees, and which of the
+    two a given field was is not worth reconstructing for an assertion whose
+    job is to catch invention rather than to audit units.
+    """
+    found: set[int] = set()
+
+    def walk(value) -> None:
+        if isinstance(value, bool) or value is None:
+            return
+        if isinstance(value, (int, float)):
+            n = int(value)
+            found.update({n, n * 100})
+        elif isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+        elif isinstance(value, str):
+            found.update(figures_in(value))
+
+    for row in rows:
+        walk(row.get("output"))
+    return found
+
+
+def unexplained(named: set[int], known: set[int]) -> list[int]:
+    """
+    Figures the agent said that no tool can account for.
+
+    Multiples and pairwise sums count as accounted for: "₹3,200 a night for
+    four nights is ₹12,800" is the agent reading a tool out loud, not deciding
+    a price. Anything left over was invented.
+    """
+    stray = []
+    for amount in sorted(named):
+        if amount in known:
+            continue
+        if any(k and amount % k == 0 and 2 <= amount // k <= 20 for k in known):
+            continue
+        if any((amount - k) in known for k in known):
+            continue
+        stray.append(amount)
+    return stray
+
+
+def rupees(paise: int) -> str:
+    return f"₹{paise // 100:,}"
+
+
+def http(url, method="GET", data=None, headers=None, raw_body=None):
+    body = raw_body if raw_body is not None else (
+        json.dumps(data).encode() if data is not None else None
+    )
+    req = urllib.request.Request(url, method=method, data=body,
+                                 headers={"Content-Type": "application/json",
+                                          **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            return r.status, json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"null")
+    except urllib.error.URLError as e:
+        return 0, {"error": str(e)}
+
+
+def webhook_body(order_id: str, payment_id: str) -> tuple[bytes, str]:
+    payload = json.dumps({
+        "event": "payment.captured",
+        "payload": {"payment": {"entity": {"id": payment_id, "order_id": order_id}}},
+    }).encode()
+    signature = hmac.new(
+        (settings.razorpay_webhook_secret or "").encode(), payload, hashlib.sha256,
+    ).hexdigest()
+    return payload, signature
 
 
 def prose() -> str:
@@ -261,11 +384,44 @@ def prose() -> str:
     ).lower()
 
 
+# The two group rows this replay needs and Casa Mandala does not have. Seeded
+# rather than assumed, because a suite that silently skips the group journey
+# when a demo row is missing is a suite that reports a feature as tested.
+GROUP_TAG = "replay group band"
+
+
+def seed_group_pricing() -> None:
+    sql(f"""
+delete from public.group_rate_tiers where property_id = '{PROPERTY}';
+insert into public.group_rate_tiers
+  (property_id, partner_id, min_units, max_units, discount_pct, negotiable)
+values ('{PROPERTY}', '{PARTNER}', 3, 5, 8, false),
+       ('{PROPERTY}', '{PARTNER}', 6, null, null, true);
+insert into public.group_policies
+  (property_id, partner_id, min_units, deposit_pct, payment_due_days)
+values ('{PROPERTY}', '{PARTNER}', 3, 30, 14)
+on conflict (property_id) do update
+   set min_units = 3, deposit_pct = 30, payment_due_days = 14;""")
+
+
 def sweep() -> None:
     conv = conversation()
-    if conv:
-        sql(f"""delete from public.quotes where conversation_id = '{conv['id']}';
-                delete from public.conversations where id = '{conv['id']}';""")
+    sql(f"delete from public.group_rate_tiers where property_id = '{PROPERTY}';")
+    sql(f"delete from public.group_policies where property_id = '{PROPERTY}';")
+    if not conv:
+        return
+    # One statement per call. A reservation points at its quote and the thread
+    # points at its reservation, so a single batch that trips one foreign key
+    # rolls back the whole sweep and leaves a paid demo booking behind.
+    for statement in (
+        f"update public.reservations set status = 'cancelled', conversation_id = null "
+        f" where conversation_id = '{conv['id']}';",
+        f"update public.conversations set reservation_id = null where id = '{conv['id']}';",
+        f"delete from public.payment_orders where conversation_id = '{conv['id']}';",
+        f"delete from public.quotes where conversation_id = '{conv['id']}';",
+        f"delete from public.conversations where id = '{conv['id']}';",
+    ):
+        sql(statement)
 
 
 def main() -> int:
@@ -280,6 +436,7 @@ on conflict (instagram_account_id) do update
    set property_id = excluded.property_id, status = 'connected', is_sandbox = true;""")
     FakeInstagramAdapter.reset()
     sweep()
+    seed_group_pricing()
 
     # ── 1 & 7: language, and a session that outlives the gap ─────────────────
     print("── the opening, as it happened ──")
@@ -355,12 +512,154 @@ on conflict (instagram_account_id) do update
         print(f"       ({len(GUARDRAIL_REFUSALS)} refused — the reference "
               f"transcript delivered this claim to a paying guest)")
 
+    # ── what the stay includes ──────────────────────────────────────────────
+    #
+    # The reference guest never got this far. Breakfast and a car from the
+    # airport are the two questions every hotel gets and the two a model will
+    # answer from nothing at all — a plausible 8-to-10 buffet and a plausible
+    # ₹1,500 transfer, both invented, both quotable back at the desk.
+    print("\n── breakfast, and a car from the airport ──")
+    mark, spoken = len(actions()), len(messages())
+    say("Breakfast included h isme?")
+    say("Airport se pickup mil jayega? Kitne ka padega?")
+    fresh = actions()[mark:]
+    used = [a["tool"] for a in fresh]
+
+    check("the hotel's own meal record was read, not inferred from a rate name",
+          "get_meal_info" in used, str(used))
+    check("and its price list was read before a transfer was priced",
+          any(t in used for t in ("list_services", "order_service",
+                                  "get_experiences", "get_property_knowledge")),
+          str(used))
+
+    said = " ".join((m.get("body") or "") for m in messages()[spoken:]
+                    if m["direction"] == "outbound")
+    # Every tool call so far, not just this turn's: "the price I quoted you
+    # includes breakfast" is the agent referring back to a quote it took two
+    # turns ago, which is exactly what it should do.
+    stray = unexplained(figures_in(said), tool_numbers(actions()))
+    check("every rupee figure it named came out of a tool",
+          not stray, f"invented: {[rupees(n) for n in stray]}")
+
+    # ── group pricing ───────────────────────────────────────────────────────
+    #
+    # Five rooms is inside the 3–5 band seeded above. The assertion is not that
+    # the agent got the discount right — it is that the agent never touched the
+    # discount: the quote row carries the id of the tier that priced it, which
+    # only `create_quote` can have put there.
+    print("\n── \"5 kamre chahiye\" ──")
+    mark = len(actions())
+    say("Actually 5 kamre chahiye, 10 log aa rahe hain")
+    fresh = actions()[mark:]
+    used = [a["tool"] for a in fresh]
+
+    check("a group was recognised as a group",
+          "get_group_rates" in used, str(used))
+
+    tiers = run(rates.tiers_for(PROPERTY))
+    band = rates.select_tier(tiers, 5, "")
+    check("and the band the engine picks for five rooms is the seeded one",
+          band is not None and band.min_units == 3 and band.discount_pct == 8,
+          str(band))
+
+    group_tool = next((a for a in fresh if a["tool"] == "get_group_rates"), None)
+    if group_tool:
+        applied = (group_tool["output"] or {}).get("appliedBand") or {}
+        check("   the agent was told the same band, not left to choose one",
+              applied.get("fromRooms") == 3, str(group_tool["output"])[:200])
+        check("   along with the deposit the hotel actually set",
+              (group_tool["output"] or {}).get("depositPct") == 30,
+              str(group_tool["output"])[:200])
+
+    conv = conversation()
+    priced = sql(f"""select q.units, q.total_paise, q.group_tier_id, t.discount_pct
+                       from public.quotes q
+                       left join public.group_rate_tiers t on t.id = q.group_tier_id
+                      where q.conversation_id = '{conv['id']}' and q.units >= 3
+                      order by q.created_at desc limit 1;""")
+    priced = priced[0] if isinstance(priced, list) and priced else None
+    if priced:
+        check("   and the quote records which rule priced it",
+              priced["group_tier_id"] is not None and priced["discount_pct"] == 8,
+              str(priced))
+    else:
+        print("       (no multi-room quote was taken this run — nothing to trace)")
+
+    # ── negotiation ─────────────────────────────────────────────────────────
+    #
+    # §20 asks for this to be deterministic, so it is asserted the only way that
+    # means anything: the same question is put to the engine twice, directly,
+    # and compared against what the guest was told. The model is a courier here.
+    print("\n── \"thoda kam karo\" ──")
+    mark, spoken = len(actions()), len(messages())
+    say("Yaar thoda kam karo na, 4000 per night mein ho jayega?")
+    fresh = actions()[mark:]
+    negotiations = [a for a in fresh if a["tool"] == "negotiate_rate"]
+
+    check("it asked the hotel's rules instead of deciding for itself",
+          negotiations, str([a["tool"] for a in fresh]))
+
+    if negotiations:
+        args, verdict = negotiations[0]["input"], negotiations[0]["output"] or {}
+        asked = dict(
+            property_id=PROPERTY,
+            rate_plan_id=args["rate_plan_id"],
+            check_in=date.fromisoformat(args["check_in"]),
+            check_out=date.fromisoformat(args["check_out"]),
+            units=int(args.get("units") or 1),
+            requested_nightly_paise=(
+                int(args["requested_nightly_rupees"]) * 100
+                if args.get("requested_nightly_rupees") is not None else None
+            ),
+        )
+        first, second = run(negotiation.negotiate(**asked)), run(negotiation.negotiate(**asked))
+        check("the same request twice gives the same answer",
+              first.as_dict() == second.as_dict(),
+              f"{first.as_dict()} vs {second.as_dict()}")
+        check("and the answer the guest got is the engine's, unedited",
+              verdict.get("verdict") == first.verdict
+              and verdict.get("finalTotalPaise") == first.final_total_paise
+              and verdict.get("counterTotalPaise") == first.counter_total_paise,
+              f"agent {verdict} vs engine {first.as_dict()}")
+
+        # The floor is the number that must never appear. It is computed here
+        # only so the transcript can be searched for it — the Decision object
+        # deliberately does not carry it, which is why this has to be derived.
+        rules = run(negotiation.rules_for(PROPERTY, rate_plan_id=args["rate_plan_id"]))
+        floor = negotiation.floor_total_for(
+            first.published_total_paise, rules, first.nights, first.units)
+        said = " ".join((m.get("body") or "") for m in messages()[spoken:]
+                        if m["direction"] == "outbound")
+        leaked_floor = []
+        for secret in (floor, rules.floor_paise,
+                       (floor // max(first.nights, 1) // max(first.units, 1)) if floor else None):
+            if not secret:
+                continue
+            rupee = secret // 100
+            if any(form in said for form in (f"{rupee:,}", str(rupee))):
+                leaked_floor.append(rupee)
+        check("   and the minimum it may go to was never said out loud",
+              not leaked_floor, f"the floor appeared in front of the guest: {leaked_floor}")
+
+        if first.verdict == "allowed" and floor:
+            check("   the agreed price is at or above that minimum",
+                  (first.final_total_paise or 0) >= floor,
+                  f"{first.final_total_paise} < {floor}")
+
+        profile = (conversation() or {}).get("guest_profile") or {}
+        check("   the outcome is on the thread as state, not as remembered prose",
+              profile.get("negotiation") in ("allowed", "counter", "needs_approval",
+                                             "refused", verdict.get("verdict")),
+              str(profile.get("negotiation")))
+
     # ── 8 & 9: the money ────────────────────────────────────────────────────
     print("\n── \"Payment hogyi\" ──")
-    used_before = len(tools_used())
+    used_before, spoken = len(tools_used()), len(messages())
     say("Payment hogyi")
     say("Check karo hogyi meri payment")
     asked = tools_used()[used_before:]
+    answered = " ".join((m.get("body") or "") for m in messages()[spoken:]
+                        if m["direction"] == "outbound").lower()
 
     check("⑧ the agent went and looked instead of guessing",
           "get_booking_status" in asked, str(asked))
@@ -369,12 +668,134 @@ on conflict (instagram_account_id) do update
           str(registry.REGISTRY["get_booking_status"].input_model.model_fields))
     check("⑨ and nobody was handed to a person for asking",
           "request_human_handoff" not in asked
-          and "trouble reaching our system" not in prose(),
+          and "trouble reaching our system" not in answered,
           str(asked))
     check("   nor was an unpaid booking described as paid",
           not any(p in prose() for p in ("payment mil gaya", "payment received",
                                          "paid ho gaya")),
           "the agent confirmed money that never arrived")
+
+    # ── ⑦ what the session remembered ───────────────────────────────────────
+    #
+    # Asserted here rather than at the end, because the end of this replay is
+    # now a confirmed booking: `_superseded` clears the stay fields once the
+    # conversation moves on, and the dates of a booking that exists live on the
+    # reservation. ⑦ is about the hour-long gap in the reference transcript,
+    # and that gap is behind us by this line.
+    profile = (conversation() or {}).get("guest_profile") or {}
+    check("⑦ the dates the guest gave are on the conversation, not in the prose",
+          profile.get("check_in") and profile.get("check_out"), str(profile))
+    check("   as are the party and the room count",
+          profile.get("adults") and profile.get("units"), str(profile))
+    check("   so the website link can carry them",
+          "get_hotel_page_link" in registry.REGISTRY, "the tool is not registered")
+
+    # ── the money actually arrives ──────────────────────────────────────────
+    #
+    # Everything above this line is the conversation the reference guest had.
+    # This is the half he reached and nobody has replayed since: he paid, the
+    # order settled, the reservation confirmed — and he was told his booking
+    # would confirm once the payment processed. The webhook is delivered over
+    # HTTP because that is how Razorpay delivers it, signature over raw bytes
+    # and all; calling the handler in-process would test a different thing.
+    print("\n── the payment, and what happens after it ──")
+    reachable, _ = http(f"{API}/public/hotels/casa-mandala-anjuna")
+    check("the API is up, since the webhook arrives over HTTP",
+          reachable == 200,
+          f"{API} answered {reachable} — start uvicorn on 8010 with .env.hotelos")
+
+    mark = len(actions())
+    say("Theek h, payment link bhej do")
+    conv = conversation()
+
+    def latest_order():
+        rows = sql(f"""select id, razorpay_order_id, amount_paise, status, quote_id
+                         from public.payment_orders
+                        where conversation_id = '{conv['id']}'
+                        order by created_at desc limit 1;""")
+        return rows[0] if isinstance(rows, list) and rows else None
+
+    order = latest_order()
+    check("the agent raised a payment link rather than describing how to pay",
+          order is not None,
+          "no payment_orders row on this thread")
+    check("   and the link is against a quote, so the price is the held one",
+          bool(order and order.get("quote_id")), str(order))
+
+    if order is None and reachable == 200:
+        # Driven directly so the rest of the journey is still exercised. The
+        # check above has already recorded that the agent did not get here on
+        # its own, which is the finding; stopping now would hide the four
+        # assertions that follow behind one flaky turn.
+        quotes = sql(f"""select id from public.quotes
+                          where conversation_id = '{conv['id']}'
+                          order by created_at desc limit 1;""")
+        if isinstance(quotes, list) and quotes:
+            from app.services.pms import quote_payment
+            run(quote_payment.create_link(
+                property_id=PROPERTY, partner_id=PARTNER, quote_id=quotes[0]["id"],
+                guest_name="Sahil", guest_phone=None, guest_email=None,
+                source="instagram", conversation_id=conv["id"]))
+            order = latest_order()
+            print("    ↩  raised the link directly so the money path still runs")
+
+    if order:
+        body, signature = webhook_body(order["razorpay_order_id"], f"pay_RPL{RUN_TAG}")
+        st, _ = http(f"{API}/public/razorpay/webhook", "POST", raw_body=body,
+                     headers={"X-Razorpay-Signature": signature})
+        check("the signed webhook settles the order", st == 200, str(st))
+
+        stays = sql(f"""select id, ref, status, payment_status, total_paise, paid_paise
+                          from public.reservations
+                         where conversation_id = '{conv['id']}'
+                         order by created_at desc limit 1;""")
+        stay = stays[0] if isinstance(stays, list) and stays else None
+        check("a reservation exists, created by the money and not by the model",
+              stay is not None and stay["status"] == "confirmed", str(stay))
+
+        if stay:
+            confirmations = [
+                m for m in messages()
+                if (m.get("client_reference") or "") == f"booking:{stay['id']}"
+            ]
+            check("the guest was told without having to ask",
+                  len(confirmations) == 1, f"{len(confirmations)} confirmations")
+            if confirmations:
+                text = confirmations[0].get("body") or ""
+                check("   it names the reference they can quote at the desk",
+                      stay["ref"] in text, text[:140])
+                check("   it carries a link to the booking",
+                      "/b/" in text, text[:200])
+                check("   and that link is a secret, not the reference",
+                      stay["ref"] not in text.split("/b/")[-1], text[:200])
+                check("   in the language the guest asked for",
+                      not DEVANAGARI.search(text), text[:140])
+
+            # ⑧ again, but this time there is something to find. The reference
+            # transcript's twenty-six-second gap between a confirmed booking and
+            # "it will confirm once the payment processes" is this assertion.
+            print("\n── \"check karo payment hui?\" — with the money in ──")
+            mark = len(actions())
+            say("Ab check karo payment hui ya nahi?")
+            fresh = actions()[mark:]
+            looked = [a for a in fresh if a["tool"] == "get_booking_status"]
+            check("the agent looked again rather than repeating itself",
+                  looked, str([a["tool"] for a in fresh]))
+            if looked:
+                found = looked[0]["output"] or {}
+                check("   and the ledger says confirmed",
+                      found.get("state") == "CONFIRMED", str(found)[:200])
+                check("   with the reference the reservation actually has",
+                      found.get("ref") == stay["ref"], str(found.get("ref")))
+            recent = " ".join((m.get("body") or "") for m in messages()[-4:]
+                              if m["direction"] == "outbound").lower()
+            check("   the guest is told it is confirmed, not that it will be",
+                  "confirm" in recent
+                  and "ho jaayegi" not in recent and "ho jayegi" not in recent,
+                  recent[:200])
+            profile = (conversation() or {}).get("guest_profile") or {}
+            check("   and the thread carries the state, so the next turn knows",
+                  profile.get("payment") == "CONFIRMED", str(profile.get("payment")))
 
     # ── the language rule, over the whole transcript ────────────────────────
     print("\n── and the rule that was broken twice ──")
@@ -390,14 +811,8 @@ on conflict (instagram_account_id) do update
     check("① no Devanagari after the guest asked for Hinglish",
           not devanagari_after, str(devanagari_after))
 
-    # ── ⑦ what the session remembered ───────────────────────────────────────
-    profile = (conversation() or {}).get("guest_profile") or {}
-    check("⑦ the dates the guest gave are on the conversation, not in the prose",
-          profile.get("check_in") and profile.get("check_out"), str(profile))
-    check("   as are the party and the room count",
-          profile.get("adults") and profile.get("units"), str(profile))
-    check("   so the website link can carry them",
-          "get_hotel_page_link" in registry.REGISTRY, "the tool is not registered")
+    print(f"    session at the end: "
+          f"{sorted((conversation() or {}).get('guest_profile') or {})}")
 
     print("\n── how the turns went ──")
     conv = conversation()

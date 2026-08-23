@@ -50,6 +50,20 @@ CORE = frozenset({
     "get_property_knowledge",
     "get_property",
     "send_message",
+    # Groups arrive under every label there is.
+    #
+    # "5 kamre chahiye, 10 log aa rahe hain" has classified, in three replays
+    # of the same sentence, as `availability`, as `guest_request` and as
+    # `multi_reservation` — plural rooms read as several bookings. Only the
+    # first of those carried the group tools, and in the other two the agent
+    # handed a ten-person enquiry to a person because it had nothing to answer
+    # it with. The classifier is not going to get this right every time, and a
+    # hotel does not care which label it was.
+    #
+    # It costs a schema of two fields on every turn, which is the cheapest tool
+    # in this catalogue, and it is the one whose absence loses the largest
+    # bookings a hotel gets.
+    "get_group_rates",
 })
 
 # task → what that task can possibly need, beyond CORE.
@@ -80,6 +94,13 @@ BY_TASK: dict[str, frozenset[str]] = {
         # sakte ho?" are both requests, and both are answerable from what the
         # hotel sells rather than by raising a ticket and hoping.
         "get_experiences", "get_checkin_options", "escalate_to_team",
+        # "5 kamre chahiye, 10 log aa rahe hain" classified here in a replay —
+        # readable as a request, and with none of the tools that answer it the
+        # agent said it could only check one room type at a time and handed the
+        # group to a person. Rooms and bands, not the quote: a message that is
+        # really a sale gets classified as one next turn, and this is only here
+        # so the turn that was misread is answerable rather than lost.
+        "search_availability", "get_room_types", "get_group_rates",
     }),
     "reservation_lookup": frozenset({
         "get_reservation", "list_guest_reservations", "get_guest",
@@ -93,6 +114,11 @@ BY_TASK: dict[str, frozenset[str]] = {
         # spent discovering they exist.
         "get_quote", "get_property_policies",
         "get_room_details", "get_group_rates",
+        # "airport se pickup mil jayega?" classifies here about as often as it
+        # classifies as a request — it is a question about whether the hotel
+        # has something, which is what this task is. Without these the answer
+        # is invented or escalated.
+        "list_services", "get_experiences", "get_meal_info",
     }),
     "simple_quote": frozenset({
         "send_room_photos", "get_hotel_page_link",
@@ -140,6 +166,10 @@ BY_TASK: dict[str, frozenset[str]] = {
     "multi_reservation": frozenset({
         "list_guest_reservations", "get_reservation", "get_booking_status",
         "get_check_in_link",
+        # An enquiry for five rooms is not several bookings, but it classifies
+        # as one often enough that this task needs to be able to answer it
+        # rather than escalate.
+        "search_availability", "get_stay_options", "get_quote",
     }),
 }
 

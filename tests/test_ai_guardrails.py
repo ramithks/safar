@@ -30,6 +30,8 @@ class FakeOutcome:
 
     tool: str
     output: dict
+    # A real ToolOutcome derives this from `status`; an executed tool is `ok`.
+    ok: bool = True
 
 
 TRUSTED = {"partner.travbuddy.in", "travbuddy.in"}
@@ -336,6 +338,58 @@ class TestInventedConfirmations:
     def test_a_real_confirmation_is_allowed(self):
         """Once something has actually secured the stay, saying so is the job."""
         assert check("Your booking is confirmed.", self.PAID).ok
+
+    LOOKED_AND_FOUND_NOTHING = [
+        FakeOutcome("get_booking_status", {"state": "QUOTED"})
+    ]
+    LOOKED_AND_FOUND_ONE = [
+        FakeOutcome("get_booking_status", {"state": "CONFIRMED", "ref": "TB-5CECKV"})
+    ]
+
+    @pytest.mark.parametrize("honest", [
+        "Aapki booking confirm nahi hui hai abhi tak.",
+        "Payment aate hi aapki booking confirm ho jayegi.",
+        "Abhi tak payment nahi mili, isliye booking confirm nahi hai.",
+        "Your booking is not confirmed yet.",
+    ])
+    def test_the_true_answer_to_payment_hogyi_is_not_a_confirmation(self, honest):
+        """
+        The rule fired on the phrase rather than on the claim, and the two most
+        common *correct* answers to "payment hogyi?" contain the phrase: "nahi
+        hui hai" and "ho jayegi". Both were refused, and a refused reply is a
+        handoff — the guest asked whether their money had arrived and was told
+        somebody would be with them shortly. That is the failure this rule
+        exists to prevent, produced by the rule.
+
+        English got through all along, because "will be confirmed" puts two
+        words between "booking" and "confirmed". The product runs in Hinglish.
+        """
+        assert check(honest, self.LOOKED_AND_FOUND_NOTHING).ok, honest
+
+    def test_a_confirmed_lookup_licenses_the_sentence_either_way(self):
+        """
+        Deliberately not the place the reference transcript's last failure is
+        caught.
+
+            Aapki booking tab confirm ho jaayegi jab payment process ho jaayegi.
+
+        was sent twenty-six seconds after the money landed, and it is wrong
+        about the tense rather than about the fact. This rule asks whether the
+        run backs a secured stay; here it does, so the reply passes. Refusing it
+        would hand a guest whose booking *is* confirmed to a human over a verb.
+        What catches it is the agent reading `state: CONFIRMED` and saying so —
+        asserted end to end in scripts/replay_e2e.py.
+        """
+        assert check("Aapki booking confirm ho gayi hai — TB-5CECKV.",
+                     self.LOOKED_AND_FOUND_ONE).ok
+
+    def test_a_denial_with_no_lookup_behind_it_is_still_refused(self):
+        """
+        "Your booking is not confirmed" is a statement about a booking, and an
+        agent that has not looked does not know. The way out is get_booking_status,
+        not a confident negative.
+        """
+        assert not check("Aapki booking confirm nahi hui hai.", self.QUOTED).ok
 
     def test_check_in_also_licenses_it(self):
         assert check("You're all checked in.",

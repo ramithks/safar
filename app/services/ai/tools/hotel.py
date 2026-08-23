@@ -716,6 +716,19 @@ async def negotiate_rate(args: NegotiateArgs, ctx: AgentContext) -> tuple[dict, 
 
     payload = decision.as_dict()
     payload["currency"] = "INR"
+    # What the guest asked for, returned rather than dropped.
+    #
+    # Not for the model's benefit — it just said it — but for the reply
+    # guardrail's. "₹4,000 mein nahi ho payega, ₹4,300 kar sakta hoon" is the
+    # ordinary shape of a counter-offer, and the first of those two figures came
+    # from the guest. With nothing in the run holding it, the guardrail read a
+    # price nobody computed and turned a normal haggle into a handoff.
+    #
+    # Deliberately narrow: it is backed on turns where the engine was actually
+    # asked about that number, and nowhere else. A figure a guest writes is not
+    # a figure the agent may repeat back for free.
+    if args.requested_nightly_rupees is not None:
+        payload["requestedNightlyPaise"] = args.requested_nightly_rupees * 100
 
     # The agent's own ceiling, applied on top of the property's.
     #
