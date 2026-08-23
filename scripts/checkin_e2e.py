@@ -28,6 +28,7 @@ the database cannot produce it.
 """
 import base64
 import json
+import os
 import subprocess
 import sys
 import urllib.error
@@ -37,7 +38,11 @@ from datetime import date, timedelta
 
 REF = "rdlozqvuywtgsodunait"
 SB = f"https://{REF}.supabase.co"
-API = "http://127.0.0.1:8010/api/v1/pms"
+# Which StayOS to test. Defaults to the uvicorn each suite's docstring tells
+# you to start; set STAYOS_API_BASE=https://stayos-backend.travbuddy.in to run
+# the same assertions against the deployed one, which is the only way to find
+# out whether what is live behaves like what is on this branch.
+API = os.environ.get("STAYOS_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
 
 PROP = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 PARTNER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -411,7 +416,11 @@ def main() -> int:
     check("and the token is not case-insensitive the way a reference is",
           st == 404, str(st))
     st, _ = http(f"{API}/public/bookings/{'%' * 32}")
-    check("a wildcard is not a pattern here", st == 404, str(st))
+    # 400 as well as 404: behind Coolify the edge rejects a malformed
+    # percent-escape before FastAPI sees it, where a bare uvicorn hands it to
+    # the handler. Both refuse — pinning this to 404 failed against production
+    # for doing the stricter thing. See tenant_isolation_e2e for the wider set.
+    check("a wildcard is not a pattern here", st in (400, 404), str(st))
     st, _ = http(f"{API}/public/bookings/{STAY_REF}")
     check("the reference does not open the booking page", st == 404, str(st))
 

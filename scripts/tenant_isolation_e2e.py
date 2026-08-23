@@ -23,9 +23,13 @@ be able to rewrite the hotel's website or open its billing.
 
 Reads only. Nothing here writes anything that succeeds — that is the point.
 """
-import base64, json, subprocess, urllib.error, urllib.request
+import base64, json, os, subprocess, urllib.error, urllib.request
 
-API = "http://127.0.0.1:8010/api/v1"
+# Which StayOS to test. Defaults to the uvicorn this suite's docstring tells
+# you to start; set STAYOS_API_BASE=https://stayos-backend.travbuddy.in to run
+# the same assertions against the deployed one, which is the only way to find
+# out whether what is live behaves like what is on this branch.
+API = os.environ.get("STAYOS_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1"
 REF = "rdlozqvuywtgsodunait"
 SB = f"https://{REF}.supabase.co/auth/v1"
 ANANDI = "47f4cbf8-7cad-4369-a4c9-a4a70a0c29c0"
@@ -153,8 +157,24 @@ print("\n── the booking link, which is the only credential a guest holds ─
 # unauthenticated route directly, because that is how a stranger would.
 st, _ = http(f"{API}/pms/public/bookings/{'0' * 32}")
 check("a token nobody was issued is 404", st == 404, st)
-st, _ = http(f"{API}/pms/public/bookings/{'%' * 32}")
-check("a wildcard is not a pattern", st == 404, st)
+# A token is compared, never matched. Each of these is a wildcard in some
+# language the token passes through — SQL LIKE, a glob, a quoted string — and
+# each must come back as "no such booking" rather than somebody's.
+#
+# 400 counts as a pass on the raw `%` case and 404 does not mean it is weaker:
+# behind Coolify the edge rejects a malformed percent-escape before FastAPI is
+# reached, where a bare uvicorn passes it through to the handler. Both refuse;
+# they refuse at different distances. Pinning this to 404 made the suite fail
+# against production while the deployed code was doing the stricter thing.
+for pattern, label in (("%" * 32, "a percent wildcard"),
+                       ("_" * 32, "an underscore wildcard"),
+                       ("*", "a glob"),
+                       ("%25", "an escaped percent"),
+                       ("'%20or%20'1'='1", "a quoted injection")):
+    st, body = http(f"{API}/pms/public/bookings/{pattern}")
+    check(f"{label} is not a pattern", st in (400, 404), st)
+    check(f"  and {label} is told nothing about why",
+          st == 400 or "could not find" in str(body).lower(), body)
 if their_reservation:
     their_ref = sql(f"""select ref from reservations where id = '{their_reservation[0]['id']}';""")
     st, _ = http(f"{API}/pms/public/bookings/{their_ref[0]['ref']}")
