@@ -302,6 +302,9 @@ def _prompt(allowed: tuple[str, ...]) -> str:
         "Judge what the person is trying to achieve, not how much they wrote. A "
         "long message asking about breakfast is still a simple question. A short "
         "message disputing a charge is not.\n"
+        "Several rooms on one enquiry is one sale, not several bookings and not "
+        "a job for the staff: '5 kamre chahiye', 'we are 12 people' is somebody "
+        "asking what it costs.\n"
         "When two labels could fit, choose the cheaper, more ordinary one. When "
         "nothing fits, reply with the first label in the list."
     )

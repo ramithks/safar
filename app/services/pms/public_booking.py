@@ -37,7 +37,7 @@ from datetime import date, datetime, timedelta, timezone
 from fastapi import HTTPException, status
 
 from app.db.client import get_db, run_db
-from app.services.pms import clock
+from app.services.pms import clock, onboarding
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,12 @@ async def resolve_published(slug: str) -> ResolvedProperty:
         timezone=prop.get("timezone") or clock.DEFAULT_TIMEZONE,
         check_in_time=str(prop.get("check_in_time") or "")[:5],
         check_out_time=str(prop.get("check_out_time") or "")[:5],
-        policies=prop.get("policies") or {},
+        # House rules only. `properties.policies` is one column holding both
+        # the hotelier's house rules and their commercial settings
+        # (`token_pct`, `max_discount_pct`). Everything downstream of this
+        # resolver is a guest-facing surface, so the split happens here
+        # rather than at each of them.
+        policies=onboarding.guest_policies(prop.get("policies")),
         is_demo=bool(prop.get("is_demo")),
         website=site.get("published") or {},
         template=site.get("template") or "boutique",

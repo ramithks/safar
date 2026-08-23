@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from app.db.client import get_db, run_db
+from app.services.pms import rates as rate_rules
 from app.services.pms.pricing import date_range, nights_between
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,13 @@ class RatePlanOption:
     # Non-null when the arrival night carries a minimum longer than this stay.
     min_stay_violation: int | None
     closed: bool
+    # How many units this *plan* may sell, which is the room type's stock unless
+    # the plan carries a smaller allocation. An agency contracted for two rooms
+    # in a ten-room hotel must not be shown ten.
+    units_left: int = 0
+    # Set when a volume tier moved the nightly rate. Carries the band so a
+    # hotelier reading a quote can see which of their own rules produced it.
+    group_tier: rate_rules.AppliedTier | None = None
 
 
 @dataclass
@@ -117,7 +125,7 @@ def _fetch(property_id: str, check_in: date, check_out: date, audience: str | No
     ).execute()
     plans = (
         db.table("rate_plans")
-        .select("id,room_type_id,code,name,meal_plan,audience,refundable,inclusions,base_price_paise,min_stay")
+        .select("id,room_type_id,code,name,meal_plan,audience,refundable,inclusions,base_price_paise,min_stay,derived_from_plan_id,derive_discount_pct,valid_from,valid_to,days_of_week,allocation_units")
         .eq("property_id", property_id)
         .eq("is_active", True)
         .execute()
@@ -200,6 +208,43 @@ async def stay_options(
     departure_night = days[-1].isoformat()
     options: list[StayOption] = []
 
+    # Rates are resolved for every plan before any room type is built, in two
+    # passes, because a derived plan cannot be priced until its parent has been.
+    # Doing it inside the room-type loop would mean a plan's price depended on
+    # whether its parent's room type happened to be iterated first.
+    nightly_by_plan: dict[str, list[tuple[date, int]]] = {}
+    closed_by_plan: dict[str, bool] = {}
+    for plan in plans:
+        per_date = rate_by_plan.get(plan["id"], {})
+        base = plan.get("base_price_paise") or 0
+        resolved: list[tuple[date, int]] = []
+        shut = False
+        for d in days:
+            # A plan outside its contract dates, or off its selling days, is
+            # closed for this stay rather than absent — the difference matters to
+            # an agency asking why its rate disappeared.
+            if not rate_rules.plan_open_on(plan, d):
+                shut = True
+            row = per_date.get(d.isoformat())
+            if row is None:
+                resolved.append((d, base))
+                continue
+            if row.get("closed"):
+                shut = True
+            resolved.append((d, row.get("price_paise") or base))
+        # A derived plan's own base price is meaningless and is about to be
+        # overwritten; it is carried this far only so the map has an entry to
+        # replace.
+        nightly_by_plan[str(plan["id"])] = resolved
+        closed_by_plan[str(plan["id"])] = shut
+
+    nightly_by_plan = rate_rules.resolve_derived(plans, nightly_by_plan)
+
+    # Volume pricing, once, for the whole request. `units` is the number of rooms
+    # being asked for, so a tier applies to every room type the same way — the
+    # tier itself decides whether it is scoped to one.
+    tiers = await rate_rules.tiers_for(property_id) if units > 1 else []
+
     for rt in types:
         by_date = left_by_type.get(rt["id"], {})
         blocked = stop_sell.get(rt["id"], set())
@@ -220,16 +265,16 @@ async def stay_options(
                 continue
 
             per_date = rate_by_plan.get(plan["id"], {})
-            nightly: list[tuple[date, int]] = []
-            closed = False
-            for d in days:
-                row = per_date.get(d.isoformat())
-                if row is None:
-                    nightly.append((d, plan["base_price_paise"]))
-                    continue
-                if row.get("closed"):
-                    closed = True
-                nightly.append((d, row.get("price_paise") or plan["base_price_paise"]))
+            nightly = nightly_by_plan.get(str(plan["id"]))
+            if nightly is None:
+                # A derived plan whose parent could not be resolved. Skipped
+                # rather than shown at zero — see rates.resolve_derived.
+                continue
+            closed = closed_by_plan.get(str(plan["id"]), False)
+
+            nightly, applied_tier = rate_rules.apply_tier(
+                nightly, rate_rules.select_tier(tiers, units, rt["id"])
+            )
 
             # Arrival-night restrictions. CTA blocks a stay *starting* here and
             # says nothing about one passing through.
@@ -258,6 +303,16 @@ async def stay_options(
                     per_night_paise=round(total / nights / units) if nights and units else 0,
                     min_stay_violation=violation,
                     closed=closed,
+                    # The smaller of the room type's stock and this plan's own
+                    # allocation. Enforced again at quote time; shown here so a
+                    # caller never offers what it cannot then sell.
+                    units_left=min(
+                        max(units_left, 0),
+                        int(plan["allocation_units"])
+                        if plan.get("allocation_units") is not None
+                        else max(units_left, 0),
+                    ),
+                    group_tier=applied_tier,
                 )
             )
 
@@ -277,16 +332,28 @@ async def stay_options(
 
 
 async def nightly_for_plan(
-    property_id: str, rate_plan_id: str, check_in: date, check_out: date
-) -> list[tuple[date, int]] | None:
+    property_id: str, rate_plan_id: str, check_in: date, check_out: date, units: int = 1
+) -> tuple[list[tuple[date, int]], "rate_rules.AppliedTier | None"] | None:
     """
     The per-night prices for one rate plan, or None when the plan is closed or
     unknown. Used by the quote path, which must not re-derive prices from a
     caller-supplied number.
+
+    **`units` is not decoration.** It was added because volume pricing has to be
+    decided in exactly one place, and this is the function the quote path calls.
+    Resolving the tier here means a hotel's group rate reaches a booking through
+    the same route as its seasonal rate — no second code path, no chance of the
+    dashboard and the guest seeing different numbers for six rooms.
+
+    Returns the rates *and* which tier produced them, because a quote that
+    silently came out 10% lower than the published rate is one nobody can explain
+    to a hotelier three weeks later.
     """
-    options = await stay_options(property_id, check_in, check_out, units=1, audience=None)
+    options = await stay_options(property_id, check_in, check_out, units=units, audience=None)
     for opt in options:
         for plan in opt.rate_plans:
             if plan.rate_plan_id == rate_plan_id:
-                return None if plan.closed else plan.nightly_paise
+                if plan.closed:
+                    return None
+                return plan.nightly_paise, plan.group_tier
     return None

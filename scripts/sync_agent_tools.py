@@ -1,97 +1,113 @@
+#!/usr/bin/env python3
 """
-Give every hotel's AI employee the tools that shipped after it was set up.
+Grants that were added to a definition after the agent was provisioned.
 
-    python scripts/sync_agent_tools.py            say what is missing
-    python scripts/sync_agent_tools.py --apply    grant it
+`provisioning._provision` writes one `agent_tools` row per tool in the
+definition, and `registry.available_for` shows the model exactly the tools it
+has rows for. Both are right. What nobody does is re-run provisioning: an agent
+is provisioned once, when the hotel activates, and every tool added to a
+definition after that day is invisible to it forever.
 
-An agent's tools are rows in `agent_tools`, written once when the hotel was
-provisioned. So a tool added to a definition afterwards — `create_payment_link`,
-`order_service`, `get_check_in_link` — exists in the code, is registered, is
-listed in the agent definition, and is still not callable by any hotel that
-signed up yesterday. Nothing fails; the agent simply never offers to take a
-payment, and the reason is invisible from every screen.
+That is not a hypothetical. `negotiate_rate` and `get_group_rates` shipped with
+the hotel-OS work and were granted to the Sales definition. The Guest agent —
+the one answering Instagram on every pilot property — never got them, so a
+guest who pushed on price met a model holding a rate card and no engine. It
+made a number up. The reply guardrail caught it, which is the only reason this
+was a finding rather than a refund.
 
-`provision()` would fix it, and also writes a new `agent_configs` version per
-agent per run. That is the wrong trade for a backfill: a version bump means
-"somebody changed how this agent behaves", and reading a hotel's config history
-should not turn up eight versions that differ in nothing.
+This reconciles every provisioned agent against its definition:
 
-**Additive only.** It inserts missing rows and never deletes one, so a hotel
-that switched a tool off by hand stays switched off — the same rule
-`provision`'s upsert follows, and for the same reason.
+    ./venv/bin/python scripts/sync_agent_tools.py            # what is missing
+    ./venv/bin/python scripts/sync_agent_tools.py --apply    # write it
+
+**It only ever adds.** A tool a property switched off by hand stays off — the
+row exists, so it is not missing — and a tool dropped from a definition keeps
+its row rather than being revoked under a running conversation. Removing a
+capability is a decision somebody should make on purpose, not a side effect of
+a deploy.
 """
-import argparse
+import pathlib
 import sys
 
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from app.db.client import get_db  # noqa: E402
 from app.services.ai import registry  # noqa: E402
-from app.services.ai.agents import all_definitions  # noqa: E402
+from app.services.ai.agents import get as get_definition  # noqa: E402
+
+registry.load_all()
+
+APPLY = "--apply" in sys.argv
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--apply", action="store_true", help="write the missing rows")
-    args = ap.parse_args()
-
-    registry.load_all()
-    definitions = all_definitions()
     db = get_db()
+    agents = (
+        db.table("agents").select("id,property_id,agent_type,status,autonomy_level")
+        .execute().data or []
+    )
+    if not agents:
+        print("no agents provisioned")
+        return 0
 
-    agents = (db.table("agents")
-              .select("id,agent_type,property_id").limit(2000).execute().data or [])
-    names = {p["id"]: p["name"] for p in
-             (db.table("properties").select("id,name").limit(2000).execute().data or [])}
+    granted: dict[str, set[str]] = {}
+    for row in (db.table("agent_tools").select("agent_id,tool_name").execute().data or []):
+        granted.setdefault(row["agent_id"], set()).add(row["tool_name"])
 
-    granted = (db.table("agent_tools")
-               .select("agent_id,tool_name").limit(20000).execute().data or [])
-    have: dict[str, set[str]] = {}
-    for row in granted:
-        have.setdefault(row["agent_id"], set()).add(row["tool_name"])
-
-    missing: list[dict] = []
+    total = 0
+    behind: list[str] = []
     for agent in agents:
-        definition = definitions.get(agent["agent_type"])
-        if definition is None:
+        try:
+            definition = get_definition(agent["agent_type"])
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ?  {agent['agent_type']}: no definition ({exc})")
             continue
-        for name in definition.tools:
-            if name not in have.get(agent["id"], set()):
-                missing.append({"agent_id": agent["id"], "tool_name": name,
-                                "_property": names.get(agent["property_id"], "?"),
-                                "_type": agent["agent_type"]})
 
-    if not missing:
-        print(f"  {len(agents)} agents, every tool already granted.")
+        # Reported, never written. `agents.autonomy_level` is also set on
+        # insert and never again, so a property provisioned before the Guest
+        # agent moved from 2 to 3 still has an agent whose every selling tool
+        # queues for approval — the guest asks the price and is told the hotel
+        # team will confirm. But a hotel that turned the dial down on purpose
+        # must not have it turned back up by a deploy, so this prints and stops.
+        if agent["autonomy_level"] < definition.autonomy_level:
+            behind.append(
+                f"    {agent['agent_type']} · {agent['property_id']} "
+                f"· level {agent['autonomy_level']}, "
+                f"definition ships at {definition.autonomy_level}"
+            )
+
+        wanted = {t for t in definition.tools if t in registry.REGISTRY}
+        missing = sorted(wanted - granted.get(agent["id"], set()))
+        if not missing:
+            continue
+
+        total += len(missing)
+        print(f"\n{agent['agent_type']} · {agent['property_id']} · {agent['status']}")
+        for name in missing:
+            print(f"    + {name}")
+
+        if APPLY:
+            db.table("agent_tools").upsert(
+                [{"agent_id": agent["id"], "tool_name": name} for name in missing],
+                on_conflict="agent_id,tool_name",
+                ignore_duplicates=True,
+            ).execute()
+
+    if behind:
+        print("\n── below the level their definition ships at ─────────────────")
+        print("\n".join(behind))
+        print("    Selling tools sit at autonomy floor 3. Below it they do not")
+        print("    fail — they queue for a human, which reads to a guest as")
+        print("    'the hotel team will confirm'. Raising it is the hotel's call.")
+
+    if not total:
+        print("\nevery agent already holds every tool its definition names")
         return 0
 
-    by_hotel: dict[str, list[str]] = {}
-    for m in missing:
-        by_hotel.setdefault(m["_property"], []).append(f"{m['_type']}.{m['tool_name']}")
-    for hotel, items in sorted(by_hotel.items()):
-        print(f"  {hotel}")
-        for item in sorted(items):
-            print(f"      + {item}")
-
-    if not args.apply:
-        print(f"\n  {len(missing)} grants missing. Re-run with --apply to write them.")
-        return 0
-
-    # A tool that is not in the registry must never reach `agent_tools`: the
-    # row would be a grant to call something that does not exist, and the
-    # failure would surface as an agent that goes quiet mid-conversation.
-    unknown = {m["tool_name"] for m in missing} - set(registry.REGISTRY)
-    if unknown:
-        print(f"\n  refusing: not registered — {', '.join(sorted(unknown))}")
-        return 1
-
-    db.table("agent_tools").upsert(
-        [{"agent_id": m["agent_id"], "tool_name": m["tool_name"]} for m in missing],
-        on_conflict="agent_id,tool_name", ignore_duplicates=True,
-    ).execute()
-    print(f"\n  granted {len(missing)}.")
+    print(f"\n{total} grants {'written' if APPLY else 'missing'}"
+          f"{'' if APPLY else ' — re-run with --apply'}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

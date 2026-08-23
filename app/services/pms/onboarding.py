@@ -841,6 +841,35 @@ GUEST_POLICY_KEYS = frozenset({
     "payment", "id_required", "check_in_note", "quiet_hours",
 })
 
+
+def guest_policies(policies: dict | None) -> dict:
+    """
+    The house rules, with the commercial settings taken out.
+
+    **`properties.policies` is two things in one column** and always has been:
+    the guest-facing house rules above, and `token_pct` / `max_discount_pct`,
+    which the pricing engine reads. The *write* path has filtered on
+    `GUEST_POLICY_KEYS` since it was written — a screen saving the whole object
+    would delete a hotel's deposit percentage — and the read paths never did.
+
+    So `GET /public/hotels/{slug}` returned `max_discount_pct: 15` to anybody
+    who asked, and `get_property_policies` handed the same number to the model
+    on any turn a guest asked about house rules. The second is the worse of the
+    two: §33 forbids the agent revealing what the hotel will accept, and this
+    put the number directly in its context where no guardrail was looking for
+    it. Found by `scripts/tenant_security_e2e.py`, which greps a guest surface
+    for the vocabulary of the commercial layer.
+
+    An allow-list rather than a deny-list, because the next commercial key
+    somebody adds to this column must be invisible by default rather than
+    invisible only if they remember this function exists.
+    """
+    return {
+        key: value
+        for key, value in (policies or {}).items()
+        if key in GUEST_POLICY_KEYS and str(value or "").strip()
+    }
+
 _TIME = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 

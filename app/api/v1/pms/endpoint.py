@@ -184,7 +184,9 @@ from app.services.pms import creators as creators_service
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
 from app.services import trace
+from app.services.pms import escalation as escalation_service
 from app.services.pms import money
+from app.services.pms import policies as pms_policies
 from app.services.pms import uploads
 from app.services.pms import payments as payments_service
 from app.services.pms import stay_payment
@@ -1679,6 +1681,17 @@ async def send_conversation_message(
     if (conversation.get("handler") or "ai") != "human":
         await messaging_service.take_over(conversation_id, property_id, member)
 
+    # A person from the hotel just answered in this thread, which is what "the
+    # hotel responded" actually looks like — a manager who approves a rate on
+    # WhatsApp and then types to the guest has responded, and nobody is going to
+    # open the dashboard afterwards to press a button saying so.
+    #
+    # Without this the escalation sits in `notified` for ever: the agent keeps
+    # telling the guest it is still waiting, and the "waiting on you" count on
+    # the team screen only ever goes up. Zero on the overwhelming majority of
+    # staff messages, and never fatal.
+    await escalation_service.note_hotel_replied(conversation_id)
+
     return MessageOut.from_row(sent.message)
 
 
@@ -2990,6 +3003,16 @@ async def upsert_service(
         "is_active": body.isActive,
         "daily_capacity": body.dailyCapacity,
         "lead_time_hours": body.leadTimeHours,
+        "price_unit": body.priceUnit,
+        "availability": body.availability,
+        "opens_at": body.opensAt or None,
+        "closes_at": body.closesAt or None,
+        "max_quantity": body.maxQuantity,
+        "available_from": body.availableFrom or None,
+        "available_to": body.availableTo or None,
+        "photo_url": body.photoUrl or None,
+        "terms": body.terms or None,
+        "advance_required": body.advanceRequired,
     }
 
     def _write():
@@ -3616,7 +3639,9 @@ async def get_public_hotel(request: Request, slug: str):
         types = (
             db.table("room_types")
             .select("id,code,name,description,max_occupancy,standard_occupancy,"
-                    "bed_type,amenities,photos,size_sqft")
+                    "bed_type,amenities,photos,size_sqft,max_adults,max_children,"
+                    "children_allowed,bed_count,extra_bed,extra_bed_paise,view,"
+                    "smoking,accessible,bathroom")
             .eq("property_id", prop.id).eq("is_active", True)
             .order("sort_order").execute().data or []
         )
@@ -3632,17 +3657,40 @@ async def get_public_hotel(request: Request, slug: str):
         # would advertise a price no guest can have.
         plans = (
             db.table("rate_plans")
-            .select("room_type_id,base_price_paise,meal_plan")
+            .select("room_type_id,base_price_paise,meal_plan,refundable,"
+                    "cancellation_cutoff_hours,cancellation_policy")
             .eq("property_id", prop.id).eq("is_active", True)
             .eq("audience", "public").execute().data or []
+        )
+        # §45: the page is built from the same rows the agent reads. A page
+        # saying "breakfast 7:30–10:30" while the AI says it will check is two
+        # answers to one question, and a guest picks whichever suits them.
+        meal_rows = (
+            db.table("meal_options").select("*")
+            .eq("property_id", prop.id).limit(10).execute().data or []
+        )
+        experience_rows = (
+            db.table("experiences")
+            .select("id,title,description,category,duration_minutes,price_paise,"
+                    "price_unit,meeting_point,min_participants,max_participants,"
+                    "min_age,requirements,photos,availability")
+            .eq("property_id", prop.id).eq("is_active", True)
+            .neq("availability", "not_available")
+            .order("sort_order").limit(50).execute().data or []
+        )
+        time_rows = (
+            db.table("stay_time_rules").select("*")
+            .eq("property_id", prop.id).eq("is_active", True)
+            .order("kind").order("until_time").limit(50).execute().data or []
         )
         domain = (
             db.table("hotel_websites").select("domain,domain_status")
             .eq("property_id", prop.id).limit(1).execute().data or []
         )
-        return types, services, plans, (domain[0] if domain else {})
+        return (types, services, plans, (domain[0] if domain else {}),
+                meal_rows, experience_rows, time_rows)
 
-    types, services, plans, site = await run_db(_read)
+    types, services, plans, site, meal_rows, experience_rows, time_rows = await run_db(_read)
 
     cheapest: dict[str, dict] = {}
     for plan in plans:
@@ -3656,7 +3704,55 @@ async def get_public_hotel(request: Request, slug: str):
         slug=prop.slug, name=prop.name, city=prop.city, template=prop.template,
         currency=prop.currency, timezone=prop.timezone,
         checkInTime=prop.check_in_time, checkOutTime=prop.check_out_time,
+        # Already house-rules-only: `resolve_published` strips the commercial
+        # keys that share this column.
         policies=prop.policies, content=prop.website,
+        # Room-only, because the page is about the hotel rather than about one
+        # rate. A guest reading "breakfast included" here would be reading a
+        # claim that depends on which rate they end up booking.
+        meals=pms_policies.meals_for_plan("EP", meal_rows),
+        experiences=[
+            {
+                "id": str(x["id"]),
+                "title": x.get("title"),
+                "description": x.get("description"),
+                "category": x.get("category"),
+                "durationMinutes": x.get("duration_minutes"),
+                "pricePaise": x.get("price_paise"),
+                "priceUnit": x.get("price_unit"),
+                "meetingPoint": x.get("meeting_point"),
+                "minParticipants": x.get("min_participants"),
+                "maxParticipants": x.get("max_participants"),
+                "minAge": x.get("min_age"),
+                "requirements": x.get("requirements"),
+                "photos": x.get("photos") or [],
+                "availability": x.get("availability"),
+            }
+            for x in experience_rows
+        ],
+        # Grouped by kind, then by time.
+        #
+        # `bands_from_rows` sorts by time alone, which is right for its own
+        # caller — the resolver only ever looks at one kind at a time. A
+        # consumer rendering *both* gets them interleaved, and the live payload
+        # came back early 08:00, early 11:00, late 13:00, early 14:00, late
+        # 17:00 — which on a page reads as "Arriving before 14:00" after
+        # "Leaving by 13:00". Ordered here rather than in the resolver so the
+        # agent's path is untouched.
+        arrivalRules=[
+            {
+                "kind": b.kind,
+                "untilTime": b.until.strftime("%H:%M"),
+                "chargeKind": b.charge_kind,
+                "amount": b.amount,
+                "subjectToAvailability": b.subject_to_availability,
+                "note": b.note,
+            }
+            for b in sorted(
+                pms_policies.bands_from_rows(time_rows),
+                key=lambda b: (b.kind != "early_in", b.until),
+            )
+        ],
         address=prop.address, state=prop.state, country=prop.country,
         pincode=prop.pincode, lat=prop.lat, lon=prop.lon,
         propertyType=prop.property_type, totalRooms=prop.total_rooms,
@@ -3689,6 +3785,27 @@ async def get_public_hotel(request: Request, slug: str):
                 standardOccupancy=t.get("standard_occupancy"),
                 fromPricePaise=(cheapest.get(t["id"]) or {}).get("base_price_paise"),
                 mealPlan=(cheapest.get(t["id"]) or {}).get("meal_plan"),
+                maxAdults=t.get("max_adults"),
+                maxChildren=t.get("max_children"),
+                childrenAllowed=t.get("children_allowed"),
+                bedCount=t.get("bed_count"),
+                extraBed=t.get("extra_bed"),
+                extraBedPaise=t.get("extra_bed_paise"),
+                view=t.get("view"),
+                smoking=t.get("smoking"),
+                accessible=t.get("accessible"),
+                bathroom=t.get("bathroom"),
+                # From the cheapest public plan — the one the "from" price
+                # belongs to — so the terms shown are the terms of the rate
+                # shown. Resolved through the same function the agent quotes.
+                cancellation=(
+                    pms_policies.cancellation_terms(
+                        (cheapest.get(t["id"]) or {}).get("cancellation_policy"),
+                        refundable=bool((cheapest.get(t["id"]) or {}).get("refundable", True)),
+                        cutoff_hours=(cheapest.get(t["id"]) or {}).get("cancellation_cutoff_hours"),
+                    ).as_dict()
+                    if cheapest.get(t["id"]) else None
+                ),
             ) for t in types
         ],
     )

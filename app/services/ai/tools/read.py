@@ -29,6 +29,7 @@ from app.services.ai.registry import tool
 from app.services.pms import availability as availability_service
 from app.services.pms import clock
 from app.services.pms import money
+from app.services.pms import onboarding
 from app.services.pms import workspace as workspace_service
 
 
@@ -183,7 +184,11 @@ async def get_property_policies(_args: NoArgs, ctx: AgentContext) -> dict:
     if not row:
         raise ToolUnavailable("the property record could not be read")
 
-    policies = row.get("policies") or {}
+    # House rules only. The same column carries `max_discount_pct` and
+    # `token_pct` — the hotel's negotiating ceiling — and this tool puts
+    # whatever it returns into the model's context on any house-rules turn,
+    # one paraphrase away from a guest reading it.
+    policies = onboarding.guest_policies(row.get("policies"))
     return {
         "policies": policies,
         "checkInTime": str(row.get("check_in_time") or ""),

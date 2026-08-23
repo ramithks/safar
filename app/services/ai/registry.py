@@ -310,6 +310,7 @@ def load_all() -> None:
         booking,
         communication,
         frontdesk,
+        hotel,
         marketing,
         operations,
         owner,

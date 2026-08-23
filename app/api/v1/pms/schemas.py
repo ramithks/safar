@@ -1303,6 +1303,23 @@ class ServiceOut(BaseModel):
     isActive: bool = True
     dailyCapacity: int | None = None
     leadTimeHours: int = 0
+    # Everything below arrived with the hotel-OS work and is defaulted, so a
+    # client written against the earlier shape keeps working unchanged.
+    #
+    # `priceUnit` is the one that mattered most: without it, ₹1,500 for an
+    # airport pickup could be per person or per vehicle, which is the difference
+    # between ₹1,500 and ₹9,000 for a family of six — and an AI quoting it had
+    # no way to know it was guessing.
+    priceUnit: str = "fixed"
+    availability: str = "available"
+    opensAt: str | None = None
+    closesAt: str | None = None
+    maxQuantity: int | None = None
+    availableFrom: str | None = None
+    availableTo: str | None = None
+    photoUrl: str | None = None
+    terms: str | None = None
+    advanceRequired: bool = False
 
     @classmethod
     def from_row(cls, r: dict) -> "ServiceOut":
@@ -1316,6 +1333,16 @@ class ServiceOut(BaseModel):
             isActive=bool(r.get("is_active", True)),
             dailyCapacity=r.get("daily_capacity"),
             leadTimeHours=int(r.get("lead_time_hours") or 0),
+            priceUnit=r.get("price_unit") or "fixed",
+            availability=r.get("availability") or "available",
+            opensAt=str(r["opens_at"])[:5] if r.get("opens_at") else None,
+            closesAt=str(r["closes_at"])[:5] if r.get("closes_at") else None,
+            maxQuantity=r.get("max_quantity"),
+            availableFrom=str(r["available_from"])[:10] if r.get("available_from") else None,
+            availableTo=str(r["available_to"])[:10] if r.get("available_to") else None,
+            photoUrl=r.get("photo_url"),
+            terms=r.get("terms"),
+            advanceRequired=bool(r.get("advance_required")),
         )
 
 
@@ -1330,6 +1357,19 @@ class ServiceUpsertRequest(BaseModel):
     isActive: bool = True
     dailyCapacity: int | None = Field(default=None, ge=0)
     leadTimeHours: int = Field(default=0, ge=0, le=720)
+    priceUnit: Literal[
+        "per_person", "per_room", "per_vehicle", "per_trip",
+        "per_night", "per_item", "fixed",
+    ] = "fixed"
+    availability: Literal["available", "on_request", "not_available"] = "available"
+    opensAt: str | None = Field(default=None, max_length=8)
+    closesAt: str | None = Field(default=None, max_length=8)
+    maxQuantity: int | None = Field(default=None, ge=1, le=999)
+    availableFrom: str | None = Field(default=None, max_length=10)
+    availableTo: str | None = Field(default=None, max_length=10)
+    photoUrl: str | None = Field(default=None, max_length=1000)
+    terms: str | None = Field(default=None, max_length=2000)
+    advanceRequired: bool = False
 
 
 class MemberOut(BaseModel):
@@ -1615,6 +1655,26 @@ class PublicRoomOptionOut(BaseModel):
     fromPricePaise: int | None = None
     mealPlan: str | None = None
 
+    # Everything the hotel-OS work made answerable, so the page and the AI say
+    # the same thing about the same room.
+    #
+    # §45 asks for exactly this and it is worth naming the failure it avoids: a
+    # page saying "children welcome" while the agent says it will check is two
+    # answers to one question, and the guest picks whichever suits them. There
+    # is one row underneath both.
+    maxAdults: int | None = None
+    maxChildren: int | None = None
+    childrenAllowed: str | None = None
+    bedCount: int | None = None
+    extraBed: str | None = None
+    extraBedPaise: int | None = None
+    view: str | None = None
+    smoking: str | None = None
+    accessible: str | None = None
+    bathroom: str | None = None
+    # Cancellation terms, resolved from the same ladder the agent quotes.
+    cancellation: dict | None = None
+
 
 class PublicAvailabilityOut(BaseModel):
     checkIn: date
@@ -1652,6 +1712,14 @@ class PublicSiteOut(BaseModel):
     content: dict = {}
     services: list[PublicServiceOut] = []
     roomTypes: list[PublicRoomOptionOut] = []
+
+    # The structured facts §45 asks the page to be built from — the same rows
+    # the agent reads, so the two cannot disagree.
+    meals: list[dict] = []
+    experiences: list[dict] = []
+    # Early arrival and late departure, as bands a page can render as a table
+    # and an answer engine can read as a policy.
+    arrivalRules: list[dict] = []
 
     # ── the facts a page about this hotel needs ─────────────────────────────
     #

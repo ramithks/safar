@@ -1,11 +1,17 @@
 """
 The Guest agent — the only one built.
 
-Ships at **autonomy 2**: it may answer, look things up, raise tickets and assign
-them, and it may not sell anything without a person. That line is where it is
-for a reason. Level 2 mistakes are recoverable — a ticket nobody needed, an
-answer that should have been a handoff. Level 3 mistakes are a room sold at a
-price nobody watched it choose.
+Ships at **autonomy 3**: it may answer, look things up, raise tickets, quote
+from the hotel's own rate table and take payment for a quote. It shipped at 2 —
+the reasoning is kept beside the field, along with why it moved — and an owner
+who wants less moves the dial down on the AI employee screen.
+
+Note that moving the default did not move anybody already provisioned:
+`agents.autonomy_level` is written on insert and never again, so every property
+activated before the change is still at 2 and its selling tools still queue for
+approval. `scripts/sync_agent_tools.py` reports that drift; it does not fix it,
+because a hotel that deliberately turned the dial down must not have it turned
+back up by a deploy.
 
 The line it does not cross is `folio`, `billing` and `payouts`. It holds
 `rates` and `frontdesk`, because quoting and booking are what a guest agent is
@@ -72,6 +78,16 @@ DEFINITION = AgentDefinition(
         # tab.
         "get_hotel_page_link",
         "list_services",
+        # The five questions that arrive constantly and had no structured
+        # answer until the hotel-OS work: what a room actually is, whether
+        # breakfast is included, whether they can arrive at ten, what happens
+        # if they cancel, and what there is to do here. Each one used to be
+        # answered from prose somebody had remembered to write, or not at all.
+        "get_room_details",
+        "get_meal_info",
+        "get_checkin_options",
+        "get_cancellation_terms",
+        "get_experiences",
         # Knowing this guest — all scoped to the conversation, none of them
         # taking a guest id the model could be talked into changing.
         "get_guest",
@@ -88,6 +104,29 @@ DEFINITION = AgentDefinition(
         "get_stay_options",
         "get_quote",
         "release_hold",
+        # Haggling and groups, which this agent could quote against and not
+        # answer.
+        #
+        # `get_quote` has been here since the beginning; `negotiate_rate` and
+        # `get_group_rates` were written for the hotel-OS work and granted only
+        # to Sales — which on Instagram, where this agent answers, meant a
+        # guest who said "thoda kam karo" met a model with a price list and no
+        # engine. Replayed against production it invented ₹4,204 a night, and
+        # the reply guardrail is the only reason a guest did not read it.
+        #
+        # Both sit at their own floors: `negotiate_rate` is a level-3 tool like
+        # `get_quote`, so a hotel at level 2 gets an approval request rather
+        # than an unwatched discount. Granting them changes what the agent may
+        # ask, not what it may decide — the engine still decides.
+        "negotiate_rate",
+        "get_group_rates",
+        "propose_rate_exception",
+        "get_payment_terms",
+        # Asking the hotel's own team, on WhatsApp, and knowing it is waiting.
+        # The alternative it had was `request_human_handoff`, which parks the
+        # thread and tells the guest a person will come — true, but it ends the
+        # conversation instead of getting an answer to it.
+        "escalate_to_team",
         # `create_booking` is deliberately NOT here.
         #
         # It was, and the gate on it produced a fork this agent could not be

@@ -40,6 +40,7 @@ from app.services.ai.errors import AgentError
 from app.services import billing
 from app.services import trace
 from app.services.messaging import language as language_module
+from app.services.messaging import obligations
 from app.services.messaging import session
 from app.services.messaging import service as messaging
 
@@ -353,7 +354,19 @@ async def process_conversation(conversation_id: str, *, provider=None, classifie
 
         # What this turn established about the stay, from the tools rather than
         # from the reply. Empty on most turns and cheap when it is.
-        await run_db(session.merge, conversation["id"], session.patch_from(result.actions))
+        #
+        # Obligations ride along in the same write. They are opened from the
+        # guest's own words and closed by the tools that answered them — see
+        # services/messaging/obligations.py — and folding them into this patch
+        # rather than adding a second update keeps one read-modify-write per
+        # turn on a column three things now share.
+        patch = session.patch_from(result.actions)
+        patch["obligations"] = obligations.open_from(
+            _agent_text(message),
+            result.actions,
+            (conversation.get("guest_profile") or {}).get("obligations"),
+        )
+        await run_db(session.merge, conversation["id"], patch)
         runs.append(result.run_id)
         processed += 1
 

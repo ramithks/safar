@@ -91,6 +91,16 @@ DEFINITION = AgentDefinition(
         # tab.
         "get_hotel_page_link",
         "list_services",
+        # The five questions that arrive constantly and had no structured
+        # answer until the hotel-OS work: what a room actually is, whether
+        # breakfast is included, whether they can arrive at ten, what happens
+        # if they cancel, and what there is to do here. Each one used to be
+        # answered from prose somebody had remembered to write, or not at all.
+        "get_room_details",
+        "get_meal_info",
+        "get_checkin_options",
+        "get_cancellation_terms",
+        "get_experiences",
         # What is free, and what it costs
         "search_availability",
         "get_stay_options",
@@ -99,9 +109,23 @@ DEFINITION = AgentDefinition(
         # believes happened. Takes no arguments, so it can only ever read this
         # conversation's own booking.
         "get_booking_status",
-        # Price, when the guest pushes back
+        # Price, when the guest pushes back.
+        #
+        # Three tools rather than two, and the new one is the one that answers.
+        # `get_negotiation_policy` says what this agent may do; `negotiate_rate`
+        # decides a specific asking price against the hotel's own floor and, when
+        # the answer is yes, produces the quote to prove it;
+        # `propose_rate_exception` is the path to a human when it is not.
         "get_negotiation_policy",
+        "negotiate_rate",
         "propose_rate_exception",
+        # What several rooms costs, before quoting one room six times.
+        "get_group_rates",
+        "get_payment_terms",
+        # Asking the hotel's own team, with the whole context, on WhatsApp.
+        # Distinct from request_human_handoff: that gives the conversation away,
+        # this keeps it while asking somebody a question.
+        "escalate_to_team",
         # Closing, and un-closing
         # `create_booking` is deliberately NOT here.
         #

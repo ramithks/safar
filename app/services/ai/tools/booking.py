@@ -251,9 +251,13 @@ async def release_hold(args: HoldArgs, ctx: AgentContext) -> tuple[dict, str]:
 
 class BookingPaymentLinkArgs(BaseModel):
     quote_id: ResourceId = Field(description="The quote the guest agreed to.")
-    guest_name: str = Field(
-        min_length=1, max_length=120,
-        description="The guest's full name, as they gave it.",
+    guest_name: str | None = Field(
+        default=None, max_length=120,
+        description=(
+            "The guest's name, if they have given it in this conversation. "
+            "Leave it out otherwise — the name on the thread is used. Never "
+            "ask for a name you have already been told."
+        ),
     )
     guest_phone: str | None = Field(
         default=None, max_length=32,
@@ -307,12 +311,26 @@ async def create_booking_payment_link(
 ) -> tuple[dict, str]:
     from app.services.pms import quote_payment
 
+    # The name on the thread, when the model was not given one.
+    #
+    # It was required, and the model — correctly — asked for it. On a channel
+    # that already carries the guest's name that is a round trip for something
+    # both sides know: the guest had said "Sahil" four messages earlier, and
+    # was asked again at the moment they had agreed to pay. Every extra turn
+    # between agreement and payment link is a sale that can go cold.
+    name = (args.guest_name or ctx.guest_name or "").strip()
+    if not name:
+        raise OutOfScope(
+            "no name for the booking, on the args or on the conversation",
+            "Could you tell me the name the booking should be in?",
+        )
+
     try:
         link = await quote_payment.create_link(
             property_id=ctx.property_id,
             partner_id=ctx.partner_id,
             quote_id=args.quote_id,
-            guest_name=args.guest_name,
+            guest_name=name,
             guest_phone=args.guest_phone or ctx.guest_phone,
             guest_email=args.guest_email,
             source=ctx.channel,

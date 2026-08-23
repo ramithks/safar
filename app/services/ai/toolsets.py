@@ -50,6 +50,20 @@ CORE = frozenset({
     "get_property_knowledge",
     "get_property",
     "send_message",
+    # Groups arrive under every label there is.
+    #
+    # "5 kamre chahiye, 10 log aa rahe hain" has classified, in three replays
+    # of the same sentence, as `availability`, as `guest_request` and as
+    # `multi_reservation` — plural rooms read as several bookings. Only the
+    # first of those carried the group tools, and in the other two the agent
+    # handed a ten-person enquiry to a person because it had nothing to answer
+    # it with. The classifier is not going to get this right every time, and a
+    # hotel does not care which label it was.
+    #
+    # It costs a schema of two fields on every turn, which is the cheapest tool
+    # in this catalogue, and it is the one whose absence loses the largest
+    # bookings a hotel gets.
+    "get_group_rates",
 })
 
 # task → what that task can possibly need, beyond CORE.
@@ -64,10 +78,29 @@ BY_TASK: dict[str, frozenset[str]] = {
     "guest_faq": frozenset({
         "send_room_photos", "get_hotel_page_link",
         "get_property_policies", "get_room_types", "list_services",
+        # The five questions that arrive constantly on Instagram and, until the
+        # hotel-OS work, had no structured answer at all: what the room is,
+        # whether breakfast is included, whether they can arrive at ten, what
+        # happens if they cancel, and what there is to do. Each is a small tool
+        # and together they are what makes `guest_faq` answerable rather than a
+        # polite escalation.
+        "get_room_details", "get_meal_info", "get_checkin_options",
+        "get_cancellation_terms", "get_experiences",
     }),
     "guest_request": frozenset({
         "create_task", "assign_task", "get_task", "get_task_status",
         "list_guest_tasks", "get_reservation", "order_service", "list_services",
+        # "airport pickup ho jayega?" and "anniversary hai, kuch arrange kar
+        # sakte ho?" are both requests, and both are answerable from what the
+        # hotel sells rather than by raising a ticket and hoping.
+        "get_experiences", "get_checkin_options", "escalate_to_team",
+        # "5 kamre chahiye, 10 log aa rahe hain" classified here in a replay —
+        # readable as a request, and with none of the tools that answer it the
+        # agent said it could only check one room type at a time and handed the
+        # group to a person. Rooms and bands, not the quote: a message that is
+        # really a sale gets classified as one next turn, and this is only here
+        # so the turn that was misread is answerable rather than lost.
+        "search_availability", "get_room_types", "get_group_rates",
     }),
     "reservation_lookup": frozenset({
         "get_reservation", "list_guest_reservations", "get_guest",
@@ -80,17 +113,29 @@ BY_TASK: dict[str, frozenset[str]] = {
         # the pricing tools here saves the whole turn that would otherwise be
         # spent discovering they exist.
         "get_quote", "get_property_policies",
+        "get_room_details", "get_group_rates",
+        # "airport se pickup mil jayega?" classifies here about as often as it
+        # classifies as a request — it is a question about whether the hotel
+        # has something, which is what this task is. Without these the answer
+        # is invented or escalated.
+        "list_services", "get_experiences", "get_meal_info",
     }),
     "simple_quote": frozenset({
         "send_room_photos", "get_hotel_page_link",
         "search_availability", "get_stay_options", "get_quote", "get_room_types",
         "get_property_policies", "list_services", "create_booking_payment_link",
+        # "4 rooms chahiye, kya rate hai" is a quote question that is also a
+        # group question, and a guest who is quoted the rack rate for six rooms
+        # has been quoted the wrong price by a system that knew better.
+        "get_group_rates", "get_payment_terms", "get_meal_info",
+        "get_cancellation_terms",
     }),
     "booking": frozenset({
         "send_room_photos", "get_hotel_page_link",
         "search_availability", "get_stay_options", "get_quote", "release_hold",
         "create_booking", "create_booking_payment_link", "get_booking_status",
         "get_property_policies", "get_room_types",
+        "get_payment_terms", "get_cancellation_terms", "get_group_rates",
     }),
     "payment_status": frozenset({
         "get_booking_status", "get_reservation", "list_guest_reservations",
@@ -100,19 +145,31 @@ BY_TASK: dict[str, frozenset[str]] = {
     "cancellation_dispute": frozenset({
         "get_booking_status", "get_reservation", "list_guest_reservations",
         "get_property_policies", "get_folio", "create_task",
+        "get_cancellation_terms", "escalate_to_team",
     }),
     "complex_negotiation": frozenset({
         "send_room_photos", "get_hotel_page_link",
         "get_negotiation_policy", "propose_rate_exception", "get_quote",
         "get_stay_options", "search_availability", "get_room_types",
         "create_booking_payment_link",
+        # `negotiate_rate` is the tool this task exists for now.
+        # `get_negotiation_policy` stays beside it rather than being replaced:
+        # the policy read is how an agent knows whether to open a negotiation at
+        # all, and the engine is how it answers one.
+        "negotiate_rate", "get_group_rates", "get_payment_terms",
+        "escalate_to_team",
     }),
     "policy_conflict": frozenset({
         "get_property_policies", "get_reservation", "get_booking_status",
+        "get_cancellation_terms", "get_checkin_options", "escalate_to_team",
     }),
     "multi_reservation": frozenset({
         "list_guest_reservations", "get_reservation", "get_booking_status",
         "get_check_in_link",
+        # An enquiry for five rooms is not several bookings, but it classifies
+        # as one often enough that this task needs to be able to answer it
+        # rather than escalate.
+        "search_availability", "get_stay_options", "get_quote",
     }),
 }
 
