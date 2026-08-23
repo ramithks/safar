@@ -50,6 +50,7 @@ import e2e_fixture  # noqa: E402
 
 from app.db.client import get_db  # noqa: E402
 from app.services.ai import registry  # noqa: E402
+from app.services.billing import service as billing_service  # noqa: E402
 from app.services.ai.providers import EchoProvider  # noqa: E402
 from app.services.messaging import pipeline, service as messaging  # noqa: E402
 from app.services.messaging.channels import MessagingError  # noqa: E402
@@ -116,7 +117,16 @@ FIXTURE = e2e_fixture.Fixture(
 FIXTURE.open()
 
 RUN_TAG = uuid.uuid4().hex[:8]
-GUEST_PHONE = f"9199{RUN_TAG[:8]}"
+# Digits, and this is a fixture bug that cost five assertions and one crash.
+#
+# `RUN_TAG` is hex, so "9199" + it was a phone number with letters in it. The
+# guest matcher strips non-digits from the sender id and compares the last ten
+# against `guests.phone` — which held those same letters — so it matched
+# nothing, `guest_id` stayed null, the reservation never linked, the ticket got
+# no room, and `get_reservation` in workflow 3 read a booking that was not on
+# the thread and returned nothing. Every one of those read as a product failure
+# on the WhatsApp path and none of them were.
+GUEST_PHONE = f"9199{uuid.uuid4().int % 10**8:08d}"
 ci = date.today() + timedelta(days=1)
 co = ci + timedelta(days=2)
 
@@ -254,6 +264,29 @@ def actions_of(run_id: str) -> list[dict]:
 
 def usage_of(run_id: str) -> list[dict]:
     return (db.table("usage_events").select("*").eq("run_id", run_id).execute().data or [])
+
+
+def usage_on_conversation(usage_type: str, *, tries: int = 4) -> dict | None:
+    """
+    A charge that belongs to the thread rather than to one turn.
+
+    `ai.conversation.whatsapp` is written once per conversation per 24-hour
+    window, so it is not necessarily on the run being examined — and it is
+    emitted after the run closes, which is why this waits a moment rather than
+    reading once and concluding it is missing.
+    """
+    conv = conversation()
+    if not conv:
+        return None
+    for attempt in range(tries):
+        rows = (db.table("usage_events").select("*")
+                .eq("conversation_id", conv["id"]).eq("usage_type", usage_type)
+                .execute().data or [])
+        if rows:
+            return rows[0]
+        if attempt < tries - 1:
+            time.sleep(0.5)
+    return None
 
 
 FakeWhatsAppAdapter.reset()
@@ -413,8 +446,23 @@ check("with the provider and model on it",
       str(by_type[TURN].get("model")))
 check("and token counts", by_type[TURN]["tokens_in"] > 0,
       str(by_type[TURN].get("tokens_in")))
-check("priced against the rate card rather than left at zero",
-      by_type[TURN]["credits_charged"] > 0, str(by_type[TURN].get("credits_charged")))
+# **The turn is deliberately free, and the conversation is what is sold.**
+#
+# This assertion used to require credits on the turn, and it has been failing
+# since 21 August, when pricing moved from per-turn to per-conversation: a guest
+# who asks six questions was six charges, and no owner could answer "how many
+# conversations does 3,000 credits buy?". `ai.guest_conversation` was set to
+# zero and kept — Vertex still bills us per turn, so the operator's cost model
+# still needs the row — and `ai.conversation.whatsapp` is charged once per
+# 24-hour window. A suite asserting the old shape reads as a billing bug and is
+# the opposite: it was measuring a price nobody sells any more.
+check("the per-turn row is kept at zero, because the conversation is the sale",
+      by_type[TURN]["credits_charged"] == 0, str(by_type[TURN].get("credits_charged")))
+conversation_charge = usage_on_conversation(
+    billing_service.usage_type_for_channel("whatsapp"))
+check("and the conversation itself was charged, once",
+      conversation_charge is not None and conversation_charge["credits_charged"] > 0,
+      str({k: v["credits_charged"] for k, v in by_type.items()}))
 # The cost side ran and found nothing to charge, which is the correct answer:
 # this suite scripts the model with EchoProvider, and a fake provider genuinely
 # costs nothing. Asserting a rupee figure here would mean seeding a cost rate
@@ -426,7 +474,8 @@ check("and the cost side resolved independently, finding no rate for a fake prov
       and (by_type[TURN].get("cost_snapshot") or {}).get("reason") is not None,
       str(by_type[TURN].get("cost_snapshot"))[:160])
 check("with the rate it used frozen onto the event",
-      bool(by_type[TURN].get("rate_snapshot")), str(by_type[TURN].get("rate_snapshot"))[:120])
+      bool((conversation_charge or {}).get("rate_snapshot")),
+      str((conversation_charge or {}).get("rate_snapshot"))[:120])
 check("the outbound WhatsApp message was metered separately",
       "whatsapp.message_sent" in by_type, str(list(by_type)))
 check("pointing at the message it charges for",
