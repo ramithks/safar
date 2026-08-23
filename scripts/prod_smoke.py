@@ -19,6 +19,7 @@ it is safe to run against production as often as you like.
 """
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -176,6 +177,38 @@ def main() -> int:
     status, body, _ = get(f"{args.backend}/api/v1/pms/properties")
     check("a hotel-scoped route needs a session", status in (401, 403, 404, 405),
           f"{status} {body[:120]}")
+
+    # ── §14 what the published key can reach ────────────────────────────────
+    #
+    # The anon key ships inside every browser bundle, so it is not a secret and
+    # everything it can reach is public whether or not a screen shows it.
+    # `wallet_state`, `usage_allowed` and `resolve_usage_rate` answered it: a
+    # hotel's credit balance, its billing tier and the rate card, to anyone
+    # holding a uuid. Revoked from anon and authenticated; service_role, which
+    # is what the backend holds, is unaffected.
+    #
+    # Skipped rather than failed without a key, because this file's promise is
+    # that it reads nothing from the environment to decide what to assert.
+    anon = os.environ.get("SUPABASE_ANON_KEY")
+    supabase = os.environ.get("SUPABASE_URL")
+    print("\n── what the published anon key can reach ──")
+    if not (anon and supabase):
+        print("  skip SUPABASE_URL / SUPABASE_ANON_KEY not set")
+    else:
+        probe = "00000000-0000-0000-0000-000000000000"
+        for fn, payload in (
+            ("wallet_state", {"p_billing_account": probe}),
+            ("usage_allowed", {"p_billing_account": probe,
+                               "p_usage_type": "agent_reply", "p_critical": False}),
+            ("resolve_usage_rate", {"p_usage_type": "agent_reply", "p_provider": "vertex",
+                                    "p_model": "gemini-2.5-flash", "p_dimension": {},
+                                    "p_at": None, "p_plan": None}),
+            ("folio_states", {"p_property": probe}),
+        ):
+            status, body = post(f"{supabase.rstrip('/')}/rest/v1/rpc/{fn}", payload,
+                                {"apikey": anon, "Authorization": f"Bearer {anon}"})
+            check(f"a stranger cannot call {fn}", status in (401, 403, 404),
+                  f"{status} {body[:120]}")
 
     print(f"\n══ {PASS} passed, {FAIL} failed ══")
     print("REAL HOSTS · READ ONLY · NO BOOKINGS CREATED")

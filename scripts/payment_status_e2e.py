@@ -71,7 +71,11 @@ from app.services.ai import guardrails, provisioning, registry, runtime  # noqa:
 from app.services.ai.providers import EchoProvider  # noqa: E402
 
 REF = "rdlozqvuywtgsodunait"
-API = "http://127.0.0.1:8010/api/v1/pms"
+# Which StayOS to test. Defaults to the uvicorn each suite's docstring tells
+# you to start; set STAYOS_API_BASE=https://stayos-backend.travbuddy.in to run
+# the same assertions against the deployed one, which is the only way to find
+# out whether what is live behaves like what is on this branch.
+API = os.environ.get("STAYOS_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
 
 # The sales property, for the same reason sales_e2e uses it: its own partner,
 # its own billing account, its own wallet. Nothing this suite books or spends
