@@ -438,6 +438,18 @@ on conflict (instagram_account_id) do update
     sweep()
     seed_group_pricing()
 
+    # The level this replay is about.
+    #
+    # `agents.autonomy_level` is shared demo state and half the e2e suites set
+    # it to 2 for their own assertions without putting it back, so what this
+    # replay measures depended on which suite ran last: at 2 every selling tool
+    # queues for approval and the sale stops at "the hotel team will confirm".
+    # Set explicitly, the way payment_status_e2e does, because a suite about
+    # closing a sale on a hotel that cannot quote is measuring nothing.
+    sql(f"""update public.agents set autonomy_level = 3
+             where property_id = '{PROPERTY}' and agent_type = 'guest';""")
+    print("    · guest agent set to autonomy 3 (unattended selling)")
+
     # ── 1 & 7: language, and a session that outlives the gap ─────────────────
     print("── the opening, as it happened ──")
     say("Hello")

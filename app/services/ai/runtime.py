@@ -444,7 +444,27 @@ async def run_turn(
             status = "escalated"
         if reply is None and not handoff:
             status = "failed"
-            error = "the model produced no reply"
+            # With the one fact that tells the two causes apart.
+            #
+            # This class is 86 runs in thirty days and splits cleanly in the
+            # data: on the conversation tier it is 76 runs averaging one output
+            # token in 347ms — a blank candidate, back too fast to have been
+            # generated — and on the reasoning tier it is 5 runs averaging 32
+            # seconds of thinking and no reply. Same message, opposite causes,
+            # and the error string said neither. `finishReason` is on the
+            # response and was being read and dropped.
+            # getattr, because a diagnostic must not be the thing that breaks
+            # the turn it is describing: any provider may hand back a step
+            # object without these.
+            finish = getattr(step, "finish_reason", None)
+            thought = getattr(step, "tokens_thought", 0) or 0
+            detail = ", ".join(
+                part for part in (
+                    f"finishReason={finish}" if finish else "",
+                    f"{thought:,} thinking tokens" if thought else "",
+                ) if part
+            )
+            error = "the model produced no reply" + (f" ({detail})" if detail else "")
 
             # **The guest was left in silence, 78 times in thirty days.**
             #
