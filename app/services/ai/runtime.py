@@ -443,9 +443,32 @@ async def run_turn(
         if handoff:
             status = "escalated"
         if reply is None and not handoff:
-            reply = None
             status = "failed"
             error = "the model produced no reply"
+
+            # **The guest was left in silence, 78 times in thirty days.**
+            #
+            # Every other failure path below produces `handoff_reply` and sets
+            # `handoff`, so the guest is told something true and a person picks
+            # it up. This one — the model succeeded and returned nothing, twice,
+            # since the empty-completion retry above already ran — set neither.
+            # `pipeline` then skipped delivery on `if result.reply` and skipped
+            # `_ensure_human` on `if handoff`, and the conversation sat with the
+            # AI still nominally on it and nothing sent.
+            #
+            # Found by counting `agent_runs.error` rather than by reading the
+            # code: 'the model produced no reply' was the second most common
+            # failure in production and had no guest-visible symptom anybody had
+            # connected to it.
+            #
+            # A tool that already spoke is not silence. `send_message` returning
+            # ok means the guest has their answer and the missing prose is the
+            # model correctly declining to say the same thing twice.
+            spoke = any(o.tool == "send_message" and o.ok for o in outcomes)
+            if not spoke:
+                reply = prompts.handoff_reply(ctx)
+                handoff = True
+                status = "escalated"
 
     except ProviderError as exc:
         # The model is gone. The conversation goes to a human, and the guest is

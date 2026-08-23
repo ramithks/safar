@@ -583,9 +583,51 @@ check("a story mention parses as its own type rather than as text",
       parsed_story[0].message_type == "story_mention", str(parsed_story[0].message_type))
 check("and is not silently dropped — it carries a media url",
       bool(parsed_story[0].media_urls), str(parsed_story[0].media_urls))
-deliver(story, script=["I can't open stories here, but tell me what you need!"])
+# Two replies, not one.
+#
+# "hello? anyone there?" arrived in §10 while a human held the thread, so it was
+# recorded and never answered. `resume_ai` gave the conversation back, and this
+# `deliver` therefore drains *two* messages — the leftover and the story — which
+# is the drain behaviour working correctly.
+#
+# A one-entry script left the second turn with nothing to say, and that used to
+# be invisible: the run was marked failed, nothing was sent, and the suite
+# carried on. It is not invisible any more, because a turn that produces no
+# reply now hands the conversation to a person rather than leaving the guest in
+# silence — so a short script here took the thread to `human_requested` and
+# every later section failed. The fixture was wrong and the change exposed it.
+deliver(story, script=[
+    "Sorry for the wait — I'm here!",
+    "I can't open stories here, but tell me what you need!",
+])
 check("an unsupported attachment is still persisted",
       any(m.get("message_type") == "story_mention" for m in messages()))
+check("and the conversation is still the agent's after it",
+      (conversation().get("handler") or "ai") == "ai",
+      str(conversation().get("handler")))
+
+
+# ── 11b. a turn with nothing to say ─────────────────────────────────────────
+#
+# The guarantee the fixture above tripped over, asserted on purpose.
+#
+# 78 runs in thirty days ended with `error = "the model produced no reply"`, and
+# every one of them sent the guest nothing while leaving the conversation
+# nominally with the AI. Every *other* failure path hands over; this one did not.
+
+print("\n── a turn that produces nothing ──")
+
+silent, _ = inbound_payload("kya rooms available hain?")
+deliver(silent, script=[])
+outbound_now = [m for m in messages() if m["direction"] == "outbound"]
+check("a turn that produces no reply still says something to the guest",
+      bool(outbound_now) and "trouble" in (outbound_now[-1].get("body") or "").lower(),
+      str((outbound_now[-1] if outbound_now else {}).get("body"))[:90])
+check("and hands the conversation to a person rather than going quiet",
+      (conversation().get("handler") or "ai") != "ai",
+      str(conversation().get("handler")))
+
+run(messaging.resume_ai(conversation()["id"], PROPERTY))
 
 
 # ── 12. the language the guest asked for ────────────────────────────────────

@@ -1082,6 +1082,11 @@ class RoomReadinessOut(BaseModel):
 
 
 class ReadinessReportOut(BaseModel):
+    # READY · NEEDS_ATTENTION · INCOMPLETE. §11: a hotel is in one of three
+    # states and a percentage is not one of them. Derived from the sections
+    # rather than stored, so it cannot drift from them.
+    state: str = "INCOMPLETE"
+    stateReason: str = ""
     sections: list[ReadinessSectionOut]
     rooms: list[RoomReadinessOut]
     sellableRooms: int
@@ -1511,3 +1516,20 @@ class AdPublishOut(BaseModel):
     externalId: str | None = None
     detail: str | None = None
     missing: list[str] = Field(default_factory=list)
+
+
+class ContextHealthOut(BaseModel):
+    """
+    Whether this hotel's agent can answer each kind of question. §12.
+
+    Deliberately a different question from readiness: readiness asks what the
+    hotelier has not filled in, this asks what the AI will get wrong tonight.
+    Every row is a count against a threshold; nothing here asks a model.
+    """
+
+    propertyId: str
+    checks: list[dict]
+    answerable: int
+    total: int
+    coreBroken: list[str]
+    health: str

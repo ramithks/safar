@@ -450,6 +450,10 @@ def _load(property_id: str) -> dict:
         db.table("services").select("id,price_unit,price_paise")
         .eq("property_id", property_id).eq("is_active", True).limit(100).execute().data or []
     )
+    experiences = (
+        db.table("experiences").select("id")
+        .eq("property_id", property_id).eq("is_active", True).limit(100).execute().data or []
+    )
     marketing_rows = (
         db.table("marketing_profiles").select("*")
         .eq("property_id", property_id).limit(1).execute().data or []
@@ -494,6 +498,7 @@ def _load(property_id: str) -> dict:
         "team_with_whatsapp": sum(1 for t in team if t.get("whatsapp")),
         "notification_rule_count": len(rules),
         "service_count": len(services),
+        "experience_count": len(experiences),
         # A service priced at zero is a free extra, which is a legitimate thing
         # to offer and does not need a unit. Only priced ones are checked.
         "services_without_unit": sum(
@@ -504,6 +509,68 @@ def _load(property_id: str) -> dict:
         "audience_count": len(audiences),
         "instagram_connected": bool(instagram and instagram[0].get("status") == "connected"),
     }
+
+
+# ── the three states ─────────────────────────────────────────────────────────
+
+# §11: a hotel is in one of three states, and a percentage is not one of them.
+#
+#   READY            everything the AI, the booking engine and the page need
+#   NEEDS_ATTENTION  it works, and something is degraded
+#   INCOMPLETE       something it cannot work without is missing
+#
+# The line between the last two is *what breaks*, not how much is left. A hotel
+# with no photographs and no team WhatsApp is NEEDS_ATTENTION — it sells rooms,
+# its AI answers, its page is thin. A hotel with no sellable room is INCOMPLETE
+# whatever else it has, because there is nothing to sell.
+READY = "READY"
+NEEDS_ATTENTION = "NEEDS_ATTENTION"
+INCOMPLETE = "INCOMPLETE"
+
+
+def state_of(report: dict) -> tuple[str, str]:
+    """
+    One of the three, and the sentence that explains it.
+
+    Derived from the sections rather than stored, so it cannot drift from them.
+    A hotelier who fixes the last gap sees the state change on the next load
+    without anything having to remember to recompute it.
+    """
+    rooms = report.get("roomCount") or 0
+    sellable = report.get("sellableRooms") or 0
+    remaining = report.get("remaining") or 0
+
+    if rooms == 0:
+        return INCOMPLETE, "You have not added any rooms yet, so there is nothing to sell."
+    if sellable == 0:
+        return INCOMPLETE, (
+            f"None of your {rooms} rooms can be sold — each one needs a name, "
+            "how many you have, and a price."
+        )
+    if remaining == 0:
+        return READY, "Everything your AI, your booking engine and your page need is set."
+
+    # **Sellability is the line, not the `booking` label on a check.**
+    #
+    # The first version of this asked whether any missing item was marked
+    # `blocks: booking`, and reported Casa Mandala as INCOMPLETE with the
+    # sentence "4 of 4 rooms can be sold, but something the booking engine needs
+    # is still missing" — a contradiction, printed on a hotel that transacts
+    # perfectly well. `blocks: booking` means *the booking engine reads this*;
+    # it does not mean the engine cannot run without it, and `MUST_PRICE` is the
+    # set that actually does. This is the same mistake `sellable` versus
+    # `readyToSell` was written to avoid, made a second time one layer up.
+    if sellable < rooms:
+        dark = rooms - sellable
+        return NEEDS_ATTENTION, (
+            f"You can take bookings, but {dark} of your {rooms} rooms cannot be "
+            "sold — each one needs a name, how many you have, and a price."
+        )
+    return NEEDS_ATTENTION, (
+        f"You can take bookings. {remaining} thing{'' if remaining == 1 else 's'} "
+        "would make your AI and your page better."
+    )
+
 
 
 async def report(property_id: str) -> dict:
@@ -560,7 +627,7 @@ async def report(property_id: str) -> dict:
     )
 
     remaining = sum(len(s["missing"]) for s in sections)
-    return {
+    report = {
         "sections": sections,
         "rooms": rooms,
         "sellableRooms": sum(1 for r in rooms if r["sellable"]),
@@ -570,4 +637,111 @@ async def report(property_id: str) -> dict:
         # score is on each section for anyone who wants one.
         "remaining": remaining,
         "complete": remaining == 0,
+    }
+    state, why = state_of(report)
+    report["state"] = state
+    report["stateReason"] = why
+    return report
+
+
+# ── agent context health ─────────────────────────────────────────────────────
+
+# §12: can this hotel's agent actually answer each of these?
+#
+# Deliberately a different question from readiness. Readiness asks *what has the
+# hotelier not filled in*; this asks *what will the AI get wrong tonight*, which
+# is the question somebody debugging a live deployment has. They overlap and are
+# not the same: a hotel with no experiences is perfectly ready and its agent
+# genuinely cannot answer "what is there to do here", and support needs to be
+# able to see that in one screen rather than infer it.
+#
+# Each entry is (capability, the tool that answers it, what has to exist).
+CAPABILITIES: tuple[tuple[str, str, str], ...] = (
+    ("rooms", "get_room_details", "room_count"),
+    ("availability", "search_availability", "sellable_rooms"),
+    ("pricing", "get_quote", "public_rates"),
+    ("b2b", "get_stay_options", "b2b_plans"),
+    ("group_rates", "get_group_rates", "group_tiers"),
+    ("negotiation", "negotiate_rate", "negotiation_rules"),
+    ("meals", "get_meal_info", "meals_described"),
+    ("services", "list_services", "services"),
+    ("experiences", "get_experiences", "experiences"),
+    ("policies", "get_property_policies", "policies"),
+    ("photos", "send_room_photos", "photos"),
+    ("payment_rules", "get_payment_terms", "deposit_rule"),
+    ("check_in_out", "get_checkin_options", "time_rules"),
+    ("team_escalation", "escalate_to_team", "reachable_team"),
+)
+
+# What a hotel's AI is *expected* to be able to do. A capability outside this
+# set that is unavailable is a gap the hotel has chosen; one inside it is a
+# question a guest will ask tonight and get an apology for.
+CORE_CAPABILITIES = frozenset({
+    "rooms", "availability", "pricing", "meals", "policies", "photos",
+    "payment_rules", "check_in_out",
+})
+
+
+def _facts_from(context: dict) -> dict:
+    """The counts each capability is checked against, from one loaded context."""
+    prop = context.get("property") or {}
+    rooms = context.get("rooms") or []
+    return {
+        "room_count": len(rooms),
+        "sellable_rooms": sum(
+            1 for r in rooms
+            if room_result(r, context["plans_by_room"].get(str(r["id"]), []), prop)["sellable"]
+        ),
+        "public_rates": context.get("rooms_with_rates", 0),
+        "b2b_plans": context.get("b2b_plan_count", 0),
+        "group_tiers": context.get("group_tier_count", 0),
+        "negotiation_rules": 1 if context.get("has_negotiation_rules") else 0,
+        "meals_described": len(context.get("meals") or set()),
+        "services": context.get("service_count", 0),
+        "experiences": context.get("experience_count", 0),
+        "policies": len(
+            {k for k, v in (prop.get("policies") or {}).items() if str(v or "").strip()}
+        ),
+        "photos": sum(len(r.get("photos") or []) for r in rooms),
+        "deposit_rule": 1 if (prop.get("settings") or {}).get("token_pct") is not None else 0,
+        "time_rules": len(context.get("time_rules") or []),
+        "reachable_team": context.get("team_with_whatsapp", 0),
+    }
+
+
+async def context_health(property_id: str) -> dict:
+    """
+    Whether this hotel's agent can answer each kind of question, and why not.
+
+    **The diagnostic §12 asks for, and it is deterministic on purpose.** A
+    support engineer looking at "the AI said it would check about breakfast"
+    needs to know in one call whether the hotel described breakfast — not to
+    read a conversation and guess. Every row here is a count against a
+    threshold; none of it asks a model anything.
+    """
+    context = await run_db(_load, property_id)
+    facts = _facts_from(context)
+
+    checks = []
+    for capability, tool, fact in CAPABILITIES:
+        count = facts.get(fact, 0)
+        checks.append({
+            "capability": capability,
+            "tool": tool,
+            "ok": count > 0,
+            "evidence": f"{fact}={count}",
+            # Core capabilities that are unavailable are the ones worth paging
+            # somebody about. The rest are a hotel's own choices.
+            "core": capability in CORE_CAPABILITIES,
+        })
+
+    broken_core = [c["capability"] for c in checks if c["core"] and not c["ok"]]
+    return {
+        "propertyId": property_id,
+        "checks": checks,
+        "answerable": sum(1 for c in checks if c["ok"]),
+        "total": len(checks),
+        "coreBroken": broken_core,
+        # One word for a monitoring check to alert on.
+        "health": "ok" if not broken_core else "degraded",
     }

@@ -404,6 +404,43 @@ def build_system_prompt(ctx: AgentContext) -> str:
         if told:
             parts.append(told)
 
+    # What the guest asked about and has not been told.
+    #
+    # `GROUND_RULES` has said "answer both" since it was written, and the
+    # six-part message still came back three parts answered — which is the
+    # evidence that a standing instruction is the wrong mechanism for this. A
+    # named list of what is outstanding is a different thing from a rule about
+    # thoroughness, and it costs one line only on the turns where something is.
+    #
+    # Outside the live-quote branch on purpose: an open question about breakfast
+    # does not stop being open because there is a quote on the table.
+    if ctx.guest_scoped and ctx.session:
+        from app.services.messaging import obligations as obligations_module
+
+        outstanding = obligations_module.describe(ctx.session)
+        if outstanding:
+            parts.append(outstanding)
+
+        # Already asked the hotel, and still waiting.
+        #
+        # §6: *the agent should know when it is waiting for the hotel team*.
+        # Without this the second time a guest pushes on price, the agent
+        # escalates again — the dedupe key stops a second message reaching
+        # anybody's phone, but the agent still tells the guest it is asking,
+        # which is a promise it has already made and not kept.
+        #
+        # Read off the session, written there by the escalation tool on the turn
+        # that raised it. No query: the alternative is a round trip on every
+        # guest turn to check a thing that is almost always absent.
+        waiting = ctx.session.get("awaiting_hotel")
+        if isinstance(waiting, dict) and waiting.get("id"):
+            parts.append(
+                "You have already asked the hotel about this and they have not "
+                "come back yet. If the guest asks again, say you are still "
+                "waiting — do not ask the team a second time, and do not imply "
+                "this is a new request."
+            )
+
     # A language the guest asked for, in an earlier message the model cannot
     # see. `_history` carries ten turns; the request "hinglish m baat karo
     # please" was turn eleven on the conversation this exists for, and the

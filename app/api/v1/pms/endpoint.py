@@ -184,6 +184,7 @@ from app.services.pms import creators as creators_service
 from app.services.pms import booking as booking_service
 from app.services.pms import frontdesk as frontdesk_service
 from app.services import trace
+from app.services.pms import escalation as escalation_service
 from app.services.pms import money
 from app.services.pms import policies as pms_policies
 from app.services.pms import uploads
@@ -1679,6 +1680,17 @@ async def send_conversation_message(
 
     if (conversation.get("handler") or "ai") != "human":
         await messaging_service.take_over(conversation_id, property_id, member)
+
+    # A person from the hotel just answered in this thread, which is what "the
+    # hotel responded" actually looks like — a manager who approves a rate on
+    # WhatsApp and then types to the guest has responded, and nobody is going to
+    # open the dashboard afterwards to press a button saying so.
+    #
+    # Without this the escalation sits in `notified` for ever: the agent keeps
+    # telling the guest it is still waiting, and the "waiting on you" count on
+    # the team screen only ever goes up. Zero on the overwhelming majority of
+    # staff messages, and never fatal.
+    await escalation_service.note_hotel_replied(conversation_id)
 
     return MessageOut.from_row(sent.message)
 

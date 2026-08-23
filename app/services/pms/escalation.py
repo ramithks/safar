@@ -371,6 +371,40 @@ def _open_for(conversation_id: str) -> list[dict]:
     )
 
 
+# The stored status, and what it means to somebody reading a screen.
+#
+# The column's vocabulary and the brief's are the same five states under
+# different names, and this is the translation rather than a migration:
+#
+#     open        raised, nobody could be reached      →  ESCALATED
+#     notified    a person has it on their phone       →  WAITING_FOR_HOTEL
+#     responded   they came back                       →  HOTEL_RESPONDED
+#     resolved    somebody closed it                   →  RESOLVED
+#     dismissed   somebody decided it needed nothing   →  RESOLVED
+#
+# **Renaming the column was considered and rejected.** `agent_escalations` has
+# a check constraint, a partial unique index on `status in ('open','notified')`
+# and rows in production; changing the words would touch all three to make a
+# screen read differently. The distinction that actually matters — *has anybody
+# seen this* — is the difference between `open` and `notified`, and it is
+# preserved either way.
+PHASE: dict[str, str] = {
+    "open": "ESCALATED",
+    "notified": "WAITING_FOR_HOTEL",
+    "responded": "HOTEL_RESPONDED",
+    "resolved": "RESOLVED",
+    "dismissed": "RESOLVED",
+}
+
+# The two the agent is still waiting on.
+UNANSWERED = frozenset({"open", "notified"})
+
+
+def phase_of(status: str | None) -> str:
+    """One stored status as the state machine §6 asks for."""
+    return PHASE.get(status or "", "OPEN")
+
+
 async def state_for(conversation_id: str) -> dict:
     """
     What the agent needs to know before escalating again.
@@ -379,16 +413,63 @@ async def state_for(conversation_id: str) -> dict:
     dedupe key on the way in; this is the other half — so the agent can tell a
     guest "I've asked, I'm waiting" rather than either escalating again or
     pretending nothing is outstanding.
+
+    **Not on the hot path.** The prompt learns that it is waiting from the
+    session, written by the tool on the turn that raised the escalation, so an
+    ordinary guest turn costs no query at all. This runs only inside
+    `escalate_to_team`, where a round trip is already being spent.
     """
     try:
         rows = await run_db(_open_for, conversation_id)
     except Exception:  # noqa: BLE001
         logger.warning("could not read escalations for %s", conversation_id, exc_info=True)
-        return {"open": [], "waiting": False}
+        return {"open": [], "waiting": False, "phase": "OPEN"}
 
-    waiting = [r for r in rows if r.get("status") in ("open", "notified")]
+    waiting = [r for r in rows if r.get("status") in UNANSWERED]
     return {
-        "open": waiting,
+        "open": [{**r, "phase": phase_of(r.get("status"))} for r in waiting],
         "waiting": bool(waiting),
-        "recent": rows[:5],
+        # The furthest-along state on this conversation, for a screen that wants
+        # one word. `notified` beats `open`: if anybody was reached, the hotel
+        # has it, whatever else did not send.
+        "phase": (
+            "WAITING_FOR_HOTEL"
+            if any(r.get("status") == "notified" for r in waiting)
+            else "ESCALATED" if waiting
+            else phase_of((rows[0] if rows else {}).get("status")) if rows
+            else "OPEN"
+        ),
+        "recent": [{**r, "phase": phase_of(r.get("status"))} for r in rows[:5]],
     }
+
+
+def _mark_responded(conversation_id: str) -> int:
+    rows = (
+        get_db().table("agent_escalations")
+        .update({"status": "responded", "responded_at": "now()", "updated_at": "now()"})
+        .eq("conversation_id", conversation_id).in_("status", list(UNANSWERED))
+        .execute().data or []
+    )
+    return len(rows)
+
+
+async def note_hotel_replied(conversation_id: str) -> int:
+    """
+    Somebody from the hotel answered in this thread. Stop waiting.
+
+    **Called when a staff member sends into a conversation**, which is what
+    "the hotel responded" actually looks like — a manager who replies to the
+    escalation on WhatsApp and then answers the guest has answered, and nobody
+    is going to open the dashboard to press a button saying so.
+
+    Without this the escalation sits in `notified` for ever, the agent keeps
+    telling the guest it is still waiting, and the dashboard's "waiting on you"
+    count only ever goes up. Returns how many were closed, which is almost
+    always one and is zero on the overwhelming majority of staff messages.
+    """
+    try:
+        return await run_db(_mark_responded, conversation_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not mark escalations responded on %s",
+                       conversation_id, exc_info=True)
+        return 0

@@ -35,6 +35,7 @@ from app.api.v1.pms.hotel_os_schemas import (
     AdPublishOut,
     AudienceOut,
     AudienceRequest,
+    ContextHealthOut,
     EscalationOut,
     EscalationResolveRequest,
     ExperienceOut,
@@ -1008,6 +1009,26 @@ async def get_full_readiness(
     once already, between the readiness gaps and the indexability gate.
     """
     return ReadinessReportOut(**await readiness_service.report(property_id))
+
+
+@router.get("/properties/{property_id}/agent-health", response_model=ContextHealthOut)
+@limiter.limit("60/minute")
+async def get_agent_context_health(
+    request: Request, property_id: str, member=Depends(require_member()),
+):
+    """
+    What this hotel's AI can and cannot answer, and the evidence for each.
+
+    §12's diagnostic. The screen a support engineer opens when a hotelier says
+    "the AI told my guest it would check about breakfast" — one call that says
+    whether breakfast was ever described, rather than a conversation to read and
+    a guess to make.
+
+    Readable by any member. There is nothing commercially sensitive in it: it is
+    counts of the hotel's own configuration, and a receptionist who can see that
+    the AI cannot answer meal questions is a receptionist who can tell somebody.
+    """
+    return ContextHealthOut(**await readiness_service.context_health(property_id))
 
 
 @router.get("/properties/{property_id}/config-audit")

@@ -92,6 +92,39 @@ def patch_from(outcomes: list) -> dict:
             patch["room_type_id"] = args["room_type_id"]
             patch["rate_plan_id"] = args.get("rate_plan_id")
 
+        # Where the price argument has got to.
+        #
+        # Recorded so the agent does not re-open a negotiation it has already
+        # settled — a guest who accepted a counter and then said "ok" should not
+        # be countered again — and so the inbox can show a manager that a
+        # conversation is mid-negotiation without reading it.
+        if tool == "negotiate_rate" and output.get("verdict"):
+            patch["negotiation"] = output["verdict"]
+
+        # Whether the hotel has been asked something, and is yet to answer.
+        #
+        # From the tool's own report rather than from a second read of
+        # `agent_escalations`: the escalation was created microseconds ago by
+        # this very turn, and querying for what we just wrote is a round trip to
+        # learn something we already know. `prompts` reads it back from the
+        # session, so the agent on the *next* turn knows it is waiting without
+        # any query at all.
+        if tool == "escalate_to_team" and output.get("escalationId"):
+            patch["awaiting_hotel"] = {
+                "id": output["escalationId"],
+                "kind": output.get("kind"),
+                "notified": bool(output.get("teamNotified")),
+            }
+
+        # Money that has actually moved, as the backend reported it. Never as
+        # the guest described it — see GROUND_RULES on "payment hogyi".
+        if tool == "get_booking_status" and output.get("state"):
+            patch["payment"] = output["state"]
+            # The hotel has answered, or the stay is done. Either way the agent
+            # is no longer waiting on anybody.
+            if output["state"] in ("CONFIRMED", "CHECKED_IN", "CHECKED_OUT", "CANCELLED"):
+                patch["awaiting_hotel"] = None
+
     if stage:
         patch["stage"] = stage
     return patch
@@ -100,7 +133,14 @@ def patch_from(outcomes: list) -> dict:
 # The fields that describe *one* stay being discussed, as opposed to what we
 # know about the guest. When the guest moves on to different nights, these go
 # with the old stay; `language` and anything else on the profile stays.
-_TRANSACTIONAL = _STAY_ARGS + ("stage", "quote_id", "room_type_id", "rate_plan_id")
+_TRANSACTIONAL = _STAY_ARGS + (
+    "stage", "quote_id", "room_type_id", "rate_plan_id",
+    # These describe *this* stay too. A guest who comes back in October
+    # about different nights is not still mid-negotiation on September's,
+    # and an `awaiting_hotel` left behind would have the agent telling them
+    # it is waiting on a question nobody asked about this trip.
+    "negotiation", "payment", "awaiting_hotel", "obligations",
+)
 
 # How long a session may sit untouched before it stops being "where we are" and
 # becomes "what we were talking about last month". A guest who comes back after
