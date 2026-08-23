@@ -1239,3 +1239,275 @@ class RatePlanDetailRequest(BaseModel):
         elif "derived_from_plan_id" in out and out["derived_from_plan_id"] is None:
             out["derive_discount_pct"] = None
         return out
+
+
+# ── marketing and ads ────────────────────────────────────────────────────────
+
+
+class MarketingProfileOut(BaseModel):
+    usp: str | None
+    bestFor: list[str]
+    idealGuest: str | None
+    popularWith: list[str]
+    nearby: list
+    bestMonths: list[int]
+    weekendDemand: str | None
+    weekdayDemand: str | None
+    seasonality: str | None
+    tone: str | None
+    languages: list[str]
+
+    @classmethod
+    def from_row(cls, row: dict | None) -> "MarketingProfileOut":
+        row = row or {}
+        return cls(
+            usp=row.get("usp"),
+            bestFor=row.get("best_for") or [],
+            idealGuest=row.get("ideal_guest"),
+            popularWith=row.get("popular_with") or [],
+            nearby=row.get("nearby") or [],
+            bestMonths=[int(m) for m in (row.get("best_months") or [])],
+            weekendDemand=row.get("weekend_demand"),
+            weekdayDemand=row.get("weekday_demand"),
+            seasonality=row.get("seasonality"),
+            tone=row.get("tone"),
+            languages=row.get("languages") or [],
+        )
+
+
+class MarketingProfileRequest(BaseModel):
+    usp: str | None = Field(None, max_length=500)
+    bestFor: list[str] | None = None
+    idealGuest: str | None = Field(None, max_length=300)
+    popularWith: list[str] | None = None
+    nearby: list | None = None
+    bestMonths: list[int] | None = None
+    weekendDemand: str | None = None
+    weekdayDemand: str | None = None
+    seasonality: str | None = Field(None, max_length=500)
+    tone: str | None = Field(None, max_length=100)
+    languages: list[str] | None = None
+
+    @field_validator("bestMonths")
+    @classmethod
+    def _months(cls, v):
+        if v is not None and any(m < 1 or m > 12 for m in v):
+            raise ValueError("Months are 1 (January) to 12 (December).")
+        return sorted(set(v)) if v is not None else v
+
+    @field_validator("weekendDemand", "weekdayDemand")
+    @classmethod
+    def _demand(cls, v):
+        if v is not None and v not in ("low", "medium", "high"):
+            raise ValueError("Say low, medium or high.")
+        return v
+
+    def to_columns(self) -> dict:
+        sent = self.model_dump(exclude_unset=True)
+        mapping = {
+            "usp": "usp", "bestFor": "best_for", "idealGuest": "ideal_guest",
+            "popularWith": "popular_with", "nearby": "nearby",
+            "bestMonths": "best_months", "weekendDemand": "weekend_demand",
+            "weekdayDemand": "weekday_demand", "seasonality": "seasonality",
+            "tone": "tone", "languages": "languages",
+        }
+        return {column: sent[key] for key, column in mapping.items() if key in sent}
+
+
+class AudienceOut(BaseModel):
+    id: str
+    name: str
+    ageMin: int | None
+    ageMax: int | None
+    genders: list[str]
+    locations: list
+    interests: list[str]
+    travelIntent: list[str]
+
+    @classmethod
+    def from_row(cls, row: dict) -> "AudienceOut":
+        return cls(
+            id=str(row["id"]),
+            name=row.get("name") or "",
+            ageMin=row.get("age_min"),
+            ageMax=row.get("age_max"),
+            genders=row.get("genders") or [],
+            locations=row.get("locations") or [],
+            interests=row.get("interests") or [],
+            travelIntent=row.get("travel_intent") or [],
+        )
+
+
+class AudienceRequest(BaseModel):
+    id: str | None = None
+    name: str = Field(..., min_length=2, max_length=80)
+    ageMin: int | None = Field(None, ge=13, le=65)
+    ageMax: int | None = Field(None, ge=13, le=65)
+    genders: list[str] = Field(default_factory=list)
+    locations: list = Field(default_factory=list)
+    interests: list[str] = Field(default_factory=list)
+    travelIntent: list[str] = Field(default_factory=list)
+
+    def to_columns(self) -> dict:
+        return {
+            "name": self.name,
+            "age_min": self.ageMin,
+            "age_max": self.ageMax,
+            "genders": self.genders,
+            "locations": self.locations,
+            "interests": self.interests,
+            "travel_intent": self.travelIntent,
+        }
+
+
+class AdCreativeOut(BaseModel):
+    id: str
+    format: str
+    headline: str | None
+    primaryText: str | None
+    cta: str | None
+    media: list
+    instagramMediaId: str | None
+    templateKey: str | None
+    edited: bool
+    isPrimary: bool
+
+    @classmethod
+    def from_row(cls, row: dict) -> "AdCreativeOut":
+        return cls(
+            id=str(row["id"]),
+            format=row.get("format") or "single_image",
+            headline=row.get("headline"),
+            primaryText=row.get("primary_text"),
+            cta=row.get("cta"),
+            media=row.get("media") or [],
+            instagramMediaId=row.get("instagram_media_id"),
+            templateKey=row.get("template_key"),
+            edited=bool(row.get("edited")),
+            isPrimary=bool(row.get("is_primary", True)),
+        )
+
+
+class AdCampaignOut(BaseModel):
+    id: str
+    name: str
+    channel: str
+    objective: str
+    destination: str
+    audienceId: str | None
+    roomTypeId: str | None
+    experienceId: str | None
+    offer: dict
+    startsOn: date | None
+    endsOn: date | None
+    dailyBudgetPaise: int | None
+    status: str
+    externalId: str | None
+    lastError: str | None
+    createdAt: str
+    creatives: list[AdCreativeOut] = Field(default_factory=list)
+
+    @classmethod
+    def from_row(cls, row: dict, creatives: list[dict] | None = None) -> "AdCampaignOut":
+        return cls(
+            id=str(row["id"]),
+            name=row.get("name") or "",
+            channel=row.get("channel") or "instagram",
+            objective=row.get("objective") or "messages",
+            destination=row.get("destination") or "whatsapp",
+            audienceId=str(row["audience_id"]) if row.get("audience_id") else None,
+            roomTypeId=str(row["room_type_id"]) if row.get("room_type_id") else None,
+            experienceId=str(row["experience_id"]) if row.get("experience_id") else None,
+            offer=row.get("offer") or {},
+            startsOn=row.get("starts_on"),
+            endsOn=row.get("ends_on"),
+            dailyBudgetPaise=row.get("daily_budget_paise"),
+            status=row.get("status") or "draft",
+            externalId=row.get("external_id"),
+            lastError=row.get("last_error"),
+            createdAt=str(row.get("created_at")),
+            creatives=[AdCreativeOut.from_row(c) for c in (creatives or [])],
+        )
+
+
+class AdCampaignRequest(BaseModel):
+    id: str | None = None
+    name: str = Field(..., min_length=2, max_length=120)
+    channel: str = "instagram"
+    objective: str = "messages"
+    destination: str = "whatsapp"
+    audienceId: str | None = None
+    roomTypeId: str | None = None
+    experienceId: str | None = None
+    offerDiscountPct: int | None = Field(None, ge=0, le=100)
+    offerValidUntil: date | None = None
+    startsOn: date | None = None
+    endsOn: date | None = None
+    dailyBudgetRupees: float | None = Field(None, ge=0, le=10_000_000)
+
+    @field_validator("channel")
+    @classmethod
+    def _channel(cls, v):
+        if v not in ("instagram", "facebook", "whatsapp"):
+            raise ValueError("Say instagram, facebook or whatsapp.")
+        return v
+
+    @field_validator("objective")
+    @classmethod
+    def _objective(cls, v):
+        if v not in ("messages", "traffic", "awareness", "engagement", "leads"):
+            raise ValueError("Unknown objective.")
+        return v
+
+    @field_validator("destination")
+    @classmethod
+    def _destination(cls, v):
+        if v not in ("whatsapp", "instagram_dm", "website", "hotel_page"):
+            raise ValueError("Unknown destination.")
+        return v
+
+
+class AdCreativeRequest(BaseModel):
+    """
+    What a hotelier edited, or picked.
+
+    `edited` is not here: it is derived server-side from whether the copy
+    differs from what the template produced. A client deciding that could
+    report a draft as hand-written, which is the one thing that flag exists to
+    tell the truth about.
+    """
+
+    id: str | None = None
+    format: str = "single_image"
+    headline: str | None = Field(None, max_length=80)
+    primaryText: str | None = Field(None, max_length=400)
+    cta: str | None = Field(None, max_length=60)
+    photos: list[str] = Field(default_factory=list)
+    photoMeta: dict[str, dict] | None = None
+    videoUrl: str | None = Field(None, max_length=1000)
+    instagramMediaId: str | None = Field(None, max_length=64)
+    templateKey: str | None = Field(None, max_length=40)
+
+    @field_validator("format")
+    @classmethod
+    def _format(cls, v):
+        if v not in ("single_image", "carousel", "video", "existing_post"):
+            raise ValueError("Say single_image, carousel, video or existing_post.")
+        return v
+
+
+class AdDraftOut(BaseModel):
+    """The generated starting points, before anybody edits one."""
+
+    drafts: list[dict]
+    offer: dict
+    # What this hotel is still missing before any ad can be published. Named so
+    # the screen can say the specific thing rather than "not available".
+    missing: list[str]
+
+
+class AdPublishOut(BaseModel):
+    status: str
+    externalId: str | None = None
+    detail: str | None = None
+    missing: list[str] = Field(default_factory=list)

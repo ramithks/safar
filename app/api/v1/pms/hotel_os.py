@@ -27,6 +27,14 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.api.v1.pms.hotel_os_schemas import (
+    AdCampaignOut,
+    AdCampaignRequest,
+    AdCreativeOut,
+    AdCreativeRequest,
+    AdDraftOut,
+    AdPublishOut,
+    AudienceOut,
+    AudienceRequest,
     EscalationOut,
     EscalationResolveRequest,
     ExperienceOut,
@@ -35,6 +43,8 @@ from app.api.v1.pms.hotel_os_schemas import (
     GroupPolicyRequest,
     GroupTierOut,
     GroupTierRequest,
+    MarketingProfileOut,
+    MarketingProfileRequest,
     MealOptionOut,
     MealOptionRequest,
     NegotiationPreviewOut,
@@ -56,6 +66,7 @@ from app.api.v1.pms.hotel_os_schemas import (
 from app.core.limiter import limiter
 from app.db.client import get_db, run_db
 from app.deps.property import require_member
+from app.services.marketing import creatives, meta_ads
 from app.services.pms import audit as audit_service
 from app.services.pms import negotiation as negotiation_service
 from app.services.pms import readiness as readiness_service
@@ -1148,3 +1159,511 @@ async def update_rate_plan(
         before=before, after=columns, actor_member=member.member_id,
     )
     return RatePlanDetailOut.from_row(updated)
+
+
+# ── marketing ────────────────────────────────────────────────────────────────
+
+
+@router.get("/properties/{property_id}/marketing-profile", response_model=MarketingProfileOut)
+@limiter.limit("120/minute")
+async def get_marketing_profile(
+    request: Request, property_id: str, member=Depends(require_member()),
+):
+    def _read():
+        rows = (
+            get_db().table("marketing_profiles").select("*")
+            .eq("property_id", property_id).limit(1).execute().data or []
+        )
+        return rows[0] if rows else None
+
+    return MarketingProfileOut.from_row(await run_db(_read))
+
+
+@router.put("/properties/{property_id}/marketing-profile", response_model=MarketingProfileOut)
+@limiter.limit("60/minute")
+async def set_marketing_profile(
+    request: Request,
+    property_id: str,
+    body: MarketingProfileRequest,
+    member=Depends(require_member("marketing")),
+):
+    """
+    Who this hotel is for, in the hotel's own words.
+
+    Every ad this product generates is filled from these fields and from the
+    room being advertised — there is no model in that path, which is why the
+    fields have to be here rather than inferred. See services/marketing/creatives.py.
+    """
+    columns = body.to_columns()
+
+    def _write():
+        rows = get_db().table("marketing_profiles").upsert(
+            {**columns, "property_id": property_id, "partner_id": member.partner_id,
+             "updated_at": "now()"},
+            on_conflict="property_id",
+        ).execute().data
+        return rows[0]
+
+    return MarketingProfileOut.from_row(await run_db(_write))
+
+
+@router.get("/properties/{property_id}/audiences", response_model=list[AudienceOut])
+@limiter.limit("120/minute")
+async def list_audiences(request: Request, property_id: str, member=Depends(require_member())):
+    def _read():
+        return _scoped("ad_audiences", property_id).order("name").limit(100).execute().data or []
+
+    return [AudienceOut.from_row(r) for r in await run_db(_read)]
+
+
+@router.post("/properties/{property_id}/audiences", response_model=AudienceOut)
+@limiter.limit("60/minute")
+async def upsert_audience(
+    request: Request,
+    property_id: str,
+    body: AudienceRequest,
+    member=Depends(require_member("marketing")),
+):
+    """
+    A saved audience, reusable across campaigns — §30's actual requirement.
+
+    **The interests are stored as the hotelier's words, not as Meta interest
+    ids.** Those ids come from a search endpoint StayOS cannot call until an ad
+    account exists, and inventing them would target an ad at something
+    arbitrary. `meta_spec` is the column that will hold what Meta accepted, once
+    Meta can be asked.
+    """
+    if body.ageMin and body.ageMax and body.ageMax < body.ageMin:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "The age range is the wrong way round.",
+        )
+    columns = body.to_columns()
+
+    def _write():
+        try:
+            return _upsert("ad_audiences", property_id, member.partner_id, body.id, columns)
+        except Exception as exc:  # noqa: BLE001
+            if "ad_audiences_property_id_name_key" in str(exc):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "You already have an audience with that name.",
+                ) from exc
+            raise
+
+    row = await run_db(_write)
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Audience not found")
+    return AudienceOut.from_row(row)
+
+
+@router.delete("/properties/{property_id}/audiences/{audience_id}", status_code=204)
+@limiter.limit("60/minute")
+async def delete_audience(
+    request: Request, property_id: str, audience_id: str,
+    member=Depends(require_member("marketing")),
+):
+    if not await run_db(_delete, "ad_audiences", property_id, audience_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Audience not found")
+
+
+# ── ads ──────────────────────────────────────────────────────────────────────
+
+
+def _ad_context(property_id: str, room_type_id: str | None, experience_id: str | None) -> dict:
+    """Everything the copy templates may draw on. Nothing else is passed in."""
+    db = get_db()
+    prop = (
+        db.table("properties").select("name,city,state")
+        .eq("id", property_id).limit(1).execute().data or [{}]
+    )[0]
+    marketing = (
+        db.table("marketing_profiles").select("*")
+        .eq("property_id", property_id).limit(1).execute().data or [{}]
+    )
+    room = rate = experience = None
+    if room_type_id:
+        rooms = (
+            db.table("room_types").select("id,name,description,photos,photo_meta")
+            .eq("id", room_type_id).eq("property_id", property_id).limit(1).execute().data or []
+        )
+        room = rooms[0] if rooms else None
+        if room:
+            plans = (
+                db.table("rate_plans").select("base_price_paise,meal_plan")
+                .eq("room_type_id", room_type_id).eq("audience", "public")
+                .eq("is_active", True).order("base_price_paise").limit(1).execute().data or []
+            )
+            rate = plans[0] if plans else None
+    if experience_id:
+        found = (
+            db.table("experiences").select("*")
+            .eq("id", experience_id).eq("property_id", property_id).limit(1).execute().data or []
+        )
+        experience = found[0] if found else None
+
+    connection = (
+        db.table("instagram_connections").select("status,instagram_account_id,username")
+        .eq("property_id", property_id).limit(1).execute().data or []
+    )
+    return {
+        "property": prop,
+        "marketing": marketing[0] if marketing else {},
+        "room": room,
+        "rate": rate,
+        "experience": experience,
+        "connection": connection[0] if connection else None,
+    }
+
+
+@router.post("/properties/{property_id}/ads/drafts", response_model=AdDraftOut)
+@limiter.limit("60/minute")
+async def generate_ad_drafts(
+    request: Request,
+    property_id: str,
+    body: AdCampaignRequest,
+    member=Depends(require_member("marketing")),
+):
+    """
+    Starting points for an ad, from this hotel's own facts.
+
+    Several, not one: a hotelier choosing between three drafts edits the one
+    they picked, while a hotelier handed a single draft either accepts it or
+    closes the screen. Nothing is written — this is a read that composes.
+
+    **The offer comes back with the drafts**, and it is what the copy is
+    authorised against. A draft that quotes ₹3,200 is only sendable because the
+    campaign's offer carries that price; `claims.check` refuses any figure the
+    offer does not name, on our text and on the hotelier's edits alike.
+    """
+    context = await run_db(_ad_context, property_id, body.roomTypeId, body.experienceId)
+
+    rate_paise = (context.get("rate") or {}).get("base_price_paise")
+    offer: dict = {}
+    if body.offerDiscountPct:
+        offer["discountPct"] = body.offerDiscountPct
+    if body.offerValidUntil:
+        offer["validUntil"] = body.offerValidUntil.isoformat()
+    if rate_paise:
+        offer["pricePaise"] = rate_paise
+    if (context.get("experience") or {}).get("price_paise"):
+        offer["amountPaise"] = context["experience"]["price_paise"]
+
+    facts = creatives.facts_from(
+        property_row=context["property"],
+        marketing=context.get("marketing"),
+        room=context.get("room"),
+        rate_paise=rate_paise,
+        meal_plan=(context.get("rate") or {}).get("meal_plan"),
+        experience=context.get("experience"),
+        offer=offer,
+    )
+    drafts = creatives.generate(facts, destination=body.destination)
+
+    return AdDraftOut(
+        drafts=[d.as_dict() for d in drafts],
+        offer=offer,
+        missing=list(meta_ads._missing_credentials(context.get("connection"))),
+    )
+
+
+@router.get("/properties/{property_id}/ads", response_model=list[AdCampaignOut])
+@limiter.limit("120/minute")
+async def list_ad_campaigns(
+    request: Request, property_id: str, member=Depends(require_member()),
+):
+    def _read():
+        rows = (
+            _scoped("ad_campaigns", property_id).order("created_at", desc=True)
+            .limit(100).execute().data or []
+        )
+        if not rows:
+            return [], {}
+        found = (
+            get_db().table("ad_creatives").select("*")
+            .in_("campaign_id", [r["id"] for r in rows]).limit(400).execute().data or []
+        )
+        by_campaign: dict[str, list[dict]] = {}
+        for c in found:
+            by_campaign.setdefault(str(c["campaign_id"]), []).append(c)
+        return rows, by_campaign
+
+    rows, by_campaign = await run_db(_read)
+    return [AdCampaignOut.from_row(r, by_campaign.get(str(r["id"]))) for r in rows]
+
+
+@router.post("/properties/{property_id}/ads", response_model=AdCampaignOut)
+@limiter.limit("60/minute")
+async def upsert_ad_campaign(
+    request: Request,
+    property_id: str,
+    body: AdCampaignRequest,
+    member=Depends(require_member("marketing")),
+):
+    """
+    Save an ad as a draft. It creates nothing on Meta — see `/publish`.
+
+    **A published campaign's commercial fields are not editable here.** Once
+    Meta holds a campaign, changing its offer in our database would make our
+    record disagree with the live ad, and the record is what a hotelier reads
+    when they ask what they are running.
+    """
+    columns = {
+        "name": body.name,
+        "channel": body.channel,
+        "objective": body.objective,
+        "destination": body.destination,
+        "audience_id": body.audienceId,
+        "room_type_id": body.roomTypeId,
+        "experience_id": body.experienceId,
+        "offer": {
+            **({"discountPct": body.offerDiscountPct} if body.offerDiscountPct else {}),
+            **({"validUntil": body.offerValidUntil.isoformat()} if body.offerValidUntil else {}),
+        },
+        "starts_on": body.startsOn.isoformat() if body.startsOn else None,
+        "ends_on": body.endsOn.isoformat() if body.endsOn else None,
+        "daily_budget_paise": (
+            round(body.dailyBudgetRupees * 100) if body.dailyBudgetRupees is not None else None
+        ),
+        "created_by_member": member.member_id,
+    }
+
+    def _write():
+        if body.id:
+            existing = _read_one("ad_campaigns", property_id, body.id)
+            if not existing:
+                return None
+            if existing.get("status") not in ("draft", "connected", "failed"):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "This ad is live on Meta. Pause it there before changing it here, "
+                    "so what you see matches what is running.",
+                )
+        # The rate is stamped onto the offer at save time rather than read at
+        # publish time. A campaign approved against ₹3,200 must not silently
+        # start claiming ₹2,900 because somebody changed the rate afterwards.
+        if body.roomTypeId:
+            plans = (
+                get_db().table("rate_plans").select("base_price_paise")
+                .eq("room_type_id", body.roomTypeId).eq("property_id", property_id)
+                .eq("audience", "public").eq("is_active", True)
+                .order("base_price_paise").limit(1).execute().data or []
+            )
+            if plans:
+                columns["offer"]["pricePaise"] = plans[0]["base_price_paise"]
+        return _upsert("ad_campaigns", property_id, member.partner_id, body.id, columns)
+
+    row = await run_db(_write)
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Ad not found")
+    return AdCampaignOut.from_row(row)
+
+
+@router.put("/properties/{property_id}/ads/{campaign_id}/creative", response_model=AdCreativeOut)
+@limiter.limit("60/minute")
+async def save_ad_creative(
+    request: Request,
+    property_id: str,
+    campaign_id: str,
+    body: AdCreativeRequest,
+    member=Depends(require_member("marketing")),
+):
+    """
+    The picture and the words, after the hotelier has had them.
+
+    **`edited` is decided here, never by the client.** It is true when the copy
+    differs from what the named template produced from this hotel's own facts —
+    which is a question only the server can answer, and the one thing that flag
+    exists to be honest about.
+
+    Refused when the copy asserts a figure the campaign's offer does not
+    authorise. The same rule broadcast bodies obey; an ad reaches more people,
+    so the bar is if anything higher.
+    """
+    campaign = await run_db(_read_one, "ad_campaigns", property_id, campaign_id)
+    if not campaign:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Ad not found")
+
+    problems = creatives.check_copy(
+        body.headline or "", body.primaryText or "", campaign.get("offer") or {},
+    )
+    if problems:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, problems[0])
+
+    context = await run_db(
+        _ad_context, property_id, campaign.get("room_type_id"), campaign.get("experience_id"),
+    )
+    room = context.get("room") or {}
+
+    media = creatives.build_media(
+        fmt=body.format,
+        photos=body.photos or (room.get("photos") or []),
+        photo_meta=body.photoMeta or room.get("photo_meta"),
+        video_url=body.videoUrl,
+        instagram_media_id=body.instagramMediaId,
+    )
+
+    # Did they change it? Regenerated from the same facts and compared, so a
+    # hotelier who accepted a draft verbatim is recorded as having accepted it.
+    edited = True
+    if body.templateKey:
+        facts = creatives.facts_from(
+            property_row=context["property"],
+            marketing=context.get("marketing"),
+            room=room or None,
+            rate_paise=(context.get("rate") or {}).get("base_price_paise"),
+            meal_plan=(context.get("rate") or {}).get("meal_plan"),
+            experience=context.get("experience"),
+            offer=campaign.get("offer") or {},
+        )
+        for draft in creatives.generate(facts, destination=campaign.get("destination") or "whatsapp"):
+            if draft.template_key == body.templateKey:
+                edited = (
+                    draft.headline != (body.headline or "")
+                    or draft.primary_text != (body.primaryText or "")
+                )
+                break
+
+    columns = {
+        "format": body.format,
+        "headline": body.headline,
+        "primary_text": body.primaryText,
+        "cta": body.cta,
+        "media": media,
+        "instagram_media_id": body.instagramMediaId,
+        "template_key": body.templateKey,
+        "edited": edited,
+        "is_primary": True,
+        "campaign_id": campaign_id,
+    }
+
+    def _write():
+        db = get_db()
+        existing = (
+            db.table("ad_creatives").select("id")
+            .eq("campaign_id", campaign_id).eq("property_id", property_id)
+            .eq("is_primary", True).limit(1).execute().data or []
+        )
+        if existing:
+            rows = (
+                db.table("ad_creatives").update({**columns, "updated_at": "now()"})
+                .eq("id", existing[0]["id"]).eq("property_id", property_id)
+                .execute().data
+            )
+            return rows[0] if rows else None
+        return db.table("ad_creatives").insert(
+            {**columns, "property_id": property_id, "partner_id": member.partner_id}
+        ).execute().data[0]
+
+    row = await run_db(_write)
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Ad not found")
+    return AdCreativeOut.from_row(row)
+
+
+@router.post("/properties/{property_id}/ads/{campaign_id}/publish", response_model=AdPublishOut)
+@limiter.limit("20/hour")
+async def publish_ad_campaign(
+    request: Request,
+    property_id: str,
+    campaign_id: str,
+    member=Depends(require_member("marketing")),
+):
+    """
+    Create this ad on Meta, or say precisely why not.
+
+    §29: *never tell the hotel "Ad published" unless the Meta API confirms it.*
+    That is enforced in three places and this is the middle one — the database's
+    own check constraint refuses a published row without an `external_id`, and
+    the screen has a `not_connected` state rather than an error dialog.
+
+    A hotel with no ad account gets `draft` back with the specific thing that is
+    missing. Not `failed`: nothing failed, and `failed` would send somebody
+    looking for a Meta rejection that does not exist.
+    """
+    def _read():
+        campaign = _read_one("ad_campaigns", property_id, campaign_id)
+        if not campaign:
+            return None, None, None, None
+        db = get_db()
+        creative_rows = (
+            db.table("ad_creatives").select("*")
+            .eq("campaign_id", campaign_id).eq("is_primary", True).limit(1).execute().data or []
+        )
+        audience = None
+        if campaign.get("audience_id"):
+            audience = _read_one("ad_audiences", property_id, campaign["audience_id"])
+        partner = (
+            db.table("partners").select("whatsapp")
+            .eq("id", campaign["partner_id"]).limit(1).execute().data or [{}]
+        )[0]
+        return campaign, (creative_rows[0] if creative_rows else None), audience, partner
+
+    campaign, creative, audience, partner = await run_db(_read)
+    if not campaign:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Ad not found")
+    if not creative:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "This ad has no picture or words yet.",
+        )
+
+    context = await run_db(
+        _ad_context, property_id, campaign.get("room_type_id"), campaign.get("experience_id"),
+    )
+
+    try:
+        result = await meta_ads.publish(
+            campaign=campaign,
+            creative=creative,
+            audience=audience,
+            connection=context.get("connection"),
+            whatsapp_number=(partner or {}).get("whatsapp"),
+        )
+    except NotImplementedError:
+        # Unreachable while no hotel has ad credentials — `publish` refuses
+        # earlier — and caught anyway, because the day that changes this route
+        # must not 500 at a hotelier who pressed a button.
+        logger.warning("ad publish reached the unimplemented Meta call", exc_info=True)
+        result = meta_ads.PublishResult(
+            status="draft",
+            detail="Publishing to Meta is not switched on yet.",
+            missing=("ads_permission",),
+        )
+
+    def _record():
+        patch: dict = {"last_error": result.detail if not result.ok else None,
+                       "updated_at": "now()"}
+        if result.ok and result.external_id:
+            patch.update({"status": result.status, "external_id": result.external_id,
+                          "last_synced_at": "now()"})
+        get_db().table("ad_campaigns").update(patch).eq("id", campaign_id).eq(
+            "property_id", property_id
+        ).execute()
+
+    await run_db(_record)
+    return AdPublishOut(**result.as_dict())
+
+
+@router.delete("/properties/{property_id}/ads/{campaign_id}", status_code=204)
+@limiter.limit("60/minute")
+async def delete_ad_campaign(
+    request: Request, property_id: str, campaign_id: str,
+    member=Depends(require_member("marketing")),
+):
+    """
+    Delete a draft. A campaign Meta knows about cannot be deleted here.
+
+    Removing our row would leave an ad running that nothing in StayOS can see —
+    the hotelier would be spending money on something their dashboard says does
+    not exist.
+    """
+    existing = await run_db(_read_one, "ad_campaigns", property_id, campaign_id)
+    if not existing:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Ad not found")
+    if existing.get("external_id"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This ad exists on Meta. Stop it there first — deleting it here would "
+            "leave it running with nothing to show you.",
+        )
+    await run_db(_delete, "ad_campaigns", property_id, campaign_id)
