@@ -1655,6 +1655,26 @@ class PublicRoomOptionOut(BaseModel):
     fromPricePaise: int | None = None
     mealPlan: str | None = None
 
+    # Everything the hotel-OS work made answerable, so the page and the AI say
+    # the same thing about the same room.
+    #
+    # §45 asks for exactly this and it is worth naming the failure it avoids: a
+    # page saying "children welcome" while the agent says it will check is two
+    # answers to one question, and the guest picks whichever suits them. There
+    # is one row underneath both.
+    maxAdults: int | None = None
+    maxChildren: int | None = None
+    childrenAllowed: str | None = None
+    bedCount: int | None = None
+    extraBed: str | None = None
+    extraBedPaise: int | None = None
+    view: str | None = None
+    smoking: str | None = None
+    accessible: str | None = None
+    bathroom: str | None = None
+    # Cancellation terms, resolved from the same ladder the agent quotes.
+    cancellation: dict | None = None
+
 
 class PublicAvailabilityOut(BaseModel):
     checkIn: date
@@ -1692,6 +1712,14 @@ class PublicSiteOut(BaseModel):
     content: dict = {}
     services: list[PublicServiceOut] = []
     roomTypes: list[PublicRoomOptionOut] = []
+
+    # The structured facts §45 asks the page to be built from — the same rows
+    # the agent reads, so the two cannot disagree.
+    meals: list[dict] = []
+    experiences: list[dict] = []
+    # Early arrival and late departure, as bands a page can render as a table
+    # and an answer engine can read as a policy.
+    arrivalRules: list[dict] = []
 
     # ── the facts a page about this hotel needs ─────────────────────────────
     #

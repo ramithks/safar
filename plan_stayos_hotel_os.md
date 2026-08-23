@@ -14,7 +14,7 @@ dropped.
 The brief reads as though none of this is built. Most of the hard half is. This
 section is here so no phase below rebuilds something that already works.
 
-### 0.1 Already built, and being reused unchanged
+### 0.1 Already built, and reused unchanged
 
 | Brief asks for | Already exists | Where |
 | --- | --- | --- |
@@ -30,207 +30,230 @@ section is here so no phase below rebuilds something that already works.
 | Team + permissions | `partner_members`, `ROLE_PERMS`, `require_member(perm)` | `deps/property.py` |
 | Instagram | OAuth connect, webhook, conversations, agent runtime | `services/messaging/instagram/` |
 | Outbound campaigns | `marketing_campaigns` — consent, frequency, per-recipient revalidation | `services/marketing/` |
+| Claim checking | `claims.check()` — a body may not assert a figure the offer does not authorise | `services/marketing/claims.py` |
 | Hotel website | `hotel_websites` draft/published + custom domain + public site API | `services/pms/website.py` |
 | Agent context sizing | classifier → `toolsets.describe_for_provider(task=…)`, −81% on FAQ turns | `services/ai/toolsets.py` |
 | Readiness | `GET /properties/{id}/readiness` — named gaps, not a percentage | `endpoint.py:475` |
 | Audit of AI actions | `agent_runs` / `agent_actions` with `result_id` provenance | — |
 
-**Nothing in the list above is rewritten.** Every new thing below either adds a
-column to one of those tables or adds a table that one of those services reads.
+**Nothing in that list was rewritten.**
 
-### 0.2 The real gaps
+### 0.2 The real gaps, and what closed them
 
-1. `room_types` has 8 useful columns. No adults/children split, no bed count, no
-   extra bed, no crib, no floor/view/smoking/accessible/connecting, no bathroom.
-2. **Nothing anywhere holds a negotiation floor as a price.** Only a property-wide
-   discount *percentage*. Per-room and per-rate-plan floors do not exist, and
-   there is no tool that decides a counter-offer — the model would have to.
-3. **No group pricing at all.** `units` is priced linearly; four rooms cost four
-   times one room.
-4. **No early check-in / late check-out rules.** `check_in_time` is a single time.
-5. **No structured meals.** `rate_plans.meal_plan` is EP/CP/MAP/AP and nothing
-   says what breakfast costs, when it is served, or whether it is a buffet.
-6. `services` has no pricing unit, no hours, no max quantity, no photo, no terms.
-7. **No experiences.**
-8. **No hotel team directory.** `partner_members` is a login list keyed on
-   `profile_id NOT NULL` — a front-desk WhatsApp number with no account cannot
-   exist in it.
-9. **No notification routing, and no escalation lifecycle.** `request_human_handoff`
-   flips `conversations.handler` and raises a task. Nobody is messaged.
-10. **No StayOS fee anywhere in the codebase.** Grepped: no `platform_fee`,
-    no `payout`, no `settlement`. The 4% exists only in conversation.
-11. **No Meta Marketing API.** `graph.facebook.com` appears only for *messaging*.
-    There is no ad account, no campaign, no creative, no audience.
-12. **No hotel-config audit log.** `admin_audit_log` is for TravBuddy staff
-    actions, not for a hotelier changing a floor price.
-13. Cancellation policy is a free `jsonb` with no schema and no resolver.
+1. `room_types` had 8 useful columns → **§1.1**, 15 more.
+2. No negotiation *floor* anywhere, only a hotel-wide percentage → **§1.4 + §2.3**.
+3. No group pricing at all → **§1.5 + §2.2**.
+4. No early check-in / late checkout rules → **§1.2 + §2.4**.
+5. No structured meals → **§1.3 + §2.4**.
+6. `services` had no pricing unit → **§1.7**.
+7. No experiences → **§1.7**.
+8. No hotel team directory (`partner_members.profile_id` is NOT NULL) → **§1.8**.
+9. No notification routing, no escalation lifecycle → **§1.8 + Phase 6**.
+10. **No StayOS fee anywhere in the codebase** → **§1.9 + §2.1**.
+11. No Meta Marketing API → **§1.10 + Phase 7**.
+12. No hotel-config audit log → **§1.11 + §2.7**.
+13. Cancellation policy a schemaless `jsonb` → **§2.4**.
+14. **Rate plans could be created and never changed** — found in Phase 4.
 
-### 0.3 Two decisions taken up front
+### 0.3 Two decisions taken up front, and both held
 
-**Nullable columns, non-null publish gate.** The brief says no core field may be
-optional. Making the columns `NOT NULL` would break the 21 room types and 10
-properties that already exist, and §36 says nothing may break. So every new
-column is nullable in Postgres, and *readiness* — a deterministic server-side
-check — is what decides whether a room may be sold. A room missing its
-cancellation policy is not rejected by the database; it is `sellable: false`
-with a named reason, and the booking engine refuses it. "Not applicable" is a
-real stored value (`extra_bed: 'none'`, `children: 'not_allowed'`), distinct
-from null, which means nobody has answered yet.
+**Nullable columns, non-null publish gate.** §2 asks that no core field be
+optional; §36 says nothing may break. A `NOT NULL` constraint cannot serve both,
+so the database records what is *known* and readiness decides what may be
+*sold*. "Not applicable" is a stored value (`extra_bed: 'none'`), distinct from
+null, which means nobody has answered.
 
-**The model never computes a price, and now it never computes a *decision*
-either.** `negotiate_rate()` returns one of four verdicts and, where it allows,
-a real `quotes` row. The LLM is handed a sentence and a quote id. It has no
-arithmetic to do and no floor to leak.
+**The model never computes a decision.** `negotiate()` returns one of four
+verdicts and, where it allows, a real `quotes` row. The LLM has no arithmetic to
+do and no floor to leak.
 
 ---
 
-## Phase 1 — Data model and migrations
+## Phase 1 — Data model and migrations ✅ DONE
 
-Nine migrations, each named for what it makes possible. Applied to
-`rdlozqvuywtgsodunait`, mirrored into `migrations/` as files.
+Eleven migrations, applied to `rdlozqvuywtgsodunait` and mirrored into
+`migrations/`. RLS on every new table; indexes on every hot foreign key. No new
+security advisories.
 
-- [ ] **1.1 `a_room_is_described_well_enough_to_sell`** — `room_types` gains
-      `max_adults`, `max_children`, `bed_count`, `extra_bed` (`available` ·
-      `on_request` · `none`), `extra_bed_paise`, `crib` (same vocabulary),
-      `crib_paise`, `floor`, `view`, `smoking`, `accessible`, `connecting`,
-      `bathroom` (`private` · `shared`), `children_allowed`. Check constraints
-      on every closed vocabulary. `size_sqft` already exists and stays.
-- [ ] **1.2 `a_hotel_decides_what_a_late_checkout_costs`** — `stay_time_rules`:
-      one row per band per kind, `(property_id, kind, until_time)` with
-      `charge_kind` ∈ `free · fixed · pct_of_night` and `amount`. Bands are
-      evaluated in time order; the first band whose `until_time` is not passed
-      wins. Hotel-level, because that is how hotels actually price it.
-- [ ] **1.3 `breakfast_is_a_fact_not_a_sentence`** — `meal_options`: per property
-      per meal, `available`, `price_paise`, `price_unit`, `starts_at`, `ends_at`,
-      `diet` (`veg` · `nonveg` · `both`), `service_style`. What a *rate plan*
-      includes stays derived from `meal_plan` — one vocabulary, not two.
-- [ ] **1.4 `a_room_has_a_floor_and_a_target_not_just_a_ceiling`** —
-      `negotiation_rules`: scope `property · room_type · rate_plan`, with
-      `target_paise`/`target_pct`, `floor_paise`/`floor_pct`, `ceiling_paise`,
-      `auto_pct`, `approval_pct`, `valid_from`, `valid_to`, `days_of_week`,
-      `blackout_dates`, `enabled`. Most specific scope wins. The property-level
-      row is written from the existing `settings.max_discount_pct` by the
-      migration itself, so no hotel loses the ceiling it already had.
-- [ ] **1.5 `three_rooms_is_a_different_price_from_one`** — `group_rate_tiers`
-      (`min_units`, `max_units`, `discount_pct` | `fixed_price_paise`,
-      `negotiable`) and `group_policies` (min group size, deposit pct, payment
-      deadline days, cancellation terms, blackout dates, meal package).
-- [ ] **1.6 `an_agent_rate_can_be_a_discount_from_the_public_one`** — `rate_plans`
-      gains `derived_from_plan_id`, `derive_discount_pct`, `valid_from`,
-      `valid_to`, `days_of_week`, `allocation_units`. A derived plan has no
-      base price of its own; `nightly_for_plan` resolves it against its parent
-      per night, so a seasonal public rate moves its B2B rate with it.
-- [ ] **1.7 `what_a_hotel_sells_besides_a_bed`** — `services` gains
-      `price_unit`, `availability`, `opens_at`, `closes_at`, `max_quantity`,
-      `available_from`, `available_to`, `photo_url`, `terms`, `advance_required`.
-      New `experiences` table with its own booking shape (duration, meeting
-      point, min/max participants, age limits, requirements, photos, policy).
-- [ ] **1.8 `the_hotel_team_is_people_not_logins`** — `hotel_team_members`
-      (name, role, department, whatsapp, phone, email, active, optional
-      `member_id` → `partner_members`), `team_notification_rules` (event →
-      member → channels), `agent_escalations` (conversation, kind, dedupe key,
-      payload, member, status `open · notified · responded · resolved`,
-      resolution, timestamps).
-- [ ] **1.9 `the_platform_fee_is_a_number_not_a_conversation`** —
-      `partners.platform_fee_bps` default 400; `reservations` gains
-      `platform_fee_paise` and `payout_paise`, both snapshotted at creation and
-      never recomputed. Backfill computes them for the 72 existing rows from
-      their own stored totals at 400 bps, so historical settlement is stable.
-- [ ] **1.10 `marketing_that_can_be_reused`** — `marketing_profiles`,
-      `ad_audiences`, `ad_campaigns`, `ad_creatives`.
-- [ ] **1.11 `who_changed_the_floor_price`** — `hotel_config_audit`, append-only,
-      RLS read-only to members with `rates`, written service-side.
+- [x] **1.1 `a_room_is_described_well_enough_to_sell`** — adults/children split,
+      bed count, extra bed and crib with prices, floor, view, smoking,
+      accessible, connecting, bathroom, `photo_meta`. Every closed vocabulary
+      checked; every column nullable.
+- [x] **1.2 `a_hotel_decides_what_a_late_checkout_costs`** — `stay_time_rules`,
+      one band per `(kind, until_time)`, unique so the answer cannot depend on
+      insertion order.
+- [x] **1.3 `breakfast_is_a_fact_not_a_sentence`** — `meal_options`. What a rate
+      *includes* stays derived from `meal_plan`; this is what the meal *is*.
+- [x] **1.4 `a_room_has_a_floor_not_just_a_ceiling`** — `negotiation_rules`,
+      scoped property/room_type/rate_plan, **no backfill** so a hotel that has
+      configured nothing keeps exactly today's behaviour. Read policy is
+      `has_partner_perm(…, 'rates')`, not `owns_partner`: the floor is the one
+      number whose leak costs money on every future negotiation.
+- [x] **1.5 `three_rooms_is_a_different_price_from_one`** — `group_rate_tiers`,
+      `group_policies`.
+- [x] **1.6 `an_agent_rate_can_be_a_discount_from_the_public_one`** —
+      `rate_plans.derived_from_plan_id`, validity dates, selling days,
+      allocation.
+- [x] **1.7 `what_a_hotel_sells_besides_a_bed`** — `services.price_unit` and
+      friends; new `experiences` table.
+- [x] **1.8 `the_hotel_team_is_people_not_logins`** — `hotel_team_members`,
+      `team_notification_rules`, `agent_escalations`.
+- [x] **1.9 `the_platform_fee_is_a_number_not_a_conversation`** —
+      `partners.platform_fee_bps` (400), `reservations.platform_fee_paise` /
+      `payout_paise`, backfilled for all 72 rows.
+      ⚠ **The backfill failed on the first attempt**: `total_paise * 400` is
+      integer × integer, which overflows a 32-bit integer at a booking total of
+      about ₹53 lakh — *before* the division that would bring it back into
+      range. Fixed with `::numeric` casts.
+- [x] **1.10 `marketing_that_can_be_reused`** — `marketing_profiles`,
+      `ad_audiences`, `ad_campaigns`, `ad_creatives`, with the
+      `ad_campaigns_published_has_id` check constraint.
+- [x] **1.11 `who_changed_the_floor_price`** — `hotel_config_audit`,
+      append-only, no write policy (service role only).
+- [x] `a_quote_remembers_which_rule_priced_it` — `quotes.group_tier_id`.
+- [x] `an_escalation_is_a_thing_that_happened` — `agent_actions.result_type`
+      gains `escalation`. Filed under `handoff` would have been wrong: a handoff
+      gives the conversation away, an escalation keeps it while asking a
+      question, and reports counting one as the other would understate how often
+      the AI finished the conversation itself.
+- [x] `a_selling_agent_can_answer_the_questions_guests_ask` — the nine new tools
+      granted to the 14 existing guest and sales agents.
 
-RLS on every new table, following the existing partner/property pattern exactly.
-Indexes on every foreign key a hot path filters by.
+## Phase 2 — Commercial services ✅ DONE
 
-## Phase 2 — Commercial services (no UI, no agent)
+- [x] **2.1 `services/pms/fees.py`** — 400 bps, integer paise, one rounding.
+      `fee + payout == total` asserted over thousands of totals.
+- [x] **2.2 `services/pms/rates.py`** — derived plans resolved per night; group
+      tiers as a **rate** and not a discount. That is the load-bearing decision:
+      as a discount a tier would compete with the negotiation ceiling and a
+      hotel with a 10% allowance could never move a rupee on a group booking.
+      As a rate it flows into gross, into `nightly_paise`, and into the GST slab.
+- [x] **2.3 `negotiation.negotiate()`** — `allowed · counter · needs_approval ·
+      rejected`. Every §10 guardrail is a branch, not a prompt instruction.
+      `Decision` carries no field named after the floor.
+- [x] **2.4 `services/pms/policies.py`** — cancellation ladders, refund
+      calculation, arrival/departure bands, meal resolution, deposit rules.
+- [x] **2.5 Pricing precedence** — negotiated → group → B2B/derived → calendar →
+      base, and it falls out of the design rather than being enforced by a rule.
+- [x] **2.6 `services/pms/readiness.py`** — declared checks, per-room and per
+      section, `pct` capped at 99 short of complete.
+      ⚠ **Found by running it against production**: the first version gated
+      sales on every check marked `blocks: booking` and reported **0 of 4 rooms
+      sellable** at Casa Mandala. Every room type live today predates those
+      columns, so it would have taken the entire inventory dark on deploy. Two
+      bars now — `sellable` (name, stock, price) and `readyToSell` (§2's bar).
+- [x] **2.7 `services/pms/audit.py`** — one row per changed field, never fails
+      the change it records.
 
-- [ ] **2.1 `services/pms/fees.py`** — `breakdown(total_paise, bps)` → subtotal,
-      fee, payout. One function, used by booking, payments, receipts, dashboard
-      and settlement. Never shown to a guest.
-- [ ] **2.2 `services/pms/rates.py`** — resolve a derived rate plan per night;
-      apply group tiers to a `units` count; return which rule applied and why.
-- [ ] **2.3 `services/pms/negotiation.py` extended** — `resolve_rules()` (scope
-      precedence), and `negotiate()` returning `allowed · counter · rejected ·
-      needs_approval` with `final_paise`, `reason`, `expires_at`. Every guardrail
-      in §10 is a branch here, server-side.
-- [ ] **2.4 `services/pms/policies.py`** — structured cancellation ladder with a
-      validated schema, a refund calculator, and one resolver both the agent and
-      the website read. `stay_time_rules` evaluator lives here too.
-- [ ] **2.5 Pricing precedence, stated once** — negotiated → group → B2B →
-      calendar → plan base. Written as a single ordered function in
-      `booking.create_quote`'s path so no second implementation is possible.
-- [ ] **2.6 Readiness v2** — deterministic section checks, and `sellable` on a
-      room type gating the booking engine.
+## Phase 3 — APIs ✅ DONE
 
-## Phase 3 — APIs
+29 routes on a second router at the same `/pms` prefix, behind the same flag and
+the same `require_member`.
 
-Every route on the existing `/api/v1/pms` router, under the existing
-`require_member(perm)` model, with the existing rate limiter.
+- [x] Room detail list + PATCH; rate-plan detail list + **PATCH (new)**.
+- [x] `stay-time-rules`, `meals`, `negotiation-rules`, `negotiation-preview`,
+      `group-tiers`, `group-policy`, `experiences`, `services` DELETE, `team`,
+      `notification-rules`, `escalations`, `readiness/full`, `config-audit`.
+- [x] Marketing: `marketing-profile`, `audiences`, `ads`, `ads/drafts`,
+      `ads/{id}/creative`, `ads/{id}/publish`.
+- [x] ⚠ **A routing collision**, found by the e2e: `GET /room-types/detail`
+      answered 405 because `PATCH /room-types/{id}` is registered first and
+      `detail` matched as a room type id. Renamed to `room-types-detail`.
 
-- [ ] Room types: full PATCH surface for the new fields (PATCH already exists).
-- [ ] `stay-time-rules`, `meals`, `negotiation-rules`, `group-tiers`,
-      `group-policy`, `experiences`, `team`, `notification-rules`,
-      `marketing-profile`, `audiences`, `ad-campaigns` — list/upsert/delete.
-- [ ] `POST /properties/{id}/negotiate` — the same deterministic engine the
-      agent tool calls, so the dashboard can show a hotelier exactly what their
-      AI would answer.
-- [ ] `GET /properties/{id}/readiness` extended with sections.
-- [ ] Media: reorder, delete, primary, alt text, caption.
+## Phase 4 — Partner dashboard UI ✅ DONE
 
-## Phase 4 — Partner dashboard UI
+- [x] **4.1** Ten-step room editor. Nothing says "optional"; "Not applicable" is
+      a button; each step saves as it is finished; the rail's ticks are the
+      server's readiness checks. A room goes on sale at step three and the
+      wizard says so.
+- [x] **4.2** Hotel → Meals / Arrival & departure / Services / Experiences.
+- [x] **4.3** Pricing → Public / Agent / Groups / Negotiation / History, with
+      "Try it on your own AI" running the real engine against the real calendar.
+- [x] **4.4** Team → People / Who hears what / Asked.
+- [x] **4.5** Marketing → Ads / Audiences / Who you're for.
+- [x] **4.6** Nav regrouped: a "Your hotel" section for what a hotel *is*,
+      separate from what it is doing today.
 
-- [ ] **4.1** Ten-step room editor replacing the one-card form, with a completion
-      rail, per-step validation, and explicit *Not applicable* rather than blank.
-- [ ] **4.2** Hotel → Profile / Photos / Amenities / Policies / Meals / Services /
-      Experiences.
-- [ ] **4.3** Pricing → Public / B2B / Group / Negotiation, with a live
-      "what your AI would say" preview driven by the real engine.
-- [ ] **4.4** Team → Members / Directory / Notifications.
-- [ ] **4.5** Marketing → Profile / Audiences / WhatsApp ad / Instagram ad.
-- [ ] **4.6** Navigation regrouped per §39; readiness surfaced as named gaps.
+## Phase 5 — Agent retrieval and tools ✅ DONE
 
-## Phase 5 — Agent retrieval and tools
+- [x] `get_room_details`, `get_checkin_options`, `get_meal_info`,
+      `get_group_rates`, `get_cancellation_terms`, `get_payment_terms`,
+      `get_experiences`, `negotiate_rate`, `escalate_to_team`.
+- [x] `toolsets.py` menus extended, never-widens invariant re-asserted.
+- [x] Prompt rules: what may never be said out loud.
+- [x] Migration granting the tools to guest and sales agents only.
 
-- [ ] New tools, each a thin call into Phase 2: `get_room_details`,
-      `get_checkin_options`, `get_meal_info`, `get_services`, `get_experiences`,
-      `get_group_rate`, `negotiate_rate`, `get_cancellation_terms`,
-      `get_payment_terms`, `escalate_to_team`.
-- [ ] `toolsets.py` — new tasks (`negotiation`, `group`, `policy`, `addons`) and
-      their menus, keeping the never-widens invariant.
-- [ ] Prompt rules: what may never be said out loud (floor, target, fee, payout,
-      internal notes, team detail).
-- [ ] Migration granting the new tools to the guest and sales agents only.
+## Phase 6 — WhatsApp team escalation ✅ DONE
 
-## Phase 6 — WhatsApp team escalation
+- [x] `services/pms/escalation.py` — routing (configured rules → role fallback →
+      anyone reachable), a message composed server-side from stored facts, a
+      dedupe key from substance rather than wording, a lifecycle the agent reads.
+- [x] The internal message **may** name the floor; nothing sent to a guest ever
+      may. That asymmetry is the reason it is composed on the server.
+- [x] Failure to notify is recorded as failure: the escalation stays `open`, the
+      dashboard shows it, and the agent is told to hand off for real.
+- [x] Verified against the live database: routed to the configured member,
+      deduped on the second attempt, message rendered correctly. The demo
+      hotel's WhatsApp connection is `is_sandbox`, so nothing left the building.
 
-- [ ] Structured internal message built server-side from the escalation payload —
-      the model supplies a reason, never the numbers.
-- [ ] Routing by event kind → `team_notification_rules` → member's WhatsApp.
-- [ ] Dedupe on `(conversation_id, kind, dedupe_key)`; lifecycle transitions;
-      the agent can read escalation state and does not re-escalate.
-- [ ] Approval loop: hotel replies → approval executes through the existing
-      `approvals.py` revalidation path.
+## Phase 7 — Instagram and ads ✅ DONE
 
-## Phase 7 — Instagram and ads
+- [x] `services/marketing/creatives.py` — five templates, filled from structured
+      data, **no model in the path**. A template with nothing true to say returns
+      nothing.
+- [x] Four formats: single image, carousel (ordered, per-card captions), video,
+      and boosting an existing Instagram post.
+- [x] `services/marketing/meta_ads.py` — the full request composed and
+      validated, `not_connected` reported with the specific thing missing.
+      §29 enforced in three places: the check constraint, this module, the
+      screen.
+- [x] ⚠ **A copy bug found by a test and then a worse one behind it**: generated
+      copy ended "…with a private balcony over the…", and a description that
+      *itself* ends on a dangling word was under the length limit and passed
+      through untouched. The trim now runs on every path.
+- [x] ⚠ **Two of Casa Mandala's stored photo URLs no longer resolve** and were
+      offered as selectable ad images. Unloadable photos now leave the pool.
 
-- [ ] Instagram management screen over the existing connection + conversations.
-- [ ] Ad studio: pick room/experience/offer, pick media from the hotel's own
-      uploaded photos or an existing IG video, choose single / carousel / video,
-      generate headline + primary text + CTA from **structured data only**, and
-      let the hotelier edit every field.
-- [ ] Caption and creative templates, editable, stored per property.
-- [ ] Publish adapter: real Meta Marketing API where credentials exist, and an
-      honest `not_connected` state where they do not. `draft · connected ·
-      published · running · paused · failed` are distinct and never faked.
+## Phase 8 — Tests and E2E ✅ DONE
 
-## Phase 8 — Tests and E2E
+| Suite | Count | What it proves |
+| --- | --- | --- |
+| unit | 1,621 | every rule, as properties rather than examples |
+| `hotel_os_e2e` | 73 | the configuration surface over real HTTP, incl. 10 cross-tenant 404s |
+| `negotiation_e2e` | 31 | the §44 conversation, deterministically |
+| `onboarding_e2e` | 65 | regression — a stranger can still sign up and sell |
+| `golden_e2e` | 88 | regression — discovery → booking → payment → check-in → bill |
+| `sales_e2e` | 185 | regression — the agent, the PMS and the ledger |
 
-- [ ] Unit suites per service, with the negotiation guardrails as properties
-      rather than examples.
-- [ ] `scripts/hotel_os_e2e.py` — the §44 checklist against a real deployment.
-- [ ] The §44 conversation, end to end: "₹5,000 ka room hai, 4 rooms chahiye,
-      best price kya doge?"
+## Phase 9 — Website, polish, responsive ✅ DONE
 
-## Phase 9 — Polish, responsive QA, final report
+- [x] `GET /public/hotels/{slug}` now returns meals, experiences, arrival bands,
+      the full room detail and resolved cancellation terms — §45's "the website
+      uses the same structured data".
+- [x] Mobile verified in a real browser at 400px: sidebar collapses, editor
+      stacks, 44px targets, 16px inputs.
+- [x] ⚠ Cover photos that 404 rendered as grey voids; they now fall back to the
+      empty state.
+- [x] ⚠ Room cards showed each gap's *consequence* sentence, which is right on
+      the review step and wrong on a grid — three rooms missing the same three
+      fields became three identical paragraphs. Short labels now.
+- [x] ⚠ The audit log wrote seven rows for one save, four of them defaults
+      nobody chose, and labelled a rule "room_type" in a table meant to be read
+      by a hotelier. Both fixed.
+
+---
+
+## Not built, and why
+
+* **Publishing to Meta.** StayOS holds `instagram_business_basic` and
+  `instagram_business_manage_messages` — DM scopes. Ads need `ads_management` on
+  a Business account with a funded ad account, a different OAuth configuration
+  and a different review. Everything up to the wire is built and tested; the one
+  function that posts raises `NotImplementedError` and is unreachable.
+* **Meta interest ids.** Audience interests are stored as the hotelier's words.
+  Resolving them needs a search endpoint that requires the same credentials.
+* **Carousel drag-to-reorder.** Order is the tap order, which works; drag is a
+  refinement.
+* **`unanswered` escalations.** Routed and composable, but nothing raises them —
+  the sweep that would notice a waiting guest is not built.
+* **AI-written ad copy.** Deliberately not built. See `creatives.py`.
