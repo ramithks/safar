@@ -43,6 +43,8 @@ from app.api.v1.pms.hotel_os_schemas import (
     NegotiationRuleRequest,
     NotificationRuleOut,
     NotificationRuleRequest,
+    RatePlanDetailOut,
+    RatePlanDetailRequest,
     ReadinessReportOut,
     RoomTypeDetailOut,
     RoomTypeDetailRequest,
@@ -424,6 +426,19 @@ async def upsert_negotiation_rule(
                     "That room or rate plan is not part of this hotel.",
                 )
 
+        # What this rule is *about*, for the history screen. `body.scope` was
+        # used here first, which rendered as "room_type" in a log a hotelier is
+        # meant to read — the whole point of that table is that somebody can
+        # answer "when did the Pool Villa's floor drop" without a schema.
+        label = "The whole hotel"
+        for column, table, name_column in (
+            ("room_type_id", "room_types", "name"), ("rate_plan_id", "rate_plans", "name"),
+        ):
+            target = columns.get(column)
+            if target:
+                row = _read_one(table, property_id, target)
+                label = (row or {}).get(name_column) or label
+
         query = db.table("negotiation_rules").select("*").eq("property_id", property_id).eq(
             "scope", body.scope
         )
@@ -440,15 +455,15 @@ async def upsert_negotiation_rule(
                 .eq("id", existing[0]["id"]).eq("property_id", property_id)
                 .execute().data
             )
-            return rows[0], existing[0]
+            return rows[0], existing[0], label
         return db.table("negotiation_rules").insert(
             {**columns, "property_id": property_id, "partner_id": member.partner_id}
-        ).execute().data[0], None
+        ).execute().data[0], None, label
 
-    row, before = await run_db(_write)
+    row, before, label = await run_db(_write)
     await audit_service.record(
         property_id=property_id, partner_id=member.partner_id,
-        entity="negotiation_rule", entity_id=str(row["id"]), entity_label=body.scope,
+        entity="negotiation_rule", entity_id=str(row["id"]), entity_label=label,
         before=before, after=columns, actor_member=member.member_id,
     )
     return NegotiationRuleOut.from_row(row)
@@ -1023,3 +1038,113 @@ async def get_config_audit(
         }
         for r in await run_db(_read)
     ]
+
+
+# ── rate plans ───────────────────────────────────────────────────────────────
+
+
+@router.get("/properties/{property_id}/rate-plans-detail",
+            response_model=list[RatePlanDetailOut])
+@limiter.limit("120/minute")
+async def list_rate_plan_details(
+    request: Request,
+    property_id: str,
+    include_inactive: bool = Query(False),
+    member=Depends(require_member()),
+):
+    """
+    Every rate plan in full: contract dates, selling days, allocation, whether it
+    derives its price from another plan, and its cancellation ladder.
+
+    The existing `/rate-plans` returns what the booking drawer needs and predates
+    all of that. Same reasoning as the room detail route — the screens that need
+    fifteen more fields are not the screens a receptionist opens all shift.
+    """
+    def _read():
+        query = _scoped("rate_plans", property_id).order("sort_order")
+        if not include_inactive:
+            query = query.eq("is_active", True)
+        return query.limit(400).execute().data or []
+
+    return [RatePlanDetailOut.from_row(r) for r in await run_db(_read)]
+
+
+@router.patch("/properties/{property_id}/rate-plans/{rate_plan_id}",
+              response_model=RatePlanDetailOut)
+@limiter.limit("120/minute")
+async def update_rate_plan(
+    request: Request,
+    property_id: str,
+    rate_plan_id: str,
+    body: RatePlanDetailRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    Amend a rate plan. The route that did not exist, and its absence was a hole.
+
+    `POST /rate-plans` created one and nothing could change it. So a hotel that
+    typed the wrong nightly rate had no way to correct it except through the ARI
+    calendar, which sets a *per-night override* rather than the plan's own base —
+    meaning the wrong number stayed underneath, resurfacing on every date the
+    calendar did not cover. §6 asks for a clear public selling price a hotel can
+    see and change; this is the route that makes the second half possible.
+
+    **A plan may not derive from another hotel's plan, or from itself, or from a
+    plan that is itself derived.** The first is checked here, the second and
+    third by the database and by `rates.resolve_derived` respectively — three
+    places because a derivation cycle is not a validation error, it is a pricing
+    engine that does not terminate.
+    """
+    columns = body.to_columns()
+    if not columns:
+        existing = await run_db(_read_one, "rate_plans", property_id, rate_plan_id)
+        if not existing:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Rate plan not found")
+        return RatePlanDetailOut.from_row(existing)
+
+    def _write():
+        before = _read_one("rate_plans", property_id, rate_plan_id)
+        if not before:
+            return None, None
+
+        parent_id = columns.get("derived_from_plan_id")
+        if parent_id:
+            if str(parent_id) == str(rate_plan_id):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "A rate cannot be a discount off itself.",
+                )
+            parent = _read_one("rate_plans", property_id, parent_id)
+            if not parent:
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND,
+                    "That rate plan is not part of this hotel.",
+                )
+            if parent.get("derived_from_plan_id"):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "That rate is itself a discount off another one. Point at the "
+                    "published rate instead.",
+                )
+            if str(parent.get("room_type_id")) != str(before.get("room_type_id")):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "A rate can only follow another rate for the same room.",
+                )
+
+        rows = (
+            get_db().table("rate_plans").update({**columns, "updated_at": "now()"})
+            .eq("id", rate_plan_id).eq("property_id", property_id).execute().data
+        )
+        return (rows[0] if rows else None), before
+
+    updated, before = await run_db(_write)
+    if not updated:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Rate plan not found")
+
+    await audit_service.record(
+        property_id=property_id, partner_id=member.partner_id,
+        entity="rate_plan", entity_id=rate_plan_id, entity_label=updated.get("name"),
+        before=before, after=columns, actor_member=member.member_id,
+    )
+    return RatePlanDetailOut.from_row(updated)

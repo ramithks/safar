@@ -1089,3 +1089,153 @@ class ReadinessReportOut(BaseModel):
     roomCount: int
     remaining: int
     complete: bool
+
+
+# ── rate plans ───────────────────────────────────────────────────────────────
+
+
+class RatePlanDetailOut(BaseModel):
+    """
+    A rate plan in full, including the four things a contract has and the
+    existing projection does not: when it runs, on which days, how much of the
+    room pool it may sell, and whether it has a price of its own at all.
+    """
+
+    id: str
+    roomTypeId: str
+    code: str
+    name: str
+    mealPlan: str
+    audience: str
+    basePricePaise: int
+    extraAdultPaise: int | None
+    extraChildPaise: int | None
+    refundable: bool
+    cancellationCutoffHours: int | None
+    cancellationPolicy: dict
+    inclusions: list[str]
+    minStay: int | None
+    maxStay: int | None
+    derivedFromPlanId: str | None
+    deriveDiscountPct: int | None
+    validFrom: date | None
+    validTo: date | None
+    daysOfWeek: list[int]
+    allocationUnits: int | None
+    isActive: bool
+    sortOrder: int
+
+    @classmethod
+    def from_row(cls, row: dict) -> "RatePlanDetailOut":
+        return cls(
+            id=str(row["id"]),
+            roomTypeId=str(row["room_type_id"]),
+            code=row.get("code") or "",
+            name=row.get("name") or "",
+            mealPlan=row.get("meal_plan") or "EP",
+            audience=row.get("audience") or "public",
+            basePricePaise=int(row.get("base_price_paise") or 0),
+            extraAdultPaise=row.get("extra_adult_paise"),
+            extraChildPaise=row.get("extra_child_paise"),
+            refundable=bool(row.get("refundable", True)),
+            cancellationCutoffHours=row.get("cancellation_cutoff_hours"),
+            cancellationPolicy=row.get("cancellation_policy") or {},
+            inclusions=row.get("inclusions") or [],
+            minStay=row.get("min_stay"),
+            maxStay=row.get("max_stay"),
+            derivedFromPlanId=(
+                str(row["derived_from_plan_id"]) if row.get("derived_from_plan_id") else None
+            ),
+            deriveDiscountPct=row.get("derive_discount_pct"),
+            validFrom=row.get("valid_from"),
+            validTo=row.get("valid_to"),
+            daysOfWeek=[int(d) for d in (row.get("days_of_week") or [])],
+            allocationUnits=row.get("allocation_units"),
+            isActive=bool(row.get("is_active", True)),
+            sortOrder=int(row.get("sort_order") or 0),
+        )
+
+
+class RatePlanDetailRequest(BaseModel):
+    """
+    Absent means unchanged, the same contract the room editor uses.
+
+    **A derived plan and a priced plan are mutually exclusive and it is enforced
+    here as well as by the database.** Setting `derivedFromPlanId` clears the
+    base price to zero rather than leaving a stale number behind it — a plan
+    that resolves from its parent has no price of its own, and a leftover figure
+    in that column is one somebody will eventually read.
+    """
+
+    name: str | None = Field(None, min_length=1, max_length=80)
+    mealPlan: str | None = None
+    audience: str | None = None
+    priceRupees: float | None = Field(None, ge=0, le=10_000_000)
+    extraAdultRupees: float | None = Field(None, ge=0, le=1_000_000)
+    extraChildRupees: float | None = Field(None, ge=0, le=1_000_000)
+    refundable: bool | None = None
+    cancellationCutoffHours: int | None = Field(None, ge=0, le=8760)
+    cancellationPolicy: dict | None = None
+    inclusions: list[str] | None = None
+    minStay: int | None = Field(None, ge=1, le=90)
+    maxStay: int | None = Field(None, ge=1, le=365)
+    derivedFromPlanId: str | None = None
+    deriveDiscountPct: int | None = Field(None, ge=0, le=100)
+    validFrom: date | None = None
+    validTo: date | None = None
+    daysOfWeek: list[int] | None = None
+    allocationUnits: int | None = Field(None, ge=0, le=999)
+    isActive: bool | None = None
+
+    @field_validator("mealPlan")
+    @classmethod
+    def _meal(cls, v):
+        if v is not None and v not in ("EP", "CP", "MAP", "AP"):
+            raise ValueError("Say EP, CP, MAP or AP.")
+        return v
+
+    @field_validator("audience")
+    @classmethod
+    def _audience(cls, v):
+        if v is not None and v not in ("public", "b2b", "corporate", "creator", "internal"):
+            raise ValueError("Unknown audience.")
+        return v
+
+    @field_validator("daysOfWeek")
+    @classmethod
+    def _days(cls, v):
+        if v is not None and any(d < 1 or d > 7 for d in v):
+            raise ValueError("Days are 1 (Monday) to 7 (Sunday).")
+        return sorted(set(v)) if v is not None else v
+
+    def to_columns(self) -> dict:
+        sent = self.model_dump(exclude_unset=True)
+        mapping = {
+            "name": "name", "mealPlan": "meal_plan", "audience": "audience",
+            "refundable": "refundable",
+            "cancellationCutoffHours": "cancellation_cutoff_hours",
+            "cancellationPolicy": "cancellation_policy", "inclusions": "inclusions",
+            "minStay": "min_stay", "maxStay": "max_stay",
+            "derivedFromPlanId": "derived_from_plan_id",
+            "deriveDiscountPct": "derive_discount_pct",
+            "daysOfWeek": "days_of_week", "allocationUnits": "allocation_units",
+            "isActive": "is_active",
+        }
+        out = {column: sent[key] for key, column in mapping.items() if key in sent}
+        for key, column in (("priceRupees", "base_price_paise"),
+                            ("extraAdultRupees", "extra_adult_paise"),
+                            ("extraChildRupees", "extra_child_paise")):
+            if key in sent:
+                out[column] = _rupees_to_paise(sent[key])
+        for key, column in (("validFrom", "valid_from"), ("validTo", "valid_to")):
+            if key in sent:
+                out[column] = sent[key].isoformat() if sent[key] else None
+
+        # A plan cannot both derive and carry a price. The database refuses the
+        # first half of that; this refuses the second, so the column does not
+        # keep a number nobody reads.
+        if out.get("derived_from_plan_id"):
+            out["base_price_paise"] = 0
+        elif "derived_from_plan_id" in out and out["derived_from_plan_id"] is None:
+            out["derive_discount_pct"] = None
+        return out

@@ -71,6 +71,12 @@ def _stringify(value) -> str | None:
     return str(value)[:500]
 
 
+# What "nothing was said here" looks like once stringified.
+#
+# Needed only on a create. See `diff`.
+_EMPTY = frozenset({None, "", "(empty)", "0", "no"})
+
+
 def diff(before: dict | None, after: dict) -> list[tuple[str, str | None, str | None]]:
     """
     The sensitive fields that actually changed, as (field, old, new).
@@ -84,7 +90,18 @@ def diff(before: dict | None, after: dict) -> list[tuple[str, str | None, str | 
     A missing key in `after` is not a change to null. PATCH semantics in this
     codebase are "absent means unchanged", and reading absence as deletion here
     would fabricate a history of fields nobody touched.
+
+    **On a create, defaults are not changes.** Found by reading the screen this
+    feeds: setting a floor price for the first time wrote seven rows, of which
+    four were `enabled: yes`, `days_of_week: (empty)`, `min_nights: 1` and
+    `min_units: 1` — every defaulted column on a freshly inserted row, none of
+    them chosen by anybody. A history where the four rows nobody cares about
+    outnumber the three that matter is a history people stop opening. So when
+    there is no prior row, an empty or zero-like value is recorded as silence
+    rather than as a decision. An *update* still records everything, including a
+    field being cleared, because there the change is real.
     """
+    creating = not before
     before = before or {}
     changes = []
     for field, new_value in after.items():
@@ -92,8 +109,11 @@ def diff(before: dict | None, after: dict) -> list[tuple[str, str | None, str | 
             continue
         old = _stringify(before.get(field))
         new = _stringify(new_value)
-        if old != new:
-            changes.append((field, old, new))
+        if old == new:
+            continue
+        if creating and new in _EMPTY:
+            continue
+        changes.append((field, old, new))
     return changes
 
 
