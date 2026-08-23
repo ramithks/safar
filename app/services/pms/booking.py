@@ -29,6 +29,7 @@ from fastapi import HTTPException, status
 
 from app.db.client import get_db, run_db
 from app.services.pms import negotiation
+from app.services.pms import fees
 from app.services.pms.availability import nightly_for_plan
 from app.services.pms.pricing import (
     NightlyRate,
@@ -165,14 +166,47 @@ async def create_quote(
 
     # Prices come from the calendar, never from the caller. This is the line
     # that stops a model-generated number reaching a guest.
-    nightly = await nightly_for_plan(property_id, rate_plan_id, check_in, check_out)
-    if nightly is None:
+    #
+    # `units` is passed because volume pricing is a *rate*, not a discount — see
+    # the header of services/pms/rates.py. A group tier lowers the nightly here,
+    # which means it flows into gross_paise, into nightly_paise, and into the GST
+    # slab decision, and leaves the negotiation allowance untouched on top of it.
+    resolved = await nightly_for_plan(property_id, rate_plan_id, check_in, check_out, units=units)
+    if resolved is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "These dates are closed on this rate plan")
+    nightly, group_tier = resolved
 
     policy = negotiation.resolve(prop.get("settings"))
-    max_discount = policy.ceiling_for(approved=authorised_discount_pct is not None)
+
+    # The ceiling is the one binding *this rate plan*, which since
+    # `negotiation_rules` may be tighter or looser than the hotel-wide setting.
+    # A hotel that has configured nothing gets `rules_from_settings`, which is
+    # the hotel-wide number it already had — no behaviour changes for anybody
+    # who has not opted in.
+    rules = await negotiation.rules_for(
+        property_id,
+        rate_plan_id=rate_plan_id,
+        room_type_id=plan["room_type_id"],
+        settings=prop.get("settings"),
+    )
+    max_discount = rules.approval_pct if authorised_discount_pct is not None else rules.auto_pct
     if authorised_discount_pct is not None:
         max_discount = min(max_discount, max(int(authorised_discount_pct), 0))
+
+    # And then the floor, which is not a percentage and therefore cannot be
+    # enforced by the percentage clamp alone.
+    #
+    # This is the third layer, and the one that matters most: the first is the
+    # argument on the approval row, the second is the property's approval
+    # ceiling, and this is the absolute price a hotelier typed in specifically so
+    # that no ladder of percentages could ever get under it. Truncating rather
+    # than rounding is deliberate — a rounded percentage can land a rupee below
+    # the floor, and a floor that is breached by a rupee is not a floor.
+    gross_preview = sum(p for _, p in nightly) * units
+    floor_total = negotiation.floor_total_for(gross_preview, rules, nights, units)
+    if floor_total is not None and gross_preview > 0:
+        max_discount = min(max_discount, max(int((gross_preview - floor_total) * 100 // gross_preview), 0))
+
     token_pct = policy.token_pct
 
     priced = price_stay(
@@ -252,6 +286,9 @@ async def create_quote(
                         "issued_by_member": issued_by_member,
                         "conversation_id": conversation_id,
                         "expires_at": expires_at.isoformat(),
+                        # Which of the hotel's own volume bands produced this
+                        # price, when one did. Null on an ordinary quote.
+                        "group_tier_id": group_tier.tier_id if group_tier else None,
                     }
                 )
                 .execute()
@@ -470,6 +507,19 @@ async def create_reservation(
 
         paid = max(0, min(int(token_paise or 0), q["total_paise"]))
 
+        # What StayOS keeps and what the hotel is owed — decided here, once, and
+        # never recomputed. §37: a booking preserves its own financial truth, so
+        # renegotiating this partner's rate next year must not change what this
+        # stay was worth. A partner row that cannot be read falls back to the
+        # standard rate rather than to no fee; see services/pms/fees.py.
+        partner_row = (
+            db.table("partners").select("platform_fee_bps")
+            .eq("id", q["partner_id"]).limit(1).execute().data or []
+        )
+        fee_columns = fees.snapshot_columns(
+            q["total_paise"], partner_row[0].get("platform_fee_bps") if partner_row else None,
+        )
+
         # Before the reservation, so the row is linked from the moment it
         # exists rather than by a second write that can fail on its own.
         guest_id = _resolve_guest(
@@ -524,6 +574,7 @@ async def create_reservation(
                             # made still belongs to that conversation, and the
                             # guest asking about it is on that conversation.
                             "conversation_id": conversation_id or q.get("conversation_id"),
+                            **fee_columns,
                         }
                     )
                     .execute()
