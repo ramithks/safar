@@ -3704,6 +3704,8 @@ async def get_public_hotel(request: Request, slug: str):
         slug=prop.slug, name=prop.name, city=prop.city, template=prop.template,
         currency=prop.currency, timezone=prop.timezone,
         checkInTime=prop.check_in_time, checkOutTime=prop.check_out_time,
+        # Already house-rules-only: `resolve_published` strips the commercial
+        # keys that share this column.
         policies=prop.policies, content=prop.website,
         # Room-only, because the page is about the hotel rather than about one
         # rate. A guest reading "breakfast included" here would be reading a
@@ -3728,6 +3730,15 @@ async def get_public_hotel(request: Request, slug: str):
             }
             for x in experience_rows
         ],
+        # Grouped by kind, then by time.
+        #
+        # `bands_from_rows` sorts by time alone, which is right for its own
+        # caller — the resolver only ever looks at one kind at a time. A
+        # consumer rendering *both* gets them interleaved, and the live payload
+        # came back early 08:00, early 11:00, late 13:00, early 14:00, late
+        # 17:00 — which on a page reads as "Arriving before 14:00" after
+        # "Leaving by 13:00". Ordered here rather than in the resolver so the
+        # agent's path is untouched.
         arrivalRules=[
             {
                 "kind": b.kind,
@@ -3737,7 +3748,10 @@ async def get_public_hotel(request: Request, slug: str):
                 "subjectToAvailability": b.subject_to_availability,
                 "note": b.note,
             }
-            for b in pms_policies.bands_from_rows(time_rows)
+            for b in sorted(
+                pms_policies.bands_from_rows(time_rows),
+                key=lambda b: (b.kind != "early_in", b.until),
+            )
         ],
         address=prop.address, state=prop.state, country=prop.country,
         pincode=prop.pincode, lat=prop.lat, lon=prop.lon,

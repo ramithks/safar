@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from app.db.client import get_db, run_db
+from app.services.pms import onboarding
 
 logger = logging.getLogger(__name__)
 
@@ -699,9 +700,10 @@ def _facts_from(context: dict) -> dict:
         "meals_described": len(context.get("meals") or set()),
         "services": context.get("service_count", 0),
         "experiences": context.get("experience_count", 0),
-        "policies": len(
-            {k for k, v in (prop.get("policies") or {}).items() if str(v or "").strip()}
-        ),
+        # Guest-facing keys only. The commercial settings sharing this column
+        # are not facts the agent can answer a question with, so counting them
+        # would report a hotel as better-briefed than it is.
+        "policies": len(onboarding.guest_policies(prop.get("policies"))),
         "photos": sum(len(r.get("photos") or []) for r in rooms),
         "deposit_rule": 1 if (prop.get("settings") or {}).get("token_pct") is not None else 0,
         "time_rules": len(context.get("time_rules") or []),
