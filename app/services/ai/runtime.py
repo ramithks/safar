@@ -822,6 +822,33 @@ async def run_turn(
                 reply = prompts.handoff_reply(ctx)
                 handoff = True
                 status = "escalated"
+            else:
+                # **And it is not a failure either.**
+                #
+                # `status` was set to 'failed' above before anything had looked
+                # at whether the guest was answered, and the `spoke` branch only
+                # ever moved it further down, to 'escalated'. So a turn where the
+                # model replied through `send_message` and then correctly
+                # declined to repeat itself was recorded as a failure with the
+                # error "the model produced no reply".
+                #
+                # Nothing behaved badly — the guest had their answer and the
+                # conversation stayed with the AI. What was wrong was the
+                # record, and the record is what every comparison is made of.
+                #
+                # It is not evenly wrong, which is why it matters. A model that
+                # answers by calling the tool books these; a model that answers
+                # in prose never does. Production on 2026-08-24 shows exactly
+                # that: 3.x replies through `send_message`, 2.5 returns prose,
+                # and any dashboard counting status='failed' would have read the
+                # difference in *style* as a difference in reliability. That is
+                # the same bias that produced a model regression which was not
+                # real, moved from the fixture into the metric.
+                status = "succeeded"
+                error = (
+                    "answered through send_message with no closing prose"
+                    + (f" ({detail})" if detail else "")
+                )
 
     except ProviderError as exc:
         # The model is gone. The conversation goes to a human, and the guest is
