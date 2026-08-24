@@ -51,7 +51,19 @@ def profile(db) -> dict:
 def test_new_dates_replace_the_old_stay_rather_than_merging_into_it(db):
     """
     The §10 case, verbatim: 10–14 Sep / 2 rooms / 4 adults, then 20–22 Oct /
-    1 room / 2 adults. Nothing of September may survive.
+    1 room / 2 adults. Nothing *priced* about September may survive.
+
+    **Narrowed, deliberately, from "nothing may survive".** The original rule
+    took the chosen room with it, and that turned out to delete a fact it had no
+    business touching: a guest who picks the Deluxe Balcony and then says
+    "actually the 20th to the 22nd" has changed their dates, not their mind
+    about the room, and being asked which room they wanted was the exact
+    complaint the audit had just fixed one layer up in the prompt.
+
+    So the split is between a *preference* and a *price*. The room stays and is
+    marked for re-checking (see the test below); the quote, the rate plan, the
+    stage and the party size go, because every one of them was true only of
+    nights the guest is no longer asking about.
     """
     session.merge(CONVERSATION, {
         "check_in": "2026-10-20", "check_out": "2026-10-22",
@@ -65,9 +77,87 @@ def test_new_dates_replace_the_old_stay_rather_than_merging_into_it(db):
     # The fields the new search did not mention are *gone*, not inherited.
     assert "children" not in now
     assert "quote_id" not in now
-    assert "room_type_id" not in now
     assert "rate_plan_id" not in now
     assert now["stage"] == "browsing"
+
+
+def test_a_change_of_dates_keeps_the_room_but_not_the_promise(db):
+    """
+    §9: "guest changes dates → preserve selected room if still valid".
+
+    Valid is the operative word and it is not knowable here — availability is a
+    tool call away — so the room is kept together with the fact that nobody has
+    checked it. `describe()` turns that into an instruction to re-check before
+    promising, which is the honest version of remembering.
+    """
+    session.merge(CONVERSATION, {"check_in": "2026-10-20", "check_out": "2026-10-22"})
+
+    now = profile(db)
+    assert now["room_type_id"] == "rt-king"
+    assert now["room_needs_recheck"] is True
+
+    told = session.describe({"guest_profile": now})
+    assert "rt-king" in told
+    assert "different dates" in told
+
+
+def test_a_room_that_stops_being_offered_is_taken_off_the_session(db):
+    """
+    §9: "room becomes unavailable → explicitly invalidate it and ask again".
+
+    The failure without this is not a repeated question — it is the agent being
+    told in its own prompt that the guest has settled on a room, and offering
+    them a room that sold an hour ago.
+    """
+    session.merge(CONVERSATION, {"_offered_room_type_ids": ["rt-deluxe", "rt-suite"]})
+
+    now = profile(db)
+    assert "room_type_id" not in now
+    assert "rate_plan_id" not in now
+    assert now["room_unavailable"] is True
+    assert "_offered_room_type_ids" not in now, "the private key must not be stored"
+
+    told = session.describe({"guest_profile": now})
+    assert "no longer free" in told
+
+
+def test_a_room_still_on_offer_is_confirmed_rather_than_doubted(db):
+    """The other half: an availability read that finds it settles the recheck."""
+    session.merge(CONVERSATION, {"room_needs_recheck": True})
+    session.merge(CONVERSATION, {"_offered_room_type_ids": ["rt-king", "rt-suite"]})
+
+    now = profile(db)
+    assert now["room_type_id"] == "rt-king"
+    assert "room_needs_recheck" not in now
+    assert "room_unavailable" not in now
+
+
+def test_a_turn_that_never_asked_about_availability_invalidates_nothing(db):
+    """
+    A turn about breakfast cannot take the guest's room away.
+
+    The key is absent rather than empty on such a turn, and that distinction is
+    the whole safety property: absent means "nobody asked", empty means "we
+    asked and the hotel has nothing", and only the second may delete anything.
+    """
+    session.merge(CONVERSATION, {"adults": 3})
+
+    now = profile(db)
+    assert now["room_type_id"] == "rt-king"
+    assert "room_unavailable" not in now
+
+
+def test_a_sold_out_stay_takes_the_room_with_it(db):
+    """
+    The empty-list half of the same rule. `search_availability` returns no room
+    types when nothing is free, and a session that kept the chosen room through
+    that would have the prompt insisting on a room the hotel cannot sell.
+    """
+    session.merge(CONVERSATION, {"_offered_room_type_ids": []})
+
+    now = profile(db)
+    assert "room_type_id" not in now
+    assert now["room_unavailable"] is True
 
 
 def test_the_guests_language_survives_a_change_of_stay(db):

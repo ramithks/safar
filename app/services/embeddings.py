@@ -31,7 +31,9 @@ async def embed_texts(texts: list[str], *, task_type: str = "SEMANTIC_SIMILARITY
     if not any(texts):
         return None
     try:
-        from app.services.vertex import _get_access_token, _regions, _get_http_client
+        from app.services.vertex import (
+            _get_access_token, _get_http_client, _regions, get_vertex_host,
+        )
         token, project_id = _get_access_token()
     except Exception as exc:  # noqa: BLE001 — no creds → embeddings simply unavailable
         logger.debug("[embeddings] auth unavailable: %s", exc)
@@ -48,7 +50,8 @@ async def embed_texts(texts: list[str], *, task_type: str = "SEMANTIC_SIMILARITY
             "instances": [{"content": t, "task_type": task_type} for t in chunk],
             "parameters": {"outputDimensionality": settings.embedding_dim},
         }
-        vecs = await _predict(client, token, project_id, regions, model, body)
+        vecs = await _predict(client, token, project_id, regions, model, body,
+                              host_for=get_vertex_host)
         if vecs is None or len(vecs) != len(chunk):
             return None
         out.extend(_normalise(v) for v in vecs)
@@ -60,12 +63,28 @@ async def embed_one(text: str, *, task_type: str = "SEMANTIC_SIMILARITY") -> lis
     return res[0] if res else None
 
 
-async def _predict(client, token, project_id, regions, model, body) -> list[list[float]] | None:
+async def _predict(client, token, project_id, regions, model, body,
+                   *, host_for) -> list[list[float]] | None:
+    """
+    `host_for` is `vertex.get_vertex_host`, and passing it is not ceremony.
+
+    This module builds its own URL because `:predict` is a different endpoint
+    from `:generateContent`, and it took the region prefix as given — which was
+    true for as long as the configured region list held only real regions. It
+    stopped being true the moment `global` was added to reach Gemini 3.x:
+    `global-aiplatform.googleapis.com` does not resolve, so the first region
+    tried would have failed DNS on every call.
+
+    The failure would have been quiet. Every exception here is swallowed and the
+    loop moves to the next region, so embeddings would simply have got slower
+    and no louder. One helper, one asymmetry, everywhere that builds a Vertex
+    URL.
+    """
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     last_exc: Exception | None = None
     for region in regions:
         url = (
-            f"https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}"
+            f"https://{host_for(region)}/v1/projects/{project_id}"
             f"/locations/{region}/publishers/google/models/{model}:predict"
         )
         try:

@@ -176,3 +176,7 @@ scraper_health.json
 .env.hotelos*
 .env.stayos*
 backups/
+
+# Evaluation output. A run's raw turns are evidence for the run that produced
+# them and noise in a diff — the numbers that matter go in the report.
+agent_eval*.json

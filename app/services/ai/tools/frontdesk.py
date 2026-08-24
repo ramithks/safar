@@ -43,7 +43,13 @@ from pydantic import BaseModel, Field
 
 from app.db.client import get_db, run_db
 from app.services.ai.context import AgentContext
-from app.services.ai.errors import AgentError, OutOfScope, PermissionDenied, ToolUnavailable
+from app.services.ai.errors import (
+    AgentError,
+    MutationUnverified,
+    OutOfScope,
+    PermissionDenied,
+    ToolUnavailable,
+)
 from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
 from app.services.ai.tools import ACTOR_TASK
@@ -559,6 +565,170 @@ async def list_open_tasks(args: ListTasksArgs, ctx: AgentContext) -> dict:
 # ═════════════════════════════════════════════════════════════════════════════
 # Writes
 # ═════════════════════════════════════════════════════════════════════════════
+#
+# ── proving they happened ────────────────────────────────────────────────────
+#
+# Every mutation below whose effect can be observed declares a `verify`, run by
+# `registry.execute` after the write. See `schemas.ToolSpec.verify` for why the
+# tool's own return value is not evidence: it is the tool reporting what it
+# asked for, and the gap between that and what the guest is told is where a
+# person gets sent to a room they were never actually put in.
+#
+# Each one re-reads through the *read* path — `workspace_service.get_reservation`,
+# `_room_by_id` — rather than trusting the row the write path handed back, which
+# is the claim under test. They return what they saw, and that goes to the model
+# so it answers from the record.
+
+
+async def _observed_stay(ctx: AgentContext, reservation_id: str) -> dict:
+    """The reservation as it stands right now, read independently of the write."""
+    found = await workspace_service.get_reservation(ctx.property_id, reservation_id)
+    if not found:
+        raise MutationUnverified(
+            f"reservation {reservation_id} could not be read back after the change",
+            model_message=(
+                "The booking could not be read back, so nothing about it can be "
+                "confirmed. Do not say the change was made. Call "
+                "request_human_handoff."
+            ),
+        )
+    return found[0]
+
+
+async def _verify_check_in(args: CheckInArgs, ctx: AgentContext,
+                           result_id: str | None) -> dict:
+    """The guest is only checked in if the reservation now says so."""
+    stay = await _observed_stay(ctx, args.reservation_id)
+    if stay.get("status") != "checked_in":
+        raise MutationUnverified(
+            f"check_in returned success for {stay.get('ref')} but the reservation "
+            f"still reads {stay.get('status')!r}",
+            guest_message=(
+                "I couldn't confirm the check-in went through — let me get "
+                "someone from the desk."
+            ),
+            model_message=(
+                f"The check-in did NOT complete: the booking still reads "
+                f"'{stay.get('status')}'. Do not tell anyone the guest is checked "
+                f"in and do not give out a room number. Say it needs the desk and "
+                f"call request_human_handoff."
+            ),
+        )
+    room_number: str | None = None
+    if stay.get("room_id"):
+        room = await run_db(_room_by_id, ctx.property_id, stay["room_id"])
+        room_number = (room or {}).get("number")
+    return {"status": stay.get("status"), "roomNumber": room_number,
+            "ref": stay.get("ref")}
+
+
+async def _verify_check_out(args, ctx: AgentContext, result_id: str | None) -> dict:
+    stay = await _observed_stay(ctx, args.reservation_id)
+    if stay.get("status") != "checked_out":
+        raise MutationUnverified(
+            f"check_out returned success for {stay.get('ref')} but the reservation "
+            f"still reads {stay.get('status')!r}",
+            model_message=(
+                f"The check-out did NOT complete: the booking still reads "
+                f"'{stay.get('status')}'. Do not say the guest has checked out or "
+                f"that the bill is settled. Call request_human_handoff."
+            ),
+        )
+    return {"status": stay.get("status"), "ref": stay.get("ref")}
+
+
+async def _verify_room_status(args: "SetRoomStatusArgs", ctx: AgentContext,
+                              result_id: str | None) -> dict:
+    """
+    A room is only in a state if the room says it is.
+
+    Worth verifying despite being a level-2 change: the housekeeping board is
+    what the front desk sells off, and a room reported clean that is not clean
+    is a guest walking into someone else's morning.
+    """
+    room = await run_db(_room_by_id, ctx.property_id, result_id) if result_id else None
+    if not room:
+        raise MutationUnverified(
+            f"room {args.room_number} could not be read back after the status change",
+        )
+    observed = room.get("housekeeping_status")
+    if observed != args.status:
+        raise MutationUnverified(
+            f"set_room_status asked for {args.status!r} on room {args.room_number} "
+            f"and the room reads {observed!r}",
+            model_message=(
+                f"The status did NOT change — room {args.room_number} still reads "
+                f"'{observed}'. Report that, do not claim the update was made."
+            ),
+        )
+    return {"roomNumber": room.get("number"), "housekeepingStatus": observed}
+
+
+async def _verify_folio_charge(args: "FolioChargeArgs", ctx: AgentContext,
+                               result_id: str | None) -> dict:
+    """
+    Money on a bill is the one thing here a guest disputes two days later.
+
+    So the charge is read back off the folio by id, and the balance the model is
+    shown is the one the folio now holds — not the one the tool computed.
+    """
+    if not result_id:
+        raise MutationUnverified(
+            "post_folio_charge returned no entry id, so the charge cannot be proven",
+        )
+    folio = await frontdesk_service.get_folio(ctx.property_id, args.reservation_id)
+    entries = (folio or {}).get("entries") or []
+    landed = next((e for e in entries if str(e.get("id")) == str(result_id)), None)
+    if landed is None:
+        raise MutationUnverified(
+            f"folio entry {result_id} is not on reservation {args.reservation_id}'s folio",
+            guest_message=(
+                "I couldn't confirm that charge went on the bill — let me get "
+                "the desk to check."
+            ),
+            model_message=(
+                "The charge is NOT on the folio. Do not tell the guest it was "
+                "added and do not state a new balance. Call request_human_handoff."
+            ),
+        )
+    return {
+        "entryId": str(result_id),
+        "amountPaise": landed.get("amount_paise"),
+        "balancePaise": (folio or {}).get("balance_paise"),
+    }
+
+
+async def _verify_task_status(args: "TaskStatusArgs", ctx: AgentContext,
+                             result_id: str | None) -> dict:
+    """
+    The tool's own description says "only say a job is done after this has
+    succeeded", and until now nothing made that true except the model's
+    good manners.
+    """
+    def _read():
+        rows = (
+            get_db().table("tasks").select("id,code,status")
+            .eq("id", args.task_id).eq("property_id", ctx.property_id)
+            .limit(1).execute().data or []
+        )
+        return rows[0] if rows else None
+
+    task = await run_db(_read)
+    if not task:
+        raise MutationUnverified(
+            f"task {args.task_id} could not be read back after the status change",
+        )
+    if task.get("status") != args.status:
+        raise MutationUnverified(
+            f"update_task_status asked for {args.status!r} and the job reads "
+            f"{task.get('status')!r}",
+            model_message=(
+                f"The job did NOT move — it still reads '{task.get('status')}'. "
+                f"Report that; do not say it is done."
+            ),
+        )
+    return {"code": task.get("code"), "status": task.get("status")}
+
 
 async def _revalidate_check_in(args: CheckInArgs, ctx: AgentContext) -> None:
     """
@@ -598,6 +768,7 @@ async def _revalidate_check_in(args: CheckInArgs, ctx: AgentContext) -> None:
     usage_type="ai.tool_write",
     result_type="reservation",
     revalidate=_revalidate_check_in,
+    verify=_verify_check_in,
 )
 async def check_in(args: CheckInArgs, ctx: AgentContext) -> tuple[dict, str]:
     """
@@ -664,6 +835,7 @@ async def check_in(args: CheckInArgs, ctx: AgentContext) -> tuple[dict, str]:
     mutating=True,
     usage_type="ai.tool_write",
     result_type="reservation",
+    verify=_verify_check_out,
 )
 async def check_out(args: ReservationArgs, ctx: AgentContext) -> tuple[dict, str]:
     """
@@ -716,6 +888,7 @@ async def check_out(args: ReservationArgs, ctx: AgentContext) -> tuple[dict, str
     mutating=True,
     usage_type="ai.tool_write",
     result_type="room",
+    verify=_verify_room_status,
 )
 async def set_room_status(args: SetRoomStatusArgs, ctx: AgentContext) -> tuple[dict, str]:
     _require_staff(ctx)
@@ -753,6 +926,7 @@ async def set_room_status(args: SetRoomStatusArgs, ctx: AgentContext) -> tuple[d
     mutating=True,
     usage_type="ai.tool_write",
     result_type="task",
+    verify=_verify_task_status,
 )
 async def update_task_status(args: TaskStatusArgs, ctx: AgentContext) -> tuple[dict, str]:
     _require_staff(ctx)
@@ -809,6 +983,7 @@ async def update_task_status(args: TaskStatusArgs, ctx: AgentContext) -> tuple[d
         "apologise, and never read the new total back to them as though it "
         "had gone on."
     ),
+    verify=_verify_folio_charge,
 )
 async def post_folio_charge(args: FolioChargeArgs, ctx: AgentContext) -> tuple[dict, str]:
     """

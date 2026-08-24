@@ -36,12 +36,15 @@ from datetime import datetime, timezone
 
 from app.config import settings
 from app.db.client import get_db, run_db
-from app.services.ai import classify, model_router, prompts, registry, usage as usage_mod
+from app.services.ai import (
+    classify, model_router, prompts, registry, required_actions, usage as usage_mod,
+)
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import AgentError, ProviderError
 from app.services.ai import guardrails
 from app.services.ai.providers import ModelStep, Provider, for_name
 from app.services.ai.schemas import RunResult, ToolOutcome
+from app.services.messaging import script
 
 logger = logging.getLogger(__name__)
 
@@ -77,13 +80,20 @@ def _open_run(ctx: AgentContext, trigger: str, summary: str | None,
     return _write()
 
 
-def _write_action(ctx: AgentContext, run_id: str, seq: int, outcome: ToolOutcome) -> str | None:
+def _write_action(ctx: AgentContext, run_id: str, seq: int, outcome: ToolOutcome,
+                  decision_source: str = "model", intent: str | None = None) -> str | None:
     """
     One row per tool call, whatever happened.
 
     `output` is truncated rather than dropped when a tool returns something
     large: an availability response over sixty nights is not evidence, but the
     shape of it is, and a row with no output at all cannot be reviewed.
+
+    `decision_source` is the question the replay could not answer: the model
+    calling `negotiate_rate` and the application calling it because the model
+    did not produce identical rows, and the difference between them is the
+    metric this whole reliability pass is measured by. See migration
+    2026-08-24_a_required_action_is_not_optional.
     """
     def _write():
         payload = outcome.output
@@ -107,6 +117,13 @@ def _write_action(ctx: AgentContext, run_id: str, seq: int, outcome: ToolOutcome
             "refusal_reason": outcome.refusal_reason,
             "latency_ms": outcome.latency_ms,
             "error": outcome.error,
+            "decision_source": decision_source,
+            "autonomy_level": ctx.principal.autonomy_level,
+            "intent": intent,
+            # The queue is the approval, and it is already visible in `status`.
+            # This column answers the same question without the reader having to
+            # know that 'awaiting_approval' is the string that means it.
+            "human_approval_required": outcome.status == "awaiting_approval",
         }
         return get_db().table("agent_actions").insert(row).execute().data[0]["id"]
 
@@ -198,6 +215,20 @@ def _close_run(run_id: str, fields: dict) -> None:
         logger.exception("could not close agent run %s", run_id)
 
 
+def _intent_for(requirements: list, tool: str) -> str | None:
+    """
+    Which detected intent this call answers, if any.
+
+    So a model call and a forced call for the same reason are filed under the
+    same intent, and "how often does the model do this by itself" is one group
+    by away rather than a join against the message text.
+    """
+    for requirement in requirements or []:
+        if tool in requirement.satisfied_by:
+            return requirement.intent
+    return None
+
+
 # ── the turn ─────────────────────────────────────────────────────────────────
 
 async def run_turn(
@@ -282,6 +313,29 @@ async def run_turn(
     # both jobs is the cheapest optimisation available here. It cannot widen a
     # permission: see services/ai/toolsets.py.
     tools = registry.describe_for_provider(ctx, task=task)
+
+    # What this message *requires*, decided before the model sees it.
+    #
+    # Guest turns only. A receptionist typing into the console is not a guest
+    # asking for five rooms, and forcing a pricing tool onto a staff question
+    # would be the system second-guessing the person it works for.
+    #
+    # Detection is regex over the guest's own words plus the structured session
+    # — no model call, no round trip. See services/ai/required_actions.py for
+    # why the two actions a hotel's revenue depends on stopped being the
+    # model's decision.
+    requirements = (
+        required_actions.detect(message, ctx.session) if ctx.guest_scoped else []
+    )
+    forced: list[str] = []
+    # Devanagari words that had to be romanised for a Hinglish guest. Counted
+    # rather than merely fixed: a language fix whose effect cannot be measured
+    # is one nobody can tell has regressed. See services/messaging/script.py.
+    language_slips: list[str] = []
+    if requirements:
+        logger.info("run %s requires %s", run_id,
+                    [f"{r.intent}->{r.tool}" for r in requirements if r.must_execute])
+
     outcomes: list[ToolOutcome] = []
     # usage_type -> the action rows that produced it, so a usage event can point
     # at the action rather than only at the run.
@@ -308,11 +362,62 @@ async def run_turn(
     deadline = started + choice.budget
     out_of_time = False
 
+    # ── the degradation ladder ───────────────────────────────────────────────
+    #
+    # `choice.fallbacks` is `3.6-flash → 3.5-flash → 2.5-flash`, and it ends on
+    # the model that has been serving production all along. Not the escalation
+    # ladder, which goes the other way: escalation is "that answer was not good
+    # enough", this is "that model is not answering and a guest is waiting".
+    #
+    # It is here rather than in the provider because the provider does not know
+    # what a turn is. `vertex.py` already retries transport failures across the
+    # locations a model has; when it gives up, the model itself is the problem,
+    # and the only thing left to change is which model.
+    #
+    # **Mid-turn is a fair place to switch.** The message list is provider shape,
+    # not model shape, so a turn that has already run two tools carries them into
+    # the fallback and continues rather than starting again.
+    model_in_use = choice.model
+    fallback_count = 0
+    tool_failures = 0
+    # (tool, arguments) already executed on this turn. Two sets, because a
+    # repeated read and a repeated write are different problems — see the loop.
+    called_reads: set[tuple[str, str]] = set()
+    called_writes: set[tuple[str, str]] = set()
+
+    async def _step(*, messages: list[dict], tools: list[dict]) -> ModelStep:
+        nonlocal model_in_use, fallback_count
+        candidates = [model_in_use] + [
+            m for m in choice.fallbacks if m != model_in_use
+        ]
+        last: Exception | None = None
+        for i, model in enumerate(candidates):
+            try:
+                out = await llm.step(
+                    model=model, messages=messages, tools=tools, params=params
+                )
+            except ProviderError as exc:
+                last = exc
+                if i + 1 < len(candidates):
+                    fallback_count += 1
+                    logger.warning(
+                        "run %s: %s failed (%s) — falling back to %s",
+                        run_id, model, exc.reason, candidates[i + 1],
+                    )
+                continue
+            if model != model_in_use:
+                # Stick with it for the rest of the turn. Flapping back to a
+                # model that just failed would spend the budget rediscovering it.
+                logger.info("run %s: continuing on %s", run_id, model)
+                model_in_use = model
+                turn_usage.used_model(model)
+            return out
+        assert last is not None
+        raise last
+
     try:
         for _turn in range(settings.agent_max_tool_turns):
-            step: ModelStep = await llm.step(
-                model=choice.model, messages=messages, tools=tools, params=params
-            )
+            step: ModelStep = await _step(messages=messages, tools=tools)
             turn_usage.add_tokens(step.tokens_in, step.tokens_out, step.tokens_thought)
             turn_usage.used_model(choice.model)
 
@@ -333,9 +438,7 @@ async def run_turn(
             if not step.wants_tools and not (step.reply or "").strip() and not retried_empty:
                 retried_empty = True
                 logger.info("run %s: empty completion, asking once more", run_id)
-                step = await llm.step(
-                    model=choice.model, messages=messages, tools=tools, params=params
-                )
+                step = await _step(messages=messages, tools=tools)
                 turn_usage.add_tokens(step.tokens_in, step.tokens_out, step.tokens_thought)
 
             if not step.wants_tools:
@@ -362,9 +465,7 @@ async def run_turn(
                             "call request_human_handoff."
                         ),
                     })))
-                final = await llm.step(
-                    model=choice.model, messages=messages, tools=[], params=params
-                )
+                final = await _step(messages=messages, tools=[])
                 turn_usage.add_tokens(final.tokens_in, final.tokens_out, final.tokens_thought)
                 reply = (final.reply or "").strip() or None
                 break
@@ -372,15 +473,82 @@ async def run_turn(
             messages.append(step.raw or {"role": "assistant", "content": None})
 
             for call in step.tool_calls:
+                # **The same call twice is not two calls.**
+                #
+                # A model that has been handed a result it did not expect will
+                # often ask again with identical arguments, and for a read that
+                # is merely wasteful. For a mutation it is a second charge on a
+                # bill, a second ticket, a second attempt at a check-in — and
+                # the tool-turn ceiling is six, so there is room for it to
+                # happen more than once inside one turn.
+                #
+                # Answered from the first result rather than refused: the model
+                # asked a question it already has the answer to, and telling it
+                # so plainly is what stops the loop. The repeat is not recorded
+                # as an action because no action occurred.
+                spec_ahead = registry.REGISTRY.get(call.name)
+                mutates = bool(spec_ahead and spec_ahead.mutating)
+                fingerprint = (call.name, json.dumps(call.arguments, sort_keys=True,
+                                                     default=str))
+
+                # **Reads and writes are deduplicated on opposite rules, and
+                # getting that backwards breaks the thing above it.**
+                #
+                # A repeated *write* is never run again for the rest of the
+                # turn. That is the whole safety property: two identical
+                # `post_folio_charge` calls are one charge.
+                #
+                # A repeated *read* is only suppressed while nothing has
+                # changed. The first version of this suppressed it
+                # unconditionally, which quietly disabled verification — the
+                # correct shape for a mutation is `get_folio → post_charge →
+                # get_folio`, and the second read has the same arguments as the
+                # first by definition. Deduplicating it would have handed the
+                # model the pre-charge folio and called it proof.
+                repeated = (fingerprint in called_writes
+                            or (not mutates and fingerprint in called_reads))
+                if repeated:
+                    logger.info("run %s: %s repeated with identical arguments",
+                                run_id, call.name)
+                    messages.append(llm.tool_result_message(call, json.dumps({
+                        "repeated": True,
+                        "reason": (
+                            "You already called this with exactly these "
+                            "arguments on this turn and it was NOT run again. "
+                            "Use the result you were given above."
+                        ) if not mutates else (
+                            "You already did this on this turn and it was NOT "
+                            "done twice. It is done. Do not call it again — "
+                            "answer with the result you were given above."
+                        ),
+                    })))
+                    continue
+
                 outcome = await registry.execute(call.name, call.arguments, ctx)
                 seq += 1
                 outcomes.append(outcome)
+                if not outcome.ok:
+                    tool_failures += 1
+
+                if mutates:
+                    if outcome.ok:
+                        # Nailed down for the turn, and the reads reopened: what
+                        # anything read before this is now potentially stale,
+                        # which is exactly what a verification step exists to
+                        # catch.
+                        called_writes.add(fingerprint)
+                        called_reads.clear()
+                else:
+                    called_reads.add(fingerprint)
 
                 spec = registry.REGISTRY.get(call.name)
                 if spec:
                     turn_usage.count(spec.usage_type)
 
-                action_id = await run_db(_write_action, ctx, run_id, seq, outcome)
+                action_id = await run_db(
+                    _write_action, ctx, run_id, seq, outcome,
+                    "model", _intent_for(requirements, outcome.tool),
+                )
                 await run_db(link_result, outcome, action_id)
                 if spec and action_id:
                     action_ids.setdefault(spec.usage_type, []).append(action_id)
@@ -410,6 +578,124 @@ async def run_turn(
             # than a truncated guess.
             logger.warning("run %s hit the tool-turn ceiling", run_id)
             handoff = True
+
+        # ── the required action, when the model did not make it ─────────────
+        #
+        # **This is the reliability fix.** Everything above is the model's turn
+        # and it keeps it: on the runs where it calls `get_group_rates` for five
+        # rooms, nothing here does anything at all. What changed is what happens
+        # on the runs where it does not — which was, until now, that a hotel
+        # lost a ten-person enquiry to a handoff at eleven at night.
+        #
+        # Three conditions, all of them about not talking over something that
+        # already decided:
+        #
+        #   * not after a handoff — the conversation has gone to a person and
+        #     an extra tool call is the AI carrying on past its own exit;
+        #   * not out of time — the guest is already waiting too long, and the
+        #     honest answer to that is the one the budget path just gave;
+        #   * not a tool the model already tried — a `negotiate_rate` that
+        #     failed is a system problem, and running it again inside the same
+        #     turn takes a second hold on the same rooms.
+        #
+        # Nothing here bypasses a gate. `registry.execute` is the same door:
+        # permission, autonomy, argument validation and the property's own
+        # rules all run, so an agent at level 2 gets its negotiation queued for
+        # approval exactly as it would have had the model asked. See §20 — the
+        # deterministic layer decides *that* a business tool runs, never what it
+        # is allowed to answer.
+        if (requirements and not handoff and not out_of_time
+                and required_actions.enforcement_enabled()):
+            attempted = {o.tool for o in outcomes}
+            pending = [
+                r for r in required_actions.unmet(requirements, outcomes)
+                if r.forceable and r.tool not in attempted and r.tool in ctx.tool_grants
+            ]
+            for requirement in pending[:required_actions.MAX_FORCED]:
+                logger.info("run %s forcing %s for %s (%s)", run_id, requirement.tool,
+                            requirement.intent, requirement.detail)
+                outcome = await registry.execute(
+                    requirement.tool, dict(requirement.arguments or {}), ctx
+                )
+                seq += 1
+                outcomes.append(outcome)
+                forced.append(requirement.tool)
+
+                spec = registry.REGISTRY.get(requirement.tool)
+                if spec:
+                    turn_usage.count(spec.usage_type)
+                action_id = await run_db(
+                    _write_action, ctx, run_id, seq, outcome,
+                    "application", requirement.intent,
+                )
+                await run_db(link_result, outcome, action_id)
+                if spec and action_id:
+                    action_ids.setdefault(spec.usage_type, []).append(action_id)
+
+            if forced:
+                # The result goes back to the model to *say*, which is the whole
+                # division of labour: the application decided the price question
+                # had to be put to the pricing engine, and the model writes the
+                # sentence — in this guest's language, in this hotel's voice,
+                # and with whatever else the turn owed them.
+                #
+                # A plain user turn rather than a tool result, because there was
+                # no tool *call* in the assistant's history for it to answer and
+                # every provider rejects an orphaned function response.
+                #
+                # `tools=[]`: this step exists to produce prose. Letting it open
+                # another round of calls after the budget has already been spent
+                # is how a forced action turns a slow turn into a timed-out one.
+                messages.append({"role": "user", "content": json.dumps({
+                    "system_note": (
+                        "You did not call the tool this message required, so the "
+                        "system called it for you. These are its real results. "
+                        "Answer the guest with them now — use only the figures "
+                        "below, follow each result's own instruction, and do not "
+                        "mention that any of this happened."
+                    ),
+                    "results": [
+                        {
+                            "tool": o.tool,
+                            "ok": o.ok,
+                            "output": o.output if o.ok else None,
+                            "refused": None if o.ok else o.model_message,
+                        }
+                        for o in outcomes[-len(forced):]
+                    ],
+                }, default=str)})
+                final = await _step(messages=messages, tools=[])
+                turn_usage.add_tokens(final.tokens_in, final.tokens_out, final.tokens_thought)
+                spoken_now = (final.reply or "").strip()
+                if spoken_now:
+                    reply = spoken_now
+                elif reply is None:
+                    # Forced the tool, and the model still said nothing. The
+                    # ordinary silent-turn path below picks this up and hands
+                    # over — a tool result nobody communicated is not an answer.
+                    logger.warning("run %s: forced %s and got no reply", run_id, forced)
+
+        # The alphabet the guest asked to be written to in.
+        #
+        # A guest asked for Hinglish and got "Aapke लिए best rate ₹4,500
+        # rahega" — one Devanagari word in an otherwise perfectly romanised
+        # sentence, a few times in a hundred turns. The prompt already forbids
+        # it, which is the evidence that a fourth prompt line was not the fix.
+        # Which alphabet a string is in is decidable by looking at it.
+        #
+        # Before the guardrail, deliberately: the guardrail should check the
+        # text the guest will actually receive. Transliteration cannot move a
+        # figure — digits, `₹` and Latin runs are outside every Devanagari run
+        # by construction — so the two orderings are equivalent for money and
+        # only this one is equivalent for the reply.
+        if reply and ctx.guest_scoped:
+            reply, romanised = script.normalise(
+                reply, preference=ctx.language, guest_message=message,
+            )
+            if romanised:
+                language_slips = romanised
+                logger.info("run %s: romanised %s for a Hinglish guest",
+                            run_id, romanised[:5])
 
         # Everything the agent has said, checked against everything it did.
         #
@@ -508,12 +794,56 @@ async def run_turn(
     turn_usage.count("ai.conversation_turn")
     usage_mod.record(run_id, turn_usage)
 
+    # What the turn owed and whether it paid it, on the run row.
+    #
+    # Written whatever the outcome, including the failures: a turn that crashed
+    # before it could negotiate is exactly the turn somebody investigating a
+    # lost sale needs to find, and a summary written only on success would hide
+    # it. §21 — every question about a turn answerable from the two tables.
+    summary_of_requirements = required_actions.summarise(requirements, outcomes, forced)
+    if language_slips:
+        # Folded into the same jsonb rather than given a column of its own: it
+        # is the turn's story, it is absent on virtually every turn, and a
+        # column that is null 99% of the time is a column nobody queries.
+        summary_of_requirements["language_slips"] = language_slips[:10]
+
+    # **Which model actually answered, not which one was chosen.**
+    #
+    # The run row records the router's decision, and once a turn can degrade
+    # mid-flight those are different facts. A turn that opened on 3.6-flash and
+    # finished on 2.5-flash looked, in the data, exactly like a turn that ran on
+    # 3.6-flash throughout — so a fallback firing on every request would have
+    # been invisible while the invoice and the latency both moved.
+    #
+    # Logged rather than added to the run row's columns: `model` there is the
+    # routing decision and changing its meaning would rewrite the history of
+    # every row already written. Structured, so it aggregates.
+    if fallback_count or tool_failures or model_in_use != choice.model:
+        logger.info(
+            "[agent-run] %s",
+            {
+                "run_id": run_id,
+                "task": task,
+                "tier": choice.tier,
+                "model_selected": choice.model,
+                "model_served": model_in_use,
+                "fallbacks": fallback_count,
+                "tool_calls": seq,
+                "tool_failures": tool_failures,
+                "latency_ms": latency,
+                "status": status,
+            },
+        )
+
     await run_db(_close_run, run_id, {
         "status": status,
         "tokens_in": turn_usage.tokens_in,
         "tokens_out": turn_usage.tokens_out,
         "latency_ms": latency,
         "error": error,
+        "intent": (requirements[0].intent if requirements else None),
+        "required_actions": summary_of_requirements,
+        "required_action_status": required_actions.status_of(summary_of_requirements),
     })
 
     # Charged after the run, when the real token counts are known — never
@@ -560,6 +890,8 @@ async def run_turn(
         tokens_out=turn_usage.tokens_out,
         latency_ms=latency,
         error=error,
+        requirements=summary_of_requirements,
+        required_action_status=required_actions.status_of(summary_of_requirements),
     )
 
 

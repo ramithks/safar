@@ -105,6 +105,11 @@ BY_TASK: dict[str, frozenset[str]] = {
     "reservation_lookup": frozenset({
         "get_reservation", "list_guest_reservations", "get_guest",
         "get_booking_status", "get_check_in_link", "get_property_policies",
+        # "meri booking cancel karni hai" classifies here as often as it
+        # classifies as a dispute — it is, on its face, a question about the
+        # guest's own reservation. Without the quote the agent can find the
+        # booking and not say what cancelling it costs.
+        "get_cancellation_terms", "get_cancellation_quote", "cancel_booking",
     }),
     "availability": frozenset({
         "send_room_photos", "get_hotel_page_link",
@@ -157,6 +162,16 @@ BY_TASK: dict[str, frozenset[str]] = {
         "get_booking_status", "get_reservation", "list_guest_reservations",
         "get_property_policies", "get_folio", "create_task",
         "get_cancellation_terms", "escalate_to_team",
+        # **The task named for cancellations could not cancel anything.**
+        #
+        # Until this build there was no tool to put here — the audit found
+        # cancellation missing from the whole system. Both go on: the quote,
+        # because a guest asking what they would get back must be answerable
+        # without cancelling anything; and the cancellation, because a toolset
+        # that can price the decision and not act on it strands the turn at the
+        # last step, which is the failure `test_a_toolset_can_use_every_tool_it
+        # _offers` exists for.
+        "get_cancellation_quote", "cancel_booking",
     }),
     "complex_negotiation": frozenset({
         "send_room_photos", "get_hotel_page_link",

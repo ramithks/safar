@@ -220,6 +220,17 @@ async def execute_approved(
         "approved_by": member.profile_id,
         "approved_at": datetime.now(timezone.utc).isoformat(),
         "latency_ms": int((time.monotonic() - started) * 1000),
+        # A person decided this one.
+        #
+        # The row was written by `runtime._write_action` as `model` — the model
+        # is what proposed it — and that stops being true the moment somebody
+        # approves it. §17 asks every action to record its decision source, and
+        # the three sources have to be distinguishable *after* the fact: an
+        # unattended discount and a discount a manager pressed a button for are
+        # the same tool with the same arguments, and only this column separates
+        # them when somebody asks who authorised it.
+        "decision_source": "human",
+        "autonomy_level": ctx.principal.autonomy_level,
     })
 
     # Metered like any other action. It happened, a guest is affected by it, and

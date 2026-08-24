@@ -15,6 +15,7 @@ import json
 import logging
 import random
 import time
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 import httpx
@@ -24,18 +25,46 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 import google.auth
 from app.config import settings
 from app.core.async_http import loop_client
+from app.services import model_catalog
 
 # Legacy alias — prefer brain()/muscle() below; model IDs come from config.
 MODEL_NAME = settings.vertex_model_brain
 _SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
 
-def _regions() -> list[str]:
-    """Ordered list of Vertex regions to try: primary first, then fallbacks.
+def get_vertex_host(location: str) -> str:
+    """
+    The hostname serving a Vertex location.
 
-    Each region has independent quota, so on a 429/503 we switch to the next
-    region and retry immediately rather than sleeping through a backoff in a
-    region that's already saturated. Deduped, order preserved.
+    **`global` is not a region and takes no prefix.** Every regional endpoint is
+    `{location}-aiplatform.googleapis.com`; `global` is bare
+    `aiplatform.googleapis.com`, and `global-aiplatform.googleapis.com` does not
+    resolve to anything.
+
+    That single asymmetry is why this codebase believed for months that Gemini
+    3.x was not enabled for the project. Almost the whole 3.x family is served
+    from `global` and nowhere else, the URL was built by string-formatting the
+    prefix unconditionally, and the resulting request came back `404` — the same
+    status a model genuinely without access returns. The models were reachable
+    the entire time.
+
+    One function, called from one place, so the asymmetry cannot be reintroduced
+    by a second call site that formats its own URL.
+    """
+    if location == model_catalog.GLOBAL:
+        return "aiplatform.googleapis.com"
+    return f"{location}-aiplatform.googleapis.com"
+
+
+def _regions() -> list[str]:
+    """The locations this deployment is willing to use, in preference order.
+
+    The *universe*, not the itinerary: which of these can actually serve a given
+    model is `model_catalog.locations_for`, because the two questions have
+    different answers and conflating them is what sends a 3.x call to
+    us-central1 and a 2.5-flash-lite call to asia-south1, both of which 404.
+
+    Deduped, order preserved.
     """
     primary = (settings.gcp_location or "us-central1").strip()
     extra = [r.strip() for r in (settings.gcp_locations or "").split(",") if r.strip()]
@@ -44,6 +73,137 @@ def _regions() -> list[str]:
         if region and region not in ordered:
             ordered.append(region)
     return ordered
+
+
+# ── what went wrong ───────────────────────────────────────────────────────────
+#
+# Vertex answers four very different problems with four status codes, and the
+# only one that used to be distinguished was 429. Everything else arrived as
+# `httpx.HTTPStatusError` with the body glued into the message, so an operator
+# reading a log could not tell "this model id does not exist" from "this service
+# account cannot call Vertex" — and the first was diagnosed as the second for
+# months. See `get_vertex_host`.
+#
+# The classes are the diagnosis. `retryable` is the policy that follows from it.
+
+
+class VertexError(RuntimeError):
+    """Base. Carries what is needed to explain the failure without the body."""
+
+    retryable = False
+
+    def __init__(self, message: str, *, model: str = "", location: str = "",
+                 status: int | None = None, detail: str = ""):
+        super().__init__(message)
+        self.model = model
+        self.location = location
+        self.status = status
+        self.detail = detail
+
+
+class VertexModelNotFound(VertexError):
+    """
+    404. The model id, or the model/location pair, does not exist.
+
+    **Never a permissions problem, and saying so costs weeks.** The three causes
+    are a wrong id (`gemini-3-flash` for `gemini-3-flash-preview`), a model asked
+    for in a location that does not serve it (any 3.x model in any region), or a
+    malformed endpoint. All three are ours to fix and none of them is access.
+    """
+
+
+class VertexAccessDenied(VertexError):
+    """403. Genuinely IAM: the credentials may not call this, or the API is off."""
+
+
+class VertexQuotaExhausted(VertexError):
+    """429 / RESOURCE_EXHAUSTED. Real, and the only one that is about capacity."""
+
+    retryable = True
+
+
+class VertexUpstreamError(VertexError):
+    """5xx. Google's problem, and bounded-retryable."""
+
+    retryable = True
+
+
+class VertexTimeout(VertexError):
+    """
+    The request did not come back.
+
+    Retryable at the transport level *only* because `generateContent` is a read:
+    it creates nothing and charges for what it produced. A mutation must never
+    be retried on a timeout, and none happen here — the tools do that, behind
+    the runtime, where idempotency is decided per tool.
+    """
+
+    retryable = True
+
+
+def classify_status(status: int, detail: str = "", *, model: str = "",
+                    location: str = "") -> VertexError:
+    """One HTTP status → the class that says what to do about it."""
+    where = f"{model} in {location}" if location else model
+    if status == 404:
+        return VertexModelNotFound(
+            f"Vertex 404 for {where}: the model id or model/location pair does not "
+            f"exist. This is not an access problem — check the id against "
+            f"model_catalog, and check the location serves it. {detail}".strip(),
+            model=model, location=location, status=status, detail=detail,
+        )
+    if status == 403:
+        return VertexAccessDenied(
+            f"Vertex 403 for {where}: the credentials may not call this. {detail}".strip(),
+            model=model, location=location, status=status, detail=detail,
+        )
+    if status == 429:
+        return VertexQuotaExhausted(
+            f"Vertex 429 for {where}: quota exhausted. {detail}".strip(),
+            model=model, location=location, status=status, detail=detail,
+        )
+    if status >= 500:
+        return VertexUpstreamError(
+            f"Vertex {status} for {where}: upstream failure. {detail}".strip(),
+            model=model, location=location, status=status, detail=detail,
+        )
+    return VertexError(
+        f"Vertex {status} for {where}: {detail}".strip(),
+        model=model, location=location, status=status, detail=detail,
+    )
+
+
+# ── what a call did ───────────────────────────────────────────────────────────
+
+@dataclass
+class CallTrace:
+    """
+    How one `generateContent` actually went.
+
+    Filled in by `_post_generate` and read by whoever asked for it. It exists
+    because "which model answered, from where, after how many retries" is the
+    first question about a slow or expensive turn and none of it was recoverable
+    from the response body — the runtime knew which model it *asked* for, which
+    is a different fact once a fallback has fired.
+    """
+
+    model: str = ""
+    location: str = ""
+    attempts: int = 0
+    retries: int = 0
+    locations_tried: list[str] = field(default_factory=list)
+    latency_ms: int = 0
+    status: str = "ok"
+
+    def as_log(self) -> dict:
+        return {
+            "model": self.model,
+            "location": self.location,
+            "attempts": self.attempts,
+            "retries": self.retries,
+            "latency_ms": self.latency_ms,
+            "status": self.status,
+        }
 
 # ── Shared HTTP client ────────────────────────────────────────────────────────
 # Bound to the running event loop — see app.core.async_http for why a plain
@@ -181,15 +341,33 @@ async def vertex_generate(
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
-async def _post_generate(body: dict, *, model: str, timeout: float) -> dict:
+async def _post_generate(body: dict, *, model: str, timeout: float,
+                         trace: CallTrace | None = None) -> dict:
     """
-    POST generateContent, rotating regions on 429/503, and return the raw JSON.
+    POST generateContent and return the raw JSON, retrying the way this model
+    can actually be retried.
 
-    Retry on 429/503 by rotating through regions. While fresh regions remain in
-    the current cycle we switch almost instantly (tiny jitter only); once every
-    region has been tried we fall back to exponential backoff before cycling
-    again. This keeps a rate-limited call from blocking on long sleeps in a
-    single saturated region (which was blowing the supervisor's budget).
+    **Rotation is a capability, not a policy.** The original loop assumed every
+    model was served from every configured region and that regions hold
+    independent quota, so a 429 meant "go next door". That is true of
+    `gemini-2.5-flash`, which answers from thirteen locations. It is false of
+    almost the whole 3.x family, which answers from `global` alone — and there,
+    rotating meant re-issuing the identical request to the identical pool with
+    almost no delay, burning the retry budget to make the same call four times.
+
+    So the itinerary comes from `model_catalog.locations_for`, and the ladder
+    forks on how long it is:
+
+        several locations   switch to a fresh one almost instantly (jitter
+                            only), and fall back to exponential backoff once
+                            every location has been tried.
+        one location        exponential backoff with jitter from the first 429.
+                            There is nowhere to go; waiting is the strategy.
+
+    A 404 is treated as "not served here" rather than as fatal *while untried
+    locations remain* — which makes an uncatalogued model self-correcting
+    instead of a hard failure — and raises `VertexModelNotFound` naming
+    everywhere it looked once they are exhausted.
 
     Extracted from `vertex_generate` so the hotel agent runtime can reuse this
     machinery instead of growing a second one. Everything the agent needs that
@@ -201,11 +379,16 @@ async def _post_generate(body: dict, *, model: str, timeout: float) -> dict:
     runtime that the trip planner had already learned to avoid.
     """
     token, project_id = _get_access_token()
-    regions = _regions()
-    n_regions = len(regions)
-    max_attempts = max(6, n_regions + 2)
+    locations = model_catalog.locations_for(model, _regions())
+    n_locations = len(locations)
+    single_pool = n_locations == 1
+    max_attempts = max(6, n_locations + 2)
     base_delay = 5.0
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    trace = trace if trace is not None else CallTrace()
+    trace.model = model
+    started = time.monotonic()
 
     # Concurrency gate on the tightest external quota (Gemini). Caps simultaneous
     # generateContent calls per process so a burst of trips queues instead of
@@ -214,32 +397,107 @@ async def _post_generate(body: dict, *, model: str, timeout: float) -> dict:
     from app.core.circuit_breaker import breaker_gemini, CircuitOpenError
 
     async def _run() -> dict:
-        # Snapshot the rotation order once per call, healthy regions first —
+        # Snapshot the rotation order once per call, healthy locations first —
         # a saturated primary is skipped instead of retried by every caller.
-        order = _healthy_first(regions)
+        order = _healthy_first(locations)
+        # Locations that answered 404: this model is not served there, which is a
+        # fact for the whole call rather than a transient. Never retried.
+        missing: set[str] = set()
+        last_error: VertexError | None = None
+
+        # An explicit cursor rather than `attempt % len(live)`.
+        #
+        # The modular form is wrong as soon as a location is crossed off: with
+        # `[asia-south1, asia-southeast1, global, …]`, a 404 on the first
+        # shortens the list, and attempt 1 then indexes past asia-southeast1
+        # straight to global — silently skipping a location the model is served
+        # from. Removing an entry shifts its successor into the same index, so
+        # the cursor advances on a 429 (move on) and holds on a 404 (the next
+        # one is already here).
+        cursor = 0
+
         for attempt in range(max_attempts):
-            location = order[attempt % n_regions]
+            live = [loc for loc in order if loc not in missing]
+            if not live:
+                break
+            cursor %= len(live)
+            location = live[cursor]
+            trace.attempts = attempt + 1
+            trace.location = location
+            if location not in trace.locations_tried:
+                trace.locations_tried.append(location)
+
             url = (
-                f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}"
+                f"https://{get_vertex_host(location)}/v1/projects/{project_id}"
                 f"/locations/{location}/publishers/google/models/{model}:generateContent"
             )
-            r = await _get_http_client().post(url, headers=headers, json=body, timeout=timeout)
+            try:
+                r = await _get_http_client().post(
+                    url, headers=headers, json=body, timeout=timeout
+                )
+            except httpx.TimeoutException as exc:
+                # Safe to retry: generateContent creates nothing. A mutation
+                # timing out is a different problem and is not decided here.
+                last_error = VertexTimeout(
+                    f"Vertex timed out after {timeout:.0f}s for {model} in {location}",
+                    model=model, location=location,
+                )
+                if attempt >= max_attempts - 1:
+                    raise last_error from exc
+                trace.retries += 1
+                cursor += 1
+                await asyncio.sleep(min(base_delay * (2 ** attempt), 30.0)
+                                    + random.uniform(0, 1.0))
+                continue
+
+            if r.status_code == 404 and len(live) > 1:
+                # Not served here. Cross it off and try somewhere that does,
+                # rather than failing a turn over a location list that is one
+                # entry out of date.
+                logger.warning(
+                    "[vertex] %s is not served from %s — trying the next location",
+                    model, location,
+                )
+                missing.add(location)
+                last_error = classify_status(404, model=model, location=location)
+                # Cursor held: the next location has shifted into this index.
+                continue
 
             if r.status_code in (429, 503) and attempt < max_attempts - 1:
                 _mark_saturated(location, r.headers.get("Retry-After"))
-                next_location = order[(attempt + 1) % n_regions]
-                cycle = (attempt + 1) // n_regions   # how many times we've wrapped the region list
-                if cycle == 0 and n_regions > 1:
-                    # Fresh region still available — switch over near-instantly.
-                    delay = random.uniform(0.2, 0.8)
-                else:
-                    # Exhausted the region list (or only one region) — back off.
-                    retry_after = r.headers.get("Retry-After")
-                    base = float(retry_after) if retry_after else base_delay * (2 ** (cycle - 1))
+                trace.retries += 1
+                retry_after = r.headers.get("Retry-After")
+
+                cursor += 1
+                if single_pool or len(live) == 1:
+                    # **One quota pool. There is nowhere to rotate to.**
+                    # Rotating "global to global" is the same call again, so the
+                    # only honest response is to wait — exponentially, with
+                    # jitter so a burst of turns does not re-synchronise.
+                    base = float(retry_after) if retry_after else base_delay * (2 ** attempt)
                     delay = min(base + random.uniform(0, base * 0.3), 60.0)
-                logger.warning(
-                    "[vertex] %s in %s — switching to %s (attempt %d/%d) in %.1fs",
-                    r.status_code, location, next_location, attempt + 1, max_attempts, delay,
+                    logger.warning(
+                        "[vertex] %s in %s (single pool) — backing off %.1fs "
+                        "(attempt %d/%d)",
+                        r.status_code, location, delay, attempt + 1, max_attempts,
+                    )
+                else:
+                    cycle = cursor // len(live)   # times we've wrapped the list
+                    if cycle == 0:
+                        # Fresh location still available — switch near-instantly.
+                        delay = random.uniform(0.2, 0.8)
+                    else:
+                        base = (float(retry_after) if retry_after
+                                else base_delay * (2 ** (cycle - 1)))
+                        delay = min(base + random.uniform(0, base * 0.3), 60.0)
+                    logger.warning(
+                        "[vertex] %s in %s — switching to %s (attempt %d/%d) in %.1fs",
+                        r.status_code, location,
+                        live[cursor % len(live)], attempt + 1, max_attempts, delay,
+                    )
+
+                last_error = classify_status(
+                    r.status_code, model=model, location=location
                 )
                 await asyncio.sleep(delay)
                 continue
@@ -255,22 +513,40 @@ async def _post_generate(body: dict, *, model: str, timeout: float) -> dict:
                     detail = str((r.json().get("error") or {}).get("message", ""))[:300]
                 except Exception:  # noqa: BLE001
                     detail = r.text[:300]
-                raise httpx.HTTPStatusError(
-                    f"Vertex {r.status_code} for {model}: {detail}",
-                    request=r.request, response=r,
+                raise classify_status(
+                    r.status_code, detail, model=model, location=location
                 )
-            break
 
-        return r.json()
+            return r.json()
+
+        # Out of attempts, or every location said 404.
+        if missing and len(missing) == len(order):
+            raise VertexModelNotFound(
+                f"Vertex 404 for {model}: not served from any of "
+                f"{', '.join(sorted(missing))}. Check the id against "
+                f"model_catalog — this is not an access problem.",
+                model=model, status=404,
+            )
+        raise last_error or VertexError(f"Vertex gave up on {model}", model=model)
 
     try:
         async with breaker_gemini.guard():
-            return await _run()
+            data = await _run()
+            trace.latency_ms = int((time.monotonic() - started) * 1000)
+            if trace.retries:
+                logger.info("[vertex] %s", trace.as_log())
+            return data
     except CircuitOpenError:
         # Gemini is shedding load (sustained outage). Surface as a normal upstream
         # failure so the supervisor degrades the affected agent, same as a raise
         # from _run would.
+        trace.status = "circuit_open"
+        trace.latency_ms = int((time.monotonic() - started) * 1000)
         raise RuntimeError("Vertex temporarily unavailable (circuit open)")
+    except VertexError as exc:
+        trace.status = type(exc).__name__
+        trace.latency_ms = int((time.monotonic() - started) * 1000)
+        raise
 
 
 async def vertex_generate_call(
@@ -283,6 +559,7 @@ async def vertex_generate_call(
     max_output_tokens: int | None = None,
     thinking_budget: int | None = None,
     timeout: float = 120.0,
+    trace: CallTrace | None = None,
 ) -> dict:
     """
     generateContent for an agent turn: function declarations in, a candidate out.
@@ -325,7 +602,7 @@ async def vertex_generate_call(
     if gc:
         body["generationConfig"] = gc
 
-    return await _post_generate(body, model=model, timeout=timeout)
+    return await _post_generate(body, model=model, timeout=timeout, trace=trace)
 
 
 def extract_json(raw: str) -> dict:

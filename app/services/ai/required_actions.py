@@ -1,0 +1,741 @@
+"""
+The business actions a message *requires*, decided without asking the model.
+
+**The failure this exists for.** The same conversation, replayed against the
+same build with the same model, scored between 28 and 44 of 44 assertions. The
+two that moved were always the same two:
+
+    "Actually 5 kamre chahiye, 10 log aa rahe hain"   → sometimes no get_group_rates
+    "Yaar thoda kam karo na, 4000 per night mein?"    → sometimes no negotiate_rate
+
+Nothing was wrong with the code on the runs that failed. The tool was granted,
+it was on the menu, its description says to use it, and the prompt says so
+twice. The model simply answered instead — *"ji bilkul, main check karti hoon"*
+— and on the negotiation turn the reply then named the guest's own figure, which
+the reply guardrail correctly refused, which sent a guest who was ready to pay
+to a person who was asleep.
+
+That is not a prompt bug. **A business action that a hotel's revenue depends on
+cannot be a thing the model does when it feels like it.** The vocabulary that
+recognises "5 kamre chahiye" is a hundred lines of regex, it is already written
+next door in `messaging/obligations.py` for a different purpose, and it is right
+every time.
+
+**So this module answers one question: given the guest's words and where the
+conversation has got to, which tool MUST run this turn?** It does not answer
+the question the model is good at — how to say the result, what else to ask,
+whether the guest sounds annoyed. `runtime.run_turn` gives the model its turn
+first and only steps in when the required call did not happen; see
+`runtime._enforce`.
+
+Three rules keep this from becoming a second, worse agent:
+
+  * **It only ever adds a tool call the model was already allowed to make.**
+    Forcing goes through `registry.execute` like everything else — permission,
+    autonomy, argument validation, the property's own rules. A level-2 agent
+    that may not negotiate still may not negotiate; it gets a queued approval,
+    which is the same answer it would have got had the model called the tool
+    itself. Nothing here can widen anything.
+
+  * **It never invents an argument.** Every field comes from the guest's own
+    sentence or from `conversations.guest_profile`, which is itself derived from
+    tool results and never from prose (see `messaging/session.py`). When the
+    context to build a safe call is missing — a negotiation before anyone has
+    named a rate plan — the requirement is recorded as unmet and the model's own
+    reply stands, because a turn that asks "which room did you have in mind?"
+    is the correct answer to that situation.
+
+  * **The result goes back to the model to say.** A forced tool produces a
+    payload and an instruction, exactly as a model-initiated one does, and the
+    model writes the sentence. The alternative — a canned reply — would be in
+    the wrong language and the wrong voice, and this product's whole claim is
+    that it does not sound like a form.
+
+**Detection is deliberately conservative in one direction and not the other.**
+A missed requirement leaves the system exactly as it was before this module
+existed. A false one calls a read-only tool nobody needed (`get_group_rates` for
+a couple) or, worse, opens a negotiation the guest never asked for. So the
+group vocabulary needs a room-or-people noun beside its number, and the
+negotiation vocabulary needs a word that only appears when somebody is pushing
+on a price.
+"""
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from datetime import date
+
+logger = logging.getLogger(__name__)
+
+
+def enforcement_enabled() -> bool:
+    """
+    Whether the application runs a required tool the model skipped.
+
+    A switch rather than a constant, for two reasons and neither of them is
+    doubt about the feature.
+
+    **It is how the improvement is measured.** `scripts/agent_eval.py` runs the
+    same scenarios with it on and off against the live model; the difference
+    between those two numbers is the only honest statement of what this layer
+    bought, and a hard-coded `True` would make that comparison require a code
+    edit and a redeploy.
+
+    **And it is the rollback.** If forcing ever turns out to be wrong for one
+    property — a hotel that wants its agent to ask before it prices anything —
+    the answer is an environment variable, not a hotfix at eleven at night.
+    Detection keeps running either way, so `agent_runs.required_actions` still
+    records what *would* have been required and the report still counts it.
+
+    Read per call rather than cached at import, so a test can flip it and so
+    the eval runner can flip it between sweeps in one process.
+    """
+    return os.environ.get("AGENT_FORCE_REQUIRED_ACTIONS", "true").strip().lower() not in (
+        "false", "0", "no", "off",
+    )
+
+# ── the intents ──────────────────────────────────────────────────────────────
+#
+# Named for what the guest is doing, not for the tool that answers it: several
+# of these are answered by different tools depending on where the conversation
+# has got to, and an intent named after a tool would have to be renamed the
+# first time that changed.
+
+GROUP_BOOKING = "GROUP_BOOKING"
+NEGOTIATION = "NEGOTIATION"
+QUOTE_REQUIRED = "QUOTE_REQUIRED"
+PAYMENT = "PAYMENT"
+BOOKING_STATUS = "BOOKING_STATUS"
+BOOKING_CANCELLATION = "BOOKING_CANCELLATION"
+BOOKING_MODIFICATION = "BOOKING_MODIFICATION"
+ESCALATION = "ESCALATION"
+ROOM_SELECTION = "ROOM_SELECTION"
+DATE_CHANGE = "DATE_CHANGE"
+GUEST_COUNT_CHANGE = "GUEST_COUNT_CHANGE"
+
+INTENTS = (
+    GROUP_BOOKING, NEGOTIATION, QUOTE_REQUIRED, PAYMENT, BOOKING_STATUS,
+    BOOKING_CANCELLATION, BOOKING_MODIFICATION, ESCALATION, ROOM_SELECTION,
+    DATE_CHANGE, GUEST_COUNT_CHANGE,
+)
+
+
+@dataclass(frozen=True)
+class Requirement:
+    """
+    One business action this turn owes the guest.
+
+    `satisfied_by` is wider than `tool` on purpose. A guest asking for five
+    rooms is answered by `get_group_rates`, but a model that went straight to
+    `get_quote` with `units=5` has done the *right* thing — the quote applies
+    the band itself — and forcing a second call after it would be the system
+    talking over a model that was already correct.
+    """
+
+    intent: str
+    tool: str
+    satisfied_by: frozenset[str]
+    # Whether the application runs `tool` itself when the model did not. False
+    # means "recorded, and watched in the evaluation report" — which is what an
+    # intent whose arguments cannot be built safely gets.
+    must_execute: bool
+    # Ready-to-run arguments, or None when the context was not there. Never
+    # partially filled: a call with a guessed date is worse than no call.
+    arguments: dict | None = None
+    # Why, for `agent_runs.required_action_status` and for a human reading it.
+    detail: str = ""
+    # What the guest's own words carried, kept for the session and the report.
+    evidence: dict = field(default_factory=dict)
+
+    @property
+    def forceable(self) -> bool:
+        return self.must_execute and self.arguments is not None
+
+
+# ── numbers, as guests write them ────────────────────────────────────────────
+#
+# "5 kamre", "paanch kamre", "five rooms", "5 rooms chahiye" are one request.
+# Digits alone would have covered the replay's own sentence and missed a third
+# of the transcripts, where the number is a word.
+
+_NUMBER_WORDS = {
+    # English
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "fifteen": 15, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    # Hinglish, in the spellings that actually turn up
+    "ek": 1, "do": 2, "teen": 3, "tin": 3, "char": 4, "chaar": 4,
+    "panch": 5, "paanch": 5, "chhe": 6, "che": 6, "chah": 6, "chhah": 6,
+    "saat": 7, "sat": 7, "aath": 8, "ath": 8, "nau": 9, "das": 10, "dus": 10,
+    "gyarah": 11, "barah": 12, "pandrah": 15, "bees": 20, "bis": 20,
+    "pachas": 50,
+    # Hindi
+    "एक": 1, "दो": 2, "तीन": 3, "चार": 4, "पांच": 5, "पाँच": 5, "छह": 6,
+    "सात": 7, "आठ": 8, "नौ": 9, "दस": 10, "बीस": 20,
+}
+
+_NUMBER = r"(?:\d{1,3}|" + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r")"
+
+# The nouns that make a number a number *of rooms*.
+_ROOM_NOUN = r"(?:rooms?|kamre|kamra|kamrey|kamron|कमरे|कमरा|suites?|villas?|cottages?|tents?)"
+# …and the ones that make it a number of people. Guests state party size at
+# least as often as room count, and a hotel that hears "10 log" and does not
+# reach for its group bands has misread the largest enquiry of its week.
+_PEOPLE_NOUN = (
+    r"(?:people|persons?|pax|guests?|adults?|heads?|members?|"
+    r"log|logo|logon|jane|bande|लोग|व्यक्ति|मेहमान)"
+)
+
+_ROOMS_BEFORE = re.compile(rf"(?<![a-z0-9])({_NUMBER})\s*{_ROOM_NOUN}", re.IGNORECASE)
+# The number *after* the noun — "rooms 4 chahiye", "kamre 3".
+#
+# With a guard that earns its keep: "rooms for 10 people" put ten rooms on a
+# request for five, because the pattern read the number beside the room noun and
+# never looked at what the number was counting. A group tool called with double
+# the rooms quotes a band the guest does not qualify for.
+_ROOMS_AFTER = re.compile(
+    rf"{_ROOM_NOUN}\s*(?:ki|ke|for)?\s*({_NUMBER})(?![a-z0-9])(?!\s*{_PEOPLE_NOUN})",
+    re.IGNORECASE,
+)
+_PEOPLE_BEFORE = re.compile(rf"(?<![a-z0-9])({_NUMBER})\s*{_PEOPLE_NOUN}", re.IGNORECASE)
+_PEOPLE_AFTER = re.compile(rf"{_PEOPLE_NOUN}\s*(?:hain?|hai|ke liye|for)?\s*({_NUMBER})(?![a-z0-9])",
+                           re.IGNORECASE)
+
+# "group booking", "shaadi", "bulk" — a group with no number in the sentence.
+# It still requires the tool, because the answer is the hotel's bands and its
+# minimum, neither of which the model may state from memory.
+_GROUP_WORDS = re.compile(
+    r"(?<![a-z0-9])(?:group booking|group rate|group rates|group|bulk|"
+    r"block booking|multiple rooms|several rooms|few rooms|couple of rooms|"
+    r"kai kamre|kai room|corporate|conference|wedding|shaadi|baraat|"
+    r"team outing|offsite|reunion)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_GROUP_WORDS_HI = re.compile(r"समूह|शादी|बारात")
+
+# How many rooms a party of N needs, when the guest gave people and not rooms.
+#
+# Two to a room is what every hotel in this segment assumes and what the group
+# bands are written against. It is an *estimate*, and it is only ever used to
+# decide whether to look the bands up — never to price anything, because
+# `get_group_rates` prices nothing and `get_quote` takes the real number.
+PEOPLE_PER_ROOM = 2
+
+# Below this a "group" is a couple with a spare room, and asking the pricing
+# engine for volume bands would be a tool call nobody needed. `get_group_rates`
+# itself decides what counts as a group for the property; this only decides
+# whether the question is worth asking.
+GROUP_FROM_ROOMS = 2
+# A party this size is worth checking the bands for even when nobody has said
+# the word "rooms" — "hum 6 log hain" is a group enquiry in every hotel in India.
+GROUP_FROM_PEOPLE = 4
+
+
+def _to_int(token: str) -> int | None:
+    token = (token or "").strip().lower()
+    if token.isdigit():
+        value = int(token)
+        # A four-digit "number of rooms" is a price, a year or a pin code.
+        return value if 1 <= value <= 500 else None
+    return _NUMBER_WORDS.get(token)
+
+
+def room_count(message: str) -> int | None:
+    """
+    How many rooms this message asks for, or None.
+
+    Rooms first and people second: a guest who says "5 kamre chahiye, 10 log aa
+    rahe hain" has told us both, and the number they chose is the one to use.
+    """
+    text = message or ""
+    for pattern in (_ROOMS_BEFORE, _ROOMS_AFTER):
+        for match in pattern.finditer(text):
+            value = _to_int(match.group(1))
+            if value:
+                return value
+    return None
+
+
+def people_count(message: str) -> int | None:
+    """How many people this message mentions, or None."""
+    text = message or ""
+    for pattern in (_PEOPLE_BEFORE, _PEOPLE_AFTER):
+        for match in pattern.finditer(text):
+            value = _to_int(match.group(1))
+            if value:
+                return value
+    return None
+
+
+# ── negotiation, as guests write it ──────────────────────────────────────────
+#
+# Stricter than the obligations vocabulary next door, and for a different job.
+# There, a false positive costs one unnecessary sentence in a prompt. Here it
+# opens a negotiation — a hold, a discount the hotel did not intend to offer,
+# a guest told about a "best rate" they had not asked for. So every pattern
+# below needs a word that is about *lowering a price*, not merely about price.
+
+_NEGOTIATION = (
+    re.compile(
+        r"(?<![a-z0-9])(?:discount|concession|rebate|"
+        r"best (?:price|rate|deal|offer)|"
+        r"last (?:price|rate)|final (?:price|rate|rate batao)|lowest (?:price|rate)|"
+        r"cheaper|cheapest|budget mein|"
+        r"kam kar|kam karo|kam kardo|kam karna|kam ho jaye|kam hoga|kam kijiye|"
+        r"kuch kam|thoda kam|aur kam|zyada hai|jyada hai|mehnga|mehanga|"
+        r"sasta|saste|kam se kam|negotiat\w*|"
+        r"koi offer|kuch offer|any offer|special offer|offer chal|"
+        r"special rate|special price|"
+        r"adjust kar|kar do|kardo)(?![a-z0-9])",
+        re.IGNORECASE,
+    ),
+    re.compile(r"कम कर|छूट|सस्ता|महंगा|कम से कम|आखिरी (?:रेट|दाम)"),
+)
+
+# "4000 mein ho jayega?", "₹4,000 mein kar do", "3500 tak", "4k mein".
+#
+# The figure is captured so it can be passed to the engine as the guest's own
+# ask — which is the *only* way a guest-supplied number is allowed to travel
+# anywhere in this system. It becomes an input to a decision, never an output;
+# `negotiate_rate` decides what may be said and the guardrail checks that only
+# what it decided was said. See §20 of the brief and `hotel.negotiate_rate`.
+_OFFERED_PRICE = re.compile(
+    r"(?:₹|rs\.?|inr)?\s*(\d{1,3}(?:,\d{3})+|\d{3,6})\s*"
+    r"(?:rs\.?|rupees|rupaye|/-)?\s*"
+    r"(?:mein|me|main|mai|m|tak|pe|par|ke andar|budget|"
+    r"per night|pn|/night|a night|nightly|प्रति रात|में|तक)"
+    r"(?![a-z0-9])",
+    re.IGNORECASE,
+)
+# The other order: "kar do 4000", "make it 3500", "4000 kar do".
+_OFFERED_PRICE_AFTER = re.compile(
+    r"(?:kar do|kardo|kar dijiye|make it|do it for|kar sakte ho)\s*"
+    r"(?:₹|rs\.?|inr)?\s*(\d{1,3}(?:,\d{3})+|\d{3,6})(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def offered_price(message: str) -> int | None:
+    """
+    The figure the guest named, in whole rupees, or None.
+
+    Bounded at both ends because the pattern is loose by design: under ₹100 is
+    a room number or a count, over ₹10,00,000 a night is a typo, and passing
+    either to the engine would produce a verdict about a stay nobody proposed.
+    """
+    for pattern in (_OFFERED_PRICE, _OFFERED_PRICE_AFTER):
+        match = pattern.search(message or "")
+        if match:
+            try:
+                value = int(match.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            if 100 <= value <= 1_000_000:
+                return value
+    return None
+
+
+def wants_discount(message: str) -> bool:
+    """Is the guest pushing on the price?"""
+    text = message or ""
+    if any(pattern.search(text) for pattern in _NEGOTIATION):
+        return True
+    # A bare figure with a rate word is a haggle even without a haggling word:
+    # "4000 per night ho jayega?" is the commonest opening in the transcripts.
+    return offered_price(text) is not None
+
+
+# ── the other intents ────────────────────────────────────────────────────────
+#
+# These are detected and recorded rather than forced. Recording them is what
+# makes the evaluation report able to say "the guest asked to cancel and no tool
+# ran", which is how the cancellation gap was found in the first place; forcing
+# them needs either an id the conversation does not have or a decision a person
+# should make. The two exceptions are `payment`/`booking_status`, which are
+# answered by a read that takes no arguments at all.
+
+_PAYMENT_LINK = re.compile(
+    r"(?<![a-z0-9])(?:payment link|pay link|link bhej|link bheje|link send|"
+    r"send (?:the |me )?link|payment karna|pay karna|pay kar|book kar do|"
+    r"booking kar do|confirm kar do|advance kaise|kaise pay|how do i pay|"
+    r"how to pay|upi|qr code)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_PAYMENT_STATUS = re.compile(
+    r"(?<![a-z0-9])(?:payment (?:ho ?gayi|hogyi|hogayi|hui|done|received|gaya|"
+    r"gone through|successful)|paise (?:bhej|gaye|kat)|paid|"
+    r"transaction (?:done|complete)|check karo|check kar do|"
+    r"received the payment|payment mil (?:gaya|gayi)|paisa mila|"
+    r"booking confirm|confirm hui|confirmed\?|status)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_PAYMENT_STATUS_HI = re.compile(r"भुगतान हो|पैसे (?:भेज|कट)|पुष्टि")
+
+_CANCELLATION = re.compile(
+    r"(?<![a-z0-9])(?:cancel|cancell?ation|cancel karna|cancel karni|cancel kar do|"
+    r"refund|refundable|paisa wapas|paise wapas|money back|"
+    r"booking rad|rad kar)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_CANCELLATION_HI = re.compile(r"रद्द|कैंसिल|वापस")
+
+_MODIFICATION = re.compile(
+    r"(?<![a-z0-9])(?:reschedule|postpone|prepone|change (?:the )?dates?|"
+    r"dates? change|dates? badal|tarikh badal|shift (?:the )?booking|"
+    r"modify|preponed|postponed|extend (?:the |my )?stay|ek din aur)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+_ESCALATION_ASK = re.compile(
+    r"(?<![a-z0-9])(?:talk to (?:a |the )?(?:human|person|manager|someone|staff)|"
+    r"speak to (?:a |the )?(?:human|person|manager|someone|staff)|"
+    r"real person|actual person|manager se|kisi se baat|"
+    r"call me|call kar|phone kar|owner se|insaan se)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+_QUOTE = re.compile(
+    r"(?<![a-z0-9])(?:price|rate|rates|tariff|cost|charge|charges|"
+    r"kitna|kitne|kitni|daam|keemat|how much|per night|total kitna|"
+    r"quote|kya lagega|kya hoga)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_QUOTE_HI = re.compile(r"कितना|कितने|दाम|कीमत|किराया")
+
+_DATES = re.compile(
+    r"(?<![a-z0-9])(?:\d{1,2}\s*(?:st|nd|rd|th)?\s*"
+    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\w*|"
+    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\w*\s*\d{1,2}|"
+    r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}|"
+    r"tomorrow|tonight|today|weekend|next week|next month|"
+    r"kal|parso|agle hafte|is weekend)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+# ── what a turn owes ─────────────────────────────────────────────────────────
+
+def _stay_context(session: dict | None) -> dict:
+    """
+    The stay as structured state knows it. Never as the transcript describes it.
+
+    Missing keys are missing on purpose — a caller that cannot find `check_in`
+    here must not proceed, and a default would hide that.
+    """
+    session = session if isinstance(session, dict) else {}
+    out: dict = {}
+    for key in ("check_in", "check_out", "rate_plan_id", "room_type_id", "room_name"):
+        value = session.get(key)
+        if value:
+            out[key] = str(value)
+    for key in ("units", "adults", "children"):
+        value = session.get(key)
+        try:
+            if value is not None:
+                out[key] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _valid_dates(stay: dict) -> bool:
+    try:
+        return date.fromisoformat(stay["check_out"]) > date.fromisoformat(stay["check_in"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _group_requirement(message: str, session: dict | None) -> Requirement | None:
+    rooms = room_count(message)
+    people = people_count(message)
+    worded = bool(_GROUP_WORDS.search(message or "") or _GROUP_WORDS_HI.search(message or ""))
+
+    units = rooms
+    source = "rooms"
+    if units is None and people is not None and people >= GROUP_FROM_PEOPLE:
+        units = max(1, -(-people // PEOPLE_PER_ROOM))  # ceil
+        source = "people"
+
+    enough = (
+        (rooms is not None and rooms >= GROUP_FROM_ROOMS)
+        or (units is not None and source == "people")
+        or worded
+    )
+    if not enough:
+        return None
+
+    if units is None:
+        # "group booking ke liye baat karni hai" with no number. The stay we
+        # already know about is the best guess at scale, and failing that the
+        # tool's own minimum is what the guest is asking about.
+        units = _stay_context(session).get("units") or GROUP_FROM_ROOMS
+
+    args: dict = {"units": int(units)}
+    chosen = _stay_context(session).get("room_type_id")
+    if chosen:
+        # Their own room, so the bands come back for the thing they picked
+        # rather than for the property in general — and so a room-count change
+        # does not quietly lose the room they already chose. §9.
+        args["room_type_id"] = chosen
+
+    return Requirement(
+        intent=GROUP_BOOKING,
+        tool="get_group_rates",
+        # A quote for the same number of rooms has already applied the band and
+        # is a *better* answer than the bands themselves. See `Requirement`.
+        satisfied_by=frozenset({"get_group_rates", "get_quote", "negotiate_rate"}),
+        must_execute=True,
+        arguments=args,
+        detail=f"{units} room(s) from {source}" if rooms or people else "group wording",
+        evidence={"rooms": rooms, "people": people, "worded": worded},
+    )
+
+
+def _negotiation_requirement(message: str, session: dict | None) -> Requirement | None:
+    if not wants_discount(message):
+        return None
+
+    stay = _stay_context(session)
+    asked = offered_price(message)
+    evidence = {"requested_nightly_rupees": asked}
+
+    if not (stay.get("rate_plan_id") and _valid_dates(stay)):
+        # Nothing to negotiate *about* yet. Recorded so the report can show how
+        # often this happens, and left to the model — whose right answer here is
+        # to find out which room and which nights, not to open a haggle.
+        return Requirement(
+            intent=NEGOTIATION,
+            tool="negotiate_rate",
+            satisfied_by=frozenset({"negotiate_rate", "get_negotiation_policy",
+                                    "propose_rate_exception", "escalate_to_team"}),
+            must_execute=False,
+            arguments=None,
+            detail="no rate plan or dates on the session yet",
+            evidence=evidence,
+        )
+
+    args = {
+        "rate_plan_id": stay["rate_plan_id"],
+        "check_in": stay["check_in"],
+        "check_out": stay["check_out"],
+        "units": stay.get("units") or 1,
+        "adults": stay.get("adults") or 2,
+        "children": stay.get("children") or 0,
+    }
+    # A room-count change in the same breath as the haggle — "5 kamre chahiye,
+    # thoda kam karo" — is about five rooms, not about the one on the session.
+    rooms = room_count(message)
+    if rooms:
+        args["units"] = rooms
+    if asked is not None:
+        args["requested_nightly_rupees"] = asked
+
+    return Requirement(
+        intent=NEGOTIATION,
+        tool="negotiate_rate",
+        satisfied_by=frozenset({"negotiate_rate", "propose_rate_exception"}),
+        must_execute=True,
+        arguments=args,
+        detail=f"guest asked for ₹{asked:,}" if asked else "guest asked for a better price",
+        evidence=evidence,
+    )
+
+
+def _status_requirement(message: str) -> Requirement | None:
+    text = message or ""
+    if not (_PAYMENT_STATUS.search(text) or _PAYMENT_STATUS_HI.search(text)):
+        return None
+    return Requirement(
+        intent=BOOKING_STATUS,
+        tool="get_booking_status",
+        satisfied_by=frozenset({"get_booking_status", "get_reservation",
+                                "list_guest_reservations"}),
+        # Takes no arguments and reads only this conversation's own booking, so
+        # there is nothing to get wrong and nothing to invent. This is the tool
+        # whose absence produced "aapki booking tab confirm hogi jab payment
+        # process hogi" twenty-six seconds after the money had landed.
+        must_execute=True,
+        arguments={},
+        detail="asked whether the payment or booking went through",
+    )
+
+
+def _simple(intent: str, tool: str, satisfied_by: set[str], detail: str) -> Requirement:
+    return Requirement(
+        intent=intent, tool=tool, satisfied_by=frozenset(satisfied_by),
+        must_execute=False, arguments=None, detail=detail,
+    )
+
+
+# Priority order. A message that is several things at once gets them in the
+# order a hotel would deal with them: know the scale before pricing it, price
+# it before haggling over it, and never let a haggle jump the queue in front of
+# whether the guest can even be accommodated.
+_PRIORITY = (
+    ESCALATION, BOOKING_CANCELLATION, BOOKING_STATUS, GROUP_BOOKING,
+    NEGOTIATION, PAYMENT, BOOKING_MODIFICATION, QUOTE_REQUIRED,
+    ROOM_SELECTION, DATE_CHANGE, GUEST_COUNT_CHANGE,
+)
+
+# How many of one turn's requirements the application will run itself.
+#
+# Two, not all of them. A turn that forced four tools has stopped being a
+# conversation and started being a batch job, and the latency the guest waits
+# through is the same latency either way.
+MAX_FORCED = 2
+
+
+def detect(message: str, session: dict | None = None) -> list[Requirement]:
+    """
+    Everything this turn owes, most pressing first.
+
+    Empty for most messages, which is the point: a greeting, a thank-you and a
+    question about parking require no business action, and this must cost
+    nothing on those turns.
+    """
+    text = (message or "").strip()
+    if not text:
+        return []
+
+    found: list[Requirement] = []
+
+    if _ESCALATION_ASK.search(text):
+        found.append(_simple(ESCALATION, "request_human_handoff",
+                             {"request_human_handoff", "escalate_to_team"},
+                             "guest asked for a person"))
+
+    if _CANCELLATION.search(text) or _CANCELLATION_HI.search(text):
+        # Forced, and forced to the *reading* tool.
+        #
+        # `get_cancellation_quote` takes no arguments, reads only this
+        # conversation's own booking and cancels nothing, so there is nothing
+        # to get wrong in running it. `cancel_booking` is deliberately not what
+        # gets forced: cancelling a stay because a guest typed the word "cancel"
+        # is exactly the class of thing a deterministic layer must never do.
+        # The guest hears the refund, says yes, and the model calls the second
+        # tool — which is the sequence a hotel would want a human to follow too.
+        found.append(Requirement(
+            intent=BOOKING_CANCELLATION,
+            tool="get_cancellation_quote",
+            satisfied_by=frozenset({
+                "get_cancellation_quote", "cancel_booking",
+                "get_cancellation_terms", "get_booking_status",
+                "escalate_to_team",
+            }),
+            must_execute=True,
+            arguments={},
+            detail="guest asked about cancelling or a refund",
+        ))
+
+    status = _status_requirement(text)
+    if status:
+        found.append(status)
+
+    group = _group_requirement(text, session)
+    if group:
+        found.append(group)
+
+    negotiation = _negotiation_requirement(text, session)
+    if negotiation:
+        found.append(negotiation)
+
+    if _PAYMENT_LINK.search(text):
+        found.append(_simple(PAYMENT, "create_booking_payment_link",
+                             {"create_booking_payment_link", "create_payment_link",
+                              "get_booking_status", "get_quote"},
+                             "guest asked to pay"))
+
+    if _MODIFICATION.search(text):
+        found.append(_simple(BOOKING_MODIFICATION, "get_booking_status",
+                             {"get_booking_status", "get_reservation",
+                              "search_availability", "get_stay_options",
+                              "escalate_to_team"},
+                             "guest asked to change an existing booking"))
+
+    if _QUOTE.search(text) or _QUOTE_HI.search(text):
+        found.append(_simple(QUOTE_REQUIRED, "get_quote",
+                             {"get_quote", "get_stay_options", "negotiate_rate",
+                              "get_group_rates", "search_availability"},
+                             "guest asked what it costs"))
+
+    if _DATES.search(text):
+        found.append(_simple(DATE_CHANGE, "search_availability",
+                             {"search_availability", "get_stay_options", "get_quote",
+                              "negotiate_rate", "get_group_rates"},
+                             "guest named dates"))
+
+    if people_count(text) is not None and not group:
+        found.append(_simple(GUEST_COUNT_CHANGE, "get_stay_options",
+                             {"get_stay_options", "search_availability", "get_quote",
+                              "get_group_rates", "get_room_types"},
+                             "guest named a party size"))
+
+    order = {intent: i for i, intent in enumerate(_PRIORITY)}
+    found.sort(key=lambda r: order.get(r.intent, 99))
+
+    # One requirement per intent — the vocabularies overlap by design and a
+    # duplicate would be forced twice.
+    seen: set[str] = set()
+    return [r for r in found if not (r.intent in seen or seen.add(r.intent))]
+
+
+def unmet(requirements: list[Requirement], outcomes: list) -> list[Requirement]:
+    """
+    Which of these the turn did not discharge.
+
+    Only successful calls count, exactly as in `obligations.satisfied_by`: a
+    `negotiate_rate` that was refused for lack of permission has not answered
+    the guest, and treating a refusal as a discharge is how a requirement
+    disappears without being met.
+    """
+    ran = {
+        getattr(o, "tool", "") for o in (outcomes or [])
+        if getattr(o, "ok", False)
+    }
+    return [r for r in requirements if not (r.satisfied_by & ran)]
+
+
+def summarise(requirements: list[Requirement], outcomes: list, forced: list[str]) -> dict:
+    """
+    The turn's requirement story, for `agent_runs` and for the evaluation report.
+
+    One small object rather than four columns of booleans, because the questions
+    asked of it in production are not known in advance — "how often does the
+    model call negotiate_rate by itself" was not a question anybody had until
+    the replay started scoring differently on identical input.
+    """
+    outstanding = unmet(requirements, outcomes)
+    still = {r.intent for r in outstanding}
+    return {
+        "intents": [r.intent for r in requirements],
+        "required": [r.tool for r in requirements if r.must_execute],
+        "satisfied": [r.intent for r in requirements if r.intent not in still],
+        # Split, because the two mean different things about the build. A
+        # required action left undone is a defect; an advisory intent left
+        # undone is usually the model choosing a better answer than the one
+        # this module would have guessed at.
+        "unmet": sorted(r.intent for r in outstanding if r.must_execute),
+        "observed_unmet": sorted(r.intent for r in outstanding if not r.must_execute),
+        "forced": forced,
+    }
+
+
+def status_of(summary: dict) -> str:
+    """
+    One word for `agent_runs.required_action_status`.
+
+        none       nothing was required
+        model      the model called everything that was required
+        forced     the application ran something the model did not
+        unmet      something was required and did not happen
+
+    `forced` and `unmet` can both be true of one turn; `unmet` wins, because the
+    turn still owes the guest something and that is the number worth watching.
+    """
+    if not summary.get("required"):
+        return "none"
+    if summary.get("unmet"):
+        return "unmet"
+    if summary.get("forced"):
+        return "forced"
+    return "model"

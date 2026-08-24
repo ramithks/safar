@@ -372,7 +372,15 @@ def test_human_takeover_stops_the_agent_answering():
 # ── failure behaviour ────────────────────────────────────────────────────────
 
 def test_a_dead_model_hands_off_rather_than_inventing(db):
-    provider = EchoProvider([ProviderError("model returned 503")])
+    # Three failures, because a dead model is no longer the end of the turn.
+    # The runtime walks the degradation ladder — 3.6-flash → 3.5-flash →
+    # 2.5-flash — before giving up, so "the model is gone" now means every rung
+    # is gone. Scripting one failure would test the fallback, not the handoff.
+    provider = EchoProvider([
+        ProviderError("model returned 503"),
+        ProviderError("model returned 503"),
+        ProviderError("model returned 503"),
+    ])
     result = run(runtime.run_turn(make_ctx(), "do you have a room tomorrow?", provider=provider))
 
     assert result.status == "failed"
@@ -413,8 +421,42 @@ def test_a_runaway_loop_is_stopped_and_handed_over(db, monkeypatch):
     result = run(runtime.run_turn(make_ctx(), "hello", provider=provider))
 
     assert result.handoff is True
-    assert len(db.rows("agent_actions")) == 3
     assert db.rows("conversations")[0]["handler"] == "human_requested"
+    # One row, not three. The ceiling still stops the loop — that is what the
+    # handoff above proves — but an identical read is no longer re-executed on
+    # every pass, so the runaway costs one query instead of one per turn.
+    assert len(db.rows("agent_actions")) == 1
+
+
+def test_a_reread_after_a_change_is_not_mistaken_for_a_repeat(db):
+    # The rule that keeps verification working. `get_reservation` before and
+    # after a change has identical arguments by definition, and suppressing the
+    # second would hand the model the state from before the change and let it
+    # report that as the result.
+    provider = EchoProvider([
+        [("get_reservation", {"reservation_id": RESERVATION})],
+        [("create_task", {"title": "AC not cooling", "category": "maintenance"})],
+        [("get_reservation", {"reservation_id": RESERVATION})],
+        "All sorted.",
+    ])
+    run(runtime.run_turn(make_ctx(autonomy_level=2), "my AC is broken", provider=provider))
+
+    tools = [row["tool"] for row in db.rows("agent_actions")]
+    assert tools == ["get_reservation", "create_task", "get_reservation"]
+
+
+def test_the_same_change_is_never_made_twice_in_one_turn(db):
+    # The other half, and the one with money on it. A mutation stays nailed down
+    # for the rest of the turn however many times the model asks for it.
+    provider = EchoProvider([
+        [("create_task", {"title": "AC not cooling", "category": "maintenance"})],
+        [("create_task", {"title": "AC not cooling", "category": "maintenance"})],
+        "Raised it.",
+    ])
+    run(runtime.run_turn(make_ctx(autonomy_level=2), "my AC is broken", provider=provider))
+
+    assert [row["tool"] for row in db.rows("agent_actions")] == ["create_task"]
+    assert len(db.rows("tasks")) == 1
 
 
 # ── what the model is shown ──────────────────────────────────────────────────

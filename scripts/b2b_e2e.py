@@ -47,6 +47,12 @@ import urllib.request
 from datetime import date, timedelta
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+# The one way a suite may kill a reservation. See `cancel_reservation_sql`:
+# a bare UPDATE to 'cancelled' bypasses the inventory RPCs and takes the room
+# out of the hotel permanently.
+import e2e_sweep  # noqa: E402
 
 REF = "rdlozqvuywtgsodunait"
 SB = f"https://{REF}.supabase.co"
@@ -484,8 +490,11 @@ def main() -> int:
           st == 200 and me3["contracts"][0]["committedPaise"] == committed(),
           f"{st} {str(me3)[:200]}")
 
-    sql(f"""update public.reservations set status = 'cancelled'
-             where id = '{reservation_id}';""")
+    # Through the helper, not through a bare UPDATE. `room_inventory.units_booked`
+    # is owned by the RPCs and an UPDATE that sets 'cancelled' goes past them —
+    # which is how Casa Mandala came to have 377 room-nights sold to nobody.
+    # See `e2e_sweep.cancel_reservation_sql`.
+    sql(e2e_sweep.cancel_reservation_sql(reservation_id, "b2b_e2e"))
     check("and a cancelled booking leaves the line entirely",
           committed() == 0, f"{committed()}")
 

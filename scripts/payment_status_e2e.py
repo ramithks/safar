@@ -449,12 +449,17 @@ delete from public.conversation_messages where conversation_id = '{CONVERSATION[
 delete from public.agent_actions where run_id in (
   select id from public.agent_runs where conversation_id = '{CONVERSATION['id']}');
 delete from public.agent_runs where conversation_id = '{CONVERSATION['id']}';
-update public.reservations set status = 'cancelled', conversation_id = null
+update public.reservations set conversation_id = null
   where id = '{STAY['id']}';
 update public.conversations set reservation_id = null where id = '{CONVERSATION['id']}';
 delete from public.conversations where id = '{CONVERSATION['id']}';
 """)
-print(f"  · swept the {TAG} thread and released its room")
+# The room is released by `FIXTURE.close()` below, which goes through
+# `sweep_reservations` and therefore through `release_booking`. This sweep
+# deliberately no longer sets `status = 'cancelled'` itself: that UPDATE
+# bypasses the inventory RPCs, and a row already marked dead is one the fixture
+# would have released and then deleted anyway. See scripts/e2e_sweep.py.
+print(f"  · swept the {TAG} thread; the fixture releases its room")
 
 FIXTURE.close()
 

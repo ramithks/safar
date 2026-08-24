@@ -130,6 +130,44 @@ class ToolUnavailable(AgentError):
         )
 
 
+class MutationUnverified(AgentError):
+    """
+    The tool said it changed something and the re-read does not agree.
+
+    **The failure this class exists to make impossible is the agent telling a
+    guest that something happened because it asked for it to happen.** A tool
+    returns a payload the model reads as success; if the write silently did not
+    land — a race, a constraint, a service that answered 200 and did nothing —
+    nothing downstream could tell, and the model would report a check-in that
+    did not occur to the person standing at the desk.
+
+    So a mutating tool that declares a `verify` re-reads the record it claims to
+    have changed, and this is what a disagreement becomes. Status `failed`, not
+    `refused`: nothing was denied, the system is in a state nobody intended, and
+    the honest end of that is a person looking at it.
+
+    The model is told the **observed** state rather than the state it wanted,
+    because that is the only thing it can say to the guest that is true.
+    """
+
+    action_status = "failed"
+
+    def __init__(self, reason: str, guest_message: str | None = None,
+                 model_message: str | None = None):
+        super().__init__(
+            reason,
+            guest_message or (
+                "I couldn't confirm that went through — let me get someone from "
+                "the team to check."
+            ),
+            model_message or (
+                "This did NOT complete. Do not tell the guest it is done, do not "
+                "apologise for a system error and do not try again — report what "
+                "is actually true and call request_human_handoff."
+            ),
+        )
+
+
 class ProviderError(AgentError):
     """
     The model itself is unreachable or refused.

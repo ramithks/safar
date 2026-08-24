@@ -137,6 +137,33 @@ class ToolSpec:
     # which is true of raising a ticket and false of almost anything priced.
     revalidate: Callable[..., Awaitable[None]] | None = None
 
+    # Run *after* a mutating tool succeeds: read the record back and prove it.
+    #
+    # The third of the trio, and the one that closes the loop.
+    #   precheck    was this ever allowed?          before anything
+    #   revalidate  is it still true?               approval path only
+    #   verify      did it actually happen?         after the write
+    #
+    # **A tool returning a payload is a tool reporting its own intention.** The
+    # service was called and did not raise; that is all `status=executed` has
+    # ever meant. Between that and the guest being told "you're checked in, room
+    # 214" sits a write that may not have landed — a race with the front desk
+    # doing it by hand, a constraint, a service answering 200 having changed
+    # nothing. Nothing in the runtime could tell the difference, and the model
+    # has every reason to believe the payload it was handed.
+    #
+    # So a mutating tool whose effect can be observed declares how to observe
+    # it. `registry.execute` calls this with the validated arguments, the
+    # context and the result id, and it re-reads the record *independently of
+    # the write path* — not the row the service returned, which is the claim
+    # under test. It returns evidence (a small dict, shown to the model) or
+    # raises `MutationUnverified` with what it actually saw.
+    #
+    # Absent means the effect cannot be observed cheaply — sending a WhatsApp
+    # message, where the transport's own receipt is the evidence and a re-read
+    # would prove nothing the send did not already.
+    verify: Callable[..., Awaitable[dict]] | None = None
+
     def json_schema(self) -> dict:
         """
         The argument schema, in the shape a provider expects.
@@ -202,9 +229,24 @@ class ToolOutcome:
     latency_ms: int = 0
     error: str | None = None
 
+    # Whether the change was read back and confirmed.
+    #
+    #   True   a `verify` hook re-read the record and it agreed.
+    #   False  it re-read the record and it did not — the outcome is `failed`.
+    #   None   not applicable: the tool did not mutate, or its effect is not
+    #          observable by a re-read. **Not the same as False**, and the
+    #          difference is what stops "unverified" being read as "broken" for
+    #          the sixty-odd tools that only ever read something.
+    verified: bool | None = None
+
     @property
     def ok(self) -> bool:
         return self.status == "executed"
+
+    @property
+    def is_verified_mutation(self) -> bool:
+        """A change that was made *and* proven. What a reply may rely on."""
+        return self.ok and self.verified is True
 
 
 @dataclass
@@ -220,3 +262,12 @@ class RunResult:
     tokens_out: int = 0
     latency_ms: int = 0
     error: str | None = None
+
+    # What the guest's message deterministically required, and what became of
+    # it. Carried on the result as well as written to `agent_runs` so the
+    # evaluation runner can score a turn without a round trip per turn — a
+    # hundred-run sweep would otherwise be a hundred extra queries.
+    # Shape: services/ai/required_actions.summarise().
+    requirements: dict = field(default_factory=dict)
+    # 'none' · 'model' · 'forced' · 'unmet'. The single number this pass moves.
+    required_action_status: str = "none"

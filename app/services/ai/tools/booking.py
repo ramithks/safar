@@ -40,6 +40,28 @@ class HoldArgs(BaseModel):
     hold_id: ResourceId = Field(description="From get_quote.")
 
 
+class CancelArgs(BaseModel):
+    """
+    Deliberately almost empty.
+
+    There is no reservation id, no refund amount and no percentage. The booking
+    comes from the conversation — `scoped_to_conversation` and
+    `ctx.allowed_reservations` — and the money comes from the policy the stay
+    was sold under. A model that could pass either could be talked into
+    cancelling somebody else's booking or into refunding more than the hotel
+    owes, and both of those are one guest sentence away from happening.
+    """
+
+    reason: str | None = Field(
+        default=None, max_length=300,
+        description=(
+            "Why the guest says they are cancelling, in their own words. "
+            "Recorded on the booking for the hotel; it does not change the "
+            "refund, which is the policy's decision and not yours."
+        ),
+    )
+
+
 async def _revalidate_booking(args: "BookingArgs", ctx: AgentContext) -> None:
     """
     Is the quote a manager approved still the quote we would honour?
@@ -87,6 +109,72 @@ async def _revalidate_booking(args: "BookingArgs", ctx: AgentContext) -> None:
             )
 
 
+async def _verify_booking(args: "BookingArgs", ctx: AgentContext,
+                          result_id: str | None) -> dict:
+    """
+    Read the reservation back before anyone is told they have one.
+
+    **The worst sentence this product can produce is "your rooms are booked"
+    when they are not** — a guest who believes it acts on it by travelling. The
+    guardrails already refuse that claim when no booking tool ran; this closes
+    the other half, where the tool *did* run and the row is not there.
+
+    Read by id off `reservations`, scoped to the property, independently of the
+    write path. A booking in `cancelled` counts as unverified: the row existing
+    is not the claim, the stay existing is.
+    """
+    from app.services.ai.errors import MutationUnverified
+
+    if not result_id:
+        raise MutationUnverified(
+            "create_booking returned no reservation id, so nothing can be confirmed",
+        )
+
+    def _read():
+        rows = (
+            get_db().table("reservations")
+            .select("id,property_id,ref,status,check_in,check_out,units")
+            .eq("id", result_id).eq("property_id", ctx.property_id)
+            .limit(1).execute().data or []
+        )
+        return rows[0] if rows else None
+
+    stay = await run_db(_read)
+    if not stay:
+        raise MutationUnverified(
+            f"create_booking returned reservation {result_id} and it is not on "
+            f"this property",
+            guest_message=(
+                "I couldn't confirm that booking went through — let me get "
+                "someone from the team onto it right away."
+            ),
+            model_message=(
+                "The booking did NOT complete. Do NOT tell the guest they are "
+                "booked, reserved or confirmed, and do not give a reference. "
+                "Say you are checking and call request_human_handoff."
+            ),
+        )
+
+    if stay.get("status") in ("cancelled", "no_show"):
+        raise MutationUnverified(
+            f"reservation {stay.get('ref')} reads {stay.get('status')!r} "
+            f"immediately after being created",
+            model_message=(
+                f"The booking is '{stay.get('status')}' and the guest does NOT "
+                f"have a room. Do not say it is confirmed. Call "
+                f"request_human_handoff."
+            ),
+        )
+
+    return {
+        "ref": stay.get("ref"),
+        "status": stay.get("status"),
+        "checkIn": stay.get("check_in"),
+        "checkOut": stay.get("check_out"),
+        "rooms": stay.get("units"),
+    }
+
+
 @tool(
     name="create_booking",
     description=(
@@ -126,6 +214,7 @@ async def _revalidate_booking(args: "BookingArgs", ctx: AgentContext) -> None:
         "then, because it is not and somebody else may take it. Only if that "
         "also refuses should you hand over to the team."
     ),
+    verify=_verify_booking,
 )
 async def create_booking(args: BookingArgs, ctx: AgentContext) -> tuple[dict, str]:
     ceiling = ctx.limits.get("max_booking_value_paise")
@@ -591,8 +680,23 @@ _GUIDANCE = {
     ),
     "NONE": (
         "This conversation has no quote, no payment and no booking. If they "
-        "believe they have one made elsewhere, ask for the booking reference "
-        "and hand over to the team."
+        "believe they have one made elsewhere, ask them for the booking "
+        "reference — the short code on their confirmation, like TB-5CECKV — "
+        "and hand over to the team. "
+        # **Say which words, because the wrong ones get the reply refused.**
+        #
+        # Observed on a live evaluation run: this guidance said "ask for the
+        # booking reference", the model wrote *"kripya reservation ID share
+        # karein"*, and the reply guardrail refused it — correctly, because no
+        # guest has ever been given a "reservation ID"; that is a column name.
+        # The turn then handed a guest to a person over a sentence that was
+        # trying to be helpful.
+        #
+        # The guardrail is right and stays. What was wrong is that one part of
+        # the system told the model to ask for something and another refused
+        # the words it chose, and the fix belongs where the situation is known.
+        "Call it a booking reference or a booking ID and nothing else — never "
+        "a 'reservation ID', a 'quote ID' or any other internal name."
     ),
 }
 
@@ -637,3 +741,202 @@ async def get_booking_status(args: BookingStatusArgs, ctx: AgentContext) -> dict
 
     state["instruction"] = _GUIDANCE.get(state["state"], _GUIDANCE["NONE"])
     return state
+
+
+# ── cancelling ───────────────────────────────────────────────────────────────
+#
+# The readiness audit found no cancellation anywhere in the system: the AI could
+# sell a room in ninety seconds and a guest had to reach a human to undo it.
+# Two tools rather than one, and the split is the safety property.
+#
+#   get_cancellation_quote   what would happen. Reads. Level 0.
+#   cancel_booking           make it happen. Writes, releases stock. Level 3.
+#
+# A guest asking "cancel karne pe kitna wapas milega?" is asking the first
+# question and must not be answered by doing the second. Merging them would
+# mean the only way to find out the refund was to cancel the booking, which is
+# the kind of design that gets a hotel a one-star review.
+
+
+def _cancellation_reply(payload: dict) -> str:
+    """
+    What the model is instructed to do with the answer.
+
+    Instructions rather than a script, for the same reason `negotiate_rate` uses
+    instructions: the sentence has to be in the guest's language and the agent's
+    voice. What is fixed is which *figures* may be said — `refund` and
+    `retained`, both formatted here — and that the agent must not soften a
+    non-refundable rate into a maybe.
+    """
+    if payload.get("alreadyCancelled"):
+        return (
+            "This booking was already cancelled. Say so plainly and give the "
+            "reference. Do not cancel anything again and do not promise a "
+            "second refund."
+        )
+    kind = payload.get("kind")
+    if kind == "non_refundable":
+        return (
+            "Cancelled. This rate was non-refundable, so nothing comes back — "
+            "say that directly rather than implying it might. Give the "
+            "reference. If they push, you may offer to ask the hotel with "
+            "escalate_to_team; do not promise an exception yourself."
+        )
+    if kind == "free":
+        return (
+            "Cancelled, with a full refund of `refund`. Say that figure and no "
+            "other, and tell them the hotel processes it back to the original "
+            "payment method — it is not instant."
+        )
+    return (
+        "Cancelled. `refund` comes back and `retained` does not, under the "
+        "policy the booking was made on. Say both figures exactly as given, "
+        "explain that the deadline had passed if afterDeadline is true, and do "
+        "not apologise for the policy or hint that it could be waived."
+    )
+
+
+def _money_out(payload: dict) -> dict:
+    """
+    Rupees beside every paise figure, so the model never divides.
+
+    The rule from `money.display`: a live replay divided 1920000 by a thousand
+    and offered a ₹19,200 stay for ₹1,920. Anything a guest could be told is
+    formatted before it reaches the context.
+    """
+    for paise_key, display_key in (
+        ("refundPaise", "refund"), ("retainedPaise", "retained"),
+        ("paidPaise", "paid"), ("totalPaise", "total"),
+    ):
+        if payload.get(paise_key) is not None:
+            payload[display_key] = money.display(payload[paise_key])
+    return payload
+
+
+async def _the_conversations_booking(ctx: AgentContext) -> str:
+    """
+    Which booking this thread is about, from the context and never the model.
+
+    `ctx.reservation_id` when the conversation is pinned to one, otherwise the
+    single reservation this guest is allowed to see. Two or more, and the agent
+    has to ask which — a guest with a booking in March and one in June saying
+    "cancel kar do" has not said enough, and guessing would cancel the wrong
+    stay.
+    """
+    if ctx.reservation_id:
+        return ctx.reservation_id
+
+    allowed = await ctx.allowed_reservations()
+    live = [r for r in allowed] if allowed else []
+    if len(live) == 1:
+        return live[0]
+    if not live:
+        raise OutOfScope(
+            "no reservation is attached to this conversation",
+            "I can't find a booking on this chat — could you send me the "
+            "booking reference?",
+        )
+    raise OutOfScope(
+        f"{len(live)} reservations are in scope and the guest named none",
+        "You have more than one booking with us — which one did you want to "
+        "cancel? The reference or the dates would help.",
+    )
+
+
+@tool(
+    name="get_cancellation_quote",
+    description=(
+        "What this guest's own booking would get back if they cancelled right "
+        "now — the refund, what is retained, and whether the deadline has "
+        "passed. Reads only; it cancels nothing. Use this for 'cancel karne pe "
+        "paisa wapas milega?' and before any cancellation, so the guest hears "
+        "the number before they decide. Never work the refund out yourself."
+    ),
+    input_model=BookingStatusArgs,
+    permission=None,
+    autonomy_floor=0,
+    mutating=False,
+    usage_type="ai.tool_read",
+    result_type="none",
+    scoped_to_conversation=True,
+)
+async def get_cancellation_quote(args: BookingStatusArgs, ctx: AgentContext) -> dict:
+    from app.services.pms import cancellation as cancellation_service
+
+    reservation_id = await _the_conversations_booking(ctx)
+    payload = await cancellation_service.preview(ctx.property_id, reservation_id)
+    payload = _money_out(payload)
+
+    if not payload["cancellable"]:
+        payload["instruction"] = (
+            (payload.get("blockedExplanation") or
+             "This booking cannot be cancelled from here.")
+            + " Say so and offer escalate_to_team. Do not quote a refund figure."
+        )
+    else:
+        payload["instruction"] = (
+            "This is what they would get back — `refund` — and what the hotel "
+            "keeps — `retained`. Quote those figures and no others. Nothing has "
+            "been cancelled: if they want to go ahead, call cancel_booking."
+        )
+    return payload
+
+
+@tool(
+    name="cancel_booking",
+    description=(
+        "Cancel this guest's own booking. Releases the rooms and records what "
+        "is refundable under the policy the booking was sold on. Use it only "
+        "after the guest has been told the refund and has confirmed they want "
+        "to go ahead. It takes no amount and no booking id — both come from the "
+        "hotel's records. Never state a refund figure this tool did not return."
+    ),
+    input_model=CancelArgs,
+    # 'frontdesk', the same scope `create_booking` uses. Not a new 'bookings'
+    # scope: the permission vocabulary is shared with a human's role, and
+    # inventing a scope nobody's role carries would mean no agent could hold it
+    # without a migration on `agent_permissions` first.
+    permission="frontdesk",
+    # Level 3, the same as create_booking and for the mirror-image reason: this
+    # gives a room back and gives money back, and a hotel that lets an AI do the
+    # second unattended has to have said so.
+    autonomy_floor=3,
+    mutating=True,
+    usage_type="ai.tool_booking",
+    result_type="reservation",
+    scoped_to_conversation=True,
+    when_deferred=(
+        "Not cancelled yet — the hotel has to approve a cancellation here. Tell "
+        "the guest their request has gone to the team and that nothing has "
+        "changed on their booking yet. Do not say it is cancelled and do not "
+        "quote a refund."
+    ),
+)
+async def cancel_booking(args: CancelArgs, ctx: AgentContext) -> tuple[dict, str | None]:
+    from fastapi import HTTPException
+
+    from app.services.pms import cancellation as cancellation_service
+
+    reservation_id = await _the_conversations_booking(ctx)
+
+    try:
+        payload = await cancellation_service.cancel(
+            ctx.property_id, reservation_id,
+            reason=args.reason,
+            actor="agent",
+            actor_name=ctx.principal.display_name or "AI agent",
+        )
+    except HTTPException as exc:
+        # A booking that has checked in, checked out or is already a no-show.
+        # The guest hears the true reason and gets a person, rather than an
+        # apology for something the agent could not name.
+        raise OutOfScope(
+            f"cancel_booking refused: {exc.detail}",
+            "I can't cancel that one from here — let me get somebody from the "
+            "hotel to look at it with you.",
+        ) from exc
+
+    payload = _money_out(payload)
+    payload["currency"] = "INR"
+    payload["instruction"] = _cancellation_reply(payload)
+    return payload, payload["reservationId"]

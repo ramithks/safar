@@ -56,6 +56,12 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+# The one way a suite may kill a reservation. See `cancel_reservation_sql`:
+# a bare UPDATE to 'cancelled' bypasses the inventory RPCs and takes the room
+# out of the hotel permanently.
+import e2e_sweep  # noqa: E402
 
 REF = "rdlozqvuywtgsodunait"
 SB = f"https://{REF}.supabase.co"
@@ -474,14 +480,16 @@ def main() -> int:  # noqa: C901 — a linear script; splitting it hides the ord
     check("and the room nights are the stay's, not a guess",
           int(row["room_nights"]) == 3, str(row["room_nights"]))
 
-    sql(f"""update public.reservations set status = 'cancelled'
-             where id = '{reservation_id}';""")
+    # Stock back first. A bare UPDATE to 'cancelled' bypasses the inventory
+    # RPCs and leaves the night sold to nobody — see e2e_sweep.
+    sql(e2e_sweep.cancel_reservation_sql(reservation_id, "creator_e2e"))
     row = recalc()
     check("a cancellation takes it back to nothing",
           int(row["amount_paise"]) == 0 and row["eligible"] is False, str(row)[:200])
 
-    sql(f"""update public.reservations set status = 'checked_out'
-             where id = '{reservation_id}';""")
+    # …and the room goes back out when the stay is reinstated, or the counter
+    # ends this test one room short for ever.
+    sql(e2e_sweep.reinstate_reservation_sql(reservation_id, "checked_out"))
     row = recalc()
     check("and reinstating the stay reinstates it", row["status"] == "pending_approval",
           str(row)[:200])
@@ -580,15 +588,13 @@ def main() -> int:  # noqa: C901 — a linear script; splitting it hides the ord
     check("though the campaign's own terms version moves, so the change is visible",
           int(one(version, "terms_version")) == 2, str(version))
 
-    sql(f"""update public.reservations set status = 'cancelled'
-             where id = '{reservation_id}';""")
+    sql(e2e_sweep.cancel_reservation_sql(reservation_id, "creator_e2e"))
     row = recalc()
     check("and nothing recomputes a payout an owner has already signed off",
           row["status"] == "approved" and int(row["amount_paise"]) == expected,
           str(row)[:200])
-    sql(f"""update public.reservations set status = 'checked_out'
-             where id = '{reservation_id}';
-           update public.creator_campaigns set commission_pct = 10
+    sql(e2e_sweep.reinstate_reservation_sql(reservation_id, "checked_out"))
+    sql(f"""update public.creator_campaigns set commission_pct = 10
              where id = '{campaign_id}';""")
 
     # ── 12. two owners, one button ───────────────────────────────────────────

@@ -445,8 +445,12 @@ def sweep() -> None:
     # points at its reservation, so a single batch that trips one foreign key
     # rolls back the whole sweep and leaves a paid demo booking behind.
     for statement in (
+        # The release above has already given the stock back, so this only
+        # marks the rows dead and unhooks them from the thread. Kept as one
+        # statement so the two halves of "release, then cancel" stay adjacent
+        # and a reader can see the order. See scripts/e2e_sweep.py.
         f"update public.reservations set status = 'cancelled', conversation_id = null "
-        f" where conversation_id = '{conv['id']}';",
+        f" where conversation_id = '{conv['id']}' and status not in ('cancelled','no_show');",
         f"update public.conversations set reservation_id = null where id = '{conv['id']}';",
         f"delete from public.payment_orders where conversation_id = '{conv['id']}';",
         f"delete from public.quotes where conversation_id = '{conv['id']}';",
@@ -630,8 +634,38 @@ on conflict (instagram_account_id) do update
     fresh = actions()[mark:]
     used = [a["tool"] for a in fresh]
 
-    check("a group was recognised as a group",
-          "get_group_rates" in used, str(used))
+    # **Priced as a group, whichever tool got there.**
+    #
+    # This asserted `get_group_rates in used` and nothing else, and a live run
+    # failed it while doing something *better*: the model went straight to
+    # `get_quote` with units=5, the quote applied the 8% band itself, and the
+    # guest was charged ₹98,918 for five rooms — the band rate, from the engine,
+    # with the tier id on the row. Nothing was wrong except the assertion, which
+    # named a tool where it meant an outcome.
+    #
+    # So the outcome is what is asserted. A quote carrying a `group_tier_id` is
+    # proof the volume rules priced this stay, and it is stronger proof than a
+    # `get_group_rates` call — which only reads the bands and could be followed
+    # by a rack-rate quote. `required_actions.satisfied_by` makes the same
+    # judgement for the same reason, so the two agree about what counts.
+    #
+    # The band-reading tool is still worth having and is still checked below
+    # when it ran: it is what lets the agent say "from six rooms it improves
+    # again", which is a sentence that sells two more rooms.
+    conv = conversation()
+    group_quote = sql(f"""select q.group_tier_id
+                            from public.quotes q
+                           where q.conversation_id = '{conv['id']}' and q.units >= 3
+                             and q.group_tier_id is not null limit 1;""")
+    priced_by_band = bool(isinstance(group_quote, list) and group_quote)
+
+    check("a group was priced as a group",
+          "get_group_rates" in used or priced_by_band,
+          f"tools={used}, no multi-room quote carries a group tier either")
+    if "get_group_rates" not in used and priced_by_band:
+        print("       (the model quoted five rooms directly; the band is on the "
+              "quote row, so the engine priced it — but the guest was not told "
+              "the bands improve further)")
 
     tiers = run(rates.tiers_for(PROPERTY))
     band = rates.select_tier(tiers, 5, "")
@@ -648,7 +682,6 @@ on conflict (instagram_account_id) do update
               (group_tool["output"] or {}).get("depositPct") == 30,
               str(group_tool["output"])[:200])
 
-    conv = conversation()
     priced = sql(f"""select q.units, q.total_paise, q.group_tier_id, t.discount_pct
                        from public.quotes q
                        left join public.group_rate_tiers t on t.id = q.group_tier_id

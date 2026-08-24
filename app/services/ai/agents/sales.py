@@ -109,6 +109,18 @@ DEFINITION = AgentDefinition(
         # believes happened. Takes no arguments, so it can only ever read this
         # conversation's own booking.
         "get_booking_status",
+        # Undoing it. The readiness audit found no cancellation anywhere in
+        # the system: this agent could sell a room in ninety seconds and a
+        # guest had to reach a human to undo it, which is the one asymmetry a
+        # guest notices immediately.
+        #
+        # Two tools, and the split is the safety property. The quote reads and
+        # is level 0, so "cancel karne pe kitna milega?" is answerable at any
+        # autonomy. The cancellation writes, releases the rooms and sits at
+        # level 3 beside `create_booking` — a hotel at level 2 gets an approval
+        # request rather than an unwatched refund.
+        "get_cancellation_quote",
+        "cancel_booking",
         # Price, when the guest pushes back.
         #
         # Three tools rather than two, and the new one is the one that answers.
