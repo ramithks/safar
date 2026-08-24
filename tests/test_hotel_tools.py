@@ -252,8 +252,40 @@ def test_a_sales_role_is_first_for_anything_about_price(kind):
 # Not a general dependency graph — only the cases where a tool takes an id that
 # nothing else can produce. `create_booking_payment_link` takes a `quote_id`,
 # and a quote id exists only because `get_quote` made one.
+# The rule for being on this list is narrow and deliberate: the tool takes a
+# **required** argument that is an id, and exactly one family of tools in the
+# catalogue can produce that id. An optional id is not a prerequisite — a
+# `get_meal_info` with no rate plan answers about room-only, which is a worse
+# answer than the one it could have given but not an impossible call. A required
+# id with no producer on the menu is a tool the model can be offered and cannot
+# use, which is what §6 is about.
+#
+# `needs` is a set: `get_quote` wants a `rate_plan_id`, and both
+# `get_stay_options` and `negotiate_rate` can hand it one. Any of them closes it.
 PREREQUISITES = {
-    "create_booking_payment_link": "get_quote",
+    # A quote id exists only because get_quote made one.
+    "create_booking_payment_link": {"get_quote", "negotiate_rate"},
+    "create_booking": {"get_quote", "negotiate_rate"},
+    # A rate plan id is not something a model may derive from a room's name —
+    # that is how it once invented `rate_plan_id = "breakfast_included"`.
+    "get_quote": {"get_stay_options"},
+    "negotiate_rate": {"get_stay_options"},
+    "propose_rate_exception": {"get_stay_options"},
+    # A hold id comes back from the quote that took it.
+    "release_hold": {"get_quote", "negotiate_rate"},
+    # A task cannot be assigned, read or closed before it has been raised or
+    # found. `list_guest_tasks` counts because a guest asking "kya hua us
+    # complaint ka" is answered by finding their own tickets, not by being
+    # asked for an id no guest has ever seen.
+    "assign_task": {"create_task", "get_task", "list_guest_tasks", "get_task_status"},
+    "get_task": {"create_task", "list_guest_tasks"},
+    "get_task_status": {"create_task", "list_guest_tasks"},
+    "update_task_status": {"create_task", "list_guest_tasks", "get_task"},
+    # A service id, from the hotel's own price list.
+    "order_service": {"list_services"},
+    # A room type id, from whatever established the room.
+    "send_room_photos": {"search_availability", "get_stay_options", "get_room_types"},
+    "get_room_details": {"search_availability", "get_stay_options", "get_room_types"},
 }
 
 
@@ -278,6 +310,55 @@ def test_a_toolset_can_use_every_tool_it_offers(tool, needs):
     for task, tools in toolsets.BY_TASK.items():
         available = set(tools) | set(toolsets.CORE)
         if tool in available:
-            assert needs in available, (
-                f"{task!r} offers {tool} but not {needs}, which it cannot run without"
+            assert available & set(needs), (
+                f"{task!r} offers {tool} and none of {sorted(needs)}, so the model "
+                f"can be handed {tool} and have no way to produce what it takes"
             )
+
+
+def test_every_prerequisite_names_tools_that_exist():
+    """
+    A typo here would silently switch the rule off for the tool it meant to
+    protect — the loop above only fires on names it finds in a toolset.
+    """
+    for tool, needs in PREREQUISITES.items():
+        assert tool in registry.REGISTRY, tool
+        for producer in needs:
+            assert producer in registry.REGISTRY, producer
+
+
+def test_every_tool_with_a_required_id_argument_is_accounted_for():
+    """
+    The list above is hand-written, which means the failure mode is *omission* —
+    a tool added next month that takes a required id and never gets a line here.
+
+    So the catalogue is walked instead of trusted: any tool with a required
+    argument whose name ends in `_id` must either be listed above, or be
+    deliberately exempted below with the reason it needs no producer. A new
+    tool that is neither fails this test on the day it is written, which is the
+    only day the answer is cheap.
+    """
+    # Ids that come from the *conversation*, not from another tool. `ctx`
+    # supplies these and the model is not trusted with them anyway — see
+    # `scoped_to_conversation` and AgentContext.allowed_reservations.
+    FROM_CONTEXT = {
+        "reservation_id", "conversation_id", "guest_id", "member_id",
+        "property_id", "folio_id", "room_id", "campaign_id", "creative_id",
+        "ad_account_id", "page_id", "recommendation_id", "escalation_id",
+        "channel_account_id", "booking_id",
+    }
+    unaccounted = []
+    for name, spec in registry.REGISTRY.items():
+        if name in PREREQUISITES:
+            continue
+        for field, info in spec.input_model.model_fields.items():
+            if not field.endswith("_id") or field in FROM_CONTEXT:
+                continue
+            if info.is_required():
+                unaccounted.append(f"{name}.{field}")
+
+    assert not unaccounted, (
+        "these tools take a required id and nothing says which tool produces "
+        f"it: {sorted(unaccounted)} — add them to PREREQUISITES or to "
+        "FROM_CONTEXT with a reason"
+    )
