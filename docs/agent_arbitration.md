@@ -25,6 +25,41 @@ turns actually run their tool, whose gate reads, literally, `not handoff`.
 That held while the model in production reached for the tool rarely. It stopped
 holding the moment a model reached for it more often.
 
+## 1a. What the measurement said, once the measurement was fixed
+
+The failure above is real and reproducible **with a scripted model**. It is not
+what the original numbers were measuring.
+
+`scripts/agent_eval.py` created its conversations without `last_inbound_at`.
+`messaging.window_open` is false when that column is null, so `send_message`
+refused with `MESSAGE_WINDOW_CLOSED` on every turn — and the agent's documented
+answer to a refused action is to hand off. A real guest turn cannot be in that
+state: the turn is *triggered by* an inbound message and the pipeline stamps
+the column before the agent runs. Only a synthetic conversation can be, and
+every conversation the evaluator made was.
+
+It was invisible while the model in production answered in prose. The moment a
+model started answering through `send_message` instead — a legitimate strategy
+the tool exists for, and the one its own description prescribes — that model hit
+a refusal on every turn, handed off on every turn, and the report attributed it
+to negotiation.
+
+With the column set and everything else held still, 30 runs per model:
+
+| | Gemini 2.5 | Gemini 3.x |
+|---|---|---|
+| negotiation completed | 83.3% | **96.7%** |
+| handoff rate | 20.0% | **3.3%** |
+| latency p50 | 70.5s | **11.7s** |
+
+Not one of the seven remaining handoffs was a `request_human_handoff` call.
+Every one is the provider-failure path.
+
+**So this layer is not a fix for an observed live failure rate.** It is the
+removal of a dependency: the system no longer relies on the model not having
+that bug. Which is the right thing to build either way — but the difference
+between those two claims matters, and the numbers say which one is true.
+
 ## 2. What the fix is not
 
 **It is not "put the old model back."** That leaves the system in the state
