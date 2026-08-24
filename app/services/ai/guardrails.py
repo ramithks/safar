@@ -148,70 +148,168 @@ _CONFIRMED = re.compile(
     r"| rooms?\s+(?:are|is)\s+(?:now\s+)?(?:yours|held|blocked)"
     r"| book\s+ho\s+ga(?:ye|ya|yi)"
     r"| confirm\s+ho\s+ga(?:ye|ya|yi)"
+    # The perfective *transitive*: "maine aapka room confirm kar diya hai" —
+    # I have confirmed it. Found by testing the mood rule below rather than by
+    # a transcript: every branch above needs the word "booking" or "rooms"
+    # adjacent to the verb, and this is the shape where a guest's own noun sits
+    # in between. `kar di` / `kar diya` / `kar liya` and the causative `karwa
+    # diya` are all completed action, which is exactly the claim.
+    #
+    # It cannot collide with the infinitive the tail rule allows: `kar diya` has
+    # a `d` where `karni`, `karna` and `karne` have their ending, so the two
+    # cannot both match.
+    r"| (?:confirm|book)\s+kar\s*(?:wa\s*)?[dl]i(?:ya|ye)?\b"
     r"| \u092c\u0941\u0915\s*\u0939\u094b\s*\u0917"
     r"| \u0915\u0928\u094d\u092b\u093c\u0930\u094d\u092e\s*\u0939\u094b\s*\u0917"
     r")"
 )
 
-# "Not yet", and "once your payment arrives".
+# ── is the phrase a claim, or only a mention of one? ────────────────────────
 #
-# `_CONFIRMED` matches the phrase, not the claim, so it fires on the two most
-# common *correct* replies to "payment hogyi?" — "aapki booking confirm nahi
-# hui hai" and "payment aate hi booking confirm ho jayegi". Both were refused,
-# and a refusal is a handoff: the guest asked whether their money arrived and
-# was told a person would come. That is the §16 failure the rule exists to
-# prevent, produced by the rule itself.
+# `_CONFIRMED` above matches a *phrase*. Whether that phrase is a *claim* is a
+# different question, and getting it wrong is expensive in both directions:
+# missing a claim tells a guest they have a room they do not have, and mistaking
+# a mention for a claim refuses an honest sentence — which is a handoff, at the
+# one moment in the conversation where a sale is being closed.
 #
-# Allowed only when a status tool ran this turn and reported a stay that is not
-# secured — see `check_reply`. With no lookup behind it, or with a confirmed
-# booking behind it, "ho jayegi" is still the sentence from the reference
-# transcript and is still refused.
-_NOT_YET = re.compile(
-    r"(?xi)"
-    r"( nahi | nahin | not\b | n't\b"
-    r"| ho\s+ja+yeg | ho\s+jaeg | will\s+be | once\b | jaise\s+hi | ke\s+baad"
-    r"| \u0928\u0939\u0940\u0902 )"
-)
+# **The second failure was the live one, and it was much worse than it looked.**
+# Every honest answer to "is my booking confirmed?" contains the words *booking
+# confirm*, because that is what the guest asked about. Measured against the
+# rule as it stood, all four of these were refused:
+#
+#     payment aate hi aapki booking confirm ho jayegi     (it will be, once you pay)
+#     booking confirm karne ke liye ₹38,647 pay kar dijiye (to confirm it, pay)
+#     aapki booking confirm nahi hui hai abhi tak          (it is NOT confirmed)
+#     I will email you once your booking is confirmed      (when it happens)
+#
+# The third one is a *denial*. The rule that exists to stop the agent claiming a
+# booking was refusing the sentence that says there isn't one.
+#
+# **Why the old shape could not be patched.** It was three regexes arguing:
+# `_CONFIRMED` for the phrase, `_NOT_YET` for a hedge anywhere in a ±90-character
+# window, and `_PURPOSIVE` for an infinitive in the twelve characters after —
+# with `_NOT_YET` gated on a `get_booking_status` call having run this turn. So
+# the same sentence was a lie or not a lie depending on which tools the model
+# happened to reach for, the window could be satisfied by an unrelated "nahi" a
+# few words back, and each new false refusal was answered with another
+# alternation. `karni` was the second one this month.
+#
+# **The shape that works is grammatical mood.** A stay is claimed to be secured
+# only when the phrase is *asserted*: indicative, affirmative, about this
+# booking, now. Infinitive, prospective, negated and conditional are all mentions
+# — whatever tools ran. Hindi puts mood in the verb and the verb after the
+# object, so the tail immediately following the phrase decides most of it; the
+# rest is an English subordinator heading the same clause. Two bounded lookups
+# instead of a window and a gate.
+
+# **The tail: what follows the phrase and unsays it.**
+#
+# Read against the phrase's own end, not a window, so nothing several words away
+# can license it.
+#
+#   infinitive    "…confirm karne ke liye"  "…confirm karni hai"   in order to / do you want to
+#   causative     "…confirm karwana hai"                           to have it confirmed
+#   prospective   "…confirm ho jayegi"  "…ho jaye"  "…hoga"        it will be / so that it may be
+#   negated       "…confirm nahi hui"  "…confirm na ho"            it has not been
+#
+# The perfective is deliberately absent, because the perfective is the claim:
+# `ho gaya`, `ho gayi`, `kar di hai`, `kar diya`, `hui hai`. Two pairs sit one
+# space apart and mean opposite things — `hoga` ("will be") against `ho gaya`
+# ("has become"), `karni` ("to do") against `kar di` ("has done") — so the
+# patterns below are anchored tightly enough to tell them apart. `hogaya` run
+# together is still perfective and still refused: `hog[aeio]` only matches with
+# a word boundary after it.
+_NOT_ASSERTED = re.compile(r"""(?xi)
+    ^\s*
+    (?:
+        # the infinitive, in all three genders, plain and causative
+          kar (?: ne | na | ni ) \b
+        | kar [wv] a (?: ne | na | ni ) \b
+        # the prospective: jaye / jayega / jayegi / jayenge / jaega / jaayegi
+        | (?: ho \s+ )? jaa? y? e (?: g [aeiou] \w* | nge | ) \b
+        | (?: ho \s+ )? jaana \b
+        # the simple future: hoga / hogi / hoge — but never "ho gaya"
+        | hog [aeio] \b
+        # the negation, which in Hindi sits between object and verb
+        | (?: nahi+n? | naa? ) \b
+        | not \b
+    )
+""")
+
+# **The head: a subordinator that makes the whole clause hypothetical.**
+#
+# English carries mood in front of the verb — "once your booking is confirmed"
+# is a condition, and the phrase itself is indicative. So the clause containing
+# the match is searched, from the nearest clause boundary, for a marker that
+# subordinates it.
+#
+# The boundary is a clause break rather than a character count, which is the
+# other half of what makes this reliable: in *"When you arrive, your room is
+# booked and ready"* the `when` governs a different clause, the comma ends the
+# segment, and the claim is correctly refused.
+#
+# **`ke liye` is deliberately not on this list**, and the reference transcript is
+# why. The sentence this whole rule was written for reads
+#
+#     aapke 2 Deluxe King Bed rooms 10 September se 14 September tak ke liye
+#     book ho gaye hain
+#
+# where `ke liye` means "for" — a date range, not a purpose. Treating it as a
+# hypothetical marker would have licensed the single worst sentence the product
+# has ever sent. The purposive is *infinitive* + `ke liye`, and the infinitive is
+# matched in the tail above, where it cannot be confused with this.
+_CLAUSE_BREAK = re.compile(r"[.!?;,\u2013\u2014\n]|\b(?:aur|lekin|magar|but|and)\b", re.I)
+_HYPOTHETICAL = re.compile(r"""(?xi)\b(?:
+      once | if | unless | whether | when (?:ever)? | after | until | till
+    | as\s+soon\s+as | so\s+that | in\s+order
+    | agar | jab | jaise\s+hi | jisse | taki | hote\s+hi | kya
+)\b""")
 
 
-# "…confirm *karne ke liye*" — in order to confirm.
+# The three moods, and they are three rather than two on purpose.
 #
-# Hindi and Hinglish build a purpose clause with the infinitive: "booking
-# confirm karne ke liye aapka email chahiye" is a request for an email address,
-# and `_CONFIRMED` read the first two words of it as a claim that the booking
-# was done. The guest asking to pay was handed to a human at the last step of
-# the sale.
+# A first cut of this rule had only "claim" and "not a claim", and it lost a
+# guarantee the old code did hold: *"aapki booking confirm nahi hui hai"* — your
+# booking is not confirmed — is every bit as much a statement about a stay as
+# the affirmative, and an agent that has not looked does not know it. Saying it
+# to a guest who *has* paid sends them to re-pay or to panic.
 #
-# Infinitives only. "confirm kar di hai" and "confirm kar diya" are the
-# perfective — *I have confirmed it* — and those are exactly the claim this
-# rule exists to catch.
-#
-# **`karni` was missing, and it is the form the word "booking" actually takes.**
-# Hindi infinitives agree with the gender of their object: `booking` is
-# feminine, so a guest is asked *"booking confirm **karni** hai?"* — do you want
-# to confirm the booking — where a masculine object would give `karna`. The rule
-# was written from a transcript that happened to contain the masculine, and the
-# feminine is the commoner one in this product's vocabulary because almost
-# everything the agent confirms is a *booking*.
-#
-# Found by `scripts/replay_e2e.py` on the live model, in the middle of a sale:
-#
-#     Agar aapko booking confirm karni hai toh batayein, main payment link
-#     bhej deta hoon.
-#
-# — an offer to send a payment link, refused as a claim that a booking existed,
-# which escalated the turn and handed the guest to a person at the exact moment
-# they were being asked to pay. Precisely the failure the `_PURPOSIVE` exception
-# was added to prevent, in a gender it did not cover.
-#
-# The causatives are here for the same reason — "booking confirm karwani hai" is
-# the same sentence with somebody else doing the confirming. `karwaya` and
-# `karvaya` are deliberately NOT matched: those are perfective ("I had it
-# confirmed"), which is a claim.
-_PURPOSIVE = re.compile(r"(?i)^\s*kar(?:ne|na|ni)\b|^\s*kar[wv]a(?:ne|na|ni)\b")
+# So a denial is asserted too; it simply needs a different licence. The
+# affirmative needs a tool that secures a stay. The denial needs a lookup that
+# came back saying there isn't one. Only the hypothetical needs nothing, because
+# it makes no claim about the present state at all.
+CLAIMED = "claimed"          # "aapki booking confirm ho gayi hai"
+DENIED = "denied"            # "aapki booking confirm nahi hui hai"
+HYPOTHETICAL = "hypothetical"  # "…confirm ho jayegi" / "…karne ke liye" / "agar…"
+
+# The negation, split out of the tail rule so it can be licensed separately.
+# Hindi puts it between the object and the verb, which is where the tail looks.
+_NEGATED = re.compile(r"(?xi) ^\s* (?: nahi+n? | naa? | not ) \b")
 
 
-def _reported_unsecured(tool_outputs: list) -> bool:
+def _mood(text: str, match: re.Match) -> str:
+    """
+    Is this occurrence a claim, a denial, or neither?
+
+    The clause head is read before the tail: *"agar booking confirm nahi hui to
+    batayein"* is a condition, not a denial, and the `agar` that makes it one
+    governs the whole clause.
+    """
+    head = text[:match.start()]
+    breaks = list(_CLAUSE_BREAK.finditer(head))
+    clause = head[breaks[-1].end():] if breaks else head
+    if _HYPOTHETICAL.search(clause):
+        return HYPOTHETICAL
+
+    tail = text[match.end():match.end() + 24]
+    if _NEGATED.match(tail):
+        return DENIED
+    if _NOT_ASSERTED.match(tail):
+        return HYPOTHETICAL
+    return CLAIMED
+
+
+def _state_was_looked_up(tool_outputs: list) -> bool:
     """Did a status lookup this turn come back saying the stay is not secured?"""
     for outcome in tool_outputs or []:
         if getattr(outcome, "tool", "") != _STATUS_TOOL:
@@ -222,6 +320,29 @@ def _reported_unsecured(tool_outputs: list) -> bool:
         if isinstance(output, dict) and output.get("state") not in _SECURED_STATES:
             return True
     return False
+
+
+def _unlicensed_claim(text: str, tool_outputs: list, tools_run: set) -> tuple[str, str] | None:
+    """
+    The first statement about a stay that nothing on this run backs.
+
+    Returns the mood and the phrase, or None when every occurrence is either
+    licensed or makes no claim.
+    """
+    licensed_affirmative = bool(tools_run & CONFIRMING_TOOLS) or _read_a_real_booking(tool_outputs)
+    licensed_denial = _state_was_looked_up(tool_outputs)
+
+    position = 0
+    while True:
+        found = _CONFIRMED.search(text, position)
+        if found is None:
+            return None
+        mood = _mood(text, found)
+        if mood == CLAIMED and not licensed_affirmative:
+            return CLAIMED, found.group(0)
+        if mood == DENIED and not licensed_denial:
+            return DENIED, found.group(0)
+        position = found.end()
 
 
 _URL = re.compile(r"""(?xi)\b(?:https?://|www\.)[^\s<>"'\)\]]+""")
@@ -515,24 +636,21 @@ def check_reply(
     # Checked before money, because it is the more expensive lie: a guest who
     # believes a wrong price argues at the desk, and a guest who believes a
     # wrong booking arrives with luggage.
-    confirmed = _CONFIRMED.search(text)
-    # An infinitive is never a claim, whatever ran this turn.
-    while confirmed and _PURPOSIVE.match(text[confirmed.end():confirmed.end() + 12]):
-        confirmed = _CONFIRMED.search(text, confirmed.end())
-    if confirmed and _reported_unsecured(tool_outputs):
-        # The agent looked, found nothing secured, and is saying so. Whether it
-        # phrased that as a negation or as what happens next, it is answering
-        # the question rather than claiming an outcome.
-        window = text[max(0, confirmed.start() - 30):confirmed.end() + 60]
-        if _NOT_YET.search(window):
-            confirmed = None
-
-    if confirmed and not (tools_run & CONFIRMING_TOOLS) \
-            and not _read_a_real_booking(tool_outputs):
+    # Only the occurrences that state something about the stay *now* — see
+    # `_mood`. An infinitive, a future or a conditional is a mention of a
+    # booking rather than an assertion that one exists, and needs no licence:
+    # no arrangement of tool calls can make "payment aate hi booking confirm ho
+    # jayegi" into a statement that the guest already has a room.
+    unlicensed = _unlicensed_claim(text, tool_outputs, tools_run)
+    if unlicensed:
+        mood, phrase = unlicensed
         return Verdict(
             False,
-            f"reply said a stay was secured ({confirmed.group(0)[:40]!r}) "
-            "with nothing on this run that secures one",
+            f"reply said a stay was secured ({phrase[:40]!r}) "
+            "with nothing on this run that secures one"
+            if mood == CLAIMED else
+            f"reply said a stay was not secured ({phrase[:40]!r}) "
+            "without looking it up on this run",
         )
 
     # ── money ───────────────────────────────────────────────────────────
