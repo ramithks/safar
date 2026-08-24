@@ -62,7 +62,7 @@ HANDLE = f"inbox_e2e_{TAG}"
 BOOKED = str(uuid.uuid4())
 QUOTED = str(uuid.uuid4())
 SILENT = str(uuid.uuid4())
-STAY_REF = f"TB-IBX{TAG[:3].upper()}"
+STAY_REF = f"TB-IBX{TAG[:3].upper()}"  # swept by STAY_PREFIX, below
 
 raw = subprocess.check_output(
     ["security", "find-generic-password", "-s", "Supabase CLI", "-w"], text=True
@@ -122,8 +122,31 @@ def signin(email):
     return {"Authorization": "Bearer " + d["access_token"]} if st == 200 else None
 
 
+# Every fixture stay this suite has ever written, not only this run's.
+#
+# `STAY_REF` carries a per-run tag, so `where ref = '{STAY_REF}'` could only
+# ever delete the row the *current* process made. A run that died between the
+# insert and the sweep left its reservation behind for good, and the next run
+# generated a new tag and could not see it.
+#
+# Found by `reconcile_inventory` on 2026-08-24: three "Inbox Panel Guest" stays
+# at Casa Mandala from 2026-08-22, six units across 2026-09-21 to 09-25, against
+# a `room_inventory.units_booked` of zero for those nights. These rows are
+# INSERTed straight into `reservations` and never call `convert_hold`, so they
+# move no counter in either direction — which makes them harmless while they are
+# swept and an *oversell* while they are not: the ledger says nothing is sold on
+# nights that have six reservations against them, and the hotel can sell them
+# again.
+#
+# The conversations sweep beside it was already prefix-scoped and self-healing.
+# The asymmetry was the whole bug, and every other suite in this directory —
+# checkin, owner, marketing, vertex — sweeps by prefix already.
+STAY_PREFIX = "TB-IBX"
+
+
 def sweep():
-    sql(f"""delete from public.reservations where ref = '{STAY_REF}';""")
+    sql(f"""delete from public.reservations
+             where property_id = '{PROP}' and ref like '{STAY_PREFIX}%';""")
     sql(f"""delete from public.conversations
              where guest_handle like 'inbox_e2e_%';""")
 

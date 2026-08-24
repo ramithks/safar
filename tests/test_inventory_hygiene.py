@@ -565,3 +565,51 @@ class TestTheInvariantItself:
         import inspect
         source = inspect.getsource(e2e_sweep.inventory_disagreements)
         assert "from reconcile_inventory import disagreements" in source
+
+
+# ── a sweep that can only clean up after itself ─────────────────────────────
+#
+# **The third way the counter goes wrong**, after the UPDATE and the DELETE that
+# skip `release_booking`. Those two lose the hotel stock it has. This one is the
+# mirror: a fixture reservation *left behind* is a live row the ledger does not
+# know about, so `room_inventory.units_booked` under-counts and the hotel can
+# sell a night it has already sold.
+#
+# Found by `reconcile_inventory` on 2026-08-24, and it had been accumulating for
+# two days: three "Inbox Panel Guest" stays at Casa Mandala, six units across
+# 2026-09-21 to 09-25, against `units_booked = 0` on those nights.
+#
+# The cause was a sweep scoped to one run. `inbox_e2e` built `STAY_REF` from a
+# per-process tag and deleted `where ref = '{STAY_REF}'` — so a run that died
+# between the insert and the sweep left its row for ever, and the next run
+# generated a new tag and could not see it. The conversations sweep on the very
+# next line was already prefix-scoped and self-healing, which is what makes this
+# a rule rather than an oversight: the correct shape was in the same function.
+#
+# So the rule is about *reachability*, not about releasing: a fixture teardown
+# has to be able to clean up the run before it. Every other suite in the
+# directory — checkin, owner, marketing, vertex — already sweeps by prefix.
+
+# `where ref = '<something>'` on a reservations delete. Equality is the tell:
+# a prefix match with LIKE reaches earlier runs and an equality match cannot.
+SWEEP_BY_EXACT_REF = re.compile(
+    r"delete\s+from\s+(?:public\.)?reservations\b[^;]*?"
+    r"\bref\s*=\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+@pytest.mark.parametrize("script", scripts(), ids=lambda p: p.name)
+def test_a_fixture_sweep_can_reach_the_run_before_it(script):
+    """
+    A teardown that deletes only its own run's reservation is a teardown that
+    leaks one row every time the suite crashes — and the rows it leaks are
+    invisible to `units_booked`, which is an oversell rather than a lost night.
+    """
+    source = script.read_text()
+    offending = SWEEP_BY_EXACT_REF.search(source)
+    assert not offending, (
+        f"{script.name} deletes reservations by an exact ref. Sweep by a stable "
+        f"prefix instead — `ref like 'TB-XX%'` — so a run that died before its "
+        f"teardown is cleaned up by the next one. See inbox_e2e.STAY_PREFIX."
+    )
