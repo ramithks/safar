@@ -316,7 +316,9 @@ async def run_turn(
     # of the base prompt and every step re-sends it, so letting one decision do
     # both jobs is the cheapest optimisation available here. It cannot widen a
     # permission: see services/ai/toolsets.py.
-    tools = registry.describe_for_provider(ctx, task=task)
+    tools = registry.describe_for_provider(
+        ctx, task=task, opening=bool(routed is not None and routed.opening),
+    )
 
     # Declared ahead of the rest of the turn's bookkeeping, because `ctx.turn`
     # is given *this* list object rather than a copy of it. A snapshot of what

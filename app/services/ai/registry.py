@@ -193,7 +193,8 @@ def available_for(ctx: AgentContext) -> list[ToolSpec]:
     ]
 
 
-def describe_for_provider(ctx: AgentContext, task: str | None = None) -> list[dict]:
+def describe_for_provider(ctx: AgentContext, task: str | None = None,
+                          *, opening: bool = False) -> list[dict]:
     """
     The tool list in the shape a chat-completions API expects.
 
@@ -201,10 +202,14 @@ def describe_for_provider(ctx: AgentContext, task: str | None = None) -> list[di
     services/ai/toolsets.py. Left out, everything granted is described, which
     is what every caller did before the narrowing existed and what the
     unclassifiable case still gets.
+
+    `opening` says the classifier recognised a bare greeting on an empty
+    thread, which narrows harder than any task does.
     """
     specs = available_for(ctx)
-    if task:
-        shown = toolsets.for_task(task, frozenset(s.name for s in specs))
+    if task or opening:
+        shown = toolsets.for_task(task, frozenset(s.name for s in specs),
+                                  opening=opening)
         specs = [s for s in specs if s.name in shown]
     return [
         {

@@ -219,7 +219,8 @@ EVERYTHING = frozenset({
 })
 
 
-def for_task(task: str | None, granted: frozenset[str] | set[str]) -> frozenset[str]:
+def for_task(task: str | None, granted: frozenset[str] | set[str],
+             *, opening: bool = False) -> frozenset[str]:
     """
     The tool names to describe for this turn.
 
@@ -227,8 +228,38 @@ def for_task(task: str | None, granted: frozenset[str] | set[str]) -> frozenset[
     subset of it — that is the invariant that makes this an optimisation rather
     than a second permission system, and `tests/test_toolsets.py` asserts it
     over every task and every agent definition.
+
+    `opening` is a message that is *only* a greeting on a thread with nothing
+    before it — see below.
     """
     granted = frozenset(granted)
+
+    # **"Hi" is the commonest turn in the system and pays the full catalogue.**
+    #
+    # Measured over three days of production: `guest_conversation` is 60% of all
+    # webhook runs, it is in EVERYTHING and so narrows nothing, and it carries
+    # every one of the guest agent's 39 schemas on every model step — about
+    # 7,300 tokens. The runs themselves call 0.43 tools on average.
+    #
+    # The reason `guest_conversation` narrows nothing is sound and is not being
+    # changed: it is the fallback for a message the classifier could not read,
+    # and under-equipping the turns we understand least is exactly backwards.
+    # But it is *also* the greeting task, and those two populations are not
+    # alike. A greeting is the one message in this product that is known, for
+    # free and before any model runs, to be asking for nothing:
+    # `classify.is_opening` is a closed list of exact strings, so "hi, do you
+    # have rooms tomorrow?" is not one and never was.
+    #
+    # CORE, not nothing. A greeting still has to be answerable — the hotel's own
+    # name and knowledge, the ability to reply through a tool where the channel
+    # needs it, and a way to reach a person. What it does not need is nineteen
+    # ways to price a stay it has not been asked about yet, and the guest's next
+    # message classifies normally.
+    if opening:
+        narrowed = granted & CORE
+        if narrowed:
+            return narrowed
+
     if not task or task in EVERYTHING:
         return granted
 

@@ -182,6 +182,14 @@ class Classification:
     tokens_out: int = 0
     model: str = ""
 
+    # Was this only a greeting, on a thread with nothing before it?
+    #
+    # Carried rather than recomputed. `is_opening` is already consulted here,
+    # under a condition — `not history` — that the runtime would have to
+    # duplicate to ask the same question, and a predicate written twice is a
+    # predicate that drifts. See services/ai/toolsets.for_task.
+    opening: bool = False
+
 
 class StaticClassifier:
     """
@@ -236,7 +244,7 @@ class ModelClassifier:
         if not history and is_opening(message):
             task = opening_task(agent_type)
             return Classification(task=task, tier=model_router.tier_of(task),
-                                  source="default")
+                                  source="default", opening=True)
 
         choice = model_router.select(
             agent_type=agent_type, task="intent_classification"
