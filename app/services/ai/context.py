@@ -94,6 +94,15 @@ class TurnState:
     thrown away, so there is nothing here to leak into the next one.
     """
 
+    # Whether a turn is actually in progress and has published itself here.
+    #
+    # False on a context built outside `run_turn` — the approval path is the one
+    # that matters: `approvals.execute_action` runs a tool a human queued and
+    # then approved, with no turn behind it. Layers that read this state have to
+    # be able to tell "there is no evidence" from "the evidence says no", and
+    # those are opposite answers. See `tools/communication._refuse_what_may_not_be_said`.
+    live: bool = False
+
     # The guest's message, exactly as they wrote it.
     message: str = ""
     # The conversation so far, as the model was given it. Carried because the

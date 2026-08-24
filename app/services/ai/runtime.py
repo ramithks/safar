@@ -341,6 +341,7 @@ async def run_turn(
     # claims to describe — a question whose evidence lives in the turn rather
     # than in the tool's arguments. See services/ai/arbiter.py and
     # services/ai/context.py:TurnState.
+    ctx.turn.live = True
     ctx.turn.message = message
     ctx.turn.requirements = tuple(requirements)
     ctx.turn.outcomes = outcomes

@@ -359,3 +359,62 @@ class TestTheQuoteCarriesItsOwnDeposit:
         assert any("min_units" in g and "units" in g for g in guarded), (
             "the deposit is not conditional on the booking being a group"
         )
+
+
+# ── the path a human has already approved ───────────────────────────────────
+
+class TestTheApprovalPath:
+    """
+    **A regression this check would have caused, found by asking who else calls
+    `registry.execute`.**
+
+    `approvals.execute_action` runs a tool a human queued and then approved, on
+    a context built outside `run_turn`. `ctx.turn` is therefore empty — and to a
+    check that reads `turn.outcomes` for its evidence, an empty turn looks
+    exactly like a turn on which no tool has run. Every figure in the message
+    would be refused.
+
+    At autonomy 1 the agent *proposes* its messages and a person approves them.
+    That is the configuration the most careful hotels run in, and prices are
+    exactly what those messages are about — so the check would have broken
+    outbound messaging for precisely the hotels that asked for the most
+    supervision.
+
+    "There is no evidence" and "the evidence says no" are opposite answers, and
+    they were about to get the same one. `TurnState.live` is the distinction,
+    and a person who has read the message and pressed approve is a better
+    authority on its contents than this function.
+    """
+
+    def test_a_context_outside_a_turn_is_not_second_guessed(self):
+        from app.services.ai.tools import communication
+
+        ctx = ctx_for()
+        assert ctx.turn.live is False
+        # A price with no tool behind it, which a live turn would refuse.
+        run(communication._refuse_what_may_not_be_said("Total ₹65,946 hai.", ctx))
+
+    def test_a_live_turn_still_is(self):
+        import pytest as _pytest
+
+        from app.services.ai.errors import OutOfScope
+        from app.services.ai.tools import communication
+
+        ctx = ctx_for()
+        ctx.turn.live = True
+        with _pytest.raises(OutOfScope):
+            run(communication._refuse_what_may_not_be_said("Total ₹65,946 hai.", ctx))
+
+    def test_the_runtime_is_what_marks_a_turn_live(self, db, sent):
+        """
+        Asserted through a real turn rather than by reading the flag, so the two
+        cannot drift: if `run_turn` stopped setting it, the check would silently
+        stop running on every guest message and every test above would still
+        pass.
+        """
+        provider = EchoProvider([
+            [("send_message", {"body": "Deposit ₹19,784 hoga."})],
+            "Theek hai.",
+        ])
+        run(runtime.run_turn(ctx_for(), "5 kamre chahiye", provider=provider))
+        assert sent == [], "a live guest turn did not get the outbound check"

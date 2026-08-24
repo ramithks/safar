@@ -247,6 +247,25 @@ async def _refuse_what_may_not_be_said(body: str, ctx: AgentContext) -> None:
     if turn is None or not (body or "").strip():
         return
 
+    # **Not on the approval path, and the distinction is the whole reason
+    # `TurnState.live` exists.**
+    #
+    # `approvals.execute_action` runs a tool a human queued and then approved,
+    # on a context built outside `run_turn` — so `turn.outcomes` is empty. To
+    # this check that looks identical to a turn where no tool has run, and every
+    # figure in the message would be refused. At autonomy 1 the agent *proposes*
+    # its messages and a person approves them, which is exactly the
+    # configuration where the most careful hotels run, and prices are exactly
+    # what those messages are about.
+    #
+    # "There is no evidence" and "the evidence says no" are opposite answers and
+    # were about to be given the same one. A human who has read the message and
+    # pressed approve is a better authority on it than this function, and
+    # `registry.execute` has already checked everything a human cannot lend —
+    # permission, grant, the property's own rules. See `approvals`.
+    if not turn.live:
+        return
+
     verdict = guardrails.check_reply(
         body,
         tool_outputs=list(turn.outcomes),
