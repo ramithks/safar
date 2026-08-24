@@ -486,16 +486,31 @@ print("\n── duplicate inbound ──")
 
 before_runs = len(runs())
 before_msgs = len(messages())
-before_usage = sql(f"""select count(*) as n from public.usage_events
-                        where property_id = '{PROPERTY}';""")[0]["n"]
+# **Scoped to this conversation, not to the property.**
+#
+# This counted every usage event Casa Mandala had ever recorded, so it was
+# really asserting "nothing anywhere billed this hotel between these two
+# reads" — which is true only when nothing else is touching the demo property.
+# It failed on a run where `scripts/agent_eval.py` was sweeping the same hotel
+# in another terminal: 15,621 → 15,627, six events that had nothing to do with
+# a redelivered webhook.
+#
+# The property is shared by every e2e suite and by the evaluation runner, and a
+# test that cannot survive a neighbour is a test that gets muted. What the
+# duplicate-inbound case is actually about is *this thread*, which is the scope
+# it now counts.
+before_usage = sql(f"""select count(*) as n from public.usage_events u
+                        where u.property_id = '{PROPERTY}'
+                          and u.conversation_id = '{conversation()['id']}';""")[0]["n"]
 
 repeat = deliver(payload, script=["This should never run."])
 check("Meta's redelivery is recognised", repeat["duplicates"] == 1, str(repeat))
 check("and accepted nothing new", repeat["accepted"] == 0, str(repeat))
 check("no second message row", len(messages()) == before_msgs, f"{before_msgs} → {len(messages())}")
 check("no second agent run", len(runs()) == before_runs, f"{before_runs} → {len(runs())}")
-after_usage = sql(f"""select count(*) as n from public.usage_events
-                       where property_id = '{PROPERTY}';""")[0]["n"]
+after_usage = sql(f"""select count(*) as n from public.usage_events u
+                       where u.property_id = '{PROPERTY}'
+                         and u.conversation_id = '{conversation()['id']}';""")[0]["n"]
 check("and nothing was metered twice", after_usage == before_usage,
       f"{before_usage} → {after_usage}")
 check("nor a second reply sent to the guest",

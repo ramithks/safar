@@ -80,6 +80,13 @@ db = get_db()
 # an UPDATE — see scripts/e2e_sweep.py for what that costs a hotel.
 BOOKED: list[str] = []
 
+# The level the selling tools need. `get_quote`, `negotiate_rate` and
+# `cancel_booking` all sit at autonomy floor 3; below it they queue for a human
+# rather than executing, and the agent hands off. Measuring "did the required
+# tool run" against an agent that is not allowed to run it measures the
+# fixture. See `prepare_property`.
+REQUIRED_AUTONOMY = 3
+
 
 # ── the scenarios ────────────────────────────────────────────────────────────
 #
@@ -254,6 +261,60 @@ def unexplained(named: set[int], known: set[int]) -> list[int]:
 
 
 # ── the harness ──────────────────────────────────────────────────────────────
+
+def prepare_property() -> dict:
+    """
+    Make sure the hotel being measured can actually do the things being measured.
+
+    **A run that skipped this produced a number that meant nothing.** The eval
+    reported negotiation accuracy of 7% and a 90% handoff rate, which read as a
+    catastrophic model regression. It was not: `agents.autonomy_level` on the
+    demo property had been left at 2 by an earlier e2e suite, `negotiate_rate`
+    and `get_quote` both sit at floor 3, and at level 2 they queue for approval
+    instead of executing. The agent then handed off — correctly, and exactly as
+    designed. Every one of those 13 "failures" was the autonomy ladder working.
+
+    `agents.autonomy_level` is shared demo state and several suites set it to 2
+    for their own assertions without putting it back; `scripts/replay_e2e.py`
+    has the same paragraph and the same `update` for the same reason. An
+    evaluation of unattended selling against an agent that may not sell
+    unattended is measuring the fixture, not the build.
+
+    **Demo properties only.** Raising a real hotel's autonomy because a script
+    wanted a cleaner number would be changing a customer's configuration to
+    make a report look better, which is the worst thing on this page.
+    """
+    rows = (
+        db.table("properties").select("id,name,is_demo")
+        .eq("id", PROPERTY).limit(1).execute().data or []
+    )
+    if not rows:
+        raise SystemExit(f"property {PROPERTY} does not exist")
+    prop = rows[0]
+    if not prop.get("is_demo"):
+        raise SystemExit(
+            f"{prop['name']} is not a demo property. This script sets autonomy "
+            f"and books rooms; point it at a demo hotel."
+        )
+
+    agents = (
+        db.table("agents").select("id,autonomy_level")
+        .eq("property_id", PROPERTY).eq("agent_type", "guest").limit(1).execute().data or []
+    )
+    if not agents:
+        raise SystemExit("no guest agent on the demo property")
+
+    was = agents[0].get("autonomy_level")
+    if was != REQUIRED_AUTONOMY:
+        db.table("agents").update({"autonomy_level": REQUIRED_AUTONOMY}).eq(
+            "id", agents[0]["id"]
+        ).execute()
+        print(f"   autonomy   guest agent was at {was}; set to "
+              f"{REQUIRED_AUTONOMY} for this run (demo property)")
+    else:
+        print(f"   autonomy   guest agent at {REQUIRED_AUTONOMY}")
+    return {"was": was, "agent_id": agents[0]["id"], "name": prop["name"]}
+
 
 def make_conversation(key: str) -> dict:
     row = {
@@ -665,6 +726,7 @@ async def main() -> int:
     print(f"   nights     {FIRST_STAY} onwards, one week per run")
     print("   legend     M model called it · A application forced it · "
           "✗ never happened · ! turn failed")
+    prepared = prepare_property()
 
     started = time.monotonic()
     everything: list[str] = []
@@ -707,6 +769,11 @@ async def main() -> int:
 
     payload = {
         "ran_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        # Stamped on the results, because a number produced at the wrong
+        # autonomy is not a worse number — it is a different measurement.
+        "property": prepared["name"],
+        "autonomy_level": REQUIRED_AUTONOMY,
+        "autonomy_was": prepared["was"],
         "runs_per_scenario": args.runs,
         "scenarios": [s["key"] for s in chosen],
         "summaries": summaries,

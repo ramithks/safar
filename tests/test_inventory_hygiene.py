@@ -213,3 +213,74 @@ def test_the_product_now_has_a_cancellation_path_of_its_own():
     source = pathlib.Path(cancellation.__file__).read_text()
     assert "release_booking" in source
     assert source.index("release_booking") < source.index('"status": "cancelled"')
+
+
+# ── the other shared fixture, and the same lesson ───────────────────────────
+
+class TestAutonomyIsAlsoSharedState:
+    """
+    Inventory was not the only demo-wide thing a suite could quietly move.
+
+    `agents.autonomy_level` is shared exactly as `room_inventory` is: several
+    e2e suites set the demo hotel's guest agent to 2 for their own assertions,
+    and none of them put it back. That is defensible on its own — until
+    something else reads it and reports a number.
+
+    **What it cost.** A live evaluation run reported negotiation accuracy of
+    7% and a handoff rate of 90%, which reads as a catastrophic model
+    regression and sent me looking for one. There was none. An earlier suite
+    had left the agent at level 2, `negotiate_rate` and `get_quote` both sit at
+    autonomy floor 3, and below their floor they queue for approval rather than
+    executing — so the agent handed off, correctly, thirteen times. Every one
+    of those "failures" was the autonomy ladder doing its job.
+
+    The failure mode is identical to the 377 phantom room-nights: a shared
+    fixture mutated by one suite and read as truth by another. The defence is
+    the same shape too — the reader states what it needs and sets it, rather
+    than hoping.
+    """
+
+    def test_the_selling_tools_really_do_need_level_three(self):
+        """
+        The premise. If these floors ever drop, the eval's `REQUIRED_AUTONOMY`
+        is over-privileging the agent it measures and should drop with them.
+        """
+        from app.services.ai import registry
+
+        registry.load_all()
+        for name in ("get_quote", "negotiate_rate", "cancel_booking"):
+            assert registry.REGISTRY[name].autonomy_floor == 3, name
+
+    def test_the_evaluator_states_the_level_it_needs(self):
+        import scripts.agent_eval as ev  # noqa: PLC0415
+
+        assert ev.REQUIRED_AUTONOMY == 3
+        assert hasattr(ev, "prepare_property")
+
+    def test_the_evaluator_refuses_to_touch_a_real_hotel(self):
+        """
+        Raising a customer's autonomy because a script wanted a cleaner number
+        would be changing their configuration to make a report look better.
+        The guard is `is_demo`, and it is asserted rather than trusted.
+        """
+        import inspect
+
+        import scripts.agent_eval as ev  # noqa: PLC0415
+
+        source = inspect.getsource(ev.prepare_property)
+        assert "is_demo" in source
+        assert "SystemExit" in source
+
+    def test_the_measurement_records_the_level_it_was_taken_at(self):
+        """
+        A number produced at the wrong autonomy is not a worse number, it is a
+        different measurement — and one that cannot be told apart from the
+        right one after the fact unless the level travels with it.
+        """
+        import inspect
+
+        import scripts.agent_eval as ev  # noqa: PLC0415
+
+        source = inspect.getsource(ev.main)
+        assert '"autonomy_level"' in source
+        assert '"autonomy_was"' in source
