@@ -18,9 +18,26 @@ class Settings(BaseSettings):
     # Each Vertex region has its own quota, so rotating spreads load and lets a
     # rate-limited request retry immediately against a fresh region instead of
     # sleeping through a long backoff. Comma-separated; primary is always first.
+    # `global` and `asia-south1` are both here for reasons worth stating.
+    #
+    # **`global` was missing and it cost the Gemini 3 upgrade.** Almost the whole
+    # 3.x family is served from `global` and from nowhere else, so a universe
+    # that did not contain it could not reach any of them however the model ids
+    # were spelled.
+    #
+    # **`asia-south1` is where this application runs.** Mumbai serves
+    # `gemini-2.5-flash` at ~0.7s against us-central1's ~2.2s, and
+    # `gemini-3.5-flash` at ~1.8s against global's ~2.4s. It was absent from a
+    # list of eleven regions on three continents.
+    #
+    # This is the universe, not the itinerary: which of these can serve a given
+    # model is `app/services/model_catalog.py`, which was measured per model.
+    # Several models 404 in several of these, and the catalogue is what keeps a
+    # call from being sent somewhere it cannot be answered.
     gcp_locations: str = (
+        "global,asia-south1,asia-southeast1,"
         "us-central1,us-east1,us-east4,us-east5,us-west1,us-west4,"
-        "us-south1,northamerica-northeast1,europe-west1,europe-west4,asia-southeast1"
+        "us-south1,northamerica-northeast1,europe-west1,europe-west4"
     )
     # Path to a service account JSON key; leave unset to use ADC
     google_application_credentials: Optional[str] = None
@@ -75,16 +92,53 @@ class Settings(BaseSettings):
     #                 costs more than the tokens.
     #   classify      routing, intent, language, spam. Never worth the others.
     #
-    # **The 3.x family is the intended target and is not yet reachable.**
-    # gemini-3-flash, gemini-3.1-pro and gemini-3.1-flash-lite all return 404
-    # for project travbuddy-499007 — in us-central1, us-east5, europe-west4 and
-    # global, on both v1 and v1beta1. Credentials are fine; the models are not
-    # enabled for this project. So the tiers run on 2.5, which is verified
-    # working with function calling, and moving is three lines here once access
-    # lands: the router, the provider and the tool conversion name no model.
-    hotel_model_conversation: str = "gemini-2.5-flash"       # target: gemini-3-flash
-    hotel_model_reasoning: str = "gemini-2.5-pro"            # target: gemini-3.1-pro
-    hotel_model_classify: str = "gemini-2.5-flash-lite"      # target: gemini-3.1-flash-lite
+    # **The 3.x family is reachable, and the note that said otherwise was wrong
+    # in a way worth recording.** It read: "gemini-3-flash, gemini-3.1-pro and
+    # gemini-3.1-flash-lite all return 404 … the models are not enabled for this
+    # project." Two mistakes compounded into that conclusion. `gemini-3-flash`
+    # and `gemini-3.1-pro` are not model ids — the real ones are
+    # `gemini-3-flash-preview` and `gemini-3.1-pro-preview`. And every 3.x model
+    # is served from `global`, whose endpoint has no region prefix, which the
+    # URL builder could not construct. Wrong id and unreachable host both return
+    # 404, which reads exactly like no access. Every model below was verified by
+    # live `generateContent`, including function calling and responseSchema.
+    #
+    # Four tiers now, because "conversation" was doing two jobs. A guest asking
+    # for the wifi password and a guest disputing a cancellation fee were both
+    # the workhorse; splitting them lets the cheap model take the volume while
+    # the brain keeps the work that needs it.
+    #
+    #   classify      the router: intent, language, spam. Never reasons.
+    #   fast          FAQs, lookups, simple CRUD. High volume, thinking off.
+    #   conversation  the agent brain: tool selection, operations, money.
+    #   deep          escalation only, when the brain has already failed.
+    #
+    # Ids only. Locations, thinking budgets and fallbacks are in
+    # `app/services/model_catalog.py`, because they are properties of the model
+    # rather than choices this deployment makes.
+    hotel_model_classify: str = "gemini-3.5-flash-lite"
+    hotel_model_fast: str = "gemini-3.5-flash"
+    hotel_model_conversation: str = "gemini-3.6-flash"
+    hotel_model_reasoning: str = "gemini-3.6-flash"
+    hotel_model_deep: str = "gemini-3.1-pro-preview"
+
+    # **The rollback, and it is one variable.**
+    #
+    # False puts every tier back on the 2.5 models that have been serving
+    # production, without a deploy and without touching the router. That is what
+    # makes this not a big-bang migration: 3.x is the default because it is
+    # better, and it is one environment variable away from not being.
+    #
+    # The 2.5 ids are kept as their own settings rather than hardcoded in the
+    # rollback path, so the floor stays configurable too.
+    hotel_models_v3: bool = True
+    hotel_model_classify_stable: str = "gemini-2.5-flash-lite"
+    hotel_model_fast_stable: str = "gemini-2.5-flash"
+    hotel_model_conversation_stable: str = "gemini-2.5-flash"
+    # 2.5-pro, so a rollback restores the exact configuration that was in
+    # production before any of this — not an approximation of it.
+    hotel_model_reasoning_stable: str = "gemini-2.5-pro"
+    hotel_model_deep_stable: str = "gemini-2.5-pro"
 
     # Per request, not per turn. A guest waiting on WhatsApp will forgive thirty
     # seconds; a hung socket holding a worker is a different problem.
@@ -170,6 +224,37 @@ class Settings(BaseSettings):
     instagram_redirect_uri: str = (
         "https://stayos-backend.travbuddy.in/api/v1/messaging/instagram/oauth/callback"
     )
+
+    # ── Meta ads ─────────────────────────────────────────────────────────────
+    #
+    # **Declared because they were unreachable, not because they are set.**
+    #
+    # `marketing/meta_ads._missing_credentials` reads these two with
+    # `getattr(settings, ..., None)` and reports `ad_account` / `ads_permission`
+    # when they are absent — which is right, and was the *only* possible
+    # outcome: neither field existed on Settings, and `model_config` above is
+    # `extra="ignore"`. So a hotelier who obtained an ad account and set
+    # META_AD_ACCOUNT_ID and META_ADS_ACCESS_TOKEN in the environment had them
+    # silently dropped by pydantic, and the product went on saying "connect a
+    # Meta ad account" at somebody who just had.
+    #
+    # Declaring them does not connect anything and does not weaken the check
+    # constraint that keeps a campaign out of `published` without a Meta id.
+    # It turns "cannot be configured" into "configured or not", which is the
+    # difference between a gap and a trap.
+    #
+    # Still required externally, and none of it is a code change: a Meta
+    # Business account, a funded ad account (`act_…`), `ads_management` granted
+    # to the app through App Review, and a Facebook Page linked to the
+    # Instagram professional account. The Instagram credentials this system
+    # already holds are messaging scopes and do not carry any of it — see
+    # services/marketing/meta_ads.py.
+    meta_ad_account_id: Optional[str] = None
+    meta_ads_access_token: Optional[str] = None
+    # The Page an ad's destination resolves to when the campaign is not
+    # click-to-WhatsApp. `build_request` already takes it per call; this is the
+    # property-independent default for a single-tenant deployment.
+    meta_page_id: Optional[str] = None
 
     # Minimum for an AI employee that reads and answers DMs. Anything more is a
     # permission the hotel is asked to grant and we never use, which is both a
