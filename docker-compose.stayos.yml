@@ -91,12 +91,49 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── no `beat` service, deliberately ─────────────────────────────────────────
+  # ── beat, scoped to StayOS's own schedule ───────────────────────────────────
   #
-  # Every entry in `beat_schedule` is a marketplace task, and
-  # `travbuddy.partners.revert_intro_commission` fires hourly and *writes* to
-  # `partners` — a table that also exists, meaning something entirely
-  # different, in the hotel OS. Beat belongs to the marketplace stack alone.
+  # There was deliberately no beat service here, and the reason given was that
+  # "every entry in beat_schedule is a marketplace task, and
+  # revert_intro_commission writes hourly to `partners` — a table that also
+  # exists, meaning something entirely different, in the hotel OS."
+  #
+  # That was true when it was written. It stopped being true when the
+  # waiting-guest sweep was added to the schedule, and nobody noticed, because
+  # the entry carried a comment explaining that the *marketplace* beat would
+  # enqueue it and the StayOS worker would pick it up off the `hotelos` queue.
+  #
+  # That reasoning assumed one broker. This file brings up its own Redis, and
+  # the api and worker above both point at it. So the marketplace beat enqueues
+  # the sweep onto the marketplace broker and the StayOS worker listens to the
+  # StayOS broker, and the task has never once been delivered. There is no
+  # error to find: the guest simply waits, and the notification built to reach
+  # a manager's phone reaches nothing. Production had zero rows in
+  # `agent_escalations`, ever.
+  #
+  # `CELERY_BEAT_ROLE=stayos` is what makes this safe rather than a rerun of
+  # the original problem: it schedules the sweep and nothing else, so nothing
+  # on this beat can write to a marketplace table. See
+  # `app/workers/celery_app._beat_schedule`.
+  #
+  # One replica. Two beats on one schedule is two notifications per waiting
+  # guest — the escalation dedupe key would collapse them, but relying on a
+  # dedupe to cover a duplicated scheduler is how a dedupe becomes load-bearing
+  # for something it was not written for.
+  beat:
+    build: .
+    command: celery -A app.workers.celery_app.celery_app beat --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BEAT_ROLE=stayos
+      - TEMP_DIR=/tmp/stayos
+      - PLACES_CACHE_DIR=/tmp/stayos/places_cache
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      replicas: 1
 
 volumes:
   stayos_redis_data:

@@ -16,6 +16,98 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+# ── which schedule this beat process owns ────────────────────────────────────
+#
+# **The sweep was scheduled and never ran, for four months.**
+#
+# `stayos-waiting-guests` sits in the schedule below with a comment saying beat
+# enqueues it and "only the StayOS worker — the one with StayOS's SUPABASE_URL —
+# ever runs it". That reasoning assumed one Redis. It is not one Redis:
+# `docker-compose.stayos.yml` brings up its own (`stayos_redis_data`), and its
+# api and worker both point at `redis://redis:6379/0` inside their own network.
+#
+# So the marketplace beat enqueues the sweep onto the *marketplace* broker's
+# `hotelos` queue, and the StayOS worker is listening to the *StayOS* broker's
+# `hotelos` queue. The two never meet. No error, no dead letter, no symptom —
+# the guest simply waits, and the notification that was built to reach a
+# manager's phone reaches nothing. Confirmed against production: zero rows in
+# `agent_escalations`, ever, and the StayOS compose has no beat service at all.
+#
+# The comment that justified having no beat service — "every scheduled entry is
+# a marketplace task" — was true when it was written and stopped being true when
+# the sweep was added, which is exactly the kind of drift a comment cannot
+# catch and a split cannot hide.
+#
+# So the schedule is split by role rather than shared. A StayOS beat runs the
+# StayOS entries and *only* those: `revert_intro_commission` writes hourly to
+# `partners`, a table that also exists and means something entirely different
+# in the hotel OS, and pointing it at a hotel database is the one outcome worse
+# than the sweep not running.
+#
+# Default is `all`, so the marketplace deployment is unchanged by this and
+# needs no redeploy.
+
+_MARKETPLACE_SCHEDULE = {
+    "reco-expected-price-nightly": {
+        "task": "travbuddy.reco.refresh_expected_price", "schedule": 24 * 3600,
+    },
+    "reco-destination-priors-nightly": {
+        "task": "travbuddy.reco.refresh_destination_priors", "schedule": 24 * 3600,
+    },
+    "reco-fit-centroids-weekly": {
+        "task": "travbuddy.reco.fit_centroids", "schedule": 7 * 24 * 3600,
+    },
+    # Hourly, not nightly: an intro rate ends at a wall-clock moment, and a
+    # partner who watches their dashboard flip a rate the morning after it
+    # expired asks why. Cheap — it touches only rows that have lapsed.
+    #
+    # **Never on a StayOS beat.** It writes to `partners`.
+    "partner-intro-commission-hourly": {
+        "task": "travbuddy.partners.revert_intro_commission", "schedule": 3600,
+    },
+}
+
+_STAYOS_SCHEDULE = {
+    # Every five minutes rather than every minute: `WAITING_AFTER_MINUTES` is
+    # ten, so five bounds the worst case at fifteen minutes from a guest's
+    # message to a manager's phone, and a sweep that found nothing is one
+    # indexed query.
+    "stayos-waiting-guests": {
+        "task": "travbuddy.messaging.sweep_waiting_guests", "schedule": 300,
+    },
+}
+
+
+def _beat_schedule() -> dict:
+    """
+    The entries this beat process is responsible for.
+
+    `CELERY_BEAT_ROLE` is read from the environment rather than from `settings`
+    because it is a property of *this process's job in the deployment*, not of
+    the product — the same image runs as api, worker and beat, and only the
+    compose file knows which.
+
+        marketplace   the reco and partner tasks (the historical default)
+        stayos        the waiting-guest sweep, and nothing that writes to a
+                      marketplace table
+        all           both — the default, so nothing changes for a deployment
+                      that does not set it
+    """
+    import os
+
+    role = (os.environ.get("CELERY_BEAT_ROLE") or "all").strip().lower()
+    if role == "stayos":
+        return dict(_STAYOS_SCHEDULE)
+    if role == "marketplace":
+        return dict(_MARKETPLACE_SCHEDULE)
+    if role != "all":
+        logger.warning(
+            "CELERY_BEAT_ROLE=%r is not a role; scheduling everything", role,
+        )
+    return {**_MARKETPLACE_SCHEDULE, **_STAYOS_SCHEDULE}
+
+
 celery_app = Celery(
     "travbuddy",
     broker=settings.redis_url,
@@ -97,35 +189,7 @@ celery_app.conf.update(
     # Part 9.3 / 14.3). Defined here — not in reco_tasks — so `celery beat` sees the
     # schedule from conf regardless of task-module import order. Task functions are
     # registered via `include` above and executed by the worker.
-    beat_schedule={
-        "reco-expected-price-nightly": {
-            "task": "travbuddy.reco.refresh_expected_price", "schedule": 24 * 3600,
-        },
-        "reco-destination-priors-nightly": {
-            "task": "travbuddy.reco.refresh_destination_priors", "schedule": 24 * 3600,
-        },
-        "reco-fit-centroids-weekly": {
-            "task": "travbuddy.reco.fit_centroids", "schedule": 7 * 24 * 3600,
-        },
-        # Hourly, not nightly: an intro rate ends at a wall-clock moment, and a
-        # partner who watches their dashboard flip a rate the morning after it
-        # expired asks why. Cheap — it touches only rows that have lapsed.
-        # The one scheduled entry that is *not* a marketplace task, and the
-        # comment above explains why that is safe: `travbuddy.messaging.*` is
-        # routed to the `hotelos` queue, so beat enqueues it here and only the
-        # StayOS worker — the one with StayOS's `SUPABASE_URL` — ever runs it.
-        #
-        # Every five minutes rather than every minute: `WAITING_AFTER_MINUTES`
-        # is ten, so five bounds the worst case at fifteen minutes from a
-        # guest's message to a manager's phone, and a sweep that found nothing
-        # is one indexed query.
-        "stayos-waiting-guests": {
-            "task": "travbuddy.messaging.sweep_waiting_guests", "schedule": 300,
-        },
-        "partner-intro-commission-hourly": {
-            "task": "travbuddy.partners.revert_intro_commission", "schedule": 3600,
-        },
-    },
+    beat_schedule=_beat_schedule(),
 )
 
 

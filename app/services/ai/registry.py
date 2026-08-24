@@ -104,17 +104,50 @@ def get(name: str) -> ToolSpec:
     return spec
 
 
+# Tools that only work on a channel with an outbound provider behind it.
+#
+# **Found in production, on a hotel's own booking page.** A visitor asked about
+# five rooms through the website chat; the model reached for `send_message` to
+# ask which dates, and the tool raised
+#
+#     ValueError: no messaging policy for channel 'website'
+#
+# `registry.execute` correctly turned that into "that lookup did not come back
+# — call request_human_handoff", the model did, and the highest-intent guest on
+# the highest-intent surface a hotel has was told somebody would get back to
+# them. Only `whatsapp` and `instagram` have a policy; `website`, `internal`,
+# `phone` and `email` do not, and the model was offered the tool on all six.
+#
+# It is not that the reply had nowhere to go — web chat returns `result.reply`
+# in the HTTP response and the staff console renders it — it is that a *second*
+# way of speaking was on the menu and only one of them worked. This module's
+# own docstring says the model is never shown a tool it cannot call; this is
+# that rule applied to a dimension it did not previously cover.
+_NEEDS_OUTBOUND_CHANNEL = frozenset({"send_message"})
+
+
+def _usable_on(spec: ToolSpec, ctx: AgentContext) -> bool:
+    """Whether this tool can actually run on this turn's channel."""
+    if spec.name not in _NEEDS_OUTBOUND_CHANNEL:
+        return True
+    from app.services.messaging import policy as channel_policy
+
+    return (ctx.channel or channel_policy.WHATSAPP) in channel_policy.channels()
+
+
 def available_for(ctx: AgentContext) -> list[ToolSpec]:
     """
     The tools this agent may call, in registration order.
 
     This is also what the model is shown. An agent is not told about a tool it
     has no grant for — describing a capability and then refusing it wastes a
-    turn and teaches the model to keep trying.
+    turn and teaches the model to keep trying — nor about one its *channel*
+    cannot carry, which is the same rule and was the same bug.
     """
     return [
         spec for nm, spec in REGISTRY.items()
         if nm in ctx.tool_grants and ctx.tool_grants[nm].get("enabled", True)
+        and _usable_on(spec, ctx)
     ]
 
 

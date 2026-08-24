@@ -29,6 +29,7 @@ as it found it — including republishing, if it was published when this started
 """
 import base64
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -39,7 +40,17 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 REF = "rdlozqvuywtgsodunait"
 SB = f"https://{REF}.supabase.co"
-API = "http://127.0.0.1:8010/api/v1/pms"
+# Local by default, so `uvicorn --port 8010 &` and run it. Point it at the
+# deployed backend to verify a release actually serves what it was given:
+#
+#     STAYOS_API=https://stayos-backend.travbuddy.in/api/v1/pms \
+#       ./venv/bin/python scripts/website_roundtrip_e2e.py
+#
+# The distinction matters more here than in most suites. Every failure this
+# script is for lives in the join between a save and a publish, and a local
+# process reading the production database proves the code is right without
+# proving the box is running it.
+API = os.environ.get("STAYOS_API", "http://127.0.0.1:8010/api/v1/pms")
 PROP = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 SLUG = "casa-mandala-anjuna"
 
