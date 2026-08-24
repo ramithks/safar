@@ -517,6 +517,12 @@ async def one_run(scenario: dict, index: int) -> dict:
         "scenario": scenario["key"],
         "conversation_id": conversation["id"],
         "latency_ms": latency,
+        # §12 asks for token and cost where available. It is available, and it
+        # is half of what "which model" means: a model that is right slightly
+        # more often and costs four times as much is a different decision from
+        # one that is right slightly more often and does not.
+        "tokens_in": result.tokens_in,
+        "tokens_out": result.tokens_out,
         "status": result.status,
         "handoff": result.handoff,
         "error": result.error,
@@ -713,6 +719,11 @@ def report(rows: list[dict], label: str) -> dict:
           f"({len(leaked)} turns)")
     print(f"║  Devanagari reached a Hinglish guest{pct(len(slips), len(usable))}   "
           f"({len(slips)} turns; {len(romanised)} were romanised on the way out)")
+    tokens_in = sum(r.get("tokens_in") or 0 for r in usable)
+    tokens_out = sum(r.get("tokens_out") or 0 for r in usable)
+    if usable:
+        print(f"║  tokens per turn                    "
+              f"{tokens_in // len(usable):,} in · {tokens_out // len(usable):,} out")
     if latencies:
         print(f"║  latency  p50 {latencies[len(latencies) // 2] / 1000:.1f}s   "
               f"p95 {latencies[int(len(latencies) * 0.95) - 1] / 1000:.1f}s   "
@@ -764,6 +775,10 @@ def report(rows: list[dict], label: str) -> dict:
         "leaked_ids": len(leaked),
         "devanagari_slips": len(slips),
         "latency_p50_ms": latencies[len(latencies) // 2] if latencies else None,
+        "latency_p95_ms": (latencies[int(len(latencies) * 0.95) - 1]
+                           if latencies else None),
+        "tokens_in_per_turn": (tokens_in // len(usable)) if usable else None,
+        "tokens_out_per_turn": (tokens_out // len(usable)) if usable else None,
     }
 
 
@@ -905,6 +920,10 @@ async def main() -> int:
             ("invented rupee figures", "invented_figures", False),
             ("internal identifiers leaked", "leaked_ids", False),
             ("Devanagari to a Hinglish guest", "devanagari_slips", False),
+            ("latency p50 (ms)", "latency_p50_ms", False),
+            ("latency p95 (ms)", "latency_p95_ms", False),
+            ("tokens in, per turn", "tokens_in_per_turn", False),
+            ("tokens out, per turn", "tokens_out_per_turn", False),
         ):
             cells = ""
             for name, _ in MODEL_FAMILIES:
