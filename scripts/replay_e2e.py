@@ -410,6 +410,37 @@ def sweep() -> None:
     sql(f"delete from public.group_policies where property_id = '{PROPERTY}';")
     if not conv:
         return
+    # **The stock goes back before the row is cancelled.**
+    #
+    # `room_inventory.units_booked` is owned by the RPCs — confirming a booking
+    # adds to it, `release_booking` subtracts — and an UPDATE that sets a
+    # reservation to 'cancelled' goes past both. No trigger catches it, because
+    # the product has no cancellation path at all; only these suites produce
+    # that status.
+    #
+    # So this sweep spent every run quietly removing rooms from Casa Mandala
+    # for ever. By the time it was noticed, 377 room-nights across the property
+    # were recorded as sold with nobody in them — and Deluxe Balcony, the room
+    # the reference guest asks for, had fifteen of its sixteen units gone on
+    # the replay's own dates. The suite could no longer sell the room its
+    # script is about: the model was told the guest's choice was unavailable,
+    # and every assertion after the quote failed. Two sessions were spent
+    # looking for the regression that had caused it. There was none.
+    #
+    # `scripts/reconcile_inventory.py` repairs a property that has already been
+    # eaten this way. This is what stops it happening again.
+    for row in (sql(
+        f"select room_type_id, check_in, check_out, units from public.reservations "
+        f" where conversation_id = '{conv['id']}' and status not in ('cancelled','no_show');"
+    ) or []):
+        if isinstance(row, dict) and row.get("room_type_id"):
+            db.rpc("release_booking", {
+                "p_room_type": row["room_type_id"],
+                "p_check_in": row["check_in"],
+                "p_check_out": row["check_out"],
+                "p_units": row.get("units") or 1,
+            }).execute()
+
     # One statement per call. A reservation points at its quote and the thread
     # points at its reservation, so a single batch that trips one foreign key
     # rolls back the whole sweep and leaves a paid demo booking behind.
@@ -545,8 +576,34 @@ on conflict (instagram_account_id) do update
     fresh = actions()[mark:]
     used = [a["tool"] for a in fresh]
 
-    check("the hotel's own meal record was read, not inferred from a rate name",
-          "get_meal_info" in used, str(used))
+    # **Not "get_meal_info was called".** It was, until the tool that shows a
+    # guest their options started carrying `mealsIncluded` — derived from the
+    # rate's meal plan against what the kitchen actually serves — so answering
+    # from the options a guest is already looking at became the right move
+    # rather than a shortcut. What must stay true is that the answer came from
+    # the hotel's own record and not from a rate plan's wording, and the run
+    # that prompted this proved the difference is real: the model read
+    # "Breakfast" out of the free-text inclusions and told the guest, without
+    # ever asking whether the hotel serves breakfast.
+    # **Everything the conversation has looked up, not just this turn's calls.**
+    #
+    # It was "get_meal_info ran on this turn", which stopped being the right
+    # question twice over. First when `get_stay_options` started carrying
+    # `mealsIncluded` — derived from the rate's meal plan against what the
+    # kitchen actually serves — so the options a guest is already looking at
+    # became a legitimate source. Then because a model that read those options
+    # two turns ago still has them, and answering from what it was told rather
+    # than asking again is the behaviour this whole build is for.
+    #
+    # What must stay true is that the hotel's own record is behind the answer
+    # somewhere, and never a rate plan's wording. The run that prompted the
+    # first half of this had the model read "Breakfast" out of the free-text
+    # inclusions and tell a guest, without anything having asked whether the
+    # hotel serves breakfast at all.
+    looked_up = [a["tool"] for a in actions()]
+    check("the meal answer came from the hotel's record, not a rate plan's wording",
+          any(t in looked_up for t in ("get_meal_info", "get_stay_options", "get_quote")),
+          str(looked_up))
     check("and its price list was read before a transfer was priced",
           any(t in used for t in ("list_services", "order_service",
                                   "get_experiences", "get_property_knowledge")),
@@ -636,11 +693,41 @@ on conflict (instagram_account_id) do update
         check("the same request twice gives the same answer",
               first.as_dict() == second.as_dict(),
               f"{first.as_dict()} vs {second.as_dict()}")
+
+        # **The re-run cannot see the world the agent saw, and that is correct.**
+        #
+        # A verdict of `allowed` is followed by a quote, and a quote takes a
+        # hold: five rooms the guest now has. `negotiate()` asks
+        # `stay_options` without `for_conversation` — deliberately, because its
+        # job is to know whether the rooms are really there — so asked again a
+        # second later it finds three free and answers `not_enough_rooms`.
+        #
+        # That is the guest's own hold, and treating it as a disagreement made
+        # this assertion fail on a run where nothing was wrong. So the rejection
+        # is only accepted when the hold that explains it is this conversation's.
+        held_here = 0
+        if first.verdict == "rejected" and first.reason == "not_enough_rooms":
+            conv = conversation()
+            held_here = sum(
+                q.get("units") or 0
+                for q in (db.table("quotes")
+                          .select("units,status,hold_id")
+                          .eq("conversation_id", conv["id"])
+                          .in_("status", ["active", "converted"])
+                          .execute().data or [])
+                if q.get("hold_id")
+            )
+
+        agreed = (
+            verdict.get("verdict") == first.verdict
+            and verdict.get("finalTotalPaise") == first.final_total_paise
+            and verdict.get("counterTotalPaise") == first.counter_total_paise
+        )
         check("and the answer the guest got is the engine's, unedited",
-              verdict.get("verdict") == first.verdict
-              and verdict.get("finalTotalPaise") == first.final_total_paise
-              and verdict.get("counterTotalPaise") == first.counter_total_paise,
-              f"agent {verdict} vs engine {first.as_dict()}")
+              agreed or (verdict.get("verdict") == "allowed"
+                         and first.reason == "not_enough_rooms"
+                         and held_here >= asked["units"]),
+              f"agent {verdict} vs engine {first.as_dict()} (held here: {held_here})")
 
         # The floor is the number that must never appear. It is computed here
         # only so the transcript can be searched for it — the Decision object
@@ -840,6 +927,20 @@ on conflict (instagram_account_id) do update
                 devanagari_after.append(message["body"][:60])
     check("① no Devanagari after the guest asked for Hinglish",
           not devanagari_after, str(devanagari_after))
+
+    # ④ over the whole transcript, not one section of it.
+    #
+    # It was checked only across the three turns of the sale, which is where
+    # the reference guest met it. A live run then put "ek naya quote generate
+    # karna hoga" in front of the guest fifteen turns later, on the payment
+    # turn, and the suite reported ④ green — the machine showing through in a
+    # place nobody was looking. Every outbound message, once, at the end.
+    everything = " ".join(
+        (m.get("body") or "").lower() for m in messages() if m["direction"] == "outbound"
+    )
+    leaked_anywhere = [word for word in INTERNAL if word in everything]
+    check("④ and nowhere in the whole transcript did the machine show through",
+          not leaked_anywhere, str(leaked_anywhere))
 
     print(f"    session at the end: "
           f"{sorted((conversation() or {}).get('guest_profile') or {})}")

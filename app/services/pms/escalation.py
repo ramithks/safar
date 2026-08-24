@@ -41,6 +41,7 @@ import logging
 from app.db.client import get_db, run_db
 from app.services.messaging import credentials as creds_module
 from app.services.messaging import service as messaging_service
+from app.services.pms import money
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,13 @@ def dedupe_key(kind: str, facts: dict) -> str:
     index on it is a fixed size. Collisions across different kinds do not
     matter: the index is on `(conversation, kind, key)`.
     """
+    if kind == "unanswered":
+        # The substance here is the conversation, and `_existing` already scopes
+        # the lookup to it. Hashing the stay as well would raise a *second*
+        # ticket for the same silent thread the moment the guest finally gave
+        # their dates — which is the point at which a hotel stops reading these.
+        return hashlib.sha256(b"unanswered").hexdigest()[:32]
+
     material = "|".join(
         str(facts.get(k) or "")
         for k in ("room_type_id", "rate_plan_id", "check_in", "check_out", "units",
@@ -99,10 +107,8 @@ def dedupe_key(kind: str, facts: dict) -> str:
 
 
 def _rupees(paise) -> str:
-    try:
-        return f"₹{int(paise) / 100:,.0f}"
-    except (TypeError, ValueError):
-        return "—"
+    """One spelling of money, shared with every other surface."""
+    return money.display(paise)
 
 
 def compose(kind: str, *, hotel: str, facts: dict, reason: str | None) -> str:
@@ -150,6 +156,14 @@ def compose(kind: str, *, hotel: str, facts: dict, reason: str | None) -> str:
         lines.append(f"Lowest allowed: {_rupees(facts['floor_paise'])} per night")
     if facts.get("total_paise") is not None:
         lines.append(f"Stay total at our rate: {_rupees(facts['total_paise'])}")
+
+    # Only the waiting sweep sets these, and they are the two things somebody
+    # picking up a stalled thread asks first: how long, and about what.
+    if facts.get("waiting_minutes") is not None:
+        why = f" — {facts['waiting_reason']}" if facts.get("waiting_reason") else ""
+        lines.append(f"Waiting: {facts['waiting_minutes']} minutes{why}")
+    if facts.get("asked_about"):
+        lines.append(f"Asked about: {facts['asked_about']}")
 
     if facts.get("payment_status"):
         lines.append(f"Payment: {facts['payment_status']}")

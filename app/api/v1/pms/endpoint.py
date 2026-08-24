@@ -3621,6 +3621,43 @@ async def post_public_chat(request: Request, slug: str, body: WebChatIn):
     return WebChatOut(reply=turn.reply, session=turn.session, handedOff=turn.handed_off)
 
 
+def _content_with_alts(content: dict | None, hotel: str, city: str | None) -> dict:
+    """The website config, with every gallery photo carrying alt text."""
+    config = dict(content or {})
+    gallery = [
+        item for item in (website_service.gallery_item(v) for v in (config.get("gallery") or []))
+        if item
+    ]
+    config["gallery"] = [
+        {**item, "alt": website_service.photo_alt(item, hotel=hotel, city=city)}
+        for item in gallery
+    ]
+    return config
+
+
+def _room_photo_meta(room: dict, hotel: str, city: str | None) -> list[dict]:
+    """
+    One entry per photo this room has, in the order the room has them.
+
+    Driven by `photos` rather than by `photo_meta`: the array is what decides
+    which photographs exist and in what order, and a caption for a URL nobody
+    is showing any more would otherwise reach the page.
+    """
+    stored = room.get("photo_meta") or {}
+    out = []
+    for url in room.get("photos") or []:
+        meta = stored.get(url) if isinstance(stored, dict) else None
+        meta = meta if isinstance(meta, dict) else {}
+        out.append({
+            "url": url,
+            "caption": (meta.get("caption") or None),
+            "alt": website_service.photo_alt(
+                meta, hotel=hotel, city=city, subject=room.get("name"),
+            ),
+        })
+    return out
+
+
 @router.get("/public/hotels/{slug}", response_model=PublicSiteOut)
 @limiter.limit("60/minute")
 async def get_public_hotel(request: Request, slug: str):
@@ -3706,7 +3743,13 @@ async def get_public_hotel(request: Request, slug: str):
         checkInTime=prop.check_in_time, checkOutTime=prop.check_out_time,
         # Already house-rules-only: `resolve_published` strips the commercial
         # keys that share this column.
-        policies=prop.policies, content=prop.website,
+        policies=prop.policies,
+        # Gallery entries with their alt text already resolved. Derived here
+        # rather than on the page so that every surface reading this payload —
+        # the hotel's site, the structured data, a preview — describes an
+        # image the same way, and so a second renderer cannot quietly ship
+        # empty alts.
+        content=_content_with_alts(prop.website, prop.name, prop.city),
         # Room-only, because the page is about the hotel rather than about one
         # rate. A guest reading "breakfast included" here would be reading a
         # claim that depends on which rate they end up booking.
@@ -3781,6 +3824,7 @@ async def get_public_hotel(request: Request, slug: str):
                 unitsLeft=0,
                 slug=onboarding_service.slugify(t["name"]) or t["code"].lower(),
                 photos=t.get("photos") or [],
+                photoMeta=_room_photo_meta(t, prop.name, prop.city),
                 sizeSqft=t.get("size_sqft"),
                 standardOccupancy=t.get("standard_occupancy"),
                 fromPricePaise=(cheapest.get(t["id"]) or {}).get("base_price_paise"),

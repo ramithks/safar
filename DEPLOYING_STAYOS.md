@@ -274,10 +274,19 @@ celery -A app.workers.celery_app worker -l info -Q hotelos
 # StayOS beat — do not run one.
 ```
 
-Every entry in `beat_schedule` is a marketplace task, and
-`partners.revert_intro_commission` fires **hourly** and writes to `partners` —
-a table that also exists, meaning something entirely different, in the hotel OS.
-Beat belongs to the marketplace service alone.
+Beat belongs to the marketplace service alone. `partners.revert_intro_commission`
+fires **hourly** and writes to `partners` — a table that also exists, meaning
+something entirely different, in the hotel OS — so it must run in the deployment
+that scheduled it.
+
+**One entry is a StayOS task and runs anyway**, because enqueueing is not
+executing: `travbuddy.messaging.sweep_waiting_guests` (every five minutes) is
+routed to `hotelos`, so the marketplace beat publishes it and only the StayOS
+worker can take it. The consequence to know: **if the marketplace beat stops,
+StayOS stops telling hotels about guests nobody answered.** It is a scheduled
+reminder rather than part of any guest's path, so that failure is silence
+towards the hotel, not towards a guest. `test_everything_beat_schedules_is_routed_to_a_deployment_that_can_run_it`
+is what stops an unrouted entry being added beside it.
 
 Give the StayOS service its own Redis database number anyway. The queue routing
 is what makes crossover impossible; a separate namespace means the two do not

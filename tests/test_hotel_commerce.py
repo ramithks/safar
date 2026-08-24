@@ -671,3 +671,51 @@ class TestAudit:
 ])
 def test_meal_plan_vocabulary_matches_the_column(meal_plan, expected):
     assert policies.MEAL_PLAN_INCLUDES[meal_plan] == expected
+
+
+# ── money, as somebody reads it ──────────────────────────────────────────────
+#
+# The AI employee is the reason this is tested at all. Tool results speak paise
+# and a guest reads rupees, and until `money.display` existed the conversion
+# happened *inside the model*: `totalPaise: 1920000` went into the context and
+# the model divided. On a live replay it divided by a thousand and offered a
+# ₹19,200 stay for ₹1,920 — caught by the reply guardrail, because the number
+# was backed by nothing, so the cost was a handoff rather than a ruinous quote.
+#
+# The lesson is not that the guardrail works. It is that a language model was
+# being asked to do arithmetic on money at all.
+
+@pytest.mark.parametrize("paise,expected", [
+    (0, "₹0"),
+    (100, "₹1"),
+    (716800, "₹7,168"),
+    (1920000, "₹19,200"),
+    (4600000, "₹46,000"),
+    (150, "₹2"),           # rounded to the rupee: a hotel does not quote paise
+])
+def test_money_reads_as_a_hotel_writes_it(paise, expected):
+    from app.services.pms import money as money_module
+    assert money_module.display(paise) == expected
+
+
+def test_a_formatter_never_fails_a_turn():
+    """
+    A tool result is built while a guest is waiting. Money that cannot be read
+    is an em dash and a sentence that says less — never an exception that
+    becomes "I'm having trouble reaching our system".
+    """
+    from app.services.pms import money as money_module
+    for bad in (None, "", "lots", object()):
+        assert money_module.display(bad) == "—"
+
+
+def test_every_surface_spells_money_the_same_way():
+    """
+    Three modules had their own `₹{paise / 100:,.0f}`. They agreed, which is
+    exactly why the fourth would not have.
+    """
+    from app.services.ai.tools import stay
+    from app.services.pms import escalation, money as money_module
+
+    assert stay._rupees(716800) == money_module.display(716800)
+    assert escalation._rupees(716800) == money_module.display(716800)

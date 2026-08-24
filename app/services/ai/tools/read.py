@@ -30,6 +30,7 @@ from app.services.pms import availability as availability_service
 from app.services.pms import clock
 from app.services.pms import money
 from app.services.pms import onboarding
+from app.services.pms import policies
 from app.services.pms import workspace as workspace_service
 
 
@@ -701,6 +702,23 @@ async def search_availability(args: AvailabilityArgs, ctx: AgentContext) -> dict
     }
 
 
+def _meal_options(property_id: str) -> list[dict]:
+    """
+    What this hotel actually serves.
+
+    One small read, so the answer to "breakfast included hai?" is *in* the
+    options a guest is being shown rather than one tool call away. The question
+    follows the price closely enough to be worth carrying — and on the run that
+    prompted this, the model answered it from the rate plan's free-text
+    inclusions instead of asking, which is the failure `get_meal_info` was
+    written for arriving through a neighbouring column.
+    """
+    return (
+        get_db().table("meal_options").select("*")
+        .eq("property_id", property_id).limit(10).execute().data or []
+    )
+
+
 @tool(
     name="get_stay_options",
     description=(
@@ -729,6 +747,7 @@ async def get_stay_options(args: AvailabilityArgs, ctx: AgentContext) -> dict:
         # availability check reports the rooms it just quoted as gone.
         for_conversation=ctx.conversation_id,
     )
+    meal_rows = await run_db(_meal_options, ctx.property_id)
 
     out = []
     for o in options:
@@ -740,9 +759,25 @@ async def get_stay_options(args: AvailabilityArgs, ctx: AgentContext) -> dict:
                 "name": p.name,
                 "mealPlan": p.meal_plan,
                 "refundable": p.refundable,
-                "inclusions": p.inclusions,
+                # The hotelier's own wording for what this rate covers. Prose
+                # typed into a box — not an authority on meals; `mealsIncluded`
+                # below is.
+                "planNotes": p.inclusions,
                 "totalPaise": p.total_paise,
                 "perNightPaise": p.per_night_paise,
+                # Formatted here, so the model never divides. See
+                # `money.display` — a live replay had it divide by a thousand
+                # and offer a ₹19,200 stay for ₹1,920.
+                "total": money.display(p.total_paise),
+                "perNight": money.display(p.per_night_paise),
+                # Derived from `meal_plan` against what the hotel actually
+                # serves, never read out of the plan's wording. The two can
+                # disagree — a plan whose inclusions say "Dinner" at a hotel
+                # that serves none — and the guest gets told the wording.
+                "mealsIncluded": [
+                    m["meal"] for m in policies.meals_for_plan(p.meal_plan, meal_rows)
+                    if m["included"]
+                ],
                 "minStayNights": p.min_stay_violation,
             }
             for p in o.rate_plans
@@ -764,6 +799,11 @@ async def get_stay_options(args: AvailabilityArgs, ctx: AgentContext) -> dict:
         "currency": "INR",
         "instruction": (
             "These totals are indicative and exclude any negotiated discount. "
-            "Quote them as 'from', and call get_quote before promising a number."
+            "Quote them as 'from', and call get_quote before promising a number. "
+            "Use the `total` and `perNight` strings exactly as written — never "
+            "convert a paise figure yourself. `mealsIncluded` is what the rate "
+            "actually covers; `planNotes` is the hotelier's own wording and is "
+            "not an answer about meals. For timings, or the price of a meal "
+            "that is not included, call get_meal_info."
         ),
     }

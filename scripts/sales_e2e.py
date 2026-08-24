@@ -527,8 +527,16 @@ check("both public rate plans on the sea view are offered",
 check("the agent rate is never shown to a guest", SEA_B2B not in plans,
       "audience='public' is passed by the tool, not chosen by the model")
 cp = next(p for o in options for p in o["ratePlans"] if p["ratePlanId"] == SEA_CP)
-check("breakfast is a configured inclusion, not a claim",
-      "Breakfast" in cp["inclusions"], str(cp["inclusions"]))
+# `planNotes` is the hotelier's own wording for the rate — still carried,
+# still checked, and no longer the thing the model answers a meal question
+# from. Whether breakfast is actually included is `mealsIncluded`, derived
+# from the rate's meal plan against what the kitchen serves; the two can
+# disagree, and a live run had the model read the wording and tell a guest.
+check("the hotelier's wording for the rate is carried through",
+      "Breakfast" in cp["planNotes"], str(cp["planNotes"]))
+check("and whether breakfast is included is derived, not read off it",
+      "breakfast" in (cp.get("mealsIncluded") or []),
+      f"mealPlan={cp.get('mealPlan')} mealsIncluded={cp.get('mealsIncluded')}")
 check("and the indicative total is the calendar's, for two nights",
       cp["totalPaise"] == 1_200_000, str(cp["totalPaise"]))
 

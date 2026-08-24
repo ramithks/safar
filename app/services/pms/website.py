@@ -44,6 +44,90 @@ SECTIONS = (
 )
 
 
+# What a photograph can be of.
+#
+# Closed, and short enough that a hotelier picks rather than types. Every one of
+# them is a thing a guest looks for before booking — which is also why they make
+# usable alt text on their own: "the pool at Casa Mandala, Anjuna" is a true
+# sentence about the image and a phrase somebody searches.
+PHOTO_CATEGORIES = (
+    "exterior", "lobby", "room", "bathroom", "dining",
+    "pool", "amenity", "surroundings", "other",
+)
+
+# The alt text each category writes when the hotelier has not.
+#
+# **Derived rather than demanded.** Nobody fills in twenty-four alt-text boxes,
+# and a required field here would mean either empty alts or twenty-four copies
+# of the hotel's name — which is what a screen reader would then read out
+# twenty-four times. A phrase built from what the hotel already told us is true
+# without anybody typing, and a hotelier who wants better can still overwrite
+# it.
+_CATEGORY_PHRASE = {
+    "exterior": "Outside {hotel}",
+    "lobby": "The lobby at {hotel}",
+    "room": "A room at {hotel}",
+    "bathroom": "A bathroom at {hotel}",
+    "dining": "Dining at {hotel}",
+    "pool": "The pool at {hotel}",
+    "amenity": "Facilities at {hotel}",
+    "surroundings": "Around {hotel}",
+    "other": "{hotel}",
+}
+
+MAX_GALLERY = 24
+
+
+def photo_alt(item: dict, *, hotel: str, city: str | None = None,
+              subject: str | None = None) -> str:
+    """
+    What a screen reader says, and what a search engine reads.
+
+    Precedence is deliberate: what the hotelier wrote, then the caption they
+    wrote for a human, then a sentence built from the category. The fallback is
+    never the empty string — an unlabelled photograph on a hotel page is a
+    guest with a screen reader being told nothing at all, and §26 asks for alt
+    text rather than for an attribute that exists.
+    """
+    explicit = (item.get("alt") or "").strip()
+    if explicit:
+        return explicit
+    caption = (item.get("caption") or "").strip()
+    if caption:
+        return caption
+    if subject:
+        # A room's own photographs. The room name is more specific than any
+        # category, and specific is the whole value of alt text.
+        return f"{subject} at {hotel}" + (f", {city}" if city else "")
+    phrase = _CATEGORY_PHRASE.get(item.get("category") or "other", "{hotel}")
+    return phrase.format(hotel=hotel) + (f", {city}" if city else "")
+
+
+def gallery_item(value) -> dict | None:
+    """
+    One gallery entry, from either shape it can arrive in.
+
+    Rows written before this existed hold bare URL strings, and they are still
+    the majority. Reading them as `{"url": ...}` costs nothing and means no
+    migration touches a jsonb column that a hotelier may be editing.
+    """
+    if isinstance(value, str):
+        url = value.strip()
+        return {"url": url[:500], "category": "other", "caption": None, "alt": None} if url else None
+    if not isinstance(value, dict):
+        return None
+    url = str(value.get("url") or "").strip()
+    if not url:
+        return None
+    category = value.get("category")
+    return {
+        "url": url[:500],
+        "category": category if category in PHOTO_CATEGORIES else "other",
+        "caption": (str(value["caption"])[:160] or None) if value.get("caption") else None,
+        "alt": (str(value["alt"])[:160] or None) if value.get("alt") else None,
+    }
+
+
 def default_draft(property_name: str, city: str | None) -> dict:
     """
     What a hotel's site says before anybody has edited it.
@@ -84,9 +168,19 @@ def _normalise(draft: dict, existing: dict) -> dict:
         if key in draft:
             value = draft[key]
             out[key] = str(value)[:2000] if value is not None else None
-    for key in ("gallery", "amenities"):
-        if key in draft and isinstance(draft[key], list):
-            out[key] = [str(v)[:500] for v in draft[key][:24]]
+    if "amenities" in draft and isinstance(draft["amenities"], list):
+        out["amenities"] = [str(v)[:500] for v in draft["amenities"][:24]]
+    if "gallery" in draft and isinstance(draft["gallery"], list):
+        # Stored as objects whichever shape arrived, so every reader downstream
+        # — the page, the preview, the structured data — handles one.
+        seen: set[str] = set()
+        gallery = []
+        for value in draft["gallery"][:MAX_GALLERY]:
+            item = gallery_item(value)
+            if item and item["url"] not in seen:
+                seen.add(item["url"])
+                gallery.append(item)
+        out["gallery"] = gallery
     if "sections" in draft and isinstance(draft["sections"], list):
         wanted = {
             s.get("id"): bool(s.get("enabled"))
@@ -296,7 +390,10 @@ def project(row: dict, *, slug: str | None = None) -> dict:
         "about": draft.get("about") or "",
         "accentColor": draft.get("accentColor") or "#0F766E",
         "heroImageUrl": draft.get("heroImageUrl"),
-        "gallery": draft.get("gallery") or [],
+        # Normalised on the way out too, because rows written before the
+        # builder had a gallery still hold bare strings and the builder must
+        # not have to know that.
+        "gallery": [i for i in (gallery_item(v) for v in (draft.get("gallery") or [])) if i],
         "amenities": draft.get("amenities") or [],
         "contactPhone": draft.get("contactPhone"),
         "contactEmail": draft.get("contactEmail"),

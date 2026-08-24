@@ -16,6 +16,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.api.v1.pms.hotel_os_schemas import PhotoMeta
 from app.services.pms import money
 
 # The six values `quotes.discount_reason` will accept. This is a category, not
@@ -1647,6 +1648,17 @@ class PublicRoomOptionOut(BaseModel):
     # also the availability response, where a slug and a photo are noise.
     slug: str | None = None
     photos: list[str] = []
+    # Alt text and captions for those photos, keyed by the URL as it appears
+    # above. A separate field rather than a richer `photos`, because this model
+    # is also the availability response — where a photo is already noise and an
+    # object per photo would be noise with structure.
+    #
+    # **Every URL in `photos` has an entry, and every entry has an `alt`.** The
+    # hotelier writes one or the room's own name does; see `website.photo_alt`.
+    # A page that has to invent its own alt text is a page where half the
+    # images end up with the hotel's name repeated, which is what a screen
+    # reader then reads out eleven times.
+    photoMeta: list[PhotoMeta] = []
     sizeSqft: int | None = None
     standardOccupancy: int | None = None
     # The cheapest public rate plan's base price. A "from" figure for a
@@ -1936,6 +1948,14 @@ class PublicSiteHostOut(BaseModel):
     name: str
 
 
+class GalleryPhotoOut(BaseModel):
+    """One photograph on the hotel's site, as the builder reads it back."""
+    url: str
+    category: str = "other"
+    caption: str | None = None
+    alt: str | None = None
+
+
 class WebsiteConfigOut(BaseModel):
     propertyId: str
     template: str
@@ -1947,7 +1967,12 @@ class WebsiteConfigOut(BaseModel):
     about: str = ""
     accentColor: str = "#0F766E"
     heroImageUrl: str | None = None
-    gallery: list[str] = []
+    # Objects, always — `website.project` normalises the bare strings that older
+    # rows hold on the way out, so the builder never has to know both shapes
+    # exist. Typed `list[str]` here, this model answered 500 to a save that had
+    # already succeeded: the write landed, the response failed validation, and
+    # the screen showed an error over a change that was live.
+    gallery: list[GalleryPhotoOut] = []
     amenities: list[str] = []
     contactPhone: str | None = None
     contactEmail: str | None = None
@@ -1965,6 +1990,22 @@ class WebsiteConfigOut(BaseModel):
     directRevenue30dPaise: int = 0
 
 
+class GalleryPhotoIn(BaseModel):
+    """
+    One photograph on the hotel's site, as the builder sends it.
+
+    `alt` and `caption` are both optional and mean different things: a caption
+    is prose shown under the photo, alt text is what a screen reader says and
+    what a search engine reads. Neither is required, because nobody fills in
+    twenty-four alt boxes — the server derives one from the category and the
+    hotel's own name. See `services/pms/website.photo_alt`.
+    """
+    url: str = Field(max_length=500)
+    category: str | None = Field(default=None, max_length=32)
+    caption: str | None = Field(default=None, max_length=160)
+    alt: str | None = Field(default=None, max_length=160)
+
+
 class WebsiteUpdateRequest(BaseModel):
     template: str | None = None
     headline: str | None = Field(default=None, max_length=200)
@@ -1972,7 +2013,11 @@ class WebsiteUpdateRequest(BaseModel):
     about: str | None = Field(default=None, max_length=2000)
     accentColor: str | None = Field(default=None, max_length=32)
     heroImageUrl: str | None = Field(default=None, max_length=500)
-    gallery: list[str] | None = None
+    # A photograph is a URL and the words that go with it — a category, a
+    # caption, alt text. The bare string is still accepted because that is what
+    # every row written before the builder had a gallery holds, and because a
+    # client that only has URLs should not have to wrap them.
+    gallery: list[GalleryPhotoIn | str] | None = None
     amenities: list[str] | None = None
     contactPhone: str | None = Field(default=None, max_length=32)
     contactEmail: str | None = Field(default=None, max_length=200)

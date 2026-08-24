@@ -174,6 +174,20 @@ _NOT_YET = re.compile(
 )
 
 
+# "…confirm *karne ke liye*" — in order to confirm.
+#
+# Hindi and Hinglish build a purpose clause with the infinitive: "booking
+# confirm karne ke liye aapka email chahiye" is a request for an email address,
+# and `_CONFIRMED` read the first two words of it as a claim that the booking
+# was done. The guest asking to pay was handed to a human at the last step of
+# the sale.
+#
+# `karne` and `karna` only. "confirm kar di hai" and "confirm kar diya" are the
+# perfective — *I have confirmed it* — and those are exactly the claim this
+# rule exists to catch.
+_PURPOSIVE = re.compile(r"(?i)^\s*kar(?:ne|na)\b")
+
+
 def _reported_unsecured(tool_outputs: list) -> bool:
     """Did a status lookup this turn come back saying the stay is not secured?"""
     for outcome in tool_outputs or []:
@@ -271,7 +285,24 @@ _SNAKE_ALLOWED = frozenset({
 
 
 def _internal_leak(text: str) -> tuple[str, str] | None:
-    """The first thing in this reply a guest should not be reading, if any."""
+    """
+    The first thing in this reply a guest should not be reading, if any.
+
+    **Links are masked out before the scan, and that is deliberate.** A URL's
+    path is not prose: it was built by a system, and whether it is a link this
+    guest may be sent is the *links* rule's question, two checks below — an
+    address whose host no tool produced is refused there regardless of what its
+    path spells.
+
+    Without the mask, the snake-case rule refused the single most important
+    message in a sale. Every payment link this product issues is
+    `/pay/order_TTNlZOqsCGlaWH` — a Razorpay order id, `order_` and all — and
+    `[a-z]{3,}_[a-z]{2,}` matches it. The guest asking to pay was handed to a
+    human instead. It survived because the replay raises the link itself when
+    the model does not, so the suite kept driving the money path around the bug
+    it was meant to find.
+    """
+    text = _URL.sub(" \u2026 ", text or "")
     for label, pattern in _INTERNALS:
         for match in pattern.finditer(text):
             found = match.group(0)
@@ -462,6 +493,9 @@ def check_reply(
     # believes a wrong price argues at the desk, and a guest who believes a
     # wrong booking arrives with luggage.
     confirmed = _CONFIRMED.search(text)
+    # An infinitive is never a claim, whatever ran this turn.
+    while confirmed and _PURPOSIVE.match(text[confirmed.end():confirmed.end() + 12]):
+        confirmed = _CONFIRMED.search(text, confirmed.end())
     if confirmed and _reported_unsecured(tool_outputs):
         # The agent looked, found nothing secured, and is saying so. Whether it
         # phrased that as a negation or as what happens next, it is answering

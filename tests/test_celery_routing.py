@@ -25,6 +25,10 @@ from app.workers.celery_app import celery_app
 HOTEL_OS_TASKS = [
     "travbuddy.messaging.process_conversation",
     "travbuddy.marketing.run_campaign",
+    # Scheduled by the marketplace's beat — the only one that runs a beat — and
+    # executed only by the StayOS worker. It reads `conversations`, which the
+    # marketplace project has never had.
+    "travbuddy.messaging.sweep_waiting_guests",
 ]
 
 MARKETPLACE_TASKS = [
@@ -71,16 +75,36 @@ def test_the_two_sets_never_share_a_queue():
     )
 
 
-def test_beat_only_schedules_marketplace_tasks():
+def test_everything_beat_schedules_is_routed_to_a_deployment_that_can_run_it():
     """
-    Beat belongs to the marketplace deployment. `revert_intro_commission` runs
-    hourly and writes to `partners` — a table that also exists, meaning
-    something entirely different, in the hotel OS. If a hotel-OS task ever
-    appears here, this schedule has to move behind a flag first.
+    Beat runs in the marketplace deployment, and *enqueueing* is not
+    *executing*. `revert_intro_commission` is unrouted, so beat's own worker
+    picks it up — correct, because it writes to `partners`, a table that also
+    exists meaning something entirely different in the hotel OS. The waiting
+    sweep is routed to `hotelos`, so beat publishes it and the StayOS worker —
+    the one process with StayOS's `SUPABASE_URL` — is the only one that can
+    take it.
+
+    The rule this holds is therefore not "no hotel-OS task in the schedule" but
+    the thing that rule was standing in for: **nothing may be scheduled that
+    the worker consuming its queue cannot run.** An entry added here with no
+    route is one the marketplace worker will execute against the marketplace
+    database, whatever it was written for.
+
+    One operational consequence, recorded in `DEPLOYING_STAYOS.md`: the StayOS
+    sweep stops if the *marketplace* beat stops. It is a scheduled reminder
+    rather than part of any guest's path, so that degrades to no reminders
+    rather than to anything a guest sees.
     """
-    scheduled = {entry["task"] for entry in celery_app.conf.beat_schedule.values()}
-    assert scheduled <= set(MARKETPLACE_TASKS)
-    assert not scheduled & set(HOTEL_OS_TASKS)
+    for name, entry in celery_app.conf.beat_schedule.items():
+        task = entry["task"]
+        if task in HOTEL_OS_TASKS:
+            assert queue_for(task) == "hotelos", (
+                f"{name} would be run by the marketplace worker against the "
+                "marketplace database"
+            )
+        else:
+            assert task in MARKETPLACE_TASKS, f"{name} is scheduled and unclassified"
 
 
 def test_every_registered_task_is_routed_somewhere_a_worker_listens():

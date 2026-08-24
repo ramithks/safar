@@ -78,6 +78,17 @@ def patch_from(outcomes: list) -> dict:
             if args.get(field) is not None:
                 patch[field] = args[field]
 
+        # The room this turn was about, whichever tool was asked.
+        #
+        # Recorded from any tool's arguments and not only from `get_quote`,
+        # because the model naming a room to `search_availability` or
+        # `send_room_photos` is the same fact arriving earlier — and the turns
+        # between choosing a room and pricing it are exactly where the choice
+        # used to be lost. A later `get_quote` overwrites it, which is right:
+        # a priced room outranks a discussed one.
+        if args.get("room_type_id"):
+            patch["room_type_id"] = args["room_type_id"]
+
         output = getattr(outcome, "output", None)
         if not isinstance(output, dict):
             continue
@@ -85,7 +96,10 @@ def patch_from(outcomes: list) -> dict:
         # re-derive them from a room name — which is how the model came to
         # invent `rate_plan_id = "breakfast_included"`.
         for key, field in (("quoteId", "quote_id"), ("roomTypeId", "room_type_id"),
-                           ("ratePlanId", "rate_plan_id")):
+                           ("ratePlanId", "rate_plan_id"),
+                           # So a later turn can say "Deluxe Balcony" rather
+                           # than reciting a uuid or asking again.
+                           ("roomName", "room_name")):
             if output.get(key):
                 patch[field] = output[key]
         if tool in ("get_quote",) and args.get("room_type_id"):
@@ -134,7 +148,7 @@ def patch_from(outcomes: list) -> dict:
 # know about the guest. When the guest moves on to different nights, these go
 # with the old stay; `language` and anything else on the profile stays.
 _TRANSACTIONAL = _STAY_ARGS + (
-    "stage", "quote_id", "room_type_id", "rate_plan_id",
+    "stage", "quote_id", "room_type_id", "rate_plan_id", "room_name",
     # These describe *this* stay too. A guest who comes back in October
     # about different nights is not still mid-negotiation on September's,
     # and an `awaiting_hotel` left behind would have the agent telling them
@@ -298,8 +312,27 @@ def describe(conversation: dict | None) -> str | None:
         party += f" and {profile['children']} children"
     rooms = profile.get("units") or 1
 
-    return (
+    lines = [
         "Earlier in this conversation the guest gave these dates. Do not ask for "
-        "them again unless they change the subject to different nights:\n"
-        f"  {check_in} to {check_out}, {rooms} room(s), {party}"
-    )
+        "them again unless they change the subject to different nights:",
+        f"  {check_in} to {check_out}, {rooms} room(s), {party}",
+    ]
+
+    # The room they have already settled on.
+    #
+    # It was on the session and never in the prompt, which meant a guest who
+    # picked a room and then changed the number of rooms was asked which room
+    # they wanted — a question they had answered two turns earlier. The id is
+    # here as well as the name because the id is what a tool takes: without it
+    # the model either asks again or re-derives one from a room name, which is
+    # how it once invented `rate_plan_id = "breakfast_included"`.
+    if profile.get("room_type_id"):
+        named = profile.get("room_name") or "the room they chose"
+        lines.append(
+            f"  They have already settled on {named} — do not ask which room "
+            f"again. room_type_id: {profile['room_type_id']}"
+            + (f", rate_plan_id: {profile['rate_plan_id']}"
+               if profile.get("rate_plan_id") else "")
+        )
+
+    return "\n".join(lines)

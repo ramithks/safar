@@ -1160,3 +1160,195 @@ branch push.
       so revoking a forwarded booking link is an API-only capability.
 - [ ] **Three of four real hotels have no photographs**, so they are correctly
       `noindex`. That is Phase 4's job and it is waiting on hotels, not on code.
+
+# Phase 11 — Production completion pass ✅ DONE
+
+Nothing in this phase was found by reading code. Every item is something that
+broke while a real sale was replayed through the real model, or something the
+production database said when it was asked a direct question.
+
+## 11.1 The guest nobody came back to
+
+- [x] **Three code paths park a conversation with a person and none told a
+      person.** `request_human_handoff`, `runtime._ensure_human` (a turn that
+      failed or a reply a guardrail refused) and the locked-too-long path in
+      `messaging_tasks`. Two of the three first *promise* the guest that
+      somebody is coming. `services/pms/escalation` was written for exactly
+      this and its own docstring says so; nothing was ever wired to it.
+
+      `services/pms/waiting` sweeps every five minutes for the two ways to be
+      waiting: nothing sent since the guest wrote, and the AI having promised a
+      person who never arrived. The second is the one every cheap test calls
+      answered — there *is* an outbound message newer than the guest's — and it
+      is the more urgent, because a promise was made.
+
+      Scheduled by the marketplace's beat and routed to `hotelos`, so only the
+      worker holding StayOS's database can run it. `test_celery_routing`'s "no
+      hotel-OS task in the schedule" rule is replaced by the thing it stood in
+      for: *nothing may be scheduled that the worker consuming its queue cannot
+      run.* **Operational consequence, recorded in `DEPLOYING_STAYOS.md`: if the
+      marketplace beat stops, StayOS stops telling hotels about waiting guests.**
+
+- [x] **Two exclusions, both from looking at production rather than at the
+      design.** Nine conversations were waiting the day this was written and
+      every one was on a demo property, left by an e2e run — and that property
+      has a real WhatsApp number on its team. Same `is_demo` gate that already
+      keeps demo hotels out of the sitemap. And one of them said "stop".
+
+- [x] **`consent.is_stop_request` was broken in both directions**, found by
+      depending on it. "AC band kar do", "extra bed hata do", "photo mat bhejo"
+      and "is there a bus stop nearby?" each opted a guest out of that hotel's
+      marketing permanently — under sixty characters and containing a stop word
+      — and the fourth was the docstring's own example of a message it handled
+      *correctly*. Meanwhile "don't message me" never worked at all: normalising
+      turned the apostrophe into a space and matched neither spelling in the
+      list. Two vocabularies now — a phrase that can only mean stop is matched
+      anywhere, a word a guest also uses about the air conditioning only when it
+      is the whole message. The function had no tests; it has 42. Three guests
+      carry an unsubscribe, all on the demo marketing property, so no real guest
+      was lost to this.
+
+## 11.2 A gallery with no way to fill it
+
+- [x] **`hotel_websites.config.gallery` has existed since the builder shipped
+      and nothing ever wrote to it.** The Sections list has had a "Photo
+      gallery" toggle a hotelier could switch on. Same for `heroImageUrl` — so
+      the picture at the top of a hotel's website was whichever bedroom uploaded
+      first — and for `about`, which is also the page's meta description and its
+      JSON-LD `description`, the only long-form text a search engine reads.
+
+- [x] **Alt text is derived, not demanded.** Nobody fills in twenty-four alt
+      boxes, and a required field produces twenty-four copies of the hotel's
+      name — which is then what a screen reader reads out twenty-four times.
+      `website.photo_alt` builds a sentence from the category and the hotel's
+      own name; a room's photographs are named by the room; the builder shows
+      that sentence as the placeholder so the box is visibly optional. Resolved
+      on the server, so every surface describes an image the same way.
+
+- [x] `alt={`${hotel.name} photo ${i + 2}`}` is gone from both templates, and
+      the photographs the hero could not fit have a section of their own,
+      grouped by what they show. A hotel that uploaded twenty-four had five on
+      its page and nineteen nowhere.
+
+- [x] **Two things the round trip through the real API found that no unit test
+      could.** `WebsiteConfigOut.gallery` was still `list[str]`, so a save that
+      had *already succeeded* answered 500 — the write landed, the response
+      failed validation, and the screen showed an error over a change that was
+      live. And clearing the cover sent null, which the save endpoint drops
+      (that is how "absent means unchanged" is implemented), so deleting the
+      cover photograph would have kept the page pointing at a file that was gone.
+
+## 11.3 The sale, replayed until it broke
+
+- [x] **The reply guardrail was refusing the payment link.** Every link StayOS
+      issues is `/pay/order_TTNlZOqsCGlaWH` — a Razorpay order id — and the
+      snake-case rule that keeps `folio_entries` away from guests matches it
+      exactly. The one message that takes the money was blocked and the guest
+      asking to pay was handed to a person. URLs are masked before that scan;
+      an address no tool produced is still refused by the links rule two checks
+      below. It survived because the replay raises the link itself when the
+      model does not, so the suite kept driving the money path around the bug it
+      exists to find.
+
+- [x] **"Booking confirm karne ke liye…"** is *in order to confirm the booking*,
+      and the rule read its first two words as a claim. Infinitives only: "kar
+      di", "kar diya", "ho gayi" are still the sentence the reference transcript
+      sent to a guest who had paid nothing.
+
+- [x] **The turn where a sale closes could not close it.** "Theek h, payment
+      link bhej do" classifies as `payment_status`, and that toolset held
+      `create_booking_payment_link` and no `get_quote` — the tool that takes the
+      money and nothing that produces what it takes. The agent said so,
+      accurately and uselessly, then handed over a guest who had agreed to pay.
+      Five of about ten live replays ended there. A toolset must be closed under
+      what its own tools depend on; `test_a_toolset_can_use_every_tool_it_offers`
+      holds it.
+
+- [x] **The model was doing arithmetic on money.** `totalPaise: 1920000` went
+      into the context and the model divided — by a thousand, on one run,
+      offering a ₹19,200 stay for ₹1,920. `money.display` is the one spelling of
+      a rupee figure now, three modules delegate to it, and the price-bearing
+      tools carry it written out.
+
+- [x] **A meal answer came out of free text.** `get_stay_options` handed over
+      the rate plan's `inclusions` — prose a hotelier typed — and the model told
+      a guest breakfast and dinner were included without anything having asked
+      whether the kitchen serves them. `mealsIncluded` is derived from the meal
+      plan against `meal_options`; the free text is `planNotes` and is not an
+      answer. A rule in a prompt was the wrong mechanism.
+
+- [x] **The chosen room was on the session and never in the prompt**, so a guest
+      who picked a room and then changed the number of rooms was asked which
+      room they wanted.
+
+## 11.4 The suite had been eating the property it runs on
+
+- [x] **377 room-nights on Casa Mandala were recorded as sold with nobody in
+      them.** `replay_e2e.sweep()` set its reservations to 'cancelled' with raw
+      SQL. `room_inventory.units_booked` is owned by two RPCs — `convert_hold`
+      adds, `release_booking` subtracts — and an UPDATE goes past both. No
+      trigger catches it, because **the product has no cancellation path at
+      all**; only these suites produce that status.
+
+      Deluxe Balcony, the room the reference guest asks for, had fifteen of
+      sixteen units gone on the replay's own dates. The suite could no longer
+      sell the room its own script is about: the model was told the guest's
+      choice was unavailable and every assertion after the quote failed. Two
+      sessions were spent looking for the regression behind that. There was
+      none — and `e2e_sweep` had documented this exact mechanism for `b2b_e2e`
+      months earlier.
+
+- [x] `scripts/reconcile_inventory.py` repairs a property already eaten this
+      way, by recomputing `units_booked` from the reservations that are actually
+      live rather than releasing per cancelled row — the truth is a sum, not a
+      delta. It refuses to be casual about the other direction: a counter
+      *below* the reservations is an oversell, not debris. Casa Mandala: 115
+      rows, 377 room-nights returned. Every other property, the four real hotels
+      included, was already clean.
+
+- [x] One assertion was wrong rather than the product: the negotiation check
+      re-ran the engine after the agent's own quote had taken a five-room hold,
+      so the engine answered `not_enough_rooms` about rooms the guest was
+      holding.
+
+## 11.5 What the replay actually measures
+
+**Between 28 and 44 of its 44 assertions, run to run, against a live model.**
+That is worth stating plainly, because a single green run was previously
+reported as though it were a property of the build. It is not: the same commit
+scores differently on consecutive runs, and a control run at the previous HEAD
+scored 23/4 on the poisoned inventory while scoring 41/1 on repaired inventory.
+
+The residual failures now are all one shape — **the model declining to call a
+tool it was offered** — most often `get_group_rates` on "5 kamre chahiye" and
+`negotiate_rate` on "thoda kam karo". Both are in the toolset, both are named in
+`GROUND_RULES`, and on most runs both are called. Closing that gap needs
+evaluation across many runs or a deterministic pre-step, not another prompt line.
+
+**Verified:** 1,788 unit · golden 88 · payment_status 30 · negotiation 31 ·
+tenant_isolation 58 · tenant_security 65 · ai 98 · inbox 28 · checkin 57 ·
+instagram 73 · whatsapp 127 · marketing 166 · onboarding 65 · hotel_os 73 ·
+pms 134 · sales 186 · booking_engine 65 · b2b 57 · frontdesk 168 · owner 150 ·
+website 427. Replay 41/44 on the last run, 17 turns, nothing refused, no
+upstream failures.
+
+## Still open after this phase
+
+- [ ] **A booking cannot be cancelled.** There is no product path — no route, no
+      service function — and the only rows with `status = 'cancelled'` were put
+      there by test scripts. It is why the inventory bug above had no trigger to
+      catch it, and it is a real gap in a hotel operating system.
+- [ ] **Nine room-nights still strand across a full suite pass**, from suites
+      other than the replay that cancel rather than delete. `reconcile_inventory`
+      repairs them; the suites should release first.
+- [ ] **The model still skips an offered tool** on the group and negotiation
+      turns, perhaps one run in three.
+- [ ] **Devanagari still appears intermittently** in a Hinglish thread, usually
+      one word.
+- [ ] The guardrail refuses the agent echoing the guest's own asking price
+      ("₹4,000 mein nahi ho payega"), because a number the guest said is not a
+      number a tool returned. Erring this way is correct — the alternative
+      licenses the model to agree to a figure the engine never approved — but it
+      costs a handoff on any turn where the model failed to use the engine.
+- [ ] **The backend has not been redeployed** since this phase. The waiting
+      sweep, the gallery API and the guardrail fixes are all in this branch.
