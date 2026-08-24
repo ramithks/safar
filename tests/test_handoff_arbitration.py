@@ -466,3 +466,59 @@ def test_a_haggle_is_still_not_a_request_for_a_person(db):
     ))
     assert result.handoff is False
     assert "request_human_handoff" not in result.requirements["forced"]
+
+
+# ── the reply that used to escape the guardrail ─────────────────────────────
+
+def test_a_price_in_a_handoff_reply_is_checked_like_any_other(db):
+    """
+    **A hole found by reading the runtime, not by a failing test.**
+
+    The guardrail ran on `if reply and not handoff`, and the exclusion had no
+    stated reason. It was harmless while a handoff reply came from
+    `prompts.handoff_reply` — a fixed sentence with no figures in it.
+
+    It stopped being harmless once a handoff could follow the model speaking.
+    The handoff tool's own instruction is "tell the guest a member of the team
+    is taking over", the model writes that sentence itself, and on a turn that
+    had already discussed a price it can write a price into it. A rupee figure
+    in the last thing a guest reads before a human arrives is precisely the
+    figure that gets honoured when the human arrives.
+
+    Failing the check is benign here: the reply is replaced, `handoff` was
+    already true, and the conversation goes to a person either way. The
+    guardrail can remove a number nothing accounts for; it cannot stop a stop.
+    """
+    result = run(runtime.run_turn(
+        make_ctx(session=QUOTED_SESSION), "mujhe kisi se baat karni hai",
+        provider=EchoProvider([
+            [("request_human_handoff", {"reason": "guest_asked"})],
+            "Ek member aapse baat karenge — aur haan, ₹2,000 per night ho jayega.",
+        ]),
+    ))
+
+    assert result.handoff is True, "the guest still has to reach a person"
+    assert "2,000" not in (result.reply or ""), (
+        "a price no tool produced reached the guest on the last turn before a "
+        "human picked the conversation up"
+    )
+    assert (result.error or "").startswith("guardrail:")
+
+
+def test_an_honest_handoff_reply_is_left_alone(db):
+    """
+    The half that would be a regression. Most handoffs say a sentence with no
+    figures in it, and a check that mangled those would replace the agent's own
+    voice with a template on every escalation.
+    """
+    result = run(runtime.run_turn(
+        make_ctx(session=QUOTED_SESSION), "mujhe kisi se baat karni hai",
+        provider=EchoProvider([
+            [("request_human_handoff", {"reason": "guest_asked"})],
+            "Ek member aapse abhi baat karenge.",
+        ]),
+    ))
+
+    assert result.handoff is True
+    assert result.reply == "Ek member aapse abhi baat karenge."
+    assert result.error is None

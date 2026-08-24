@@ -734,7 +734,23 @@ async def run_turn(
         # produced it, and before any caller can deliver it. See
         # services/ai/guardrails — this is where an invented payment link stops
         # being a thing a guest can tap.
-        if reply and not handoff:
+        # **Every reply, including the ones that end in a handoff.**
+        #
+        # This read `if reply and not handoff`, and the exclusion had no stated
+        # reason. It was harmless while a handoff reply came from
+        # `prompts.handoff_reply` — a fixed sentence with no figures in it — and
+        # stopped being harmless the moment a handoff could follow the model
+        # speaking: the handoff tool's own instruction is "tell the guest a
+        # member of the team is taking over", the model writes that sentence
+        # itself, and on a turn that had already priced something it can write a
+        # price into it. A rupee figure in the last thing a guest reads before a
+        # human arrives is exactly the figure that gets honoured.
+        #
+        # Failing here is benign in the way that matters: the reply is replaced
+        # with `handoff_reply`, `handoff` is already true, and the conversation
+        # was going to a person regardless. The check can only remove a number
+        # nothing accounts for; it cannot stop the handoff.
+        if reply:
             verdict = guardrails.check_reply(
                 reply,
                 tool_outputs=outcomes,
