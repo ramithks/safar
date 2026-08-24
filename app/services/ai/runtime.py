@@ -344,6 +344,7 @@ async def run_turn(
     ctx.turn.message = message
     ctx.turn.requirements = tuple(requirements)
     ctx.turn.outcomes = outcomes
+    ctx.turn.history = tuple(history or [])
 
     forced: list[str] = []
     # Devanagari words that had to be romanised for a Hinglish guest. Counted

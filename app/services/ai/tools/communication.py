@@ -203,6 +203,74 @@ class SendTemplateArgs(BaseModel):
     )
 
 
+async def _refuse_what_may_not_be_said(body: str, ctx: AgentContext) -> None:
+    """
+    The reply guardrail, on the path a reply actually takes.
+
+    **Found in production on 2026-08-24.** A guest asked about five rooms. The
+    model ran `get_group_rates`, `search_availability`, `get_stay_options` and
+    `get_quote` — everything right — and then sent:
+
+        …total price ₹65,946 hai … 30% deposit (₹19,784) abhi pay karna hoga
+
+    ₹19,784 is thirty per cent of ₹65,946. No tool returned it. `get_group_rates`
+    gave `depositPct: 30` and `get_quote` gave the total, and the model did the
+    multiplication itself — which §24 rule 3 says it must never do, and which
+    `guardrails.check_reply` exists to catch.
+
+    It *was* caught. The run ends `guardrail: reply quoted ['19784'], which no
+    tool result contains`, and the turn escalated. But the check ran on
+    `result.reply` at the end of the turn, and the message had already gone out
+    through this tool sixteen seconds earlier. The guardrail refused a
+    paraphrase of a number the guest was already looking at.
+
+    This tool's own description calls itself "the only way to say anything to
+    them". That was true, and it meant the primary channel for saying things was
+    the one channel the check on what may be said did not cover. Everything the
+    guardrail protects — a price nobody quoted, a payment link nobody created, a
+    booking nobody made — was reachable by putting it in `body` instead of in
+    the reply.
+
+    Same function, same evidence, one turn earlier. `ctx.turn.outcomes` holds
+    the tools that have run *so far*, which is exactly the right set: a figure
+    has to come from something that already happened, not from this call.
+
+    Refusing is a real cost — the guest gets nothing from this call and the
+    model has to try again — and it is the cheaper half of the trade. The
+    alternative is a number the hotel never authorised, in a guest's hand, on
+    WhatsApp, which somebody has to either honour or take back.
+    """
+    from app.services.ai import guardrails
+    from app.services.ai.runtime import _trusted_hosts
+
+    turn = getattr(ctx, "turn", None)
+    if turn is None or not (body or "").strip():
+        return
+
+    verdict = guardrails.check_reply(
+        body,
+        tool_outputs=list(turn.outcomes),
+        trusted_hosts=await _trusted_hosts(ctx),
+        history=list(turn.history),
+    )
+    if verdict.ok:
+        return
+
+    logger.error("run %s: send_message refused by guardrails: %s | body=%r",
+                 ctx.run_id, verdict.reason, (body or "")[:300])
+    raise OutOfScope(
+        f"guardrail: {verdict.reason}",
+        # If everything above this somehow fails, the guest hears nothing about
+        # a price rather than a wrong one.
+        "Let me check that figure with the hotel and come back to you.",
+        # The model can act on this: it names what was wrong and what to do.
+        f"NOT SENT. {verdict.reason}. Every figure and every link you send has "
+        f"to come from a tool result on this turn, exactly as the tool wrote "
+        f"it. Do not calculate anything — if you need a number no tool gave "
+        f"you, call the tool that produces it, or leave it out.",
+    )
+
+
 @tool(
     name="send_message",
     description=(
@@ -224,6 +292,7 @@ class SendTemplateArgs(BaseModel):
 )
 async def send_message(args: SendMessageArgs, ctx: AgentContext) -> tuple[dict, str]:
     conversation = await _conversation(ctx)
+    await _refuse_what_may_not_be_said(args.body, ctx)
 
     try:
         sent = await messaging.send(

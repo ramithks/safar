@@ -96,6 +96,11 @@ class TurnState:
 
     # The guest's message, exactly as they wrote it.
     message: str = ""
+    # The conversation so far, as the model was given it. Carried because the
+    # reply guardrail needs it: restating a figure the agent itself already
+    # sent is legitimate, and a check without the history would refuse the
+    # second half of every two-turn answer.
+    history: tuple = ()
     # `required_actions.Requirement`s, in priority order. Typed loosely to keep
     # the import one-directional — required_actions imports nothing from here.
     requirements: tuple = ()
