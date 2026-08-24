@@ -804,6 +804,22 @@ async def get_stay_options(args: AvailabilityArgs, ctx: AgentContext) -> dict:
             "convert a paise figure yourself. `mealsIncluded` is what the rate "
             "actually covers; `planNotes` is the hotelier's own wording and is "
             "not an answer about meals. For timings, or the price of a meal "
-            "that is not included, call get_meal_info."
+            "that is not included, call get_meal_info. "
+            # **"rate plan" is a word from inside the machine.**
+            #
+            # Found by `scripts/replay_e2e.py`, whose transcript-quality bar is
+            # deliberately higher than the reply guardrail's: the agent said
+            # "rate plan" to a guest, and a guest does not have rate plans, they
+            # have a room with breakfast or a room without.
+            #
+            # Fixed here rather than in the guardrail on purpose. A guardrail
+            # that refused the phrase would turn a cosmetic problem into a
+            # handoff — a refusal *is* a handoff — which is strictly worse than
+            # the thing it fixes. And fixed here rather than in the system
+            # prompt because this is where the word comes from: the field is
+            # called `ratePlans`, the model reads it, and the remedy belongs
+            # next to the cause.
+            "Say a plan by its `name` — 'Room + Breakfast' — never as a 'rate "
+            "plan'; that is our word for it, not the guest's."
         ),
     }
