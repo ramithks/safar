@@ -470,6 +470,24 @@ def test_an_unverified_link_is_still_refused_however_its_path_reads():
     "Aapki booking confirm karne ke liye kripya apna email address bataiye.",
     "Booking confirm karna hai to payment kar dijiye.",
     "Booking confirm karne ke liye token amount dena hoga.",
+    # **The feminine, which is the form the word "booking" actually takes.**
+    #
+    # Hindi infinitives agree with the gender of their object, and `booking` is
+    # feminine — so the commonest sentence in this product's whole vocabulary is
+    # `karni`, not `karna`. The rule was written from a transcript that happened
+    # to contain the masculine, and covered only that.
+    #
+    # Found by `scripts/replay_e2e.py` on the live model, mid-sale: the first
+    # line below was refused as a claim that a booking existed, which escalated
+    # the turn and handed the guest to a person at the exact moment they were
+    # being offered a payment link. The failure `_PURPOSIVE` exists to prevent,
+    # in a gender it did not cover.
+    "Agar aapko booking confirm karni hai toh batayein, main payment link bhej "
+    "deta hoon.",
+    "Booking confirm karni hai toh bataiye.",
+    # The causative: the same sentence with somebody else doing the confirming.
+    "Booking confirm karwani hai toh bataiye.",
+    "Booking confirm karvane ke liye email chahiye.",
 ])
 def test_an_infinitive_is_not_a_claim_that_the_stay_is_secured(reply):
     """
@@ -487,6 +505,11 @@ def test_an_infinitive_is_not_a_claim_that_the_stay_is_secured(reply):
     "Maine aapki booking confirm kar di hai.",
     "Aapki booking confirm ho gayi hai.",
     "Aapke rooms book ho gaye hain.",
+    # The causative *perfective*, which is the trap in widening the exception
+    # above. "karwaya" is "I had it confirmed" — a claim — and sits one letter
+    # from "karwani", which is not.
+    "Maine aapki booking confirm karwaya hai.",
+    "Aapki booking confirm karvaya hai.",
 ])
 def test_the_perfective_is_still_a_claim(reply):
     """
