@@ -314,6 +314,13 @@ async def run_turn(
     # permission: see services/ai/toolsets.py.
     tools = registry.describe_for_provider(ctx, task=task)
 
+    # Declared ahead of the rest of the turn's bookkeeping, because `ctx.turn`
+    # is given *this* list object rather than a copy of it. A snapshot of what
+    # has run so far is exactly the thing that must not go stale mid-turn: the
+    # arbiter reads it from inside `registry.execute`, while the turn is still
+    # filling it.
+    outcomes: list[ToolOutcome] = []
+
     # What this message *requires*, decided before the model sees it.
     #
     # Guest turns only. A receptionist typing into the console is not a guest
@@ -324,23 +331,20 @@ async def run_turn(
     # — no model call, no round trip. See services/ai/required_actions.py for
     # why the two actions a hotel's revenue depends on stopped being the
     # model's decision.
-    # Declared here rather than with the rest of the turn's bookkeeping below,
-    # because `ctx.turn` holds *this* list object and the arbiter reads it while
-    # the turn is still filling it. A second list would be a snapshot, and a
-    # snapshot of what has run so far is exactly the thing that must not go
-    # stale mid-turn.
-    outcomes: list[ToolOutcome] = []
-
     requirements = (
         required_actions.detect(message, ctx.session) if ctx.guest_scoped else []
     )
-    # Published to the turn so the layers that run *inside* `registry.execute`
-    # can see it. Only one does today: the arbiter, which decides whether a
-    # handoff the model asked for is supported by the conversation it claims to
-    # describe. See services/ai/arbiter.py and services/ai/context.py:TurnState.
+
+    # Published to the turn, so the layers that run *inside* `registry.execute`
+    # can see what the turn is about. One does today: the arbiter, which decides
+    # whether a handoff the model asked for is supported by the conversation it
+    # claims to describe — a question whose evidence lives in the turn rather
+    # than in the tool's arguments. See services/ai/arbiter.py and
+    # services/ai/context.py:TurnState.
     ctx.turn.message = message
     ctx.turn.requirements = tuple(requirements)
     ctx.turn.outcomes = outcomes
+
     forced: list[str] = []
     # Devanagari words that had to be romanised for a Hinglish guest. Counted
     # rather than merely fixed: a language fix whose effect cannot be measured
