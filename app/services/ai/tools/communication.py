@@ -31,6 +31,7 @@ from app.db.client import get_db, run_db
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import OutOfScope, ToolUnavailable
 from app.services.ai.ids import ResourceId
+from app.services.ai import registry
 from app.services.ai.registry import tool
 from app.services.messaging import service as messaging
 from app.services.messaging.channels import (
@@ -46,6 +47,74 @@ REASONS = (
     "guest_asked", "no_knowledge", "low_confidence", "complaint",
     "refund", "policy_conflict", "unusual_request", "autonomy_limit",
 )
+
+
+async def _precheck_handoff(args: "HandoffArgs", ctx: AgentContext) -> None:
+    """
+    Is the conversation actually the one the model just described?
+
+    The whole of the decision is in `services/ai/arbiter.py`; this is the seam.
+    It is a precheck rather than a check inside the tool body for the reason
+    every other precheck is: it runs **before** anything happens. By the time
+    the function below has run, `conversations.handler` says 'human_requested',
+    the inbox has moved the thread, and undoing that is a compensating write
+    that can fail. Refusing here means there is nothing to undo.
+
+    Refusal, not exception. `registry.execute` turns an `AgentError` into a
+    `ToolOutcome` the model is shown and can answer — so a turned-down handoff
+    arrives as an instruction naming the tool that has not run yet, which is
+    what makes the model take the business path instead of apologising.
+
+    **It can only ever delay.** `turn.handoff_rejected` is set here, and the
+    arbiter lets the next request through unconditionally. One extra tool call
+    is the entire cost of being wrong.
+    """
+    from app.services.ai import arbiter
+
+    judgement = arbiter.judge(args.reason, ctx)
+    turn = getattr(ctx, "turn", None)
+    if judgement.valid:
+        if turn is not None:
+            turn.handoff_rejections.append({
+                "category": judgement.category, "accepted": True,
+                "reason_given": judgement.reason_given, "why": judgement.why,
+            })
+        return
+
+    # Recorded whether or not it is acted on. With arbitration switched off the
+    # judgement still lands on the run and the handoff still goes through, so
+    # `agent_runs.required_actions.handoff_judgements` says what *would* have
+    # been turned down — which is what makes the off/on comparison possible at
+    # all, and what makes a rollback measurable rather than blind.
+    enforcing = arbiter.enabled()
+    if turn is not None:
+        turn.handoff_rejected = enforcing
+        turn.handoff_rejections.append({
+            "category": judgement.category, "accepted": not enforcing,
+            "enforced": enforcing,
+            "reason_given": judgement.reason_given, "instead": judgement.instead,
+            "intent": judgement.intent, "why": judgement.why,
+            "evidence": judgement.evidence,
+        })
+    logger.info("handoff %s on run %s: %s",
+                "turned down" if enforcing else "questioned but allowed",
+                ctx.run_id, judgement.why)
+    if not enforcing:
+        return
+
+    raise OutOfScope(
+        # The audit row keeps the whole judgement, in the arbiter's own words.
+        f"HANDOFF_NOT_SUPPORTED: {judgement.why}",
+        # Never shown to a guest on this path — the model answers instead — but
+        # it is what they would hear if everything above this failed, and
+        # "someone will call you" is the one thing that must not be said when
+        # nobody has been asked to.
+        "One moment — let me check that for you.",
+        # What the model is told, which is an instruction rather than the
+        # sentence above it. A model handed the audit line paraphrases it at the
+        # guest; a model handed a tool name calls the tool.
+        arbiter.instruction_for(judgement),
+    )
 
 
 class HandoffArgs(BaseModel):
@@ -70,6 +139,7 @@ class HandoffArgs(BaseModel):
     mutating=True,
     usage_type="ai.tool_write",
     result_type="handoff",
+    precheck=_precheck_handoff,
 )
 async def request_human_handoff(args: HandoffArgs, ctx: AgentContext) -> tuple[dict, str | None]:
     reason = args.reason if args.reason in REASONS else "unusual_request"
@@ -133,6 +203,93 @@ class SendTemplateArgs(BaseModel):
     )
 
 
+async def _refuse_what_may_not_be_said(body: str, ctx: AgentContext) -> None:
+    """
+    The reply guardrail, on the path a reply actually takes.
+
+    **Found in production on 2026-08-24.** A guest asked about five rooms. The
+    model ran `get_group_rates`, `search_availability`, `get_stay_options` and
+    `get_quote` — everything right — and then sent:
+
+        …total price ₹65,946 hai … 30% deposit (₹19,784) abhi pay karna hoga
+
+    ₹19,784 is thirty per cent of ₹65,946. No tool returned it. `get_group_rates`
+    gave `depositPct: 30` and `get_quote` gave the total, and the model did the
+    multiplication itself — which §24 rule 3 says it must never do, and which
+    `guardrails.check_reply` exists to catch.
+
+    It *was* caught. The run ends `guardrail: reply quoted ['19784'], which no
+    tool result contains`, and the turn escalated. But the check ran on
+    `result.reply` at the end of the turn, and the message had already gone out
+    through this tool sixteen seconds earlier. The guardrail refused a
+    paraphrase of a number the guest was already looking at.
+
+    This tool's own description calls itself "the only way to say anything to
+    them". That was true, and it meant the primary channel for saying things was
+    the one channel the check on what may be said did not cover. Everything the
+    guardrail protects — a price nobody quoted, a payment link nobody created, a
+    booking nobody made — was reachable by putting it in `body` instead of in
+    the reply.
+
+    Same function, same evidence, one turn earlier. `ctx.turn.outcomes` holds
+    the tools that have run *so far*, which is exactly the right set: a figure
+    has to come from something that already happened, not from this call.
+
+    Refusing is a real cost — the guest gets nothing from this call and the
+    model has to try again — and it is the cheaper half of the trade. The
+    alternative is a number the hotel never authorised, in a guest's hand, on
+    WhatsApp, which somebody has to either honour or take back.
+    """
+    from app.services.ai import guardrails
+    from app.services.ai.runtime import _trusted_hosts
+
+    turn = getattr(ctx, "turn", None)
+    if turn is None or not (body or "").strip():
+        return
+
+    # **Not on the approval path, and the distinction is the whole reason
+    # `TurnState.live` exists.**
+    #
+    # `approvals.execute_action` runs a tool a human queued and then approved,
+    # on a context built outside `run_turn` — so `turn.outcomes` is empty. To
+    # this check that looks identical to a turn where no tool has run, and every
+    # figure in the message would be refused. At autonomy 1 the agent *proposes*
+    # its messages and a person approves them, which is exactly the
+    # configuration where the most careful hotels run, and prices are exactly
+    # what those messages are about.
+    #
+    # "There is no evidence" and "the evidence says no" are opposite answers and
+    # were about to be given the same one. A human who has read the message and
+    # pressed approve is a better authority on it than this function, and
+    # `registry.execute` has already checked everything a human cannot lend —
+    # permission, grant, the property's own rules. See `approvals`.
+    if not turn.live:
+        return
+
+    verdict = guardrails.check_reply(
+        body,
+        tool_outputs=list(turn.outcomes),
+        trusted_hosts=await _trusted_hosts(ctx),
+        history=list(turn.history),
+    )
+    if verdict.ok:
+        return
+
+    logger.error("run %s: send_message refused by guardrails: %s | body=%r",
+                 ctx.run_id, verdict.reason, (body or "")[:300])
+    raise OutOfScope(
+        f"guardrail: {verdict.reason}",
+        # If everything above this somehow fails, the guest hears nothing about
+        # a price rather than a wrong one.
+        "Let me check that figure with the hotel and come back to you.",
+        # The model can act on this: it names what was wrong and what to do.
+        f"NOT SENT. {verdict.reason}. Every figure and every link you send has "
+        f"to come from a tool result on this turn, exactly as the tool wrote "
+        f"it. Do not calculate anything — if you need a number no tool gave "
+        f"you, call the tool that produces it, or leave it out.",
+    )
+
+
 @tool(
     name="send_message",
     description=(
@@ -150,9 +307,11 @@ class SendTemplateArgs(BaseModel):
     usage_type="ai.tool_write",
     result_type="message",
     creates_result=True,
+    requires=(registry.OUTBOUND,),
 )
 async def send_message(args: SendMessageArgs, ctx: AgentContext) -> tuple[dict, str]:
     conversation = await _conversation(ctx)
+    await _refuse_what_may_not_be_said(args.body, ctx)
 
     try:
         sent = await messaging.send(
@@ -208,6 +367,7 @@ async def send_message(args: SendMessageArgs, ctx: AgentContext) -> tuple[dict, 
     usage_type="ai.tool_write",
     result_type="message",
     creates_result=True,
+    requires=(registry.OUTBOUND, registry.TEMPLATES),
 )
 async def send_template(args: SendTemplateArgs, ctx: AgentContext) -> tuple[dict, str]:
     """
@@ -338,6 +498,7 @@ def _photo_sources(property_id: str, room_type_id: str | None) -> list[dict]:
     usage_type="ai.tool_write",
     result_type="none",
     scoped_to_conversation=True,
+    requires=(registry.OUTBOUND,),
 )
 async def send_room_photos(args: RoomPhotosArgs, ctx: AgentContext) -> dict:
     """

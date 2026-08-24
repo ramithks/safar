@@ -60,6 +60,8 @@ from datetime import date, datetime, timedelta, timezone
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+
+import e2e_sweep  # noqa: E402
 os.environ.setdefault("MESSAGING_INLINE_PROCESSING", "true")
 
 import e2e_fixture  # noqa: E402
@@ -195,7 +197,15 @@ agent_row = (
     db.table("agents").select("*").eq("property_id", PROPERTY)
     .eq("agent_type", "sales").limit(1).execute().data[0]
 )
-db.table("agents").update({"autonomy_level": 3, "status": "active"}).eq(
+# **Borrowed, not taken.** `agents.autonomy_level` on the demo property is one
+# row and six suites write to it; whichever ran last used to decide what the
+# property was. An evaluation then measured a configuration an unrelated suite
+# had left behind and reported it as a model regression. `borrow_autonomy`
+# records the level it found and puts it back on exit, crash included.
+# See scripts/e2e_sweep.py.
+e2e_sweep.borrow_autonomy(db, PROPERTY, 3,
+                          agent_type=agent_row["agent_type"])
+db.table("agents").update({"status": "active"}).eq(
     "id", agent_row["id"]).execute()
 
 granted = {

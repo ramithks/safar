@@ -314,6 +314,13 @@ async def run_turn(
     # permission: see services/ai/toolsets.py.
     tools = registry.describe_for_provider(ctx, task=task)
 
+    # Declared ahead of the rest of the turn's bookkeeping, because `ctx.turn`
+    # is given *this* list object rather than a copy of it. A snapshot of what
+    # has run so far is exactly the thing that must not go stale mid-turn: the
+    # arbiter reads it from inside `registry.execute`, while the turn is still
+    # filling it.
+    outcomes: list[ToolOutcome] = []
+
     # What this message *requires*, decided before the model sees it.
     #
     # Guest turns only. A receptionist typing into the console is not a guest
@@ -327,6 +334,19 @@ async def run_turn(
     requirements = (
         required_actions.detect(message, ctx.session) if ctx.guest_scoped else []
     )
+
+    # Published to the turn, so the layers that run *inside* `registry.execute`
+    # can see what the turn is about. One does today: the arbiter, which decides
+    # whether a handoff the model asked for is supported by the conversation it
+    # claims to describe — a question whose evidence lives in the turn rather
+    # than in the tool's arguments. See services/ai/arbiter.py and
+    # services/ai/context.py:TurnState.
+    ctx.turn.live = True
+    ctx.turn.message = message
+    ctx.turn.requirements = tuple(requirements)
+    ctx.turn.outcomes = outcomes
+    ctx.turn.history = tuple(history or [])
+
     forced: list[str] = []
     # Devanagari words that had to be romanised for a Hinglish guest. Counted
     # rather than merely fixed: a language fix whose effect cannot be measured
@@ -336,7 +356,6 @@ async def run_turn(
         logger.info("run %s requires %s", run_id,
                     [f"{r.intent}->{r.tool}" for r in requirements if r.must_execute])
 
-    outcomes: list[ToolOutcome] = []
     # usage_type -> the action rows that produced it, so a usage event can point
     # at the action rather than only at the run.
     action_ids: dict[str, list[str]] = {}
@@ -621,6 +640,20 @@ async def run_turn(
                 outcomes.append(outcome)
                 forced.append(requirement.tool)
 
+                # **A forced stop is still a stop.**
+                #
+                # `handoff` was set only inside the model's own tool loop, so a
+                # handoff the *application* ran left the flag false: the tool
+                # moved `conversations.handler` to 'human_requested', and then
+                # `_ensure_human` never ran, the run recorded no handoff, and
+                # `messaging/pipeline` went on to deliver the reply and look for
+                # the next message as though nothing had happened. One line,
+                # and it is the difference between a guest who asked for a
+                # person reaching one and a guest who asked for a person being
+                # answered by the AI on the very turn it agreed to stop.
+                if outcome.tool == "request_human_handoff" and outcome.ok:
+                    handoff = True
+
                 spec = registry.REGISTRY.get(requirement.tool)
                 if spec:
                     turn_usage.count(spec.usage_type)
@@ -703,7 +736,23 @@ async def run_turn(
         # produced it, and before any caller can deliver it. See
         # services/ai/guardrails — this is where an invented payment link stops
         # being a thing a guest can tap.
-        if reply and not handoff:
+        # **Every reply, including the ones that end in a handoff.**
+        #
+        # This read `if reply and not handoff`, and the exclusion had no stated
+        # reason. It was harmless while a handoff reply came from
+        # `prompts.handoff_reply` — a fixed sentence with no figures in it — and
+        # stopped being harmless the moment a handoff could follow the model
+        # speaking: the handoff tool's own instruction is "tell the guest a
+        # member of the team is taking over", the model writes that sentence
+        # itself, and on a turn that had already priced something it can write a
+        # price into it. A rupee figure in the last thing a guest reads before a
+        # human arrives is exactly the figure that gets honoured.
+        #
+        # Failing here is benign in the way that matters: the reply is replaced
+        # with `handoff_reply`, `handoff` is already true, and the conversation
+        # was going to a person regardless. The check can only remove a number
+        # nothing accounts for; it cannot stop the handoff.
+        if reply:
             verdict = guardrails.check_reply(
                 reply,
                 tool_outputs=outcomes,
@@ -775,6 +824,33 @@ async def run_turn(
                 reply = prompts.handoff_reply(ctx)
                 handoff = True
                 status = "escalated"
+            else:
+                # **And it is not a failure either.**
+                #
+                # `status` was set to 'failed' above before anything had looked
+                # at whether the guest was answered, and the `spoke` branch only
+                # ever moved it further down, to 'escalated'. So a turn where the
+                # model replied through `send_message` and then correctly
+                # declined to repeat itself was recorded as a failure with the
+                # error "the model produced no reply".
+                #
+                # Nothing behaved badly — the guest had their answer and the
+                # conversation stayed with the AI. What was wrong was the
+                # record, and the record is what every comparison is made of.
+                #
+                # It is not evenly wrong, which is why it matters. A model that
+                # answers by calling the tool books these; a model that answers
+                # in prose never does. Production on 2026-08-24 shows exactly
+                # that: 3.x replies through `send_message`, 2.5 returns prose,
+                # and any dashboard counting status='failed' would have read the
+                # difference in *style* as a difference in reliability. That is
+                # the same bias that produced a model regression which was not
+                # real, moved from the fixture into the metric.
+                status = "succeeded"
+                error = (
+                    "answered through send_message with no closing prose"
+                    + (f" ({detail})" if detail else "")
+                )
 
     except ProviderError as exc:
         # The model is gone. The conversation goes to a human, and the guest is
@@ -806,6 +882,14 @@ async def run_turn(
         # is the turn's story, it is absent on virtually every turn, and a
         # column that is null 99% of the time is a column nobody queries.
         summary_of_requirements["language_slips"] = language_slips[:10]
+    if ctx.turn.handoff_rejections:
+        # Every handoff the model asked for this turn and what the arbiter made
+        # of it — accepted and rejected alike. §21: a handoff that was turned
+        # down is exactly as much of an event as one that went through, and a
+        # record that only kept the rejections would make the layer look busier
+        # than it is. This is also the only way to answer "how often does the
+        # arbiter fire", which is the number that decides whether it is helping.
+        summary_of_requirements["handoff_judgements"] = ctx.turn.handoff_rejections[:6]
 
     # **Which model actually answered, not which one was chosen.**
     #

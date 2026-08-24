@@ -245,18 +245,81 @@ def test_a_haggle_with_no_figure_names_none(message):
     assert "requested_nightly_rupees" not in found.arguments
 
 
-def test_a_negotiation_before_there_is_anything_to_negotiate_is_not_forced():
+class TestANegotiationBeforeThereIsAnythingToNegotiate:
     """
-    No rate plan and no dates on the session. Recorded — so the evaluation
-    report can count how often this happens — and left to the model, whose
-    correct answer here is to find out which room and which nights rather than
-    to open a haggle over nothing.
+    The ordinary first turn, and the one this module used to have no opinion on.
+
+    **What was wrong.** This case returned `must_execute=False` with
+    `negotiate_rate` named as its tool. Both halves were mistakes, and they were
+    mistakes in opposite directions.
+
+    Advisory was wrong because "best price kya de sakte ho?" before anything has
+    been priced is not a rare state — it is how most haggles *open*. Leaving the
+    deterministic layer with no opinion there left the model unsupervised at
+    exactly the moment it was most likely to stop: the arbiter has nothing to
+    weigh a handoff against when the turn is owed nothing, so an unjustified
+    `request_human_handoff` went through unchallenged. That is the shape of the
+    lost sale that started this work.
+
+    Naming `negotiate_rate` was wrong because there is no rate plan to discount.
+    Sending the model at that tool would be sending it at one that cannot run.
+
+    **What the new assertions measure.** That the turn is owed a business
+    action (`must_execute`), that the action is *discovery* rather than
+    negotiation (`get_stay_options`), and — unchanged in substance from the
+    assertion this replaces — that the application does not run it on a session
+    with nothing in it. `forceable` is what "the application will run this
+    itself" has always actually meant; `must_execute` means "this turn owes the
+    guest something", and separating them is what lets a requirement be real
+    without being executable.
     """
-    found = requirement("thoda kam karo", {}, ra.NEGOTIATION)
-    assert found is not None
-    assert found.must_execute is False
-    assert found.arguments is None
-    assert found.forceable is False
+
+    def test_the_turn_owes_something_even_with_an_empty_session(self):
+        found = requirement("thoda kam karo", {}, ra.NEGOTIATION)
+        assert found is not None
+        assert found.must_execute is True
+
+    def test_and_what_it_owes_is_to_find_out_what_is_being_haggled_over(self):
+        found = requirement("thoda kam karo", {}, ra.NEGOTIATION)
+        assert found.tool == "get_stay_options"
+        assert "negotiate_rate" in found.satisfied_by, (
+            "a model that goes straight to the negotiation engine has answered "
+            "the guest, and must not be told it still owes something"
+        )
+
+    def test_but_the_application_does_not_run_it_over_nothing(self):
+        """
+        Unchanged in substance. There is no honest set of arguments to invent
+        for a stay nobody has described, and inventing dates would be the
+        application doing what the model is forbidden from doing.
+        """
+        found = requirement("thoda kam karo", {}, ra.NEGOTIATION)
+        assert found.arguments is None
+        assert found.forceable is False
+
+    def test_dates_without_a_rate_plan_are_enough_to_run_the_lookup(self):
+        """
+        The half that *is* constructible. A guest who has said which nights has
+        given the system everything the search needs, so this stops being a
+        thing to hope the model does.
+        """
+        found = requirement(
+            "thoda kam karo",
+            {"check_in": "2026-12-01", "check_out": "2026-12-03", "adults": 2},
+            ra.NEGOTIATION,
+        )
+        assert found.forceable is True
+        assert found.tool == "get_stay_options"
+        assert found.arguments["check_in"] == "2026-12-01"
+        assert found.arguments["check_out"] == "2026-12-03"
+
+    def test_a_room_count_in_the_same_breath_is_carried_into_the_lookup(self):
+        found = requirement(
+            "5 kamre chahiye, thoda kam karo",
+            {"check_in": "2026-12-01", "check_out": "2026-12-03"},
+            ra.NEGOTIATION,
+        )
+        assert found.arguments["units"] == 5
 
 
 def test_a_negotiation_takes_its_stay_from_structured_state_only():
@@ -441,3 +504,57 @@ def test_one_requirement_per_intent():
     """The vocabularies overlap by design; a duplicate would be forced twice."""
     detected = ra.detect("5 rooms chahiye, 10 log, group booking hai", {})
     assert len(detected) == len({r.intent for r in detected})
+
+
+class TestThePercentageAGuestNamesThemselves:
+    """
+    *"give me 70% off"* — found in production, not here.
+
+    A real guest turn on 2026-08-24 arrived through the webhook, ran on the live
+    model, and was recorded with `required_action_status: none`. No intent, no
+    requirement, nothing for any deterministic layer to have an opinion about —
+    on a message whose entire content is a demand for a discount.
+
+    The negotiation vocabulary is built out of *words*: "discount", "kam karo",
+    "best price". A percentage is not a word. It is also one of the two or three
+    commonest ways a guest asks, in every language this product sees, and it was
+    the one shape the list could not express.
+
+    **The second half of these assertions is the one that constrains the fix.**
+    A bare percentage is not a haggle: hotels talk about occupancy in per cent,
+    and every price in India carries GST in per cent. So the digit needs a
+    discount word beside it, and the tests that must fail are written down
+    beside the tests that must pass.
+    """
+
+    @pytest.mark.parametrize("message", [
+        "how much for two nights? give me 70% off",
+        "give me 70% off",
+        "can you do 20% off",
+        "70% off karo",
+        "10 percent discount de do",
+        "thoda discount 15% kar do",
+        "kya 5% kam kar sakte ho",
+    ])
+    def test_a_percentage_beside_a_discount_word_is_a_haggle(self, message):
+        assert ra.wants_discount(message) is True
+
+    @pytest.mark.parametrize("message", [
+        "what is your occupancy, 70% full?",
+        "is 18% GST included in the price",
+        "the room is 70% booked already",
+        "do you have a room tomorrow for two?",
+    ])
+    def test_a_bare_percentage_is_not(self, message):
+        """
+        §The detector is conservative in one direction on purpose. A missed
+        negotiation leaves the system where it was; a false one opens a haggle
+        the guest never asked for, and now also lets the arbiter turn down a
+        handoff on the strength of it.
+        """
+        assert ra.wants_discount(message) is False
+
+    def test_the_production_message_now_reaches_the_negotiation_engine(self):
+        """The turn as it actually arrived, end to end through `detect`."""
+        found = ra.detect("how much for two nights? give me 70% off", {})
+        assert "NEGOTIATION" in [r.intent for r in found]

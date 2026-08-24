@@ -14,7 +14,7 @@ argument with an accountant.
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.v1.pms.hotel_os_schemas import PhotoMeta
 from app.services.pms import money
@@ -1977,6 +1977,11 @@ class WebsiteConfigOut(BaseModel):
     contactPhone: str | None = None
     contactEmail: str | None = None
     sections: list[dict] = []
+    # Names the server did not recognise on the request that produced this
+    # response. Empty on every read and on every correct save, so a client can
+    # surface it without checking what kind of call it made. See
+    # `WebsiteUpdateRequest`.
+    ignoredFields: list[str] = []
     publishedAt: datetime | None = None
     hasUnpublishedChanges: bool = False
     # The hotel's own address, if it has claimed one. `domain` above stays for
@@ -2007,6 +2012,31 @@ class GalleryPhotoIn(BaseModel):
 
 
 class WebsiteUpdateRequest(BaseModel):
+    """
+    A partial save of the builder's draft.
+
+    **Unknown fields are captured rather than dropped, and reported back.**
+
+    Pydantic's default is `extra="ignore"`, so a builder sending `cover_image`
+    when the field is `heroImageUrl` got a 200, an unchanged draft, and no
+    indication that anything had been ignored. That is the exact shape of "it
+    says it saved and it didn't" — found by `website_roundtrip_e2e`, which sent
+    that very key on its own first run.
+
+    §16 asks whether to make this strict, and the honest answer is: not blindly.
+    The builder that calls this lives in another repository, so nothing here can
+    prove no client has been sending a stray key for months, and a 422 to one of
+    them turns a cosmetic bug into a hotelier who cannot edit their own page.
+
+    So `extra="allow"` — which changes nothing about what is *saved*, because
+    the draft is still built from the declared fields — and the endpoint returns
+    the names it ignored and logs them. That is the migration path: when the
+    telemetry has been empty for long enough, `website_strict_fields` flips the
+    same information into a 422 without another schema change.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
     template: str | None = None
     headline: str | None = Field(default=None, max_length=200)
     tagline: str | None = Field(default=None, max_length=300)

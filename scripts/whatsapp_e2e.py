@@ -40,6 +40,10 @@ from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+
+# `scripts/` on the path so the shared teardown helpers are importable.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import e2e_sweep  # noqa: E402
 # Inline processing and a known app secret, set before anything imports settings.
 os.environ.setdefault("MESSAGING_INLINE_PROCESSING", "true")
 os.environ.setdefault("WHATSAPP_APP_SECRET", "whatsapp-e2e-app-secret")
@@ -165,7 +169,14 @@ stranger = db.table("reservations").insert({
 }).execute().data[0]
 
 # Reset the agent's preconditions, so a crashed previous run cannot poison this.
-db.table("agents").update({"autonomy_level": 2, "status": "active"}).eq(
+# **Borrowed, not taken.** `agents.autonomy_level` on the demo property is one
+# row and six suites write to it; whichever ran last used to decide what the
+# property was. An evaluation then measured a configuration an unrelated suite
+# had left behind and reported it as a model regression. `borrow_autonomy`
+# records the level it found and puts it back on exit, crash included.
+# See scripts/e2e_sweep.py.
+e2e_sweep.borrow_autonomy(db, PROPERTY, 2, agent_type="guest")
+db.table("agents").update({"status": "active"}).eq(
     "property_id", PROPERTY).eq("agent_type", "guest").execute()
 
 
@@ -486,16 +497,31 @@ print("\n── duplicate inbound ──")
 
 before_runs = len(runs())
 before_msgs = len(messages())
-before_usage = sql(f"""select count(*) as n from public.usage_events
-                        where property_id = '{PROPERTY}';""")[0]["n"]
+# **Scoped to this conversation, not to the property.**
+#
+# This counted every usage event Casa Mandala had ever recorded, so it was
+# really asserting "nothing anywhere billed this hotel between these two
+# reads" — which is true only when nothing else is touching the demo property.
+# It failed on a run where `scripts/agent_eval.py` was sweeping the same hotel
+# in another terminal: 15,621 → 15,627, six events that had nothing to do with
+# a redelivered webhook.
+#
+# The property is shared by every e2e suite and by the evaluation runner, and a
+# test that cannot survive a neighbour is a test that gets muted. What the
+# duplicate-inbound case is actually about is *this thread*, which is the scope
+# it now counts.
+before_usage = sql(f"""select count(*) as n from public.usage_events u
+                        where u.property_id = '{PROPERTY}'
+                          and u.conversation_id = '{conversation()['id']}';""")[0]["n"]
 
 repeat = deliver(payload, script=["This should never run."])
 check("Meta's redelivery is recognised", repeat["duplicates"] == 1, str(repeat))
 check("and accepted nothing new", repeat["accepted"] == 0, str(repeat))
 check("no second message row", len(messages()) == before_msgs, f"{before_msgs} → {len(messages())}")
 check("no second agent run", len(runs()) == before_runs, f"{before_runs} → {len(runs())}")
-after_usage = sql(f"""select count(*) as n from public.usage_events
-                       where property_id = '{PROPERTY}';""")[0]["n"]
+after_usage = sql(f"""select count(*) as n from public.usage_events u
+                       where u.property_id = '{PROPERTY}'
+                         and u.conversation_id = '{conversation()['id']}';""")[0]["n"]
 check("and nothing was metered twice", after_usage == before_usage,
       f"{before_usage} → {after_usage}")
 check("nor a second reply sent to the guest",

@@ -142,9 +142,18 @@ def sweep_waiting_guests_task(self) -> dict:
     Tell each hotel about the guests nobody came back to.
 
     Routed to the `hotelos` queue by `travbuddy.messaging.*`, which is what
-    makes it read the right database: this is enqueued by the marketplace's
-    beat — the only deployment that runs one — and must never be executed by
-    the marketplace's worker, which has no `conversations` table.
+    makes it read the right database: it must never be executed by the
+    marketplace's worker, which has no `conversations` table.
+
+    **Enqueued by the StayOS beat, not the marketplace's.** This docstring used
+    to say the marketplace beat was "the only deployment that runs one", and
+    that sentence is why `agent_escalations` was empty for the whole life of the
+    feature: the marketplace beat enqueues onto the marketplace broker, StayOS
+    brings up its own Redis, and the StayOS worker was listening to a queue
+    nothing was writing to. Routing was correct and irrelevant — the message
+    never crossed. See `celery_app._beat_schedule` and
+    `tests/test_escalation_beat.py`, which runs this function rather than
+    inspecting the configuration around it.
     """
     import asyncio
 

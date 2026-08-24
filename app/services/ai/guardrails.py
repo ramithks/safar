@@ -182,10 +182,33 @@ _NOT_YET = re.compile(
 # was done. The guest asking to pay was handed to a human at the last step of
 # the sale.
 #
-# `karne` and `karna` only. "confirm kar di hai" and "confirm kar diya" are the
+# Infinitives only. "confirm kar di hai" and "confirm kar diya" are the
 # perfective — *I have confirmed it* — and those are exactly the claim this
 # rule exists to catch.
-_PURPOSIVE = re.compile(r"(?i)^\s*kar(?:ne|na)\b")
+#
+# **`karni` was missing, and it is the form the word "booking" actually takes.**
+# Hindi infinitives agree with the gender of their object: `booking` is
+# feminine, so a guest is asked *"booking confirm **karni** hai?"* — do you want
+# to confirm the booking — where a masculine object would give `karna`. The rule
+# was written from a transcript that happened to contain the masculine, and the
+# feminine is the commoner one in this product's vocabulary because almost
+# everything the agent confirms is a *booking*.
+#
+# Found by `scripts/replay_e2e.py` on the live model, in the middle of a sale:
+#
+#     Agar aapko booking confirm karni hai toh batayein, main payment link
+#     bhej deta hoon.
+#
+# — an offer to send a payment link, refused as a claim that a booking existed,
+# which escalated the turn and handed the guest to a person at the exact moment
+# they were being asked to pay. Precisely the failure the `_PURPOSIVE` exception
+# was added to prevent, in a gender it did not cover.
+#
+# The causatives are here for the same reason — "booking confirm karwani hai" is
+# the same sentence with somebody else doing the confirming. `karwaya` and
+# `karvaya` are deliberately NOT matched: those are perfective ("I had it
+# confirmed"), which is a claim.
+_PURPOSIVE = re.compile(r"(?i)^\s*kar(?:ne|na|ni)\b|^\s*kar[wv]a(?:ne|na|ni)\b")
 
 
 def _reported_unsecured(tool_outputs: list) -> bool:

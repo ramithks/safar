@@ -41,6 +41,8 @@ from datetime import date, timedelta
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from app.config import settings  # noqa: E402
+# `scripts/` on the path so the shared teardown helpers are importable.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import e2e_sweep  # noqa: E402
 
 from app.db.client import get_db  # noqa: E402
@@ -183,7 +185,14 @@ conversation = db.table("conversations").insert({
     "handler": "ai", "status": "open",
 }).execute().data[0]
 
-db.table("agents").update({"autonomy_level": 2, "status": "active"}).eq(
+# **Borrowed, not taken.** `agents.autonomy_level` on the demo property is one
+# row and seven suites write to it; whichever ran last used to decide what the
+# property was. An evaluation then measured a configuration an unrelated suite
+# had left behind and reported it as a model regression. `borrow_autonomy`
+# records the level it found and puts it back on exit, crash included.
+# See scripts/e2e_sweep.py.
+e2e_sweep.borrow_autonomy(db, PROPERTY, 2, agent_type="guest")
+db.table("agents").update({"status": "active"}).eq(
     "property_id", PROPERTY).eq("agent_type", "guest").execute()
 
 

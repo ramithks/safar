@@ -139,6 +139,31 @@ class TestASilentTurn:
 
         Handing over here would be the opposite bug: a person called in because
         the model declined to repeat, in prose, what a tool had just sent.
+
+        **One assertion below changed, from `failed` to `succeeded`, and it is
+        worth saying why it is not a weakened assertion.**
+
+        The behaviour was always right: no handoff, no reply invented, the
+        conversation left with the AI. Only the *label* was wrong. `status` was
+        set to 'failed' before anything had looked at whether the guest had been
+        answered, and this branch only ever moved it further down to
+        'escalated' — so a turn that worked was filed as a failure with the
+        error "the model produced no reply".
+
+        It is not evenly wrong, which is what makes it worth fixing rather than
+        tolerating. A model that answers by calling `send_message` books one of
+        these every time it does so; a model that answers in prose never books
+        one at all. Production on 2026-08-24 shows exactly that split — 3.x
+        replies through the tool, 2.5 returns prose — so any dashboard counting
+        `status='failed'` would have read a difference in *style* as a
+        difference in reliability. That is the same bias that produced a model
+        regression which was not real, moved out of the fixture and into the
+        metric.
+
+        What is still asserted, unchanged: the guest is not handed over, and no
+        prose is invented to stand in for what the tool already said. The error
+        string is still written, because "there was no closing prose" is a true
+        and occasionally useful fact — it is just not a failure.
         """
         from app.services.ai.schemas import ToolOutcome
 
@@ -158,5 +183,8 @@ class TestASilentTurn:
             ctx, "photos bhejo", provider=provider, task="guest_faq",
         ))
         assert result.handoff is False
-        assert result.status == "failed"
+        assert result.status == "succeeded"
         assert result.reply is None
+        assert "send_message" in (result.error or ""), (
+            "the fact is still recorded — it is only no longer called a failure"
+        )

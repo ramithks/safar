@@ -89,6 +89,25 @@ class ToolSpec:
     # conversation before anything is returned.
     scoped_to_conversation: bool = False
 
+    # What the *channel* has to be able to do for this tool to work at all.
+    #
+    #   'outbound'   the tool reaches `messaging.send`, so the channel needs a
+    #                messaging policy. `website`, `internal`, `phone` and
+    #                `email` have none, and calling it there raises before it
+    #                reaches anything that could refuse politely.
+    #   'templates'  the tool sends an approved template, which Instagram has
+    #                no mechanism for.
+    #
+    # Declared here rather than listed in `registry`, and the list that used to
+    # be in `registry` was the reason this exists: it held `send_message` alone
+    # while `send_template` and `send_room_photos` reach `messaging.send` too,
+    # so both were offered on channels where they raise. A hand-maintained set
+    # in a file away from the tools it describes is a set that goes stale the
+    # next time somebody adds a tool — which is the §10 lesson about one regex,
+    # in a different room. `tests/test_channel_capability.py` derives the same
+    # answer from the tool bodies and fails if a declaration is missing.
+    requires: tuple[str, ...] = ()
+
     # Business validation, run *before* the autonomy gate on every path.
     #
     # `revalidate` below asks "is this still true?" and only runs on the approval

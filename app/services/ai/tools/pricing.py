@@ -28,6 +28,7 @@ from app.services.ai.registry import tool
 from app.services.ai.tools import ACTOR_QUOTE
 from app.services.pms import booking as booking_service
 from app.services.pms import money
+from app.services.pms import rates
 
 logger = logging.getLogger(__name__)
 
@@ -214,4 +215,36 @@ async def get_quote(args: QuoteArgs, ctx: AgentContext) -> tuple[dict, str]:
             )
         ).strip(),
     }
+
+    # **The deposit, worked out here rather than by the model.**
+    #
+    # A real group turn on 2026-08-24 ended with the reply guardrail refusing
+    # ₹19,784 — thirty per cent of a ₹65,946 total, which the model had
+    # multiplied out itself because nothing had given it the figure.
+    # `get_group_rates` returns `depositPct: 30`, this returns the total, and
+    # between them they invited exactly the arithmetic §24 rule 3 forbids.
+    #
+    # A percentage and a total together in a model's context is a
+    # multiplication waiting to happen, and the answer is not a firmer
+    # instruction — it is the number, in the shape the model is allowed to
+    # quote, so there is nothing left to work out. Same reasoning as `total`
+    # above; see `money.display`.
+    #
+    # Only when the booking actually is a group. A single room carries no
+    # deposit, and a `deposit: ₹0` on every quote is a field the model would
+    # eventually mention to somebody.
+    group = await rates.group_policy_for(ctx.property_id)
+    if group and group.deposit_pct and args.units >= group.min_units:
+        deposit_paise = round(priced.total_paise * group.deposit_pct / 100)
+        payload["depositPct"] = group.deposit_pct
+        payload["depositPaise"] = deposit_paise
+        payload["deposit"] = money.display(deposit_paise)
+        payload["balancePaise"] = priced.total_paise - deposit_paise
+        payload["balance"] = money.display(priced.total_paise - deposit_paise)
+        payload["instruction"] += (
+            " This is a group booking: the deposit is `deposit` and the rest is "
+            "`balance`. Quote both exactly as written — do not work out a "
+            "percentage of anything."
+        )
+
     return payload, quote.id

@@ -290,6 +290,31 @@ _NEGOTIATION = (
         re.IGNORECASE,
     ),
     re.compile(r"कम कर|छूट|सस्ता|महंगा|कम से कम|आखिरी (?:रेट|दाम)"),
+    # **"give me 70% off".**
+    #
+    # Found in production traffic on 2026-08-24, not here: a real guest turn
+    # that arrived through the webhook, ran on the live model, and was recorded
+    # with `required_action_status: none` — no intent, no requirement, nothing
+    # for any deterministic layer to have an opinion about.
+    #
+    # The vocabulary above is built out of *words* — "discount", "kam karo",
+    # "best price" — and a percentage is not a word. It is also one of the two
+    # or three commonest ways a guest asks, in every language this product sees,
+    # and it was the one shape the list could not express.
+    #
+    # A digit-plus-`%` needs a discount word beside it, because "70% occupancy"
+    # and "18% GST" are not haggles. `off`, `discount`, `kam`, `chhoot` and
+    # their neighbours are; a bare percentage is left alone.
+    re.compile(
+        r"\d{1,2}\s*(?:%|percent|pct|फ़ीसदी|फीसदी)\s*"
+        r"(?:ki\s+|ka\s+)?(?:off|discount|kam|kum|chhoot|chhut|छूट|कम)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:off|discount|kam|kum|chhoot|छूट|कम)\s*(?:kar\w*|do|de\s*do|dijiye)?\s*"
+        r"\d{1,2}\s*(?:%|percent|pct)",
+        re.IGNORECASE,
+    ),
 )
 
 # "4000 mein ho jayega?", "₹4,000 mein kar do", "3500 tak", "4k mein".
@@ -500,17 +525,57 @@ def _negotiation_requirement(message: str, session: dict | None) -> Requirement 
     evidence = {"requested_nightly_rupees": asked}
 
     if not (stay.get("rate_plan_id") and _valid_dates(stay)):
-        # Nothing to negotiate *about* yet. Recorded so the report can show how
-        # often this happens, and left to the model — whose right answer here is
-        # to find out which room and which nights, not to open a haggle.
+        # Nothing to negotiate *about* yet — and this is the ordinary first
+        # turn, not an edge case. "Best price kya de sakte ho?" arrives before
+        # anything has been priced far more often than it arrives after.
+        #
+        # **The requirement is real; only the tool is different.** It used to be
+        # advisory, with `negotiate_rate` named as the tool it wanted, and both
+        # halves of that were wrong. Advisory meant the deterministic layer had
+        # no opinion at precisely the moment the model was most likely to form a
+        # bad one — a handoff on a turn where the hotel had an answer. And
+        # naming `negotiate_rate` on a session with no rate plan would send the
+        # model at a tool that cannot run: there is nothing to discount yet.
+        #
+        # What the turn actually owes is to find out what is being haggled over.
+        # A hotelier asked "what's your best price" says "for which nights?" —
+        # that is the required action, and `get_stay_options` is the tool that
+        # is it.
+        satisfied_by = frozenset({
+            "get_stay_options", "get_quote", "search_availability",
+            "negotiate_rate", "get_negotiation_policy", "propose_rate_exception",
+            "escalate_to_team",
+        })
+        if _valid_dates(stay):
+            # Dates but no plan: the lookup is fully constructible, so this is
+            # forceable and the application will run it rather than hoping.
+            return Requirement(
+                intent=NEGOTIATION,
+                tool="get_stay_options",
+                satisfied_by=satisfied_by,
+                must_execute=True,
+                arguments={
+                    "check_in": stay["check_in"],
+                    "check_out": stay["check_out"],
+                    "units": room_count(message) or stay.get("units") or 1,
+                    "adults": stay.get("adults") or 2,
+                    "children": stay.get("children") or 0,
+                },
+                detail="guest asked for a better price before anything was priced",
+                evidence=evidence,
+            )
+        # No dates either. Required, because the guest is owed an answer and a
+        # handoff is not one — but not *forceable*, because there is no honest
+        # set of arguments to invent. The right move is to ask which nights,
+        # which is a sentence rather than a tool call, and `arguments=None`
+        # is how this module says "the model's turn, not mine".
         return Requirement(
             intent=NEGOTIATION,
-            tool="negotiate_rate",
-            satisfied_by=frozenset({"negotiate_rate", "get_negotiation_policy",
-                                    "propose_rate_exception", "escalate_to_team"}),
-            must_execute=False,
+            tool="get_stay_options",
+            satisfied_by=satisfied_by,
+            must_execute=True,
             arguments=None,
-            detail="no rate plan or dates on the session yet",
+            detail="guest asked for a better price with no dates on the session",
             evidence=evidence,
         )
 
@@ -600,9 +665,34 @@ def detect(message: str, session: dict | None = None) -> list[Requirement]:
     found: list[Requirement] = []
 
     if _ESCALATION_ASK.search(text):
-        found.append(_simple(ESCALATION, "request_human_handoff",
-                             {"request_human_handoff", "escalate_to_team"},
-                             "guest asked for a person"))
+        # **Forced, and the only forced action whose effect is to stop.**
+        #
+        # It was advisory, which meant a guest asking for a human got one if and
+        # only if the model noticed. That was the shape of every other
+        # requirement here before this module existed, and it is least
+        # defensible on this one: the other requirements are about a hotel
+        # losing a sale, and this one is about a person asking for a person.
+        #
+        # It matters more now than it did. `services/ai/arbiter.py` turns down
+        # handoffs the conversation does not support, so the system has started
+        # having opinions about when the agent may stop — and a layer that can
+        # say "not yet" needs a counterweight that can say "now". This is it,
+        # and the two agree by construction: both read `_ESCALATION_ASK`, so a
+        # sentence that forces a handoff can never be one the arbiter turns
+        # down.
+        #
+        # Forcing a *stop* is also the one forced action that cannot overreach.
+        # Every other one moves stock, money or a booking; this parks a thread
+        # with a person, which is what the guest asked for and what a false
+        # positive costs nothing worse than.
+        found.append(Requirement(
+            intent=ESCALATION,
+            tool="request_human_handoff",
+            satisfied_by=frozenset({"request_human_handoff", "escalate_to_team"}),
+            must_execute=True,
+            arguments={"reason": "guest_asked"},
+            detail="guest asked for a person",
+        ))
 
     if _CANCELLATION.search(text) or _CANCELLATION_HI.search(text):
         # Forced, and forced to the *reading* tool.

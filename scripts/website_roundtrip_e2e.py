@@ -29,6 +29,7 @@ as it found it — including republishing, if it was published when this started
 """
 import base64
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -39,7 +40,17 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 REF = "rdlozqvuywtgsodunait"
 SB = f"https://{REF}.supabase.co"
-API = "http://127.0.0.1:8010/api/v1/pms"
+# Local by default, so `uvicorn --port 8010 &` and run it. Point it at the
+# deployed backend to verify a release actually serves what it was given:
+#
+#     STAYOS_API=https://stayos-backend.travbuddy.in/api/v1/pms \
+#       ./venv/bin/python scripts/website_roundtrip_e2e.py
+#
+# The distinction matters more here than in most suites. Every failure this
+# script is for lives in the join between a save and a publish, and a local
+# process reading the production database proves the code is right without
+# proving the box is running it.
+API = os.environ.get("STAYOS_API", "http://127.0.0.1:8010/api/v1/pms")
 PROP = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 SLUG = "casa-mandala-anjuna"
 
@@ -218,26 +229,34 @@ def main() -> int:
               (saved or {}).get("heroImageUrl") == COVER,
               f"got {(saved or {}).get('heroImageUrl')!r}")
 
-        # **A save that quietly accepts a field it does not have.**
+        # **A save that quietly accepted a field it does not have.**
         #
-        # `WebsiteUpdateRequest` does not forbid extra keys, so a client sending
-        # `cover_image` — the name this script used on its first run — gets a
-        # 200, an unchanged draft and no indication that anything was ignored.
-        # That is the exact shape of "it says it saved and it didn't", which is
-        # the complaint the gallery fixes in this audit came from.
+        # `cover_image` is the name this script used on its own first run, and
+        # it used to get a 200, an unchanged draft and no indication that
+        # anything had been ignored — the exact shape of "it says it saved and
+        # it didn't".
         #
-        # Reported rather than asserted green: it is a real sharp edge and it is
-        # not this pass's to change, because tightening it could reject a
-        # client that has been sending a stray field for months.
+        # The finding this used to print is now the assertion below. It is still
+        # a 200 and the draft is still unchanged, both deliberately: the builder
+        # lives in another repository and a 422 to a client that has been
+        # sending a stray key for months is a hotelier who cannot edit their own
+        # page. What changed is that the response says so. See
+        # `WebsiteUpdateRequest` and `settings.website_strict_fields`.
         st_extra, extra = http(
             f"{API}/properties/{PROP}/website", "PATCH",
-            {"cover_image": "https://images.stayos.test/roundtrip/ignored.jpg"},
+            {"cover_image": "https://images.stayos.test/roundtrip/ignored.jpg",
+             "tagline": "Rooms around a courtyard"},
             headers=manager,
         )
-        if st_extra == 200 and (extra or {}).get("heroImageUrl") == COVER:
-            print("    ⚠ FINDING: PATCH /website accepts unknown fields silently — "
-                  "`cover_image` returned 200 and changed nothing. A builder "
-                  "sending the wrong key is told it saved.")
+        check("an unknown field is named in the response, not swallowed",
+              st_extra == 200 and "cover_image" in ((extra or {}).get("ignoredFields") or []),
+              f"{st_extra}: ignoredFields={(extra or {}).get('ignoredFields')!r}")
+        check("   and the correct field in the same save still saved",
+              (extra or {}).get("tagline") == "Rooms around a courtyard",
+              f"got {(extra or {}).get('tagline')!r}")
+        check("   while the unknown one reached nothing",
+              (extra or {}).get("heroImageUrl") == COVER,
+              f"heroImageUrl is now {(extra or {}).get('heroImageUrl')!r}")
 
         # ── 2. a draft is not a page ────────────────────────────────────────
         print("\n── 2. saving is not publishing ──")

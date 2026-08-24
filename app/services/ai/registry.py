@@ -56,6 +56,7 @@ def tool(
     creates_result: bool = False,
     always_requires_approval: bool = False,
     scoped_to_conversation: bool = False,
+    requires: tuple[str, ...] = (),
     when_deferred: str | None = None,
     precheck: Callable | None = None,
     revalidate: Callable | None = None,
@@ -87,6 +88,7 @@ def tool(
             creates_result=creates_result,
             always_requires_approval=always_requires_approval,
             scoped_to_conversation=scoped_to_conversation,
+            requires=tuple(requires),
             when_deferred=when_deferred,
             precheck=precheck,
             revalidate=revalidate,
@@ -104,17 +106,87 @@ def get(name: str) -> ToolSpec:
     return spec
 
 
+# What a channel has to be able to do, for the tools that need it to.
+#
+# **Found in production, on a hotel's own booking page.** A visitor asked about
+# five rooms through the website chat; the model reached for `send_message` to
+# ask which dates, and the tool raised
+#
+#     ValueError: no messaging policy for channel 'website'
+#
+# `registry.execute` correctly turned that into "that lookup did not come back
+# — call request_human_handoff", the model did, and the highest-intent guest on
+# the highest-intent surface a hotel has was told somebody would get back to
+# them. Only `whatsapp` and `instagram` have a policy; `website`, `internal`,
+# `phone` and `email` do not, and the model was offered the tool on all six.
+#
+# It is not that the reply had nowhere to go — web chat returns `result.reply`
+# in the HTTP response and the staff console renders it — it is that a *second*
+# way of speaking was on the menu and only one of them worked. This module's
+# own docstring says the model is never shown a tool it cannot call; this is
+# that rule applied to a dimension it did not previously cover.
+#
+# **The first version of this fix was a set of tool names living here, and it
+# was wrong on the day it was written.** It held `send_message`, because that
+# is the tool the production incident named. `send_template` and
+# `send_room_photos` reach `messaging.send` too, so both were still offered on
+# all six channels — a guest on a hotel's booking page could be sent room
+# photographs that raised instead of arriving. A list of names kept in the
+# module that filters them is a list nobody updates when they add a tool
+# somewhere else; the requirement now travels on the tool, next to the code
+# that has it, and `tests/test_channel_capability.py` re-derives it from the
+# tool bodies so a missing declaration fails rather than ships.
+
+# The capability names a tool may declare in `requires`.
+OUTBOUND = "outbound"      # reaches messaging.send; the channel needs a policy
+TEMPLATES = "templates"    # sends an approved template; Instagram has none
+
+CAPABILITIES = (OUTBOUND, TEMPLATES)
+
+
+def channel_capabilities(channel: str | None) -> frozenset[str]:
+    """
+    What this channel can actually carry.
+
+    Derived from `messaging/policy` rather than restated, so a channel that
+    gains a provider tomorrow gains its tools without anybody editing this file
+    — and one that loses it loses them the same way.
+
+    An unknown channel gets nothing, which is the conservative direction: a
+    channel nobody has thought about is not offered a tool that would raise on
+    it, and the agent answers in prose, which every channel can carry.
+    """
+    from app.services.messaging import policy as channel_policy
+
+    name = channel or channel_policy.WHATSAPP
+    if name not in channel_policy.channels():
+        return frozenset()
+    able = {OUTBOUND}
+    if channel_policy.for_channel(name).supports_templates:
+        able.add(TEMPLATES)
+    return frozenset(able)
+
+
+def _usable_on(spec: ToolSpec, ctx: AgentContext) -> bool:
+    """Whether this tool can actually run on this turn's channel."""
+    if not spec.requires:
+        return True
+    return set(spec.requires) <= channel_capabilities(ctx.channel)
+
+
 def available_for(ctx: AgentContext) -> list[ToolSpec]:
     """
     The tools this agent may call, in registration order.
 
     This is also what the model is shown. An agent is not told about a tool it
     has no grant for — describing a capability and then refusing it wastes a
-    turn and teaches the model to keep trying.
+    turn and teaches the model to keep trying — nor about one its *channel*
+    cannot carry, which is the same rule and was the same bug.
     """
     return [
         spec for nm, spec in REGISTRY.items()
         if nm in ctx.tool_grants and ctx.tool_grants[nm].get("enabled", True)
+        and _usable_on(spec, ctx)
     ]
 
 

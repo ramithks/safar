@@ -4879,12 +4879,38 @@ async def update_website(
     the whole reason draft and published are separate: a hotelier typing a new
     headline must not change the page a guest is reading.
     """
+    # Fields the schema does not know. See `WebsiteUpdateRequest` for why they
+    # are captured and reported rather than silently dropped or refused.
+    ignored = sorted(body.model_extra or {})
+    if ignored:
+        logger.warning(
+            "[website-draft] unknown fields ignored %s",
+            {"property_id": property_id, "fields": ignored,
+             "member_id": getattr(member, "profile_id", None)},
+        )
+        if settings.website_strict_fields:
+            # The far end of the migration path, off by default. Turned on once
+            # the log above has been quiet for long enough that no builder in
+            # the wild is still sending a stray key.
+            raise HTTPException(
+                422,
+                f"unknown field(s): {', '.join(ignored)}. The website draft "
+                f"accepts only the documented fields; a name it does not "
+                f"recognise would be saved nowhere.",
+            )
+
     row = await website_service.save_draft(
         property_id,
         template=body.template,
-        draft=body.model_dump(exclude_none=True, exclude={"template"}),
+        draft=body.model_dump(
+            exclude_none=True,
+            # `exclude` names the declared field; `model_extra` keys are excluded
+            # explicitly because `extra="allow"` puts them in the dump too, and
+            # writing them to the draft would be storing a typo as content.
+            exclude={"template", *(body.model_extra or {})},
+        ),
     )
-    return website_service.project(row)
+    return {**website_service.project(row), "ignoredFields": ignored}
 
 
 @router.post("/properties/{property_id}/website/publish", response_model=WebsiteConfigOut)
