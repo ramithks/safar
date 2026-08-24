@@ -147,6 +147,43 @@ def webhook_body(event: str, order_id: str, payment_id: str) -> tuple[bytes, str
 
 
 def sweep():
+    """
+    Take this suite's rows back out — **stock first, row second.**
+
+    The delete below used to stand alone, and it leaked. `room_inventory.
+    units_booked` is owned by the RPCs — `convert_hold` adds to it when a
+    booking confirms, `release_booking` subtracts when one goes away — and a
+    DELETE goes past both. No trigger catches it, because the product has no
+    path that deletes a reservation; only suites do.
+
+    Caught by `scripts/reconcile_inventory.py` after a post-deployment run:
+    five room-nights on 2026-12-22, 2026-12-23 and 2027-03-12 recorded as sold
+    with no reservation behind them — this suite books at +120 and +200 days,
+    which is exactly those dates. Every previous green run had taken two more
+    Garden Standards and one more Pool Villa out of the demo hotel for ever.
+
+    This is the same failure `e2e_sweep` was written for, arriving through the
+    other door: that module's docstring names "a DELETE from a fixture
+    teardown" explicitly, and the regression guard in
+    `tests/test_inventory_hygiene.py` only looked for the UPDATE form until
+    this was found. Both are now checked.
+
+    Released before deleted, deliberately: a crash in between leaves stock that
+    reads as free against a row that is gone, which a later sweep can still
+    fix. The other order leaves the invisible failure.
+    """
+    for row in (sql(f"""
+        select room_type_id, check_in, check_out, units
+          from public.reservations
+         where property_id = '{PROP}' and ref like '{PREFIX}%'
+           and status = 'confirmed' and room_type_id is not null;""") or []):
+        if isinstance(row, dict) and row.get("room_type_id"):
+            sql(f"""select public.release_booking(
+                        '{row["room_type_id"]}'::uuid,
+                        '{row["check_in"]}'::date,
+                        '{row["check_out"]}'::date,
+                        {int(row.get("units") or 1)});""")
+
     sql(f"""
 delete from public.payment_orders
  where quote_id in (select id from public.quotes where property_id = '{PROP}'

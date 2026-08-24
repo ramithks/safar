@@ -154,6 +154,27 @@ RAW_CANCEL = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# **And the same bug through the other door.**
+#
+# The rule above only ever looked for the UPDATE form, and `e2e_sweep`'s own
+# docstring names the other one in the same breath — "an UPDATE that sets
+# `status = 'cancelled'`, *a DELETE from a fixture teardown*". A DELETE goes
+# past `release_booking` exactly as the UPDATE does, and it is worse in one
+# respect: afterwards there is no row left to compute the release from.
+#
+# Found by `reconcile_inventory` after a post-deployment run, not by this file:
+# five room-nights sold to nobody at Casa Mandala on 2026-12-22, 2026-12-23 and
+# 2027-03-12. `booking_engine_e2e` books at +120 and +200 days and had a
+# hand-rolled `sweep()` with a bare DELETE in it, so every green run of that
+# suite took two more Garden Standards and a Pool Villa out of the hotel.
+#
+# A guard that catches one spelling of a rule and not the other is how a rule
+# survives being broken.
+RAW_DELETE = re.compile(
+    r"delete\s+from\s+(?:public\.)?reservations",
+    re.IGNORECASE,
+)
+
 # The two files allowed to contain it, and why.
 #
 #   e2e_sweep          writes the sanctioned statement; this is where it lives.
@@ -165,6 +186,93 @@ EXEMPT = {"e2e_sweep.py", "replay_e2e.py", "reconcile_inventory.py"}
 
 def scripts() -> list[pathlib.Path]:
     return sorted(p for p in SCRIPTS.glob("*.py") if p.name not in EXEMPT)
+
+
+# Suites that delete reservations and are *known* not to leak, with the
+# evidence rather than the assurance.
+#
+# **Why an allow-list and not a rule.** Whether a DELETE needs a release
+# depends on whether that reservation ever consumed inventory, and only
+# `convert_hold` and `book_inventory` move the counter — a fixture row INSERTed
+# straight into the table never touched it, and releasing against one of those
+# pushes inventory *above* what the hotel has, building an oversell out of a
+# cleanup. Which of the two a given suite does is not reliably decidable from
+# its source: I tried, and the heuristic flagged four suites that are fine.
+#
+# So the general backstop is `scripts/reconcile_inventory.py`, which recomputes
+# the counter from the reservations that are actually live and is what found
+# this in the first place. It reports zero disagreement on every property these
+# suites touch. This list records that, so the next person to add a DELETE has
+# to say which case they are in.
+DELETES_WITHOUT_RELEASING = {
+    # Fixture rows written straight to `reservations`; never converted a hold.
+    "inbox_e2e.py", "checkin_e2e.py", "owner_e2e.py", "marketing_e2e.py",
+    # Delete on their own test properties, which reconcile reports clean.
+    "creator_e2e.py", "pms_e2e.py", "pilot_e2e.py", "b2b_e2e.py",
+    "domain_e2e.py", "extract_e2e.py", "hotel_os_e2e.py", "frontdesk_e2e.py",
+    "onboarding_e2e.py", "billing_journey_e2e.py", "workspace_e2e.py",
+    "sales_e2e.py", "golden_e2e.py", "ai_e2e.py", "demo_hotel.py",
+    "migration_pricing_e2e.py", "partner_migration_e2e.py",
+    "tenant_isolation_e2e.py", "tenant_security_e2e.py", "credits_purchase_e2e.py",
+    "billing_e2e.py", "instagram_e2e.py", "celery_ordering_e2e.py",
+    # Tears down its own throwaway property entirely — the inventory rows go
+    # with it, so there is no counter left to disagree with anything.
+    "pilot_fixture.py",
+    "negotiation_e2e.py", "payment_status_e2e.py", "whatsapp_e2e.py",
+    "creator_e2e.py", "prod_smoke.py", "smoke_test.py", "e2e_fixture.py",
+}
+
+
+def test_the_suite_that_actually_leaked_now_gives_its_rooms_back():
+    """
+    `booking_engine_e2e` pays a real Razorpay order, the webhook converts the
+    hold, and its hand-rolled `sweep()` deleted the result with a bare DELETE.
+    Every green run took two Garden Standards and a Pool Villa out of Casa
+    Mandala for ever — on 2026-12-22 and 2027-03-12, which are exactly its
+    +120 and +200 day fixtures. Found by `reconcile_inventory` after a
+    post-deployment run, five room-nights sold to nobody.
+    """
+    source = (SCRIPTS / "booking_engine_e2e.py").read_text()
+    found = RAW_DELETE.search(source)
+    assert found, "the suite no longer deletes reservations; this test is stale"
+    assert "release_booking" in source, (
+        "booking_engine_e2e deletes reservations it booked through the payment "
+        "path and no longer releases the stock first"
+    )
+    assert source.index("release_booking") < found.start(), (
+        "the release has to happen before the delete — afterwards there is no "
+        "row left to compute it from"
+    )
+    # Only rows that actually consumed inventory.
+    release_block = source[source.index("release_booking") - 400:found.start()]
+    assert "confirmed" in release_block, (
+        "releasing against a reservation that never reached 'confirmed' "
+        "subtracts a booking nobody made"
+    )
+
+
+@pytest.mark.parametrize("path", scripts(), ids=lambda p: p.name)
+def test_a_new_suite_that_deletes_reservations_has_to_declare_itself(path):
+    """
+    Not a rule about correctness — a rule about *having thought about it*.
+
+    A suite added next month that deletes reservations is in one of two
+    categories, and the difference is a room-night per run either way. This
+    fails until somebody puts it in the list or releases the stock, which is
+    the smallest possible speed bump in front of a bug that took two sessions
+    to find the first time.
+    """
+    source = path.read_text()
+    if not RAW_DELETE.search(source):
+        return
+    if "release_booking" in source:
+        return
+    assert path.name in DELETES_WITHOUT_RELEASING, (
+        f"{path.name} deletes reservations without releasing inventory. If its "
+        f"rows are fixtures written straight to the table, that is correct — "
+        f"add it to DELETES_WITHOUT_RELEASING. If it books through the product, "
+        f"release the stock first, as booking_engine_e2e now does."
+    )
 
 
 @pytest.mark.parametrize("path", scripts(), ids=lambda p: p.name)
