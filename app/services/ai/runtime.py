@@ -638,6 +638,20 @@ async def run_turn(
                 outcomes.append(outcome)
                 forced.append(requirement.tool)
 
+                # **A forced stop is still a stop.**
+                #
+                # `handoff` was set only inside the model's own tool loop, so a
+                # handoff the *application* ran left the flag false: the tool
+                # moved `conversations.handler` to 'human_requested', and then
+                # `_ensure_human` never ran, the run recorded no handoff, and
+                # `messaging/pipeline` went on to deliver the reply and look for
+                # the next message as though nothing had happened. One line,
+                # and it is the difference between a guest who asked for a
+                # person reaching one and a guest who asked for a person being
+                # answered by the AI on the very turn it agreed to stop.
+                if outcome.tool == "request_human_handoff" and outcome.ok:
+                    handoff = True
+
                 spec = registry.REGISTRY.get(requirement.tool)
                 if spec:
                     turn_usage.count(spec.usage_type)

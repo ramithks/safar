@@ -387,3 +387,82 @@ def test_with_the_switch_on_the_same_turn_is_answered(db, monkeypatch):
 
     assert result.handoff is False
     assert result.requirements["forced"] == ["negotiate_rate"]
+
+
+# ── the counterweight ───────────────────────────────────────────────────────
+#
+# The arbiter can say "not yet". A system that can say that needs something
+# that can say "now", or the only way it can be wrong is the way that matters
+# most. Both read `required_actions._ESCALATION_ASK`, so the two agree by
+# construction: a sentence that forces a handoff can never be one the arbiter
+# turns down.
+
+def test_a_guest_who_asks_for_a_person_gets_one_even_if_the_model_does_nothing(db):
+    """
+    The model answers in prose and never reaches for the tool — which is the
+    behaviour that made every other requirement in `required_actions` necessary,
+    and is least defensible on this one. The others are about a hotel losing a
+    sale; this is about a person asking for a person.
+    """
+    result = run(runtime.run_turn(
+        make_ctx(session=QUOTED_SESSION), "mujhe kisi se baat karni hai",
+        provider=EchoProvider(["Ji, main aapki kya madad kar sakti hoon?"]),
+    ))
+
+    assert result.handoff is True, "the guest asked for a human and kept talking to the AI"
+    assert db.rows("conversations")[0]["handler"] == "human_requested"
+
+    rows = tool_rows(db, "request_human_handoff")
+    assert rows and rows[0]["decision_source"] == "application"
+    assert rows[0]["intent"] == "ESCALATION"
+    assert rows[0]["input"]["reason"] == "guest_asked"
+
+
+def test_the_forced_handoff_is_not_turned_down_by_the_arbiter(db):
+    """
+    The two layers agreeing, asserted rather than assumed. The application
+    forces `request_human_handoff("guest_asked")`, which then goes through the
+    arbiter like any other call — and would be a comic failure if the same
+    sentence that required it also failed to justify it.
+    """
+    result = run(runtime.run_turn(
+        make_ctx(session=QUOTED_SESSION), "manager se baat karao",
+        provider=EchoProvider(["Ji bilkul."]),
+    ))
+
+    assert result.handoff is True
+    assert result.requirements["forced"] == ["request_human_handoff"]
+    judgement = result.requirements["handoff_judgements"][0]
+    assert judgement["accepted"] is True
+
+
+def test_a_model_that_does_hand_off_is_not_made_to_do_it_twice(db):
+    """
+    The requirement is discharged by the model's own call, so nothing is forced
+    and the thread is parked once.
+    """
+    result = run(runtime.run_turn(
+        make_ctx(session=QUOTED_SESSION), "mujhe kisi se baat karni hai",
+        provider=EchoProvider([
+            [("request_human_handoff", {"reason": "guest_asked"})],
+            "Ek member aapse baat karenge.",
+        ]),
+    ))
+
+    assert result.handoff is True
+    assert result.requirements["forced"] == []
+    assert len(tool_rows(db, "request_human_handoff")) == 1
+
+
+def test_a_haggle_is_still_not_a_request_for_a_person(db):
+    """
+    The other side of the same regex. Forcing a stop is safe precisely because
+    the vocabulary that triggers it is narrow, and a build that widened it into
+    ordinary sales conversation would park every negotiation with a human.
+    """
+    result = run(runtime.run_turn(
+        make_ctx(session=QUOTED_SESSION), "thoda kam karo na",
+        provider=EchoProvider(["Main dekhti hoon."]),
+    ))
+    assert result.handoff is False
+    assert "request_human_handoff" not in result.requirements["forced"]

@@ -640,9 +640,34 @@ def detect(message: str, session: dict | None = None) -> list[Requirement]:
     found: list[Requirement] = []
 
     if _ESCALATION_ASK.search(text):
-        found.append(_simple(ESCALATION, "request_human_handoff",
-                             {"request_human_handoff", "escalate_to_team"},
-                             "guest asked for a person"))
+        # **Forced, and the only forced action whose effect is to stop.**
+        #
+        # It was advisory, which meant a guest asking for a human got one if and
+        # only if the model noticed. That was the shape of every other
+        # requirement here before this module existed, and it is least
+        # defensible on this one: the other requirements are about a hotel
+        # losing a sale, and this one is about a person asking for a person.
+        #
+        # It matters more now than it did. `services/ai/arbiter.py` turns down
+        # handoffs the conversation does not support, so the system has started
+        # having opinions about when the agent may stop — and a layer that can
+        # say "not yet" needs a counterweight that can say "now". This is it,
+        # and the two agree by construction: both read `_ESCALATION_ASK`, so a
+        # sentence that forces a handoff can never be one the arbiter turns
+        # down.
+        #
+        # Forcing a *stop* is also the one forced action that cannot overreach.
+        # Every other one moves stock, money or a booking; this parks a thread
+        # with a person, which is what the guest asked for and what a false
+        # positive costs nothing worse than.
+        found.append(Requirement(
+            intent=ESCALATION,
+            tool="request_human_handoff",
+            satisfied_by=frozenset({"request_human_handoff", "escalate_to_team"}),
+            must_execute=True,
+            arguments={"reason": "guest_asked"},
+            detail="guest asked for a person",
+        ))
 
     if _CANCELLATION.search(text) or _CANCELLATION_HI.search(text):
         # Forced, and forced to the *reading* tool.
