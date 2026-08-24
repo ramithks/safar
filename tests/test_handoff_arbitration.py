@@ -522,3 +522,79 @@ def test_an_honest_handoff_reply_is_left_alone(db):
     assert result.handoff is True
     assert result.reply == "Ek member aapse abhi baat karenge."
     assert result.error is None
+
+
+# ── the two switches together ───────────────────────────────────────────────
+
+def test_with_both_layers_off_the_build_behaves_as_it_did_before_them(db, monkeypatch):
+    """
+    `AGENT_FORCE_REQUIRED_ACTIONS=false` and `AGENT_ARBITRATE_HANDOFFS=false`.
+
+    Two independent switches are two chances for the combination nobody tried to
+    be the broken one. With both off the turn must be exactly what it was before
+    any of this existed: the model's handoff stands, nothing is forced, and the
+    conversation goes to a person — which is also what a rollback has to produce
+    if it is going to be worth having.
+    """
+    monkeypatch.setenv("AGENT_FORCE_REQUIRED_ACTIONS", "false")
+    monkeypatch.setenv("AGENT_ARBITRATE_HANDOFFS", "false")
+
+    result = run(runtime.run_turn(
+        make_ctx(session=QUOTED_SESSION), "4000 mein kar do na",
+        provider=EchoProvider(list(HANDOFF_ON_A_HAGGLE)),
+    ))
+
+    assert result.handoff is True
+    assert result.requirements["forced"] == []
+    assert tool_rows(db, "negotiate_rate") == []
+    # Detection keeps running either way, so the run still records what the
+    # turn owed and what would have been done about it.
+    assert "NEGOTIATION" in result.requirements["unmet"]
+    assert result.requirements["handoff_judgements"][0]["enforced"] is False
+
+
+def test_forcing_on_and_arbitration_off_is_a_coherent_state(db, monkeypatch):
+    """
+    The half-rolled-back case, which is the one somebody actually reaches for at
+    eleven at night. The handoff stands, so the forcing layer stays out of the
+    way — its gate has always been `not handoff` and that is still right.
+    """
+    monkeypatch.setenv("AGENT_FORCE_REQUIRED_ACTIONS", "true")
+    monkeypatch.setenv("AGENT_ARBITRATE_HANDOFFS", "false")
+
+    result = run(runtime.run_turn(
+        make_ctx(session=QUOTED_SESSION), "4000 mein kar do na",
+        provider=EchoProvider(list(HANDOFF_ON_A_HAGGLE)),
+    ))
+
+    assert result.handoff is True
+    assert result.requirements["forced"] == []
+
+
+def test_arbitration_on_and_forcing_off_still_answers_the_guest(db, monkeypatch):
+    """
+    The other half. The arbiter turns the handoff down and hands the model back
+    its turn — and with forcing off, the model has to do the work itself. What
+    must not happen is the worst of both: no handoff *and* no answer.
+    """
+    monkeypatch.setenv("AGENT_FORCE_REQUIRED_ACTIONS", "false")
+    monkeypatch.setenv("AGENT_ARBITRATE_HANDOFFS", "true")
+
+    result = run(runtime.run_turn(
+        make_ctx(session=QUOTED_SESSION), "4000 mein kar do na",
+        provider=EchoProvider([
+            [("request_human_handoff", {"reason": "guest_asked"})],
+            [("negotiate_rate", {"rate_plan_id": RATE_PLAN,
+                                 "check_in": "2026-09-10", "check_out": "2026-09-12",
+                                 "units": 1, "adults": 2, "children": 0,
+                                 "requested_nightly_rupees": 4000})],
+            "Main aapke liye best rate laayi hoon.",
+        ]),
+    ))
+
+    assert result.handoff is False
+    assert result.reply
+    assert tool_rows(db, "negotiate_rate"), (
+        "the handoff was refused and nothing took its place — the guest got "
+        "neither a person nor a price"
+    )
