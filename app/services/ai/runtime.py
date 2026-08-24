@@ -124,6 +124,10 @@ def _write_action(ctx: AgentContext, run_id: str, seq: int, outcome: ToolOutcome
             # This column answers the same question without the reader having to
             # know that 'awaiting_approval' is the string that means it.
             "human_approval_required": outcome.status == "awaiting_approval",
+            # What the next attempt at this same guest message looks itself up
+            # by. Null for reads, for staff turns and for the approval queue —
+            # see services/ai/registry.execute.
+            "idempotency_key": outcome.idempotency_key,
         }
         return get_db().table("agent_actions").insert(row).execute().data[0]["id"]
 

@@ -326,6 +326,14 @@ async def process_conversation(conversation_id: str, *, provider=None, classifie
             await messaging.request_human(conversation["id"], conversation["property_id"])
             return {"processed": 0, "reason": "no agent configured"}
 
+        # The scope every mutating call this turn makes is idempotent within.
+        #
+        # Set here because here is the only place that knows which guest message
+        # is being answered — and because the failure it defends against is this
+        # function's own: the stamp below can fail, and when it does Celery
+        # replays this whole turn. See services/ai/registry.execute.
+        ctx.answering = message["id"]
+
         history = await run_db(_history, conversation_id, message["sent_at"])
         result = await runtime.run_turn(
             ctx,

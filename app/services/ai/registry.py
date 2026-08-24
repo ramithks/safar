@@ -19,13 +19,16 @@ record all happen, and a second entrance would be a way to skip all five.
 Tool bodies contain no security logic at all. That is the point: a tool author
 cannot forget a check that lives somewhere they never edit.
 """
+import hashlib
 import inspect
+import json
 import logging
 import time
 from typing import Any, Callable
 
 from pydantic import BaseModel, ValidationError
 
+from app.db.client import get_db, run_db
 from app.services.ai import autonomy, permissions, toolsets
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import (
@@ -216,6 +219,85 @@ def describe_for_provider(ctx: AgentContext, task: str | None = None) -> list[di
     ]
 
 
+# ── one guest message, one effect ────────────────────────────────────────────
+#
+# `runtime` already refuses to run the same mutating call twice inside one turn
+# (`called_writes`), and that set is a local variable which dies with the turn.
+# Across turns there was nothing, and there is a real ordering that needs it:
+#
+#     run_turn  →  create_booking_payment_link  →  a Razorpay order exists
+#               →  _mark_answered  ✗  (a reset connection, an OOM, a redeploy)
+#               →  Celery redelivers (acks_late, autoretry_for=Exception)
+#               →  the message is still pending, so the whole turn runs again
+#               →  a second Razorpay order for the same stay
+#
+# The stamp cannot simply be made unfailable: if `_mark_answered` swallowed its
+# error the same message would come straight back from `_pending` on the next
+# iteration of the drain loop and be answered again inside the same task. So the
+# mark is allowed to fail, and the tools underneath it are made safe when it
+# does.
+#
+# **Scoped to the guest's message, not to a clock.** A time window would have to
+# choose between covering a slow retry and honouring a guest who genuinely asks
+# for the same thing twice. The message id needs no such choice: answering
+# message X again is a replay by definition, and a guest's next message is a new
+# scope however fast it arrives.
+#
+# Reads are deliberately not guarded. Re-running `get_quote` costs a moment and
+# returns the truth; returning the first run's price would hand a replay a
+# number fetched before whatever went wrong in between.
+
+def idempotency_key(scope: str, tool: str, arguments: dict) -> str:
+    """
+    The identity of one mutating call made in service of one guest message.
+
+    Built from the *validated* arguments rather than the model's raw ones, so
+    `{"units": "5"}` and `{"units": 5}` are the same call — which they are, and
+    which the model is entirely capable of alternating between across a retry.
+    """
+    canonical = json.dumps(arguments or {}, sort_keys=True, default=str)
+    return hashlib.sha256(
+        "\u0000".join((scope, tool, canonical)).encode("utf-8")
+    ).hexdigest()
+
+
+def _already_done(key: str, ctx: AgentContext) -> ToolOutcome | None:
+    """
+    The recorded result of this exact call, if it already succeeded.
+
+    Only `executed` rows. A refusal must stay reachable — the second attempt may
+    come from a run at a different autonomy level or after a grant was fixed,
+    and answering it from a stale refusal would make the fix invisible until the
+    guest wrote again. An `awaiting_approval` row is likewise not a result: the
+    work has not happened, and the replay should queue behind the same human.
+    """
+    rows = (
+        get_db().table("agent_actions")
+        .select("tool,output,result_type,result_id")
+        .eq("property_id", ctx.property_id)
+        .eq("idempotency_key", key)
+        .eq("status", "executed")
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    return ToolOutcome(
+        tool=row["tool"],
+        status="replayed",
+        output=row.get("output"),
+        result_type=row.get("result_type") or "none",
+        result_id=row.get("result_id"),
+        idempotency_key=key,
+        # The model is told it is done, and not told it was done twice. Anything
+        # else invites it to explain a retry to a guest who never saw one.
+        model_message="",
+    )
+
+
 async def execute(
     name: str,
     arguments: dict[str, Any],
@@ -325,6 +407,31 @@ async def execute(
         except AgentError as exc:
             return refusal(exc)
 
+    # **Below every gate, and that placement is the point.**
+    #
+    # Permission, argument validation, the precheck and the autonomy verdict
+    # have all already run on this attempt. A replay is a shortcut past the
+    # *work*, never past a rule — so a grant revoked between the two attempts
+    # still refuses, and the guard can only ever answer a call that would have
+    # been allowed to run anyway.
+    key: str | None = None
+    if spec.mutating and ctx.answering:
+        key = idempotency_key(ctx.answering, spec.name, args.model_dump(mode="json"))
+        try:
+            done = await run_db(_already_done, key, ctx)
+        except Exception:  # noqa: BLE001
+            # The lookup is a guard, not the guest's answer. If it cannot run,
+            # the turn proceeds as it did before this existed — which is the
+            # behaviour it improves on, not one it depends on.
+            logger.warning("idempotency lookup failed for %s", spec.name, exc_info=True)
+            done = None
+        if done is not None:
+            logger.info("%s was already done for message %s — returning its result",
+                        spec.name, ctx.answering)
+            done.input = args.model_dump(mode="json")
+            done.latency_ms = elapsed()
+            return done
+
     try:
         result = spec.fn(args, ctx)
         if inspect.isawaitable(result):
@@ -409,6 +516,8 @@ async def execute(
         model_message="",
         latency_ms=elapsed(),
         verified=verified,
+        # Written to the action row, which is where the next attempt looks.
+        idempotency_key=key,
     )
 
 

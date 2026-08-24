@@ -232,7 +232,14 @@ class ToolOutcome:
     """One execution, in the shape `agent_actions` stores."""
 
     tool: str
-    status: str                      # executed · awaiting_approval · refused · failed
+    # executed · replayed · awaiting_approval · refused · failed
+    #
+    # 'replayed' is a success that did not run: this exact call was already made
+    # in service of this exact guest message and its recorded result is being
+    # returned instead. It counts as `ok` — the effect the model asked for
+    # exists — and is kept distinct from 'executed' so that "what did this run
+    # do" never reads as "it made a second booking".
+    status: str
     input: dict = field(default_factory=dict)
     output: Any = None
     result_type: str = "none"
@@ -258,9 +265,14 @@ class ToolOutcome:
     #          the sixty-odd tools that only ever read something.
     verified: bool | None = None
 
+    # sha256 of (message being answered · tool · validated arguments), for the
+    # mutating calls made on a guest turn. Null everywhere else. See
+    # services/ai/registry.execute.
+    idempotency_key: str | None = None
+
     @property
     def ok(self) -> bool:
-        return self.status == "executed"
+        return self.status in ("executed", "replayed")
 
     @property
     def is_verified_mutation(self) -> bool:
