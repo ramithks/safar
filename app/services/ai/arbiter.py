@@ -278,12 +278,39 @@ def judge(reason: str | None, ctx) -> Judgement:
     if turn is not None and turn.handoff_rejected:
         return valid("already turned this turn down once; a second request stands")
 
+    # **The guest's own words outrank the model's label for them.**
+    #
+    # Checked before the category, and that order is the fix for a real gap in
+    # the first version of this. A guest writes "manager se baat karao" and the
+    # model — for whatever reason — files the handoff as `no_knowledge`. That
+    # categorises as UNSUPPORTED_REQUEST, which is checkable, and with a
+    # negotiation outstanding on the same turn the handoff would have been
+    # turned down. The guest asked for a person and would not have got one,
+    # because the model chose the wrong word for why.
+    #
+    # The reason string is the model's *description* of the conversation. The
+    # conversation is the conversation. When they disagree about something this
+    # module can read directly, the conversation wins — and it wins in the
+    # direction of stopping, which is the only direction it is safe to be wrong
+    # in.
+    if _guest_asked_for_a_person(message) or _NAMES_A_PERSON.search(message or ""):
+        return valid("the guest asked for a person, whatever reason was given",
+                     message=(message or "")[:160])
+
+    # A tool that actually broke. An agent that has hit a real failure must be
+    # able to stop, and sending it back to try another one is how a broken
+    # system produces a wrong answer instead of no answer.
+    failed = [o for o in (turn.outcomes if turn else []) if o.status == "failed"]
+    if failed:
+        return valid(f"{failed[0].tool} failed on this turn", tool=failed[0].tool)
+
     if category not in CHECKABLE:
         return valid(f"{category} is not a claim about the conversation")
 
     if category == GUEST_REQUESTED_HUMAN:
-        if _guest_asked_for_a_person(message) or _NAMES_A_PERSON.search(message or ""):
-            return valid("the guest asked for a person", message=message[:160])
+        # The corroboration above already covers this; reaching here means the
+        # guest did not ask, which is exactly the claim being tested.
+        pass
     elif category == AUTONOMY_REQUIRES_APPROVAL:
         queued = [o for o in (turn.outcomes if turn else [])
                   if o.status in ("awaiting_approval", "refused")]

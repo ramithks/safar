@@ -344,3 +344,60 @@ def test_the_handoff_tool_can_never_nominate_itself():
     judgement = arbiter.judge("guest_asked", ctx)
     assert judgement.valid
     assert judgement.instead is None
+
+
+# ── the guest's words outrank the model's label for them ────────────────────
+#
+# A gap in the first version of this module, found by reading it rather than by
+# a failing test — which is why it is written down here rather than quietly
+# fixed. Worth stating plainly: the reason string is the model's *description*
+# of the conversation, and the conversation is the conversation.
+
+@pytest.mark.parametrize("reason", ["no_knowledge", "low_confidence",
+                                    "unusual_request", "autonomy_limit"])
+def test_a_guest_who_asked_for_a_person_gets_one_whatever_the_model_called_it(reason):
+    """
+    "manager se baat karao, aur 4000 mein kar do" filed as `no_knowledge`.
+
+    That categorises as UNSUPPORTED_REQUEST, which is checkable, and with a
+    negotiation outstanding on the same turn the handoff would have been turned
+    down. The guest asked for a person and would not have got one, because the
+    model chose the wrong word for why.
+    """
+    judgement = arbiter.judge(reason, ctx_for(
+        "manager se baat karao, aur 4000 mein kar do", session=PRICED))
+    assert judgement.valid, judgement.why
+    assert "whatever reason was given" in judgement.why
+
+
+def test_a_turn_with_a_broken_tool_may_stop_however_it_labels_it():
+    """
+    An agent that has hit a real failure must be able to stop. Sending it back
+    to try another tool is how a broken system produces a wrong answer instead
+    of no answer.
+    """
+    judgement = arbiter.judge("guest_asked", ctx_for(
+        "Best price kya de sakte ho?", session=PRICED,
+        outcomes=[ran("get_quote", "failed")],
+    ))
+    assert judgement.valid
+    assert "failed on this turn" in judgement.why
+
+
+def test_a_refusal_is_not_a_failure_and_does_not_open_the_gate():
+    """
+    The distinction that matters. A tool *refused* — for permission, for
+    autonomy, for the property's own rules — has given a real business answer
+    the model can act on. Treating that as a breakage would make every
+    approval queue a handoff.
+
+    A refusal still corroborates AUTONOMY_REQUIRES_APPROVAL, which is the
+    correct place for it, and is asserted above.
+    """
+    judgement = arbiter.judge("guest_asked", ctx_for(
+        "Best price kya de sakte ho?", session=PRICED,
+        outcomes=[ran("get_group_rates", "refused")],
+    ))
+    assert judgement.rejected, (
+        "a refused *unrelated* tool opened the gate for an unjustified handoff"
+    )

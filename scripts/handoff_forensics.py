@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import pathlib
 import sys
 import time
@@ -233,6 +234,7 @@ async def one_run(message: str, index: int, priced: bool) -> dict:
         "handoff_note": (handoff_call or {}).get("input", {}).get("note"),
         "calls": calls,
         "tools": [c["tool"] for c in calls],
+        "judgements": requirements.get("handoff_judgements") or [],
         "intents": requirements.get("intents") or [],
         "required": requirements.get("required") or [],
         "satisfied": requirements.get("satisfied") or [],
@@ -244,6 +246,7 @@ async def one_run(message: str, index: int, priced: bool) -> dict:
 
 def summarise(rows: list[dict]) -> dict:
     real = [r for r in rows if "error" not in r]
+    judged = [j for r in real for j in r.get("judgements") or []]
     refused = Counter(
         c["tool"] for r in real for c in r.get("calls", []) if c["status"] == "refused"
     )
@@ -262,6 +265,13 @@ def summarise(rows: list[dict]) -> dict:
         # A refusal is the thing a handoff most often follows, so it is counted
         # beside the handoff rather than left in the per-run detail.
         "refused_tools": dict(refused),
+        # What the arbiter made of every handoff the model asked for. With the
+        # switch off these are all `accepted` and the handoff went through
+        # anyway, which is what makes the off sweep a real "before".
+        "handoffs_requested": len(judged),
+        "handoffs_questioned": sum(1 for j in judged if not j.get("accepted")),
+        "would_have_been_questioned": sum(
+            1 for j in judged if j.get("enforced") is False and j.get("instead")),
         "handoff_after_refusal": sum(
             1 for r in real if r["handoff"]
             and any(c["status"] == "refused" for c in r.get("calls", []))
@@ -269,11 +279,18 @@ def summarise(rows: list[dict]) -> dict:
     }
 
 
-async def family(message: str, runs: int, v3: bool, label: str, priced: bool) -> dict:
+async def family(message: str, runs: int, v3: bool, label: str, priced: bool,
+                 arbitrate: bool = True) -> dict:
     settings.hotel_models_v3 = v3
+    # The arbiter's own switch, flipped between sweeps in one process so the
+    # before and after are measured on the same day, the same hotel, the same
+    # model and the same nights. See services/ai/arbiter.enabled.
+    os.environ["AGENT_ARBITRATE_HANDOFFS"] = "true" if arbitrate else "false"
     static = await capture_static(message, label, priced)
     print(f"\n{'=' * 78}\n{label}  —  {static['model']}\n{'=' * 78}")
     print(f"  autonomy              {static['autonomy']}")
+    print(f"  handoff arbitration   "
+          f"{'on' if os.environ.get('AGENT_ARBITRATE_HANDOFFS') != 'false' else 'OFF'}")
     print(f"  session state         {static['session_state']} "
           f"(rate_plan_id={'yes' if static['session'].get('rate_plan_id') else 'no'})")
     print(f"  system prompt         {static['system_prompt_chars']} chars")
@@ -317,6 +334,9 @@ async def main() -> int:
     parser.add_argument("--only", choices=["v3", "stable"], default=None)
     parser.add_argument("--fresh", action="store_true",
                         help="no rate plan on the session — the normal first turn")
+    parser.add_argument("--arbiter", choices=["on", "off", "both"], default="on",
+                        help="'both' runs each model twice, arbitration off then "
+                             "on, which is the only honest before/after")
     args = parser.parse_args()
 
     print(f"message: {args.message!r}")
@@ -324,14 +344,21 @@ async def main() -> int:
     result = {}
     try:
         priced = not args.fresh
-        if args.only != "v3":
-            result["stable"] = await family(args.message, args.runs, False,
-                                            "Gemini 2.5", priced)
-        if args.only != "stable":
-            result["v3"] = await family(args.message, args.runs, True,
-                                        "Gemini 3.x", priced)
+        modes = ([("off", False), ("on", True)] if args.arbiter == "both"
+                 else [(args.arbiter, args.arbiter == "on")])
+        for mode, arbitrate in modes:
+            suffix = f" · arbitration {mode.upper()}" if args.arbiter == "both" else ""
+            if args.only != "v3":
+                result[f"stable-{mode}"] = await family(
+                    args.message, args.runs, False, f"Gemini 2.5{suffix}",
+                    priced, arbitrate)
+            if args.only != "stable":
+                result[f"v3-{mode}"] = await family(
+                    args.message, args.runs, True, f"Gemini 3.x{suffix}",
+                    priced, arbitrate)
     finally:
         settings.hotel_models_v3 = was
+        os.environ.pop("AGENT_ARBITRATE_HANDOFFS", None)
         cleanup()
 
     print(f"\n{'=' * 78}\nSUMMARY\n{'=' * 78}")
@@ -345,6 +372,9 @@ async def main() -> int:
         print(f"  no tool at all    {s['no_tool_at_all']}")
         print(f"  refused tools     {s['refused_tools']}")
         print(f"  handoff⟵refusal   {s['handoff_after_refusal']}")
+        print(f"  handoffs asked    {s['handoffs_requested']}   "
+              f"turned down {s['handoffs_questioned']}   "
+              f"would have been {s['would_have_been_questioned']}")
 
     pathlib.Path(args.out).write_text(json.dumps(result, indent=2, default=str))
     print(f"\nfull capture written to {args.out}")
