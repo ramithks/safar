@@ -26,19 +26,41 @@ registry.load_all()
 
 # ── the router ───────────────────────────────────────────────────────────────
 
-def test_a_guest_turn_gets_the_workhorse():
+def test_a_guest_turn_gets_the_agent_brain():
     choice = model_router.select(agent_type="guest", task="guest_conversation")
     assert choice.model == settings.hotel_model_conversation
     assert choice.tier == model_router.CONVERSATION
     assert choice.provider == "vertex_ai"
 
 
-def test_the_default_for_an_unknown_task_is_the_workhorse_not_the_expensive_one():
-    # Defaulting the other way would make one forgotten task name expensive on
-    # every guest message, and nobody would find out until the invoice.
+def test_the_default_for_an_unknown_task_is_the_brain_not_the_expensive_one():
+    # Defaulting to `deep` would make one forgotten task name reach a preview
+    # model on every guest message, and nobody would find out until the invoice.
     choice = model_router.select(task="something_nobody_registered")
     assert choice.model == settings.hotel_model_conversation
     assert "unrecognised" in choice.reason
+
+
+@pytest.mark.parametrize("task", [
+    "guest_faq", "reservation_lookup", "availability", "simple_quote",
+    "payment_status", "handoff", "frontdesk_summary",
+])
+def test_the_high_volume_lookups_run_on_the_fast_tier(task):
+    # The split this tier exists for: a written-down FAQ answered by the brain
+    # is the same answer for several times the cost, on the traffic that is most
+    # of the day.
+    choice = model_router.select(task=task)
+    assert choice.tier == model_router.FAST
+    assert choice.model == settings.hotel_model_fast
+
+
+@pytest.mark.parametrize("task", [
+    "guest_conversation", "guest_request", "booking", "frontdesk_operations",
+])
+def test_anything_that_acts_stays_on_the_brain(task):
+    # A tool the model has to choose, or a change to the hotel. Never the cheap
+    # tier, however short the message asking for it was.
+    assert model_router.select(task=task).tier == model_router.CONVERSATION
 
 
 @pytest.mark.parametrize("task", [
@@ -61,12 +83,26 @@ def test_routing_and_classification_use_the_cheapest_model(task):
     assert choice.thinking_budget == 0
 
 
-def test_escalation_moves_up_a_tier_rather_than_repeating_the_same_call():
-    plain = model_router.select(task="guest_conversation")
-    escalated = model_router.select(task="guest_conversation", escalated=True)
-    assert plain.model == settings.hotel_model_conversation
-    assert escalated.model == settings.hotel_model_reasoning
-    assert "escalated" in escalated.reason
+def test_escalation_climbs_one_rung_at_a_time():
+    # fast → conversation → reasoning → deep. Never straight to the preview
+    # model, because a ladder whose first rung is a preview dependency turns
+    # every ordinary failure into an outage nobody chose.
+    assert model_router.select(task="guest_faq", escalated=True).tier == (
+        model_router.CONVERSATION)
+    assert model_router.select(task="guest_conversation", escalated=True).tier == (
+        model_router.REASONING)
+    assert model_router.select(task="revenue_analysis", escalated=True).tier == (
+        model_router.DEEP)
+    assert "escalated" in model_router.select(
+        task="guest_conversation", escalated=True
+    ).reason
+
+
+def test_the_deep_tier_is_never_reached_without_escalation():
+    # The property that keeps a preview model off the request path: no task in
+    # the table routes there directly.
+    for task in model_router.known_tasks():
+        assert model_router.tier_of(task) != model_router.DEEP
 
 
 def test_escalating_a_classification_stays_cheap():
@@ -110,9 +146,7 @@ def test_no_model_id_appears_outside_config_and_the_router():
 
 def test_every_task_maps_to_a_real_tier():
     for task in model_router.known_tasks():
-        assert model_router.tier_of(task) in (
-            model_router.CONVERSATION, model_router.REASONING, model_router.CLASSIFY
-        )
+        assert model_router.tier_of(task) in model_router.tiers()
 
 
 # ── the Gemini dialect ───────────────────────────────────────────────────────

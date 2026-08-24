@@ -59,6 +59,7 @@ def tool(
     when_deferred: str | None = None,
     precheck: Callable | None = None,
     revalidate: Callable | None = None,
+    verify: Callable | None = None,
 ) -> Callable:
     """
     Declare a tool.
@@ -89,6 +90,7 @@ def tool(
             when_deferred=when_deferred,
             precheck=precheck,
             revalidate=revalidate,
+            verify=verify,
         )
         return fn
 
@@ -286,6 +288,45 @@ async def execute(
     if isinstance(result, tuple) and len(result) == 2:
         result, result_id = result
 
+    # **Did it actually happen?**
+    #
+    # The last gate, and the only one that runs after the write. Everything
+    # above this line decides whether the tool *may* run; this asks whether it
+    # *did*. See `ToolSpec.verify` — the rule the agent must never break is
+    # "reason → mutate → verify → respond", and a rule enforced only by a system
+    # prompt is a rule the model may skip on the turn it matters.
+    #
+    # A verification failure is `failed`, not `refused`: nothing was denied, the
+    # world is in a state nobody chose, and the model is handed the observed
+    # state so it reports the truth instead of the request.
+    verified: bool | None = None
+    if spec.verify is not None:
+        try:
+            evidence = await spec.verify(args, ctx, result_id)
+        except AgentError as exc:
+            logger.error(
+                "unverified mutation: %s claimed %s and the re-read disagreed (%s)",
+                spec.name, result_id or "a change", exc.reason,
+            )
+            out = refusal(exc)
+            out.input = args.model_dump(mode="json")
+            out.verified = False
+            out.result_type = spec.result_type
+            out.result_id = str(result_id) if result_id else None
+            return out
+        except Exception as exc:  # noqa: BLE001
+            # The check itself broke. That is not proof the write failed, and
+            # treating it as such would hand off every turn the moment a read
+            # replica hiccups — so the mutation stands and the evidence is
+            # absent, which is exactly what `verified=None` means.
+            logger.warning("verification of %s could not run: %s", spec.name, exc)
+        else:
+            verified = True
+            if isinstance(result, dict) and isinstance(evidence, dict) and evidence:
+                # Shown to the model, so it answers from the record rather than
+                # from what it asked for.
+                result = {**result, "verified": evidence}
+
     return ToolOutcome(
         tool=spec.name,
         status="executed",
@@ -295,6 +336,7 @@ async def execute(
         result_id=str(result_id) if result_id else None,
         model_message="",
         latency_ms=elapsed(),
+        verified=verified,
     )
 
 
