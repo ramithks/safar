@@ -290,6 +290,31 @@ _NEGOTIATION = (
         re.IGNORECASE,
     ),
     re.compile(r"कम कर|छूट|सस्ता|महंगा|कम से कम|आखिरी (?:रेट|दाम)"),
+    # **"give me 70% off".**
+    #
+    # Found in production traffic on 2026-08-24, not here: a real guest turn
+    # that arrived through the webhook, ran on the live model, and was recorded
+    # with `required_action_status: none` — no intent, no requirement, nothing
+    # for any deterministic layer to have an opinion about.
+    #
+    # The vocabulary above is built out of *words* — "discount", "kam karo",
+    # "best price" — and a percentage is not a word. It is also one of the two
+    # or three commonest ways a guest asks, in every language this product sees,
+    # and it was the one shape the list could not express.
+    #
+    # A digit-plus-`%` needs a discount word beside it, because "70% occupancy"
+    # and "18% GST" are not haggles. `off`, `discount`, `kam`, `chhoot` and
+    # their neighbours are; a bare percentage is left alone.
+    re.compile(
+        r"\d{1,2}\s*(?:%|percent|pct|फ़ीसदी|फीसदी)\s*"
+        r"(?:ki\s+|ka\s+)?(?:off|discount|kam|kum|chhoot|chhut|छूट|कम)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:off|discount|kam|kum|chhoot|छूट|कम)\s*(?:kar\w*|do|de\s*do|dijiye)?\s*"
+        r"\d{1,2}\s*(?:%|percent|pct)",
+        re.IGNORECASE,
+    ),
 )
 
 # "4000 mein ho jayega?", "₹4,000 mein kar do", "3500 tak", "4k mein".

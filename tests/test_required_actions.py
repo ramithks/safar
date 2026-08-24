@@ -504,3 +504,57 @@ def test_one_requirement_per_intent():
     """The vocabularies overlap by design; a duplicate would be forced twice."""
     detected = ra.detect("5 rooms chahiye, 10 log, group booking hai", {})
     assert len(detected) == len({r.intent for r in detected})
+
+
+class TestThePercentageAGuestNamesThemselves:
+    """
+    *"give me 70% off"* — found in production, not here.
+
+    A real guest turn on 2026-08-24 arrived through the webhook, ran on the live
+    model, and was recorded with `required_action_status: none`. No intent, no
+    requirement, nothing for any deterministic layer to have an opinion about —
+    on a message whose entire content is a demand for a discount.
+
+    The negotiation vocabulary is built out of *words*: "discount", "kam karo",
+    "best price". A percentage is not a word. It is also one of the two or three
+    commonest ways a guest asks, in every language this product sees, and it was
+    the one shape the list could not express.
+
+    **The second half of these assertions is the one that constrains the fix.**
+    A bare percentage is not a haggle: hotels talk about occupancy in per cent,
+    and every price in India carries GST in per cent. So the digit needs a
+    discount word beside it, and the tests that must fail are written down
+    beside the tests that must pass.
+    """
+
+    @pytest.mark.parametrize("message", [
+        "how much for two nights? give me 70% off",
+        "give me 70% off",
+        "can you do 20% off",
+        "70% off karo",
+        "10 percent discount de do",
+        "thoda discount 15% kar do",
+        "kya 5% kam kar sakte ho",
+    ])
+    def test_a_percentage_beside_a_discount_word_is_a_haggle(self, message):
+        assert ra.wants_discount(message) is True
+
+    @pytest.mark.parametrize("message", [
+        "what is your occupancy, 70% full?",
+        "is 18% GST included in the price",
+        "the room is 70% booked already",
+        "do you have a room tomorrow for two?",
+    ])
+    def test_a_bare_percentage_is_not(self, message):
+        """
+        §The detector is conservative in one direction on purpose. A missed
+        negotiation leaves the system where it was; a false one opens a haggle
+        the guest never asked for, and now also lets the arbiter turn down a
+        handoff on the strength of it.
+        """
+        assert ra.wants_discount(message) is False
+
+    def test_the_production_message_now_reaches_the_negotiation_engine(self):
+        """The turn as it actually arrived, end to end through `detect`."""
+        found = ra.detect("how much for two nights? give me 70% off", {})
+        assert "NEGOTIATION" in [r.intent for r in found]
