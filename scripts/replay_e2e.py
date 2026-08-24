@@ -585,9 +585,25 @@ on conflict (instagram_account_id) do update
     # that prompted this proved the difference is real: the model read
     # "Breakfast" out of the free-text inclusions and told the guest, without
     # ever asking whether the hotel serves breakfast.
+    # **Everything the conversation has looked up, not just this turn's calls.**
+    #
+    # It was "get_meal_info ran on this turn", which stopped being the right
+    # question twice over. First when `get_stay_options` started carrying
+    # `mealsIncluded` — derived from the rate's meal plan against what the
+    # kitchen actually serves — so the options a guest is already looking at
+    # became a legitimate source. Then because a model that read those options
+    # two turns ago still has them, and answering from what it was told rather
+    # than asking again is the behaviour this whole build is for.
+    #
+    # What must stay true is that the hotel's own record is behind the answer
+    # somewhere, and never a rate plan's wording. The run that prompted the
+    # first half of this had the model read "Breakfast" out of the free-text
+    # inclusions and tell a guest, without anything having asked whether the
+    # hotel serves breakfast at all.
+    looked_up = [a["tool"] for a in actions()]
     check("the meal answer came from the hotel's record, not a rate plan's wording",
-          any(t in used for t in ("get_meal_info", "get_stay_options", "get_quote")),
-          str(used))
+          any(t in looked_up for t in ("get_meal_info", "get_stay_options", "get_quote")),
+          str(looked_up))
     check("and its price list was read before a transfer was priced",
           any(t in used for t in ("list_services", "order_service",
                                   "get_experiences", "get_property_knowledge")),
@@ -911,6 +927,20 @@ on conflict (instagram_account_id) do update
                 devanagari_after.append(message["body"][:60])
     check("① no Devanagari after the guest asked for Hinglish",
           not devanagari_after, str(devanagari_after))
+
+    # ④ over the whole transcript, not one section of it.
+    #
+    # It was checked only across the three turns of the sale, which is where
+    # the reference guest met it. A live run then put "ek naya quote generate
+    # karna hoga" in front of the guest fifteen turns later, on the payment
+    # turn, and the suite reported ④ green — the machine showing through in a
+    # place nobody was looking. Every outbound message, once, at the end.
+    everything = " ".join(
+        (m.get("body") or "").lower() for m in messages() if m["direction"] == "outbound"
+    )
+    leaked_anywhere = [word for word in INTERNAL if word in everything]
+    check("④ and nowhere in the whole transcript did the machine show through",
+          not leaked_anywhere, str(leaked_anywhere))
 
     print(f"    session at the end: "
           f"{sorted((conversation() or {}).get('guest_profile') or {})}")

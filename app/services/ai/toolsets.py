@@ -141,6 +141,17 @@ BY_TASK: dict[str, frozenset[str]] = {
         "get_booking_status", "get_reservation", "list_guest_reservations",
         "create_payment_link", "create_booking_payment_link",
         "get_check_in_link", "get_property_policies",
+        # **`create_booking_payment_link` needs a quote, and this task had no
+        # way to make one.** "Theek h, payment link bhej do" classifies here —
+        # it is a question about payment — and the agent was handed the tool
+        # that takes the money and nothing that produces what it takes. It said
+        # so, honestly and uselessly: *"payment link generate karne ke liye
+        # mujhe ek naya quote banana hoga. Abhi main woh nahi kar pa rahi
+        # hoon."* Then it handed a guest who had just agreed to pay to a person.
+        #
+        # A toolset has to be closed under what its own tools depend on. See
+        # `test_a_toolset_can_use_every_tool_it_offers`.
+        "get_quote", "get_stay_options",
     }),
     "cancellation_dispute": frozenset({
         "get_booking_status", "get_reservation", "list_guest_reservations",

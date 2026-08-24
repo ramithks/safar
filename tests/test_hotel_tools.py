@@ -243,3 +243,41 @@ class TestRouting:
 def test_a_sales_role_is_first_for_anything_about_price(kind):
     if kind in ("discount_request", "group_inquiry"):
         assert escalation.DEFAULT_ROLES[kind][0] == "sales"
+
+
+# ── a toolset has to be able to use what it offers ──────────────────────────
+
+# Which tools cannot run without another tool's result, and what they need.
+#
+# Not a general dependency graph — only the cases where a tool takes an id that
+# nothing else can produce. `create_booking_payment_link` takes a `quote_id`,
+# and a quote id exists only because `get_quote` made one.
+PREREQUISITES = {
+    "create_booking_payment_link": "get_quote",
+}
+
+
+@pytest.mark.parametrize("tool,needs", sorted(PREREQUISITES.items()))
+def test_a_toolset_can_use_every_tool_it_offers(tool, needs):
+    """
+    The defect this is for cost a sale at the last step.
+
+    "Theek h, payment link bhej do" classifies as `payment_status` — it is a
+    question about payment — and that toolset held `create_booking_payment_link`
+    and no `get_quote`. So the agent was handed the tool that takes the money
+    and nothing that produces what that tool takes. It reported the problem
+    accurately and uselessly — *"payment link generate karne ke liye mujhe ek
+    naya quote banana hoga. Abhi main woh nahi kar pa rahi hoon"* — and then
+    handed a guest who had just agreed to pay to a person.
+
+    Narrowing the tools per task is right: it is what keeps the prompt small
+    and the model's choice easy. The rule it has to obey is that a task offering
+    a tool must also offer what that tool depends on, or the narrowing has
+    removed a capability rather than the noise around it.
+    """
+    for task, tools in toolsets.BY_TASK.items():
+        available = set(tools) | set(toolsets.CORE)
+        if tool in available:
+            assert needs in available, (
+                f"{task!r} offers {tool} but not {needs}, which it cannot run without"
+            )
