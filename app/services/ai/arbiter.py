@@ -307,11 +307,12 @@ def judge(reason: str | None, ctx) -> Judgement:
     if category not in CHECKABLE:
         return valid(f"{category} is not a claim about the conversation")
 
-    if category == GUEST_REQUESTED_HUMAN:
-        # The corroboration above already covers this; reaching here means the
-        # guest did not ask, which is exactly the claim being tested.
-        pass
-    elif category == AUTONOMY_REQUIRES_APPROVAL:
+    # One category is left with its own corroboration. `GUEST_REQUESTED_HUMAN`
+    # was answered above — reaching here means the guest did not ask, which is
+    # exactly the claim being tested — and `UNSUPPORTED_REQUEST` has nothing
+    # that could corroborate it: "I do not know" is not a fact about the
+    # conversation, it is a fact about the model.
+    if category == AUTONOMY_REQUIRES_APPROVAL:
         queued = [o for o in (turn.outcomes if turn else [])
                   if o.status in ("awaiting_approval", "refused")]
         if queued:
@@ -319,8 +320,6 @@ def judge(reason: str | None, ctx) -> Judgement:
                 f"{queued[0].tool} came back {queued[0].status} on this turn",
                 tool=queued[0].tool, status=queued[0].status,
             )
-    else:  # UNSUPPORTED_REQUEST
-        pass  # never corroborated by anything; falls through to the test below
 
     # The claim is uncorroborated. That alone is not enough to turn it down —
     # the model may simply be right in a way nothing here can see. It is turned
