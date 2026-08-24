@@ -81,15 +81,26 @@ async def _precheck_handoff(args: "HandoffArgs", ctx: AgentContext) -> None:
             })
         return
 
+    # Recorded whether or not it is acted on. With arbitration switched off the
+    # judgement still lands on the run and the handoff still goes through, so
+    # `agent_runs.required_actions.handoff_judgements` says what *would* have
+    # been turned down — which is what makes the off/on comparison possible at
+    # all, and what makes a rollback measurable rather than blind.
+    enforcing = arbiter.enabled()
     if turn is not None:
-        turn.handoff_rejected = True
+        turn.handoff_rejected = enforcing
         turn.handoff_rejections.append({
-            "category": judgement.category, "accepted": False,
+            "category": judgement.category, "accepted": not enforcing,
+            "enforced": enforcing,
             "reason_given": judgement.reason_given, "instead": judgement.instead,
             "intent": judgement.intent, "why": judgement.why,
             "evidence": judgement.evidence,
         })
-    logger.info("handoff turned down on run %s: %s", ctx.run_id, judgement.why)
+    logger.info("handoff %s on run %s: %s",
+                "turned down" if enforcing else "questioned but allowed",
+                ctx.run_id, judgement.why)
+    if not enforcing:
+        return
 
     raise OutOfScope(
         # The audit row keeps the whole judgement, in the arbiter's own words.

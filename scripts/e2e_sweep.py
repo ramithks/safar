@@ -418,7 +418,7 @@ def configuration_snapshot(db, property_id: str, *,
 
     rows = (
         db.table("agents")
-        .select("id,agent_type,autonomy_level,status,config_id")
+        .select("id,agent_type,autonomy_level,status,active_config_id,limits")
         .eq("property_id", property_id).eq("agent_type", agent_type)
         .limit(1).execute().data or []
     )
@@ -435,7 +435,12 @@ def configuration_snapshot(db, property_id: str, *,
         "agent_type": agent.get("agent_type"),
         "autonomy_level": agent.get("autonomy_level"),
         "agent_status": agent.get("status"),
-        "config_id": agent.get("config_id"),
+        "config_id": agent.get("active_config_id"),
+        # The per-agent ceilings a discount is checked against. Part of the
+        # configuration a negotiation number depends on, and invisible without
+        # it: an agent with max_discount_pct of 5 and one with 15 are two
+        # different products being measured under one name.
+        "limits": agent.get("limits") or {},
         "models": {
             tier: model_router.model_for_tier(tier)
             for tier in ("classify", "fast", "conversation", "reasoning")

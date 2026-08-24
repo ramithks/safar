@@ -332,3 +332,58 @@ def test_a_member_typing_into_the_console_is_not_arbitrated(db):
         ]),
     ))
     assert result.handoff is True
+
+
+# ── the switch ──────────────────────────────────────────────────────────────
+
+def test_arbitration_can_be_turned_off_without_a_deploy(db, monkeypatch):
+    """
+    §12. A new layer that changes what a guest is told needs a way back that is
+    an environment variable rather than a hotfix at eleven at night.
+    """
+    monkeypatch.setenv("AGENT_ARBITRATE_HANDOFFS", "false")
+
+    result = run(runtime.run_turn(
+        make_ctx(session=QUOTED_SESSION), "4000 mein kar do na",
+        provider=EchoProvider(list(HANDOFF_ON_A_HAGGLE)),
+    ))
+
+    assert result.handoff is True, "the switch did not switch anything off"
+    assert db.rows("conversations")[0]["handler"] == "human_requested"
+
+
+def test_the_judgement_is_recorded_even_when_it_is_not_acted_on(db, monkeypatch):
+    """
+    **What makes the off/on comparison possible at all.** With the layer off,
+    the arbiter still says what it would have done and the run still records it
+    — so the "before" number can be measured on the same day, against the same
+    hotel and the same model, rather than quoted from an audit last week.
+
+    It is also what makes a rollback measurable: a property running with this
+    off can still be asked how often it *would* have fired.
+    """
+    monkeypatch.setenv("AGENT_ARBITRATE_HANDOFFS", "false")
+
+    result = run(runtime.run_turn(
+        make_ctx(session=QUOTED_SESSION), "4000 mein kar do na",
+        provider=EchoProvider(list(HANDOFF_ON_A_HAGGLE)),
+    ))
+
+    judgements = result.requirements["handoff_judgements"]
+    assert judgements, "nothing was recorded, so the off case is unmeasurable"
+    assert judgements[0]["enforced"] is False
+    assert judgements[0]["instead"] == "negotiate_rate"
+    assert judgements[0]["category"] == "GUEST_REQUESTED_HUMAN"
+
+
+def test_with_the_switch_on_the_same_turn_is_answered(db, monkeypatch):
+    """The other half of the comparison, so the pair reads as one statement."""
+    monkeypatch.setenv("AGENT_ARBITRATE_HANDOFFS", "true")
+
+    result = run(runtime.run_turn(
+        make_ctx(session=QUOTED_SESSION), "4000 mein kar do na",
+        provider=EchoProvider(list(HANDOFF_ON_A_HAGGLE)),
+    ))
+
+    assert result.handoff is False
+    assert result.requirements["forced"] == ["negotiate_rate"]

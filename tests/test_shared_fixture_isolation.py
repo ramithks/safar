@@ -182,7 +182,8 @@ def test_the_snapshot_records_everything_the_number_depends_on():
     db.seed("properties", {"id": "p-1", "name": "Casa Mandala", "is_demo": True})
     db.seed("agents", {"id": "a-1", "property_id": "p-1", "agent_type": "guest",
                        "autonomy_level": 3, "status": "active",
-                       "config_id": "cfg-9"})
+                       "active_config_id": "cfg-9",
+                       "limits": {"max_discount_pct": 12}})
 
     snapshot = e2e_sweep.configuration_snapshot(db, "p-1")
 
@@ -190,6 +191,10 @@ def test_the_snapshot_records_everything_the_number_depends_on():
     assert snapshot["agent_id"] == "a-1"
     assert snapshot["autonomy_level"] == 3
     assert snapshot["config_id"] == "cfg-9"
+    # The ceilings a discount is checked against are part of what a negotiation
+    # number depends on. An agent capped at 5% and one capped at 15% are two
+    # different products measured under one name.
+    assert snapshot["limits"] == {"max_discount_pct": 12}
     assert snapshot["is_demo"] is True
     # Which model actually answered is half of what a comparison is about.
     assert set(snapshot["models"]) >= {"conversation", "reasoning"}

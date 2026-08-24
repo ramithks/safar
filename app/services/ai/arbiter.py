@@ -133,6 +133,39 @@ def categorise(reason: str | None) -> str:
     return _CATEGORY_OF.get((reason or "").strip().lower(), DEFAULT_CATEGORY)
 
 
+def enabled() -> bool:
+    """
+    Whether a handoff is checked against the conversation at all.
+
+    A switch rather than a constant, for the same two reasons
+    `required_actions.enforcement_enabled` is one, and neither is doubt about
+    the feature.
+
+    **It is how the improvement is measured.** The only honest statement of
+    what this layer bought is the same scenarios, on the same day, against the
+    same hotel and the same model, with it on and off. A hard-coded `True`
+    makes that comparison require a code edit and a redeploy, which means it
+    does not get made.
+
+    **And it is the rollback.** If checking a handoff ever turns out to be
+    wrong for one property, the answer is an environment variable rather than a
+    hotfix at eleven at night. §12.
+
+    Judging keeps running either way: with it off, the judgement is recorded on
+    the run and the handoff goes through regardless, so `agent_runs` still says
+    what *would* have been turned down. A layer whose effect can only be
+    measured by turning it on is one nobody can decide about.
+
+    Read per call rather than cached at import, so a test can flip it and the
+    eval runner can flip it between sweeps in one process.
+    """
+    import os
+
+    return os.environ.get("AGENT_ARBITRATE_HANDOFFS", "true").strip().lower() not in (
+        "false", "0", "no", "off",
+    )
+
+
 # ── did the guest actually ask for a person ──────────────────────────────────
 #
 # The same question `required_actions` already answers, asked from the other
