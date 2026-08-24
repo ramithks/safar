@@ -553,7 +553,10 @@ async def one_run(scenario: dict, index: int) -> dict:
             summary=f"eval:{scenario['key']}",
         )
     except Exception as exc:  # noqa: BLE001
-        return {"error": f"{type(exc).__name__}: {exc}",
+        # `harness_error`, not `error`. The two were one key, and the turn that
+        # never ran and the turn that ran and recorded something were being
+        # thrown away together. See `report`.
+        return {"harness_error": f"{type(exc).__name__}: {exc}",
                 "conversation_id": conversation["id"]}
 
     latency = int((time.monotonic() - started) * 1000)
@@ -582,7 +585,7 @@ async def one_run(scenario: dict, index: int) -> dict:
         "tokens_out": result.tokens_out,
         "status": result.status,
         "handoff": result.handoff,
-        "error": result.error,
+        "run_error": result.error,
         "reply": reply[:400],
         "tools": ran,
         "intents": requirements.get("intents") or [],
@@ -720,7 +723,28 @@ def pct(part: int, whole: int) -> str:
 
 
 def report(rows: list[dict], label: str) -> dict:
-    usable = [r for r in rows if not r.get("error") and not r.get("skipped")]
+    """
+    **What counts as a turn, and why it stopped being "no error string".**
+
+    This read `not r.get("error")`, where `error` was both the harness blowing
+    up *and* `agent_runs.error` on a turn that completed. Two different things
+    under one key, and excluding on it threw away turns that had worked.
+
+    It threw them away unevenly, which is what makes it a measurement bug
+    rather than a rounding one. `agent_runs.error` carries "the model produced
+    no reply" on a turn where the model answered through `send_message` and
+    then declined to repeat itself in prose — so a model that replies by
+    calling the tool loses those turns from its sample and a model that replies
+    in prose loses none. In this matrix that was 6 of 24 turns for 3.x against
+    2 of 24 for 2.5, and the six were mostly turns that succeeded.
+
+    It also silently dropped every guardrail refusal, which is the single
+    outcome §14 is most explicit about not hiding.
+
+    So: a turn counts if it ran. `status` and `error` are then *measured*
+    rather than used to decide what gets measured.
+    """
+    usable = [r for r in rows if not r.get("harness_error") and not r.get("skipped")]
     by_scenario: dict[str, list[dict]] = defaultdict(list)
     for row in usable:
         by_scenario[row["scenario"]].append(row)
@@ -826,11 +850,31 @@ def report(rows: list[dict], label: str) -> dict:
               f"p95 {latencies[int(len(latencies) * 0.95) - 1] / 1000:.1f}s   "
               f"mean {statistics.mean(latencies) / 1000:.1f}s")
 
-    errors = [r for r in rows if r.get("error")]
-    if errors:
-        print(f"║\n║  {len(errors)} turns failed outright:")
-        for row in errors[:5]:
-            print(f"║    · {str(row['error'])[:100]}")
+    # Three different things, named separately rather than lumped as "errors".
+    crashed = [r for r in rows if r.get("harness_error")]
+    failed = [r for r in usable if r["status"] == "failed"]
+    refused = [r for r in usable if (r.get("run_error") or "").startswith("guardrail:")]
+    noted = [r for r in usable
+             if r.get("run_error") and r["status"] == "succeeded"
+             and not (r.get("run_error") or "").startswith("guardrail:")]
+
+    if crashed:
+        print(f"║\n║  {len(crashed)} turns the harness could not run:")
+        for row in crashed[:4]:
+            print(f"║    · {str(row['harness_error'])[:100]}")
+    if failed:
+        print(f"║\n║  {len(failed)} turns failed outright:")
+        for row in failed[:5]:
+            print(f"║    · {str(row.get('run_error'))[:100]}")
+    if refused:
+        # §14: never hidden. A reply the guardrail stopped is the most
+        # informative single row in this report.
+        print(f"║\n║  {len(refused)} replies refused by a guardrail:")
+        for row in refused[:5]:
+            print(f"║    · {row['scenario']}: {str(row.get('run_error'))[:90]}")
+    if noted:
+        print(f"║\n║  {len(noted)} turns succeeded with a note "
+              f"(e.g. answered through send_message, no closing prose)")
 
     # The failures, named. §18: do not hide them.
     misses = [r for r in usable if r.get("never")]
@@ -851,6 +895,9 @@ def report(rows: list[dict], label: str) -> dict:
         "label": label,
         "usable": len(usable),
         "attempted": len(rows),
+        "harness_errors": len(crashed),
+        "turns_failed": len(failed),
+        "guardrail_refusals": len(refused),
         "required_total": n,
         "by_model": totals["model"],
         "by_application": totals["forced"],
@@ -903,7 +950,7 @@ async def sweep_once(chosen: list[dict], runs: int, enforce: bool,
                 conversations.append(row["conversation_id"])
             mark = (
                 "·" if row.get("skipped") else
-                "!" if row.get("error") else
+                "!" if row.get("harness_error") or row.get("status") == "failed" else
                 "M" if row.get("by_model") else
                 "A" if row.get("by_application") else
                 "✗" if row.get("never") else
@@ -981,7 +1028,12 @@ async def main() -> int:
                              "print the matrix (§12)")
     args = parser.parse_args()
 
-    chosen = [s for s in SCENARIOS if not args.only or args.only in s["key"]]
+    # Comma-separated, so a run can name a few categories without naming all of
+    # them. `--only escalation,adversarial` is the shape this is actually used
+    # in: the two §12 categories that are about the arbiter rather than revenue.
+    wanted = [w.strip() for w in (args.only or "").split(",") if w.strip()]
+    chosen = [s for s in SCENARIOS
+              if not wanted or any(w in s["key"] for w in wanted)]
     if not chosen:
         print(f"no scenario matches {args.only!r}")
         return 2
@@ -1028,6 +1080,8 @@ async def main() -> int:
             ("invented rupee figures", "invented_figures", False),
             ("internal identifiers leaked", "leaked_ids", False),
             ("Devanagari to a Hinglish guest", "devanagari_slips", False),
+            ("turns that failed", "turns_failed", False),
+            ("replies a guardrail refused", "guardrail_refusals", False),
             ("latency p50 (ms)", "latency_p50_ms", False),
             ("latency p95 (ms)", "latency_p95_ms", False),
             ("tokens in, per turn", "tokens_in_per_turn", False),
@@ -1061,7 +1115,13 @@ async def main() -> int:
             "matrix": {n: {k: v for k, v in m.items() if k != "turns"}
                        for n, m in matrix.items()},
             "gate": GATE,
-            "turns": [t for m in matrix.values() for t in m["turns"]],
+            # Tagged with the model that produced them. They used to be one flat
+            # list in the order the sweeps ran, so re-scoring the file later
+            # meant inferring which half was which from its position — which is
+            # exactly the kind of thing that is right until somebody adds a
+            # third model.
+            "turns": [dict(t, model=m["model"], family=name)
+                      for name, m in matrix.items() for t in m["turns"]],
         }
         pathlib.Path(args.out).write_text(json.dumps(payload, indent=1, default=str))
         print(f"\n   every turn written to {args.out}")
