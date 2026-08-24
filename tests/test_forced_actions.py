@@ -248,17 +248,31 @@ def test_a_haggle_reaches_the_engine_even_when_the_model_answers_in_prose(db):
 
 def test_a_haggle_with_nothing_to_haggle_over_forces_nothing(db):
     """
-    No rate plan on the session. The right answer is the model's — find out
-    which room and which nights — and the layer stays out of it rather than
-    opening a negotiation against a stay nobody has described.
+    No rate plan and no dates on the session. The right answer is the model's —
+    find out which nights — and the layer stays out of it rather than opening a
+    negotiation against a stay nobody has described.
+
+    **One assertion here changed and it is worth saying why.** This used to end
+    `assert "NEGOTIATION" in result.requirements["observed_unmet"]`, because the
+    requirement was advisory. It is now required and unmet, so it appears in
+    `unmet` instead.
+
+    That is not a weakened assertion — it is a stronger one about the same
+    thing. `observed_unmet` means "the model chose differently and that is
+    probably fine"; `unmet` means "the guest is owed an answer and did not get
+    one". A guest who asks for a discount *is* owed an answer, and the layer
+    that decides whether a handoff may end the turn needs to know that. What has
+    not changed, and is still asserted below, is that nothing was executed: a
+    requirement being real and the application running it are two different
+    things, and only the second one touches a hotel's rooms.
     """
     provider = EchoProvider(["Kaunse dates ke liye dekh rahe hain aap?"])
     result = run(runtime.run_turn(make_ctx(), "thoda kam karo na", provider=provider))
 
     assert tool_rows(db, "negotiate_rate") == []
+    assert tool_rows(db, "get_stay_options") == []
     assert result.requirements["forced"] == []
-    # Recorded rather than hidden: the report counts these.
-    assert "NEGOTIATION" in result.requirements["observed_unmet"]
+    assert "NEGOTIATION" in result.requirements["unmet"]
 
 
 def test_autonomy_still_decides_whether_a_forced_negotiation_executes(db):

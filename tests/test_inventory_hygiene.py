@@ -41,6 +41,7 @@ import e2e_sweep  # noqa: E402
 
 from tests.fake_supabase import FakeDb  # noqa: E402
 
+PROPERTY = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 RESERVATION = "a0a0a0a0-0001-4001-8001-000000000001"
 ROOM_TYPE = "22222222-2222-4222-8222-222222222222"
 
@@ -392,3 +393,175 @@ class TestAutonomyIsAlsoSharedState:
         source = inspect.getsource(ev.main)
         assert '"autonomy_level"' in source
         assert '"autonomy_was"' in source
+
+# ── the runtime check §10 asked for ──────────────────────────────────────────
+#
+# Everything above this line is static: a regex over suite source, and a list of
+# files that have declared which case they are in. That is a speed bump, and it
+# is the right speed bump — but §10 is explicit that it is not enough, and it is
+# right for a reason worth writing down.
+#
+# **A static reading cannot answer the question.** Whether a DELETE needs a
+# release depends on whether that reservation ever consumed inventory, which is
+# a fact about what ran, not about how the statement is spelled. A fixture row
+# INSERTed straight into `reservations` never moved the counter; releasing one
+# subtracts a booking nobody made and builds an *oversell* out of a cleanup —
+# the dangerous direction. I tried to decide it from source and the heuristic
+# flagged four suites that were fine, which is how a guard gets muted.
+#
+# So the decision moves to runtime, per row, and the invariant is checked by
+# recomputing rather than by reasoning about syntax.
+
+class TestTheSanctionedCleanup:
+    """
+    One way to delete a reservation, and it decides per row what to give back.
+    """
+
+    def _db(self):
+        """Rows shaped the way `cancel_reservation` reads them."""
+        db = FakeDb()
+        return db
+
+    @staticmethod
+    def _reservation(id_: str, status: str) -> dict:
+        return {"id": id_, "status": status, "room_type_id": ROOM_TYPE,
+                "check_in": "2026-09-10", "check_out": "2026-09-12", "units": 2}
+
+    def test_a_live_reservation_gives_its_stock_back_before_it_goes(self):
+        db = self._db()
+        db.seed("reservations", self._reservation("r-1", "confirmed"))
+        result = e2e_sweep.delete_reservations(db, ["r-1"])
+
+        released = [c for c in db.rpc_calls if c[0] == "release_booking"]
+        assert len(released) == 1
+        assert released[0][1]["p_units"] == 2
+        assert result == {"deleted": 1, "released": 1, "already_dead": 0}
+        assert db.rows("reservations") == []
+
+    @pytest.mark.parametrize("status", ["cancelled", "no_show"])
+    def test_a_reservation_that_already_gave_its_stock_back_does_not_give_it_twice(
+        self, status,
+    ):
+        """
+        The direction that builds an oversell. A cancelled reservation released
+        its rooms when it was cancelled; releasing again pushes `units_booked`
+        below the truth, and the hotel sells a room it does not have.
+        """
+        db = self._db()
+        db.seed("reservations", self._reservation("r-1", status))
+        result = e2e_sweep.delete_reservations(db, ["r-1"])
+
+        assert [c for c in db.rpc_calls if c[0] == "release_booking"] == []
+        assert result["already_dead"] == 1
+        assert result["released"] == 0
+
+    def test_every_row_is_accounted_for_one_way_or_the_other(self):
+        db = self._db()
+        db.seed("reservations",
+                self._reservation("r-1", "confirmed"),
+                self._reservation("r-2", "cancelled"),
+                self._reservation("r-3", "confirmed"))
+        result = e2e_sweep.delete_reservations(db, ["r-1", "r-2", "r-3"])
+
+        assert result["released"] + result["already_dead"] == result["deleted"] == 3
+
+    def test_a_release_that_fails_does_not_leave_the_row_behind(self):
+        """
+        Called from teardown, where raising loses the suite's own result. A row
+        left behind is debris somebody can see; a suite that died in cleanup is
+        a red run nobody can read.
+        """
+        db = self._db()
+        db.seed("reservations", self._reservation("r-1", "confirmed"))
+
+        def _explode(args):
+            raise RuntimeError("rpc unavailable")
+
+        db.rpcs["release_booking"] = _explode
+
+        result = e2e_sweep.delete_reservations(db, ["r-1"])
+        assert result["deleted"] == 1
+        assert db.rows("reservations") == []
+
+    def test_nothing_to_delete_touches_nothing(self):
+        db = self._db()
+        assert e2e_sweep.delete_reservations(db, []) == {
+            "deleted": 0, "released": 0, "already_dead": 0}
+
+
+class TestTheInvariantItself:
+    """
+    *Tests must never leave production-style inventory inconsistent* — checked
+    by recomputing the counter from the reservations, which is the only thing
+    that can tell debris from an oversell.
+    """
+
+    def _seeded(self, units_booked: int):
+        db = FakeDb()
+        db.seed("room_types", {"id": "rt-1", "property_id": PROPERTY,
+                               "name": "Garden Standard"})
+        db.seed("reservations", {
+            "id": "r-1", "property_id": PROPERTY, "ref": "TB-TEST",
+            "status": "confirmed", "check_in": "2026-12-22",
+            "check_out": "2026-12-23", "units": 1, "room_type_id": "rt-1"})
+        db.seed("room_inventory", {
+            "id": "i-1", "property_id": PROPERTY, "room_type_id": "rt-1",
+            "date": "2026-12-22", "units_booked": units_booked})
+        return db
+
+    def test_a_property_that_agrees_passes_silently(self):
+        e2e_sweep.assert_inventory_agrees(self._seeded(1), PROPERTY)
+
+    def test_the_exact_failure_that_was_found_in_production(self):
+        """
+        `booking_engine_e2e`'s +120 day fixture: a reservation deleted with a
+        bare DELETE, its room-night still on the counter. Casa Mandala,
+        2026-12-22, one Garden Standard sold to nobody.
+        """
+        db = self._seeded(1)
+        db.table("reservations").delete().eq("id", "r-1").execute()
+
+        with pytest.raises(AssertionError) as caught:
+            e2e_sweep.assert_inventory_agrees(db, PROPERTY, label="booking_engine_e2e")
+
+        message = str(caught.value)
+        assert "1 room-nights stranded" in message
+        assert "2026-12-22" in message
+        assert "booking_engine_e2e" in message
+        # And it says what to do about it, because a failure nobody can act on
+        # is a failure somebody deletes.
+        assert "reconcile_inventory.py" in message
+        assert "delete_reservations" in message
+
+    def test_the_dangerous_direction_is_reported_as_such(self):
+        """
+        A counter *below* the live reservations is not debris — it is rooms
+        sold that nothing is counting, and it must not be quietly tidied.
+        """
+        db = self._seeded(0)
+        with pytest.raises(AssertionError) as caught:
+            e2e_sweep.assert_inventory_agrees(db, PROPERTY)
+        assert "1 oversold" in str(caught.value)
+
+    def test_the_sanctioned_delete_leaves_the_invariant_intact(self):
+        """
+        The two halves closing the loop: the API releases, and the invariant
+        agrees afterwards. This is the test that would have failed on the run
+        that stranded five room-nights.
+        """
+        db = self._seeded(1)
+        db.rpcs["release_booking"] = lambda args: db.table("room_inventory") \
+            .update({"units_booked": 0}).eq("id", "i-1").execute()
+
+        e2e_sweep.delete_reservations(db, ["r-1"])
+        e2e_sweep.assert_inventory_agrees(db, PROPERTY)
+
+    def test_the_suite_and_the_repair_tool_share_one_definition(self):
+        """
+        `assert_inventory_agrees` imports `reconcile_inventory.disagreements`
+        rather than recomputing. Two definitions of "consistent" is how a suite
+        passes against a hotel the repair tool would still change.
+        """
+        import inspect
+        source = inspect.getsource(e2e_sweep.inventory_disagreements)
+        assert "from reconcile_inventory import disagreements" in source

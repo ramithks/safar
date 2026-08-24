@@ -31,6 +31,7 @@ from app.db.client import get_db, run_db
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import OutOfScope, ToolUnavailable
 from app.services.ai.ids import ResourceId
+from app.services.ai import registry
 from app.services.ai.registry import tool
 from app.services.messaging import service as messaging
 from app.services.messaging.channels import (
@@ -46,6 +47,63 @@ REASONS = (
     "guest_asked", "no_knowledge", "low_confidence", "complaint",
     "refund", "policy_conflict", "unusual_request", "autonomy_limit",
 )
+
+
+async def _precheck_handoff(args: "HandoffArgs", ctx: AgentContext) -> None:
+    """
+    Is the conversation actually the one the model just described?
+
+    The whole of the decision is in `services/ai/arbiter.py`; this is the seam.
+    It is a precheck rather than a check inside the tool body for the reason
+    every other precheck is: it runs **before** anything happens. By the time
+    the function below has run, `conversations.handler` says 'human_requested',
+    the inbox has moved the thread, and undoing that is a compensating write
+    that can fail. Refusing here means there is nothing to undo.
+
+    Refusal, not exception. `registry.execute` turns an `AgentError` into a
+    `ToolOutcome` the model is shown and can answer — so a turned-down handoff
+    arrives as an instruction naming the tool that has not run yet, which is
+    what makes the model take the business path instead of apologising.
+
+    **It can only ever delay.** `turn.handoff_rejected` is set here, and the
+    arbiter lets the next request through unconditionally. One extra tool call
+    is the entire cost of being wrong.
+    """
+    from app.services.ai import arbiter
+
+    judgement = arbiter.judge(args.reason, ctx)
+    turn = getattr(ctx, "turn", None)
+    if judgement.valid:
+        if turn is not None:
+            turn.handoff_rejections.append({
+                "category": judgement.category, "accepted": True,
+                "reason_given": judgement.reason_given, "why": judgement.why,
+            })
+        return
+
+    if turn is not None:
+        turn.handoff_rejected = True
+        turn.handoff_rejections.append({
+            "category": judgement.category, "accepted": False,
+            "reason_given": judgement.reason_given, "instead": judgement.instead,
+            "intent": judgement.intent, "why": judgement.why,
+            "evidence": judgement.evidence,
+        })
+    logger.info("handoff turned down on run %s: %s", ctx.run_id, judgement.why)
+
+    raise OutOfScope(
+        # The audit row keeps the whole judgement, in the arbiter's own words.
+        f"HANDOFF_NOT_SUPPORTED: {judgement.why}",
+        # Never shown to a guest on this path — the model answers instead — but
+        # it is what they would hear if everything above this failed, and
+        # "someone will call you" is the one thing that must not be said when
+        # nobody has been asked to.
+        "One moment — let me check that for you.",
+        # What the model is told, which is an instruction rather than the
+        # sentence above it. A model handed the audit line paraphrases it at the
+        # guest; a model handed a tool name calls the tool.
+        arbiter.instruction_for(judgement),
+    )
 
 
 class HandoffArgs(BaseModel):
@@ -70,6 +128,7 @@ class HandoffArgs(BaseModel):
     mutating=True,
     usage_type="ai.tool_write",
     result_type="handoff",
+    precheck=_precheck_handoff,
 )
 async def request_human_handoff(args: HandoffArgs, ctx: AgentContext) -> tuple[dict, str | None]:
     reason = args.reason if args.reason in REASONS else "unusual_request"
@@ -150,6 +209,7 @@ class SendTemplateArgs(BaseModel):
     usage_type="ai.tool_write",
     result_type="message",
     creates_result=True,
+    requires=(registry.OUTBOUND,),
 )
 async def send_message(args: SendMessageArgs, ctx: AgentContext) -> tuple[dict, str]:
     conversation = await _conversation(ctx)
@@ -208,6 +268,7 @@ async def send_message(args: SendMessageArgs, ctx: AgentContext) -> tuple[dict, 
     usage_type="ai.tool_write",
     result_type="message",
     creates_result=True,
+    requires=(registry.OUTBOUND, registry.TEMPLATES),
 )
 async def send_template(args: SendTemplateArgs, ctx: AgentContext) -> tuple[dict, str]:
     """
@@ -338,6 +399,7 @@ def _photo_sources(property_id: str, room_type_id: str | None) -> list[dict]:
     usage_type="ai.tool_write",
     result_type="none",
     scoped_to_conversation=True,
+    requires=(registry.OUTBOUND,),
 )
 async def send_room_photos(args: RoomPhotosArgs, ctx: AgentContext) -> dict:
     """

@@ -132,6 +132,17 @@ class Settings(BaseSettings):
     # The 2.5 ids are kept as their own settings rather than hardcoded in the
     # rollback path, so the floor stays configurable too.
     hotel_models_v3: bool = True
+
+    # Whether PATCH /website refuses a field it does not recognise.
+    #
+    # False, for now, and deliberately. The builder that calls it lives in
+    # another repository, so nothing here can prove no client has been sending a
+    # stray key for months — and a 422 to one of them turns a cosmetic bug into
+    # a hotelier who cannot edit their own page. While it is false the endpoint
+    # accepts the request, saves only the fields it knows, logs the names it did
+    # not, and returns them as `ignoredFields`. When that log has been quiet
+    # long enough, this flips and the same information becomes a 422.
+    website_strict_fields: bool = False
     hotel_model_classify_stable: str = "gemini-2.5-flash-lite"
     hotel_model_fast_stable: str = "gemini-2.5-flash"
     hotel_model_conversation_stable: str = "gemini-2.5-flash"

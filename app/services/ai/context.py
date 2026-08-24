@@ -74,6 +74,43 @@ class AgentPrincipal:
 
 
 @dataclass
+class TurnState:
+    """
+    What the turn knows about itself, while it is still happening.
+
+    Everything else on `AgentContext` is settled before the model runs: who the
+    agent is, what it may touch, where the booking flow had got to. This is the
+    part that is still being written — the guest's own words, what the
+    deterministic layer decided they require, and what has been executed so far.
+
+    It exists because a `precheck` runs inside `registry.execute`, which is
+    handed a tool and a context and nothing else. That is the right shape for
+    every tool whose question is "may this be done" — and the wrong shape for
+    the one tool whose question is "is what the model just claimed actually
+    true", because the evidence for that lives in the turn rather than in the
+    tool's arguments. See services/ai/arbiter.py.
+
+    Mutable and per-turn, deliberately. `AgentContext` is built once per turn and
+    thrown away, so there is nothing here to leak into the next one.
+    """
+
+    # The guest's message, exactly as they wrote it.
+    message: str = ""
+    # `required_actions.Requirement`s, in priority order. Typed loosely to keep
+    # the import one-directional — required_actions imports nothing from here.
+    requirements: tuple = ()
+    # Every `ToolOutcome` this turn has produced, in order. Appended by the
+    # runtime as they happen, so a precheck sees what came before it.
+    outcomes: list = field(default_factory=list)
+    # Set once the arbiter has turned a handoff down. A second request is let
+    # through: the arbiter may delay a stop by one step so the model can take
+    # the business path instead, and it may never prevent one outright.
+    handoff_rejected: bool = False
+    # Why it was turned down, for the run record.
+    handoff_rejections: list = field(default_factory=list)
+
+
+@dataclass
 class AgentContext:
     """One turn's worth of who, where and what about."""
 
@@ -130,6 +167,9 @@ class AgentContext:
     # Reservations this conversation is allowed to see, resolved once per turn
     # from the guest identity. None means "not resolved yet".
     _allowed_reservations: set[str] | None = None
+
+    # What is happening *now*. See `TurnState`.
+    turn: TurnState = field(default_factory=TurnState)
 
     @property
     def guest_scoped(self) -> bool:

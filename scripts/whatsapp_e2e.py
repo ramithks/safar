@@ -40,6 +40,10 @@ from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+
+# `scripts/` on the path so the shared teardown helpers are importable.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import e2e_sweep  # noqa: E402
 # Inline processing and a known app secret, set before anything imports settings.
 os.environ.setdefault("MESSAGING_INLINE_PROCESSING", "true")
 os.environ.setdefault("WHATSAPP_APP_SECRET", "whatsapp-e2e-app-secret")
@@ -165,7 +169,14 @@ stranger = db.table("reservations").insert({
 }).execute().data[0]
 
 # Reset the agent's preconditions, so a crashed previous run cannot poison this.
-db.table("agents").update({"autonomy_level": 2, "status": "active"}).eq(
+# **Borrowed, not taken.** `agents.autonomy_level` on the demo property is one
+# row and six suites write to it; whichever ran last used to decide what the
+# property was. An evaluation then measured a configuration an unrelated suite
+# had left behind and reported it as a model regression. `borrow_autonomy`
+# records the level it found and puts it back on exit, crash included.
+# See scripts/e2e_sweep.py.
+e2e_sweep.borrow_autonomy(db, PROPERTY, 2, agent_type="guest")
+db.table("agents").update({"status": "active"}).eq(
     "property_id", PROPERTY).eq("agent_type", "guest").execute()
 
 

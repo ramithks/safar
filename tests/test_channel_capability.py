@@ -26,6 +26,8 @@ That was true of permissions and false of channels. This file is that rule
 applied to the dimension it had missed, in both directions — because the fix
 that removes `send_message` everywhere would be worse than the bug.
 """
+import textwrap
+
 import pytest
 
 from app.services.ai import registry
@@ -55,7 +57,129 @@ def shown_on(channel: str) -> set[str]:
     return {s.name for s in registry.available_for(ctx_on(channel))}
 
 
+# ── the audit §8 asked for: every tool, every channel ───────────────────────
+#
+# The first version of this file tested one tool against six channels, because
+# `send_message` was the tool the production incident named. That was the same
+# mistake in miniature as the one it was fixing: a rule stated about the case
+# somebody happened to hit rather than about the class it belongs to.
+#
+# `send_template` and `send_room_photos` both reach `messaging.send` and both
+# were still on the menu everywhere. Neither was found by reading this file —
+# they were found by writing the derivation below and letting it disagree with
+# the hand-maintained list.
+
+ALL_CHANNELS = ("whatsapp", "instagram", "website", "internal", "phone", "email")
+
+
+def sends_outbound(spec) -> bool:
+    """
+    Whether this tool's own body reaches `messaging.send`.
+
+    Read out of the source rather than off the declaration, so the two are
+    independent answers to the same question. A declaration that agrees with
+    the code proves nothing on its own; a declaration checked against the code
+    is what stops the next sending tool shipping without one.
+    """
+    import ast
+    import inspect
+
+    try:
+        source = inspect.getsource(spec.fn)
+    except (OSError, TypeError):  # pragma: no cover
+        return False
+    tree = ast.parse(textwrap.dedent(source))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            rendered = ast.unparse(node.func)
+            if rendered.endswith("messaging.send") or rendered.endswith("service.send"):
+                return True
+    return False
+
+
+@pytest.mark.parametrize("name", sorted(registry.REGISTRY))
+def test_every_tool_that_sends_declares_that_it_needs_a_channel(name):
+    """
+    The derivation, run against every tool in the registry.
+
+    This is the test that found the two the hand-list had missed. It fails on a
+    tool that calls `messaging.send` without `requires=(OUTBOUND,)`, which is
+    the only way a new sending tool can be written — so the next one cannot
+    ship on six channels the way these three did.
+    """
+    spec = registry.REGISTRY[name]
+    if sends_outbound(spec):
+        assert registry.OUTBOUND in spec.requires, (
+            f"{name} calls messaging.send and does not declare "
+            f"requires=(registry.OUTBOUND,) — it will be offered on website, "
+            f"internal, phone and email, where messaging.send raises"
+        )
+
+
+@pytest.mark.parametrize("channel", ALL_CHANNELS)
+@pytest.mark.parametrize("name", sorted(registry.REGISTRY))
+def test_every_tool_on_every_channel_is_either_shown_or_impossible(name, channel):
+    """
+    §8, stated exhaustively: **every tool × every channel**. Around 240 pairs,
+    and each one has to be one of two things — shown, and its channel able to
+    carry what it needs; or hidden, and unable.
+
+    A pair that is shown *and* unable is the production bug. A pair that is
+    hidden *and* able is a capability quietly lost, which is the failure mode
+    of over-correcting and would be much harder to notice.
+    """
+    spec = registry.REGISTRY[name]
+    shown = name in shown_on(channel)
+    able = set(spec.requires) <= registry.channel_capabilities(channel)
+
+    assert shown == able, (
+        f"{name} on {channel}: shown={shown} able={able}. A tool that is shown "
+        f"and unable raises in front of a guest; one that is hidden and able is "
+        f"a capability the channel silently lost."
+    )
+
+
+def test_the_capability_of_a_channel_comes_from_the_messaging_policy():
+    """
+    Derived, not restated — the property the first version of this file had and
+    that is worth keeping. Nobody edits `registry` when a channel gains a
+    provider.
+    """
+    assert registry.channel_capabilities("whatsapp") == {
+        registry.OUTBOUND, registry.TEMPLATES}
+    # Instagram has no approved-template mechanism, so a tool needing one is
+    # not offered there — the second dimension, which the name-list could not
+    # express at all.
+    assert registry.channel_capabilities("instagram") == {registry.OUTBOUND}
+    for channel in policy.WINDOWLESS:
+        assert registry.channel_capabilities(channel) == frozenset()
+
+
+def test_the_template_tool_is_not_offered_where_there_are_no_templates():
+    """
+    Instagram. `send_template` there raises TEMPLATE_NOT_FOUND — a clean refusal
+    rather than a crash, which is why it survived: the agent was told "this
+    channel has no approved-template mechanism" and wasted a turn learning it,
+    every time, on the channel where the window closing is most likely.
+    """
+    assert "send_template" not in shown_on("instagram")
+    assert "send_template" in shown_on("whatsapp")
+    assert "send_message" in shown_on("instagram"), (
+        "narrowing templates must not take ordinary replies with it"
+    )
+
+
 # ── the bug ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("channel", sorted(policy.WINDOWLESS))
+@pytest.mark.parametrize("tool", ["send_message", "send_template", "send_room_photos"])
+def test_a_channel_that_cannot_send_is_not_offered_any_sending_tool(channel, tool):
+    """
+    All three, on all four. `send_template` and `send_room_photos` are the two
+    the original fix missed.
+    """
+    assert tool not in shown_on(channel)
+
 
 @pytest.mark.parametrize("channel", sorted(policy.WINDOWLESS))
 def test_a_channel_that_cannot_send_is_not_offered_the_sending_tool(channel):
@@ -123,8 +247,9 @@ def test_only_the_sending_tool_is_affected():
     website = shown_on("website")
     whatsapp = shown_on("whatsapp")
 
-    assert whatsapp - website == {"send_message"}, (
-        f"the channel filter removed more than the sending tool: "
+    assert whatsapp - website == {"send_message", "send_template",
+                                  "send_room_photos"}, (
+        f"the channel filter removed more than the sending tools: "
         f"{sorted(whatsapp - website)}"
     )
     for essential in ("get_group_rates", "negotiate_rate", "get_quote",

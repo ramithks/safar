@@ -201,3 +201,243 @@ def announce(label: str, stays: int, rooms: int = 0) -> None:
     if stays or rooms:
         bits = [f"{stays} stays"] + ([f"{rooms} rooms"] if rooms else [])
         print(f"  · swept {' and '.join(bits)} left by previous {label} runs")
+
+# ── the sanctioned cleanup, and the invariant behind it ──────────────────────
+#
+# §10: *provide one sanctioned cleanup API* and *runtime-check test database
+# mutations where possible*, rather than relying on one regex over test source.
+#
+# The regex is still there and still useful — it is what stops somebody typing
+# the bad statement — but it cannot answer the question that actually matters.
+# Whether a DELETE needs a release depends on whether that reservation ever
+# consumed inventory: a fixture row INSERTed straight into `reservations` never
+# moved the counter, and releasing one pushes `units_booked` *below* the truth,
+# building an oversell out of a cleanup. A static reading of the statement
+# cannot tell those apart. I tried; the heuristic flagged four suites that were
+# fine, which is how a guard gets muted.
+#
+# So the decision is made per row, from the row, and the invariant is checked
+# by recomputing rather than by reasoning.
+
+def delete_reservations(db, reservation_ids: list[str]) -> dict:
+    """
+    Remove test reservations, giving back exactly the stock they took.
+
+    The one sanctioned way to delete a reservation from a suite. It reads each
+    row first and decides *per row*:
+
+      * a live row consumed inventory through `convert_hold` or
+        `book_inventory`, so its stock is released before the row goes;
+      * a row already `cancelled` or `no_show` gave its stock back when it was
+        cancelled, and releasing again would subtract a booking nobody made —
+        the same corruption from the other end, and the direction that oversells
+        a night rather than hiding it.
+
+    The release itself is `cancel_reservation` above rather than a second call
+    to the RPC. One spelling of the arguments, in one place: this function
+    existing at all is an admission that a second spelling is how the original
+    bug happened.
+
+    Returns what it did, so a suite can print it and a reader can check that
+    the two counts add up to the number of rows.
+    """
+    if not reservation_ids:
+        return {"deleted": 0, "released": 0, "already_dead": 0}
+
+    rows = (
+        db.table("reservations").select("id,status")
+        .in_("id", list(reservation_ids)).execute().data or []
+    )
+    released = already_dead = 0
+    for row in rows:
+        try:
+            if cancel_reservation(db, row["id"], reason="e2e-delete"):
+                released += 1
+            else:
+                already_dead += 1
+        except Exception:  # noqa: BLE001
+            # A release that fails must not take the delete with it. This runs
+            # in teardown, where raising loses the suite's own result — and a
+            # row left behind is debris somebody can see, which is strictly
+            # better than the invisible kind.
+            logger.warning("could not release %s before deleting it", row["id"],
+                           exc_info=True)
+
+    for row in rows:
+        db.table("reservations").delete().eq("id", row["id"]).execute()
+
+    return {"deleted": len(rows), "released": released, "already_dead": already_dead}
+
+
+def inventory_disagreements(db, property_id: str) -> dict:
+    """
+    Recompute `room_inventory` from the reservations that are actually live.
+
+    The runtime check. `scripts/reconcile_inventory.py` owns the arithmetic —
+    this is the same function, imported rather than reimplemented, so a suite
+    and the repair tool can never disagree about what "consistent" means.
+    """
+    import pathlib as _pathlib
+    import sys as _sys
+
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent))
+    from reconcile_inventory import disagreements
+
+    return disagreements(db, property_id)
+
+
+def assert_inventory_agrees(db, property_id: str, *, label: str = "") -> None:
+    """
+    Fail the suite that left a hotel's availability wrong.
+
+    **This is the invariant §10 states**, asserted rather than inferred:
+    *tests must never leave production-style inventory inconsistent*. Call it
+    at the end of any suite that books rooms, and it fails on the run that
+    caused the damage instead of six weeks later when somebody notices a hotel
+    cannot sell a room it has.
+
+    Deliberately not called automatically from every sweep: it is one query per
+    room type and a suite that never touched a booking should not pay for it.
+    """
+    found = inventory_disagreements(db, property_id)
+    if not found["wrong"]:
+        return
+
+    where = f" after {label}" if label else ""
+    detail = ", ".join(
+        f"{found['rooms'].get(row['room_type_id'], row['room_type_id'][:8])} "
+        f"{row['date'][:10]} counter={row.get('units_booked')} actual={actual}"
+        for row, actual in sorted(found["wrong"], key=lambda x: x[0]["date"])[:6]
+    )
+    raise AssertionError(
+        f"inventory on {property_id} disagrees with its reservations{where}: "
+        f"{len(found['wrong'])} nights, {found['stranded']} room-nights stranded, "
+        f"{found['oversold']} oversold. {detail}. "
+        f"Run scripts/reconcile_inventory.py {property_id} --apply to repair, "
+        f"and use e2e_sweep.delete_reservations() rather than a bare DELETE."
+    )
+
+# ── shared configuration a suite borrows and must give back ──────────────────
+#
+# §11: *tests must not fight over shared state.*
+#
+# `agents.autonomy_level` on the demo property is one row, and six suites write
+# to it. `ai_e2e`, `frontdesk_e2e`, `marketing_e2e`, `sales_e2e`,
+# `whatsapp_e2e` and `payment_status_e2e` each set the level their own
+# assertions need — correctly, and for good reasons — and none of them put it
+# back. The last one to run decides what the property is until somebody
+# notices.
+#
+# **What it cost.** A post-deployment evaluation reported negotiation accuracy
+# of 7% and a 90% handoff rate, which reads as a catastrophic model regression
+# and was very nearly published as one. It was an earlier suite's leftover 2:
+# `get_quote` and `negotiate_rate` sit at autonomy floor 3, and at level 2 they
+# queue for approval instead of executing, so the agent handed off — correctly,
+# and exactly as designed. Every one of those thirteen "failures" was the
+# autonomy ladder working.
+#
+# The ideal fix is a per-suite agent, so there is nothing shared to fight over.
+# That is a change across six suites that each assert against the demo
+# property's own configuration, and doing it while also changing the agent's
+# decision path would be two large changes at once — rule 11. So the smaller
+# one: a suite *borrows* the level and the borrowing is registered, and it goes
+# back whether the suite ends, fails or crashes.
+
+_BORROWED_AUTONOMY: dict[tuple[str, str], int | None] = {}
+
+
+def borrow_autonomy(db, property_id: str, level: int, *,
+                    agent_type: str = "guest") -> int | None:
+    """
+    Set an agent's autonomy for the duration of this suite, and arrange to
+    give it back.
+
+    Returns the level it was at, which is what a suite should print — a run
+    that had to change the property's configuration to get its result should
+    say so, because that is a fact about the measurement.
+
+    The restore is registered with `atexit`, so a suite that raises halfway
+    through still leaves the property as it found it. That is the whole point:
+    the suites that leaked were not careless, they were the ones that died
+    before their own teardown.
+    """
+    import atexit
+
+    rows = (
+        db.table("agents").select("id,autonomy_level")
+        .eq("property_id", property_id).eq("agent_type", agent_type)
+        .limit(1).execute().data or []
+    )
+    if not rows:
+        return None
+    agent_id, was = rows[0]["id"], rows[0].get("autonomy_level")
+
+    key = (property_id, agent_type)
+    if key not in _BORROWED_AUTONOMY:
+        # Only the *first* borrow records the baseline. A suite that raises the
+        # level twice must restore to what it found, not to its own first
+        # change.
+        _BORROWED_AUTONOMY[key] = was
+        atexit.register(restore_autonomy, db)
+
+    if was != level:
+        db.table("agents").update({"autonomy_level": level}).eq(
+            "id", agent_id).execute()
+    return was
+
+
+def restore_autonomy(db) -> int:
+    """Put every borrowed autonomy level back. Safe to call more than once."""
+    restored = 0
+    for (property_id, agent_type), was in list(_BORROWED_AUTONOMY.items()):
+        _BORROWED_AUTONOMY.pop((property_id, agent_type), None)
+        if was is None:
+            continue
+        try:
+            db.table("agents").update({"autonomy_level": was}).eq(
+                "property_id", property_id).eq("agent_type", agent_type).execute()
+            restored += 1
+        except Exception:  # noqa: BLE001 — teardown must not mask the result
+            logger.warning("could not restore autonomy on %s", property_id,
+                           exc_info=True)
+    return restored
+
+
+def configuration_snapshot(db, property_id: str, *,
+                           agent_type: str = "guest") -> dict:
+    """
+    What the thing being measured was configured as, at the moment of measuring.
+
+    §11: *every evaluator must record hotel_id, agent_id, autonomy_level, model
+    and a configuration snapshot with the evaluation result.* A number without
+    this is not reproducible, and the 7% above is what that looks like — a real
+    measurement of a configuration nobody recorded, indistinguishable from a
+    measurement of the build.
+    """
+    from app.services.ai import model_router
+
+    rows = (
+        db.table("agents")
+        .select("id,agent_type,autonomy_level,status,config_id")
+        .eq("property_id", property_id).eq("agent_type", agent_type)
+        .limit(1).execute().data or []
+    )
+    agent = rows[0] if rows else {}
+    prop = (
+        db.table("properties").select("id,name,is_demo")
+        .eq("id", property_id).limit(1).execute().data or [{}]
+    )[0]
+    return {
+        "hotel_id": property_id,
+        "hotel_name": prop.get("name"),
+        "is_demo": prop.get("is_demo"),
+        "agent_id": agent.get("id"),
+        "agent_type": agent.get("agent_type"),
+        "autonomy_level": agent.get("autonomy_level"),
+        "agent_status": agent.get("status"),
+        "config_id": agent.get("config_id"),
+        "models": {
+            tier: model_router.model_for_tier(tier)
+            for tier in ("classify", "fast", "conversation", "reasoning")
+        },
+    }

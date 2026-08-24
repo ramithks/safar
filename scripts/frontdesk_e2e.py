@@ -57,6 +57,10 @@ from app.services.messaging import service as messaging  # noqa: E402
 from app.services.pms import clock  # noqa: E402
 from app.services.pms import frontdesk as frontdesk_service  # noqa: E402
 
+
+# `scripts/` on the path so the shared teardown helpers are importable.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import e2e_sweep  # noqa: E402
 REF = "rdlozqvuywtgsodunait"
 PROPERTY = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 OTHER_PROPERTY = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
@@ -130,9 +134,13 @@ db = get_db()
 # run that dies in between leaves it raised, and the next run fails on an
 # assertion about level 2 for a reason that has nothing to do with the code.
 # Reset rather than trust the previous run's tidiness.
-db.table("agents").update({"autonomy_level": 2}).eq("property_id", PROPERTY).eq(
-    "agent_type", "frontdesk"
-).execute()
+# **Borrowed, not taken.** `agents.autonomy_level` on the demo property is one
+# row and six suites write to it; whichever ran last used to decide what the
+# property was. An evaluation then measured a configuration an unrelated suite
+# had left behind and reported it as a model regression. `borrow_autonomy`
+# records the level it found and puts it back on exit, crash included.
+# See scripts/e2e_sweep.py.
+e2e_sweep.borrow_autonomy(db, PROPERTY, 2, agent_type="frontdesk")
 db.table("conversations").update({"handler": "ai", "ai_enabled": True}).eq(
     "property_id", PROPERTY
 ).eq("channel", "internal").execute()

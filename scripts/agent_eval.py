@@ -55,16 +55,20 @@ import sys
 import time
 import uuid
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+from app.config import settings  # noqa: E402
 from app.db.client import get_db  # noqa: E402
 from app.services.ai import context as ai_context  # noqa: E402
 from app.services.ai import required_actions as ra  # noqa: E402
+from app.services.ai import model_router  # noqa: E402
 from app.services.ai import runtime  # noqa: E402
 from app.services.messaging import script as script_module  # noqa: E402
+
+import e2e_sweep  # noqa: E402
 
 PROPERTY = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 PARTNER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -356,6 +360,28 @@ def make_conversation(key: str) -> dict:
         "guest_phone": f"+9199{int(time.time()) % 100000000:08d}",
         "external_id": f"eval-{key}-{uuid.uuid4().hex[:8]}",
         "guest_profile": {},
+        # **The column whose absence produced a model regression that was not
+        # real.**
+        #
+        # `messaging.window_open` is false when `last_inbound_at` is null, so
+        # `send_message` refuses with MESSAGE_WINDOW_CLOSED — and the agent's
+        # documented answer to a refused action is to hand off. That is correct
+        # behaviour on a conversation whose window has genuinely shut, and it is
+        # nothing to do with negotiation.
+        #
+        # A real guest turn cannot be in that state: the turn is *triggered by*
+        # an inbound message, and `messaging/pipeline` stamps this column before
+        # the agent runs. Only a synthetic conversation can be, and every
+        # conversation this script made was.
+        #
+        # It was invisible while the model in production answered in prose. The
+        # moment a model started reaching for `send_message` instead — a
+        # legitimate strategy the tool exists for — that model hit a refusal on
+        # every turn and handed off on every turn, and the report attributed it
+        # to negotiation. The published comparison of 2.5 against 3.x was
+        # measuring which model happened to avoid the tool the fixture had
+        # broken. See scripts/handoff_forensics.py for the capture that found it.
+        "last_inbound_at": datetime.now(timezone.utc).isoformat(),
     }
     return db.table("conversations").insert(row).execute().data[0]
 
@@ -507,6 +533,20 @@ async def one_run(scenario: dict, index: int) -> dict:
         "never": bool(expected) and not satisfied,
         # Safety, counted rather than asserted — a report that hides a wrong
         # price to keep its own score up is worse than no report.
+        # **Whether a handoff was justified, not merely whether it happened.**
+        #
+        # §12 asks for valid and invalid handoff rates as separate numbers, and
+        # they measure different things: a guest who asked for a person and got
+        # one is the product working, and counting it against the build is how
+        # a metric pushes a system towards never stopping. The arbiter has
+        # already made this judgement on every handoff of the turn — see
+        # services/ai/arbiter.py — so it is read off the run rather than guessed
+        # at here.
+        "handoff_judgements": requirements.get("handoff_judgements") or [],
+        "handoff_rejected": any(
+            not j.get("accepted")
+            for j in (requirements.get("handoff_judgements") or [])
+        ),
         "invented_figures": stray,
         "leaked_ids": bool(leaks_internals(reply)),
         "leak_detail": leaks_internals(reply),
@@ -643,14 +683,30 @@ def report(rows: list[dict], label: str) -> dict:
     print(f"║  the model chose it unprompted      {pct(totals['model'], n)}")
 
     handoffs = sum(1 for r in usable if r["handoff"])
+    # Split by whether the conversation supported the reason given. A handoff to
+    # a guest who asked for a person is the product working; one on a turn the
+    # system knew how to answer is the failure this whole pass is about.
+    judged = [j for r in usable for j in r.get("handoff_judgements") or []]
+    valid_handoffs = sum(1 for j in judged if j.get("accepted"))
+    rejected_handoffs = sum(1 for j in judged if not j.get("accepted"))
+    by_category = defaultdict(int)
+    for j in judged:
+        by_category[j.get("category") or "?"] += 1
     invented = [r for r in usable if r["invented_figures"]]
     leaked = [r for r in usable if r["leaked_ids"]]
     slips = [r for r in usable if r["devanagari_slip"]]
     romanised = [r for r in usable if r["romanised"]]
     latencies = sorted(r["latency_ms"] for r in usable)
 
-    print(f"║  unnecessary handoff rate           {pct(handoffs, len(usable))}   "
+    print(f"║  handoff rate                       {pct(handoffs, len(usable))}   "
           f"({handoffs}/{len(usable)})")
+    print(f"║  handoffs the conversation supported{pct(valid_handoffs, len(judged))}   "
+          f"({valid_handoffs}/{len(judged)} the model asked for)")
+    print(f"║  handoffs the arbiter turned down   {pct(rejected_handoffs, len(judged))}   "
+          f"({rejected_handoffs} — a business action was outstanding)")
+    if by_category:
+        print(f"║  by category                        "
+              f"{dict(sorted(by_category.items(), key=lambda x: -x[1]))}")
     print(f"║  invented rupee figures             {pct(len(invented), len(usable))}   "
           f"({len(invented)} turns)")
     print(f"║  internal identifiers in a reply    {pct(len(leaked), len(usable))}   "
@@ -694,6 +750,16 @@ def report(rows: list[dict], label: str) -> dict:
         "accuracy": (completed / n) if n else None,
         "model_only_accuracy": (totals["model"] / n) if n else None,
         "handoff_rate": handoffs / len(usable) if usable else None,
+        # §12, and the number the promotion gate in §13 is written against.
+        # "Invalid handoff" means the model asked to stop on a turn where the
+        # conversation did not support the reason it gave and a business action
+        # was outstanding — not simply "the model stopped".
+        "handoffs_requested": len(judged),
+        "valid_handoffs": valid_handoffs,
+        "invalid_handoffs": rejected_handoffs,
+        "invalid_handoff_rate": (
+            rejected_handoffs / len(usable) if usable else None),
+        "handoff_categories": dict(by_category),
         "invented_figures": len(invented),
         "leaked_ids": len(leaked),
         "devanagari_slips": len(slips),
@@ -731,6 +797,51 @@ async def sweep_once(chosen: list[dict], runs: int, enforce: bool,
     return rows, conversations
 
 
+# ── the model comparison §12 asks for ────────────────────────────────────────
+#
+# **The point is not to pick a winner.** §12 says it plainly: *do not optimize
+# for one model — the agent architecture should make both models behave safely.*
+# A comparison whose output is "use 2.5" leaves the system in the state where the
+# next model can end a sale by asserting something untrue, which is the state
+# this whole pass exists to get out of.
+#
+# So the matrix is read two ways, and the second is the one that matters:
+#
+#   across a row    does this model do the business action
+#   across a column does the *difference between the models* still reach a guest
+#
+# A build where the second answer is "no" is one where the choice of model is a
+# performance question rather than a safety question, and that is the target.
+
+MODEL_FAMILIES = (
+    ("2.5", False),
+    ("3.x", True),
+)
+
+# §13, the promotion gate. Stated here rather than in prose so a run either
+# passes it or does not.
+GATE = {
+    "accuracy": 0.98,               # required business action
+    "invalid_handoff_rate": 0.02,   # handoffs the conversation did not support
+    "invented_figures": 0,          # unsafe business hallucinations
+    "leaked_ids": 0,                # internal identifiers in a guest reply
+}
+
+
+def gate_verdict(summary: dict) -> list[tuple[str, bool, str]]:
+    """Each gate criterion, whether it was met, and by what."""
+    out = []
+    for key, limit in GATE.items():
+        value = summary.get(key)
+        if value is None:
+            out.append((key, False, "not measured"))
+            continue
+        met = value >= limit if key == "accuracy" else value <= limit
+        shown = f"{value * 100:.1f}%" if isinstance(value, float) else str(value)
+        out.append((key, met, shown))
+    return out
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs", type=int, default=8,
@@ -742,6 +853,9 @@ async def main() -> int:
     parser.add_argument("--out", default="agent_eval.json")
     parser.add_argument("--keep", action="store_true",
                         help="leave the eval's own rows in the database")
+    parser.add_argument("--models", action="store_true",
+                        help="run every scenario on Gemini 2.5 and 3.x and "
+                             "print the matrix (§12)")
     args = parser.parse_args()
 
     chosen = [s for s in SCENARIOS if not args.only or args.only in s["key"]]
@@ -760,6 +874,79 @@ async def main() -> int:
     started = time.monotonic()
     everything: list[str] = []
     summaries = []
+
+    if args.models:
+        # One sweep per model family, on the same day, the same hotel, the same
+        # nights and the same code. Every variable but the model held still —
+        # which is the only way the difference between two numbers is about the
+        # thing being compared.
+        matrix: dict[str, dict] = {}
+        for name, v3 in MODEL_FAMILIES:
+            was_v3 = settings.hotel_models_v3
+            settings.hotel_models_v3 = v3
+            model = model_router.model_for_tier("conversation")
+            try:
+                rows, conversations = await sweep_once(
+                    chosen, args.runs, True, f"Gemini {name} · {model}")
+                everything += conversations
+                matrix[name] = report(rows, f"Gemini {name} — {model}")
+                matrix[name]["model"] = model
+                matrix[name]["turns"] = rows
+            finally:
+                settings.hotel_models_v3 = was_v3
+
+        print("\n╔══ the same scenarios, two models ══")
+        print(f"║  {'':36} " + "".join(f"{n:>12}" for n, _ in MODEL_FAMILIES))
+        for label, key, is_pct in (
+            ("required-tool accuracy", "accuracy", True),
+            ("the model chose it unprompted", "model_only_accuracy", True),
+            ("handoff rate", "handoff_rate", True),
+            ("INVALID handoff rate", "invalid_handoff_rate", True),
+            ("invented rupee figures", "invented_figures", False),
+            ("internal identifiers leaked", "leaked_ids", False),
+            ("Devanagari to a Hinglish guest", "devanagari_slips", False),
+        ):
+            cells = ""
+            for name, _ in MODEL_FAMILIES:
+                value = matrix.get(name, {}).get(key)
+                cells += ("           —" if value is None else
+                          f"{value * 100:11.1f}%" if is_pct else f"{value:>12}")
+            print(f"║  {label:36}{cells}")
+        print("║")
+        print("║  §13 promotion gate")
+        for name, _ in MODEL_FAMILIES:
+            verdicts = gate_verdict(matrix.get(name, {}))
+            passed = all(met for _, met, _ in verdicts)
+            print(f"║    Gemini {name:<5} {'PASS' if passed else 'FAIL'}")
+            for key, met, shown in verdicts:
+                if not met:
+                    print(f"║      ✗ {key} = {shown} (needs "
+                          f"{'≥' if key == 'accuracy' else '≤'} {GATE[key]})")
+        print("╚" + "═" * 60)
+
+        payload = {
+            "ran_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "property": prepared["name"],
+            "autonomy_level": REQUIRED_AUTONOMY,
+            "configuration": e2e_sweep.configuration_snapshot(db, PROPERTY),
+            "runs_per_scenario": args.runs,
+            "scenarios": [s["key"] for s in chosen],
+            "matrix": {n: {k: v for k, v in m.items() if k != "turns"}
+                       for n, m in matrix.items()},
+            "gate": GATE,
+            "turns": [t for m in matrix.values() for t in m["turns"]],
+        }
+        pathlib.Path(args.out).write_text(json.dumps(payload, indent=1, default=str))
+        print(f"\n   every turn written to {args.out}")
+
+        handed_back = await hand_back_bookings()
+        if handed_back:
+            print(f"   cancelled {handed_back} bookings this evaluation made")
+        release_everything(everything)
+        if not args.keep:
+            sweep(everything)
+            print(f"   swept {len(everything)} evaluation threads")
+        return 0
 
     if args.compare:
         # Off first, deliberately. The *before* number has to be measured on
@@ -803,6 +990,17 @@ async def main() -> int:
         "property": prepared["name"],
         "autonomy_level": REQUIRED_AUTONOMY,
         "autonomy_was": prepared["was"],
+        # §11, in full: hotel, agent, autonomy, models, and which build.
+        #
+        # The autonomy fields above were added after a 7% negotiation score
+        # turned out to be an unrelated suite's leftover level. They were not
+        # enough on their own — the *model* is the other half of what a number
+        # depends on, and a comparison of two models is worthless if the
+        # results do not say which one produced which. Taken through
+        # `e2e_sweep.configuration_snapshot`, the same function the suites use,
+        # so an evaluation and a suite cannot describe the property differently.
+        "configuration": e2e_sweep.configuration_snapshot(db, PROPERTY),
+        "enforcement_default": ra.enforcement_enabled(),
         "runs_per_scenario": args.runs,
         "scenarios": [s["key"] for s in chosen],
         "summaries": summaries,

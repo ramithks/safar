@@ -324,9 +324,23 @@ async def run_turn(
     # — no model call, no round trip. See services/ai/required_actions.py for
     # why the two actions a hotel's revenue depends on stopped being the
     # model's decision.
+    # Declared here rather than with the rest of the turn's bookkeeping below,
+    # because `ctx.turn` holds *this* list object and the arbiter reads it while
+    # the turn is still filling it. A second list would be a snapshot, and a
+    # snapshot of what has run so far is exactly the thing that must not go
+    # stale mid-turn.
+    outcomes: list[ToolOutcome] = []
+
     requirements = (
         required_actions.detect(message, ctx.session) if ctx.guest_scoped else []
     )
+    # Published to the turn so the layers that run *inside* `registry.execute`
+    # can see it. Only one does today: the arbiter, which decides whether a
+    # handoff the model asked for is supported by the conversation it claims to
+    # describe. See services/ai/arbiter.py and services/ai/context.py:TurnState.
+    ctx.turn.message = message
+    ctx.turn.requirements = tuple(requirements)
+    ctx.turn.outcomes = outcomes
     forced: list[str] = []
     # Devanagari words that had to be romanised for a Hinglish guest. Counted
     # rather than merely fixed: a language fix whose effect cannot be measured
@@ -336,7 +350,6 @@ async def run_turn(
         logger.info("run %s requires %s", run_id,
                     [f"{r.intent}->{r.tool}" for r in requirements if r.must_execute])
 
-    outcomes: list[ToolOutcome] = []
     # usage_type -> the action rows that produced it, so a usage event can point
     # at the action rather than only at the run.
     action_ids: dict[str, list[str]] = {}
@@ -806,6 +819,14 @@ async def run_turn(
         # is the turn's story, it is absent on virtually every turn, and a
         # column that is null 99% of the time is a column nobody queries.
         summary_of_requirements["language_slips"] = language_slips[:10]
+    if ctx.turn.handoff_rejections:
+        # Every handoff the model asked for this turn and what the arbiter made
+        # of it — accepted and rejected alike. §21: a handoff that was turned
+        # down is exactly as much of an event as one that went through, and a
+        # record that only kept the rejections would make the layer look busier
+        # than it is. This is also the only way to answer "how often does the
+        # arbiter fire", which is the number that decides whether it is helping.
+        summary_of_requirements["handoff_judgements"] = ctx.turn.handoff_rejections[:6]
 
     # **Which model actually answered, not which one was chosen.**
     #

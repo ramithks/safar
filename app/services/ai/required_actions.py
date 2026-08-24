@@ -500,17 +500,57 @@ def _negotiation_requirement(message: str, session: dict | None) -> Requirement 
     evidence = {"requested_nightly_rupees": asked}
 
     if not (stay.get("rate_plan_id") and _valid_dates(stay)):
-        # Nothing to negotiate *about* yet. Recorded so the report can show how
-        # often this happens, and left to the model — whose right answer here is
-        # to find out which room and which nights, not to open a haggle.
+        # Nothing to negotiate *about* yet — and this is the ordinary first
+        # turn, not an edge case. "Best price kya de sakte ho?" arrives before
+        # anything has been priced far more often than it arrives after.
+        #
+        # **The requirement is real; only the tool is different.** It used to be
+        # advisory, with `negotiate_rate` named as the tool it wanted, and both
+        # halves of that were wrong. Advisory meant the deterministic layer had
+        # no opinion at precisely the moment the model was most likely to form a
+        # bad one — a handoff on a turn where the hotel had an answer. And
+        # naming `negotiate_rate` on a session with no rate plan would send the
+        # model at a tool that cannot run: there is nothing to discount yet.
+        #
+        # What the turn actually owes is to find out what is being haggled over.
+        # A hotelier asked "what's your best price" says "for which nights?" —
+        # that is the required action, and `get_stay_options` is the tool that
+        # is it.
+        satisfied_by = frozenset({
+            "get_stay_options", "get_quote", "search_availability",
+            "negotiate_rate", "get_negotiation_policy", "propose_rate_exception",
+            "escalate_to_team",
+        })
+        if _valid_dates(stay):
+            # Dates but no plan: the lookup is fully constructible, so this is
+            # forceable and the application will run it rather than hoping.
+            return Requirement(
+                intent=NEGOTIATION,
+                tool="get_stay_options",
+                satisfied_by=satisfied_by,
+                must_execute=True,
+                arguments={
+                    "check_in": stay["check_in"],
+                    "check_out": stay["check_out"],
+                    "units": room_count(message) or stay.get("units") or 1,
+                    "adults": stay.get("adults") or 2,
+                    "children": stay.get("children") or 0,
+                },
+                detail="guest asked for a better price before anything was priced",
+                evidence=evidence,
+            )
+        # No dates either. Required, because the guest is owed an answer and a
+        # handoff is not one — but not *forceable*, because there is no honest
+        # set of arguments to invent. The right move is to ask which nights,
+        # which is a sentence rather than a tool call, and `arguments=None`
+        # is how this module says "the model's turn, not mine".
         return Requirement(
             intent=NEGOTIATION,
-            tool="negotiate_rate",
-            satisfied_by=frozenset({"negotiate_rate", "get_negotiation_policy",
-                                    "propose_rate_exception", "escalate_to_team"}),
-            must_execute=False,
+            tool="get_stay_options",
+            satisfied_by=satisfied_by,
+            must_execute=True,
             arguments=None,
-            detail="no rate plan or dates on the session yet",
+            detail="guest asked for a better price with no dates on the session",
             evidence=evidence,
         )
 
