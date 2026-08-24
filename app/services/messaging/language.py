@@ -60,13 +60,36 @@ _HINGLISH_MARKERS = frozenset({
     "kya", "kyu", "kyun", "kaise", "kaisa", "kitna", "kitne", "kab", "kahan",
     "aap", "aapka", "aapko", "aapke", "mera", "meri", "mere", "hum", "hume",
     "mujhe", "main", "mai", "m", "tum", "unka",
-    "ka", "ki", "ke", "ko", "se", "mein", "par", "aur", "ya", "bhi", "to",
+    # "to" is gone for the same reason as "please": it is a Hindi particle
+    # ("to chaliye") and an English preposition, and "I want to book a room"
+    # contains it. A shared word cannot distinguish the languages that share it.
+    "ka", "ki", "ke", "ko", "se", "mein", "par", "aur", "ya", "bhi",
+    # The contractions guests actually type. "isme" is "in this" and turned up
+    # in the sentence that exposed the bug above; the rest are its neighbours,
+    # and every one of them is a function word rather than a content word,
+    # which is the rule this list is built on.
+    "isme", "ismein", "usme", "usmein", "inme", "unme", "iska", "iski", "iske",
+    "uska", "uski", "uske", "yeh", "ye", "wo", "woh", "yah", "vah",
     "karo", "karna", "karke", "kar", "karta", "karte", "kardo", "kardi",
     "chahiye", "chahhiye", "chaiye", "hoga", "hogi", "hogya", "hogyi", "gaya",
     "gayi", "raha", "rahi", "rhe", "diya", "dena", "lena", "liye", "wala",
     "achha", "acha", "theek", "thik", "sahi", "bilkul", "abhi", "phir",
-    "jaldi", "kripya", "please", "bhai", "sir", "madam", "din", "log", "logo",
+    "jaldi", "kripya", "bhai", "din", "log", "logo",
 })
+
+# **"please", "sir" and "madam" were in that list and are not markers.**
+#
+# The rule the list is built on is stated at the top of it: *the words that hold
+# a Hindi sentence together do not appear in an English one at all.* Those three
+# appear in English sentences constantly — they are loan words, shared by both
+# languages, which is exactly the property that disqualifies them.
+#
+# It mattered once one marker stopped being a tie-break and started withholding
+# the English claim: "Could you send me the cancellation policy please" is
+# English by any reading, and a single shared courtesy word was enough to make
+# the detector unsure of it. Removing them costs nothing — a Hinglish sentence
+# with "please" in it has other markers, because it has Hindi grammar in it —
+# and it restores the rule the list claims to follow.
 
 _WORD = re.compile(r"[a-z]+")
 
@@ -95,6 +118,32 @@ def detect(message: str | None) -> str | None:
     hits = sum(1 for w in words if w in _HINGLISH_MARKERS)
     if hits >= 2:
         return HINGLISH
+
+    # **One marker is not English, it is "not sure".**
+    #
+    # This used to be `return EN if len(words) >= 3 else None`, so any sentence
+    # with three words and one marker was claimed as English — and a claim
+    # overwrites the stored preference in `pipeline`. Found by the live replay,
+    # on a guest who had asked for Hinglish four turns earlier:
+    #
+    #     Breakfast included h isme?
+    #
+    # Four words, one marker ("h"), so: English. The preference flipped, the
+    # prompt stopped carrying the Hinglish instruction, and the reply came back
+    # in Devanagari — neither the language stored nor the one just claimed.
+    #
+    # The mistake is treating EN as the fallback for "not obviously Hinglish".
+    # Hinglish *is* mostly English words — that is what the word means — so the
+    # absence of Hindi grammar is not evidence of English. A positive claim
+    # needs positive evidence, and one marker in a short sentence is exactly the
+    # case where there is none either way.
+    #
+    # None is the honest answer there, and None is already defined to mean
+    # "leave the preference alone". A guest who really has switched to English
+    # will write a sentence with no markers in it at all, which is the common
+    # case and still returns EN.
+    if hits:
+        return None
     return EN if len(words) >= 3 else None
 
 

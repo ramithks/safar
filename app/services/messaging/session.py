@@ -46,11 +46,24 @@ _STAGES = {
     "search_availability": "browsing",
     "get_stay_options": "browsing",
     "get_quote": "quoted",
+    "negotiate_rate": "quoted",
     "create_booking_payment_link": "awaiting_payment",
     "create_payment_link": "awaiting_payment",
     "create_booking": "booked",
+    "cancel_booking": "cancelled",
 }
-_ORDER = ("browsing", "quoted", "awaiting_payment", "booked")
+_ORDER = ("browsing", "quoted", "awaiting_payment", "booked", "cancelled")
+
+# The tools that move the *business*, as opposed to answering a question about
+# it. Recorded as `last_business_action` so a manager opening the inbox — and
+# the next turn's prompt — can see where the money got to without reading the
+# thread, and so the evaluation report can say which turn a conversation
+# actually stalled on. §9.
+_BUSINESS_TOOLS = frozenset({
+    "get_quote", "negotiate_rate", "get_group_rates", "propose_rate_exception",
+    "create_booking_payment_link", "create_payment_link", "create_booking",
+    "cancel_booking", "escalate_to_team", "request_human_handoff",
+})
 
 
 def patch_from(outcomes: list) -> dict:
@@ -68,6 +81,9 @@ def patch_from(outcomes: list) -> dict:
         if not getattr(outcome, "ok", False):
             continue
         tool = getattr(outcome, "tool", "") or ""
+
+        if tool in _BUSINESS_TOOLS:
+            patch["last_business_action"] = tool
 
         reached = _STAGES.get(tool)
         if reached and (stage is None or _ORDER.index(reached) > _ORDER.index(stage)):
@@ -92,6 +108,23 @@ def patch_from(outcomes: list) -> dict:
         output = getattr(outcome, "output", None)
         if not isinstance(output, dict):
             continue
+
+        # Every room the hotel just said was free, so a room that has *stopped*
+        # being free can be taken off the session rather than quietly kept.
+        #
+        # §9: "room becomes unavailable → explicitly invalidate it and ask
+        # again". The failure without this is worse than asking twice — the
+        # prompt tells the model the guest has settled on the Deluxe and not to
+        # ask again, and the model then offers a room that sold an hour ago.
+        # Carried under a private key and consumed by `merge`, which is the only
+        # place that can see the room the session already holds.
+        if tool in ("search_availability", "get_stay_options"):
+            listed = output.get("roomTypes") or output.get("options") or []
+            if isinstance(listed, list):
+                patch["_offered_room_type_ids"] = sorted({
+                    str(row.get("roomTypeId")) for row in listed
+                    if isinstance(row, dict) and row.get("roomTypeId")
+                })
         # The ids the guest has settled on, so a later turn does not have to
         # re-derive them from a room name — which is how the model came to
         # invent `rate_plan_id = "breakfast_included"`.
@@ -154,7 +187,13 @@ _TRANSACTIONAL = _STAY_ARGS + (
     # and an `awaiting_hotel` left behind would have the agent telling them
     # it is waiting on a question nobody asked about this trip.
     "negotiation", "payment", "awaiting_hotel", "obligations",
+    "last_business_action", "room_needs_recheck",
 )
+
+# What a *price* was true of. When the guest moves the dates, these are wrong
+# and the room they picked is not — which is the distinction §9 asks for and
+# which `clear_stay` on its own could not make.
+_PRICED = ("quote_id", "rate_plan_id", "negotiation", "payment", "stage")
 
 # How long a session may sit untouched before it stops being "where we are" and
 # becomes "what we were talking about last month". A guest who comes back after
@@ -201,6 +240,33 @@ def _stale(profile: dict, now: datetime | None = None) -> bool:
     return (now or datetime.now(timezone.utc)) - at > timedelta(hours=STALE_AFTER_HOURS)
 
 
+def move_dates(profile: dict) -> dict:
+    """
+    The guest is talking about different nights. Keep the room, drop the price.
+
+    **The bug this exists for.** `_superseded` cleared the whole stay, room
+    included, so a guest who chose the Deluxe Balcony and then said "actually
+    12th to 14th" was asked which room they wanted — a question they had
+    answered two turns earlier, and the same question the prompt fix earlier in
+    this audit had just stopped the agent asking. One correct rule (a price is
+    only true of the dates it was quoted for) was deleting a fact it had no
+    business touching.
+
+    The room is carried forward *unverified*: `room_needs_recheck` is what
+    `describe` reads to tell the model it must confirm the room is free for the
+    new nights before promising it. A preference is not availability, and the
+    difference between them is the whole reason this is two keys and not one.
+    """
+    moved = {k: v for k, v in (profile or {}).items() if k not in _PRICED}
+    for field in _STAY_ARGS:
+        moved.pop(field, None)
+    moved.pop("awaiting_hotel", None)
+    moved.pop("obligations", None)
+    if moved.get("room_type_id"):
+        moved["room_needs_recheck"] = True
+    return moved
+
+
 def clear_stay(profile: dict) -> dict:
     """
     Drop the current stay, keep what we know about the guest.
@@ -210,6 +276,47 @@ def clear_stay(profile: dict) -> dict:
     somebody stores on it should not be silently deleted by a booking ending.
     """
     return {k: v for k, v in (profile or {}).items() if k not in _TRANSACTIONAL}
+
+
+def _revalidate_room(merged: dict) -> dict:
+    """
+    Is the room this session holds still one the hotel is offering?
+
+    Runs only on turns that actually asked — `_offered_room_type_ids` is set by
+    `patch_from` from an availability read and is absent otherwise, so a turn
+    about breakfast cannot invalidate anything.
+
+    An empty list is not "nothing is free": `search_availability` returns no
+    room types when the stay is sold out, and that is precisely the case where
+    the selected room must go. A turn that never asked has no key at all, which
+    is the distinction between the two.
+    """
+    offered = merged.pop("_offered_room_type_ids", None)
+    chosen = merged.get("room_type_id")
+
+    if offered is None or not chosen:
+        # A room chosen after the flag was raised answers it. Otherwise the
+        # session would keep telling the prompt the room has gone while holding
+        # the id of the one that replaced it.
+        if chosen:
+            merged.pop("room_unavailable", None)
+        return merged
+
+    if str(chosen) in set(offered):
+        merged.pop("room_unavailable", None)
+        # Confirmed free for these nights, so the doubt raised by a date change
+        # is settled and the prompt can stop hedging.
+        merged.pop("room_needs_recheck", None)
+        return merged
+
+    logger.info("room %s is no longer on offer; clearing it from the session", chosen)
+    for field in ("room_type_id", "room_name", "rate_plan_id", "quote_id",
+                  "room_needs_recheck"):
+        merged.pop(field, None)
+    # Named rather than merely absent, so the prompt can say "the room they
+    # chose has gone" instead of behaving as though they never chose one.
+    merged["room_unavailable"] = True
+    return merged
 
 
 def merge(conversation_id: str, patch: dict) -> None:
@@ -237,10 +344,14 @@ def merge(conversation_id: str, patch: dict) -> None:
         if not isinstance(profile, dict):
             profile = {}
 
-        if _superseded(profile, patch) or _stale(profile):
+        if _stale(profile):
+            # Three days untouched. Everything here is what we were talking
+            # about last month, the room included.
             profile = clear_stay(profile)
+        elif _superseded(profile, patch):
+            profile = move_dates(profile)
 
-        merged = {**profile, **patch}
+        merged = _revalidate_room({**profile, **patch})
         if merged == profile:
             # Nothing new. Returning here rather than stamping `touched_at`
             # anyway is what keeps the staleness clock honest: it should measure
@@ -333,6 +444,25 @@ def describe(conversation: dict | None) -> str | None:
             f"again. room_type_id: {profile['room_type_id']}"
             + (f", rate_plan_id: {profile['rate_plan_id']}"
                if profile.get("rate_plan_id") else "")
+        )
+        # Chosen for different nights, and not yet checked against these. The
+        # room survives a date change (see `move_dates`) and its *availability*
+        # does not, and the difference has to reach the model or it will promise
+        # a room nobody has confirmed.
+        if profile.get("room_needs_recheck"):
+            lines.append(
+                "  They chose that room for different dates. Check it is free "
+                "for these nights with search_availability or get_stay_options "
+                "before promising it, and re-price it — the old price does not "
+                "apply to new dates."
+            )
+    elif profile.get("room_unavailable"):
+        # The room they had chosen has gone. Said plainly, because the
+        # alternative is an agent that behaves as though they never chose one
+        # and offers the same room back a turn later.
+        lines.append(
+            "  The room they had chosen is no longer free for these dates. Say "
+            "so, and offer what search_availability actually returns."
         )
 
     return "\n".join(lines)
