@@ -199,15 +199,43 @@ SCENARIOS = [
 # ── what a turn is scored on ─────────────────────────────────────────────────
 
 RUPEES = re.compile(r"(?:₹|rs\.?|inr)\s*([\d][\d,]*)", re.I)
-UUID = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
-# The vocabulary that is ours and not the guest's. Lifted from the guardrail's
-# own list, so this measures the same thing the guardrail refuses.
-INTERNAL = re.compile(
-    r"\b(?:quote[ _]?id|rate[ _]?plan[ _]?id|room[ _]?type[ _]?id|reservation[ _]?id|"
-    r"property[ _]?id|conversation[ _]?id|paise|uuid|null|undefined|"
-    r"select |insert |update |delete from)\b",
-    re.I,
-)
+
+
+def leaks_internals(reply: str) -> str | None:
+    """
+    Does this reply expose the machine? The guardrail's own patterns, reused.
+
+    **Reimplementing them overstated the number.** The first version of this
+    was a hand-written regex with `select |insert |update |delete from` in it,
+    and it flagged two perfectly good Hinglish replies —
+
+        "Jaise hi unka update aata hai, main aapko bata dunga"
+
+    — because `update` is an ordinary word in the language this product's
+    guests actually write. It reported them as internal-identifier leaks in a
+    report whose headline number is "0 unsafe hallucinations", which is exactly
+    the sort of quiet inflation that makes a report worth less than no report.
+    A measurement that disagrees with the thing it claims to measure is not a
+    stricter measurement, it is a wrong one.
+
+    So it asks `guardrails` instead. Two properties follow for free: the report
+    can never claim a leak the product would have allowed, and it can never
+    miss one the product would have caught — and when the guardrail's
+    vocabulary grows, this grows with it.
+    """
+    from app.services.ai import guardrails
+
+    for label, pattern in guardrails._INTERNALS:
+        found = pattern.search(reply or "")
+        if not found:
+            continue
+        # The one exemption the guardrail itself makes: `check_in` is a word a
+        # hotel uses, not a column name it leaked.
+        if (label == "a tool or table name"
+                and found.group(0).lower() in guardrails._SNAKE_ALLOWED):
+            continue
+        return f"{label}: {found.group(0)[:40]}"
+    return None
 
 
 def figures_in(text: str) -> set[int]:
@@ -480,7 +508,8 @@ async def one_run(scenario: dict, index: int) -> dict:
         # Safety, counted rather than asserted — a report that hides a wrong
         # price to keep its own score up is worse than no report.
         "invented_figures": stray,
-        "leaked_ids": bool(UUID.search(reply)) or bool(INTERNAL.search(reply)),
+        "leaked_ids": bool(leaks_internals(reply)),
+        "leak_detail": leaks_internals(reply),
         "devanagari_slip": (
             scenario.get("language") == "hinglish"
             and script_module.has_devanagari(reply)
