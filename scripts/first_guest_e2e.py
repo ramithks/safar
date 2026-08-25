@@ -335,6 +335,16 @@ async def converse(slug: str, property_id: str, steps: list[dict]) -> dict:
             "fallback_count": model.get("fallback_count"),
             "latency_ms": latency,
             "attempt_class": attempt_class,
+            # **The guardrail's own record, copied out before cleanup.**
+            #
+            # Run 3 of a three-run repeat blocked at turn 9 and the reason was
+            # unrecoverable an hour later: `--destroy` had cascaded the
+            # `agent_runs` rows away with the tenant. A harness that deletes the
+            # only copy of why it failed is a harness that can only tell you
+            # *that* it failed — which is the same defect this pass fixed in the
+            # product two passes ago, made in the tool that found it.
+            "guardrail": (run.get("required_actions") or {}).get("guardrail") or [],
+            "recovery": (run.get("required_actions") or {}).get("recovery") or [],
             "tokens": (run.get("tokens_in"), run.get("tokens_out")),
             "problems": problems,
         })
