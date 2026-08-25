@@ -29,6 +29,11 @@ HOTEL_OS_TASKS = [
     # executed only by the StayOS worker. It reads `conversations`, which the
     # marketplace project has never had.
     "travbuddy.messaging.sweep_waiting_guests",
+    # Reads `room_inventory` and `reservations` per property and reports drift.
+    # Hotel tables throughout, so it must reach the StayOS worker — a
+    # reconciliation run against the marketplace database would find every
+    # hotel's inventory missing and say so hourly.
+    "travbuddy.pms.reconcile_inventory",
 ]
 
 MARKETPLACE_TASKS = [
@@ -162,8 +167,16 @@ class TestTheBeatThatOwnsTheSweep:
 
         assert "travbuddy.partners.revert_intro_commission" not in scheduled
         for task in scheduled:
-            assert task.startswith("travbuddy.messaging."), (
-                f"{task} is on the StayOS beat and is not a messaging task"
+            # **Two prefixes, not one.** `travbuddy.messaging.*` was the
+            # whole of StayOS on the beat until inventory reconciliation
+            # joined it, and `travbuddy.pms.*` is equally the hotel side —
+            # renaming a reconciliation task "messaging" to satisfy a
+            # prefix check would be the dishonest way past this. What the
+            # rule is actually for is keeping *marketplace* tasks off a
+            # beat pointed at a hotel database, and that is unchanged.
+            assert task.startswith(("travbuddy.messaging.", "travbuddy.pms.")), (
+                f"{task} is on the StayOS beat and belongs to neither the\n"
+                f"messaging nor the hotel side"
             )
 
     def test_a_marketplace_beat_is_unchanged_by_any_of_this(self, monkeypatch):

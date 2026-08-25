@@ -195,6 +195,11 @@ celery_app.conf.update(
     task_routes={
         "travbuddy.messaging.*": {"queue": "hotelos"},
         "travbuddy.marketing.*": {"queue": "hotelos"},
+        # The hotel's own operational tasks. Same deployment as messaging —
+        # `pms` is the hotel side of this codebase, and a reconciliation that
+        # ran on the marketplace worker would be reading a hotel database from
+        # a process that has no business with one.
+        "travbuddy.pms.*": {"queue": "hotelos"},
     },
     # Recommendation-engine nightly/weekly maintenance (docs/recommendation_engine.md
     # Part 9.3 / 14.3). Defined here — not in reco_tasks — so `celery beat` sees the
