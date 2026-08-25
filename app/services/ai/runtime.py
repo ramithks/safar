@@ -1142,6 +1142,30 @@ async def run_turn(
         recovery_log.append(
             recovery.Attempt("promised_a_person", model_in_use, "handoff").as_dict())
 
+    # **A turn that hands off must not leave a promise standing.**
+    #
+    # `promises_a_person` above covers the reply that says a human is coming.
+    # This is the same failure one step over: a reply that undertakes to send a
+    # *thing* — a link, a price, a confirmation — on a turn that then hands the
+    # conversation to somebody. The guest is left waiting for something nobody
+    # has undertaken to send.
+    #
+    # Found on turn 8 of the first-guest journey: "I am checking on the payment
+    # link for you right now. I will share it with you as soon as it is ready."
+    # The turn escalated, the promise stood, and the guest's next three messages
+    # got the handoff sentence — so from their side a link was coming and then
+    # the conversation went quiet.
+    #
+    # Only on a handing-off turn, which is what keeps this from touching the
+    # ordinary case: a promise the agent goes on to keep in the same turn never
+    # reaches here.
+    if handoff and reply and recovery.promises_an_action(reply):
+        logger.warning("run %s: the reply promised an action and the turn is "
+                       "handing over — replacing it", run_id)
+        reply = prompts.handoff_reply(ctx)
+        recovery_log.append(
+            recovery.Attempt("promised_an_action", model_in_use, "handoff").as_dict())
+
     if handoff and ctx.conversation_id:
         # And the other way: the sentence is composed before this runs, and this
         # used to swallow its own failure — a database blip left the guest

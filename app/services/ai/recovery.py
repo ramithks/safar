@@ -304,6 +304,49 @@ _PROMISED_A_PERSON = re.compile(
 )
 
 
+# **"I will share it with you as soon as it is ready", and then a handoff.**
+#
+# `promises_a_person` covers a reply that says a human is coming. This is the
+# same failure one step over: a reply that promises a *thing* is coming — a
+# link, a price, a confirmation — on a turn that then hands the conversation to
+# somebody. The guest is left waiting for something nobody has undertaken to
+# send, and unlike the person case there is not even a queue entry that names
+# what they are waiting for.
+#
+# Found on turn 8 of the first-guest journey, on the second of three runs:
+# "I am checking on the payment link for you right now. I will share it with
+# you as soon as it is ready." The turn escalated, the promise stood, and the
+# guest's next three messages got the handoff sentence.
+#
+# Deliberately narrow — a *future-tense first-person promise*. "Here is the
+# link" is not one; "I'll send the link" is. The check is only ever consulted
+# on a turn that is already handing off, so a promise the agent goes on to keep
+# in the same turn never reaches it.
+_PROMISED_AN_ACTION = re.compile(
+    r"(?xi)"
+    r"(?:"
+    r"  (?:i|we)\s*(?:'ll|\s+will|\s+shall|\s+am\s+going\s+to|\s+are\s+going\s+to)"
+    r"  [^.!?]{0,60}?"
+    r"  (?:send|share|get|give|provide|create|generate|confirm|check|arrange|"
+    r"     update|revert|come\s+back|let\s+you\s+know|update\s+you)"
+    r"| (?:main|hum)\s+[^.!?]{0,40}?"
+    r"  (?:bhej|bhejta|bhejti|bhejunga|bhej\s+dunga|de\s+dunga|kar\s+dunga|"
+    r"     bata\s+dunga|bata\s+dungi|check\s+kar)"
+    r"| (?:sharing|sending|generating|creating|checking)\s+(?:it|this|that|the)"
+    r"  [^.!?]{0,30}?(?:shortly|soon|right\s+away|in\s+a\s+moment|now)"
+    # "Let me check and get back to you" — an undertaking without
+    # a first-person future, and one of the commonest ways to make one.
+    r"| let\s+me\s+[^.!?]{0,40}?(?:check|find\s+out|confirm|look|see)"
+    r"| (?:shortly|soon|in\s+a\s+moment|right\s+away)\s*[.!]?\s*$"
+    r")"
+)
+
+
+def promises_an_action(reply: str | None) -> bool:
+    """Does this reply undertake to do something later?"""
+    return bool(_PROMISED_AN_ACTION.search(reply or ""))
+
+
 def promises_a_person(reply: str | None) -> bool:
     """Does this reply tell the guest that somebody will come?"""
     return bool(_PROMISED_A_PERSON.search(reply or ""))

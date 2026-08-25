@@ -157,7 +157,7 @@ MINIMAL_JOURNEY = [
 def _run_row(db, conversation_id: str) -> dict:
     rows = (db.table("agent_runs")
             .select("id,status,error,required_actions,required_action_status,"
-                    "model,tokens_in,tokens_out,latency_ms,intent")
+                    "model,tokens_in,tokens_out,latency_ms,intent,conversation_id")
             .eq("conversation_id", conversation_id)
             .order("started_at", desc=True).limit(1).execute().data or [])
     return rows[0] if rows else {}
@@ -250,6 +250,29 @@ def check(step: dict, *, reply: str, run: dict, actions: list[dict],
 
     if run.get("status") == "failed":
         problems.append(f"the run failed: {run.get('error')}")
+
+    # **A turn that answered with the handoff sentence is not a turn that
+    # passed.**
+    #
+    # Run 2 of three escalated at turn 8, and turns 9, 10 and 11 came back in
+    # under half a second with "Someone from the hotel is reading this" — no
+    # model call, no tool, no business action — and this scored all three as
+    # passes, because a non-empty reply and no invented money is exactly what
+    # they were. Three no-ops read as a clean run.
+    #
+    # The conversation being handed over is correct behaviour and not the
+    # complaint. The complaint is a *journey* that stopped and a report that
+    # said it had not.
+    if run.get("status") == "escalated" and (step.get("owes_any") or step.get("owes")):
+        problems.append(
+            "the turn escalated, so the business action it owed never ran — "
+            "the rest of this journey is a human's, not the agent's")
+
+    handler = (db.table("conversations").select("handler")
+               .eq("id", run.get("conversation_id") or "")
+               .limit(1).execute().data or [{}])[0].get("handler")
+    if handler and handler != "ai":
+        problems.append(f"the conversation is handled by {handler!r}, not the agent")
 
     return problems
 

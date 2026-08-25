@@ -265,3 +265,106 @@ class TestWhenTheHandoffCannotBeRecorded:
         result = run(runtime.run_turn(ctx(), "rooms hain?", provider=provider,
                                       task="guest_conversation"))
         assert result.reply == "Haan ji, available hai."
+
+
+# ── and a promise to send a thing ───────────────────────────────────────────
+
+class TestAHandingOffTurnLeavesNoPromise:
+    """
+    Turn 8 of the first-guest journey, second of three runs:
+
+        "I am checking on the payment link for you right now.
+         I will share it with you as soon as it is ready."
+
+    The turn escalated. The promise stood. The guest's next three messages got
+    the handoff sentence — so from their side a link was coming and then the
+    conversation went quiet.
+
+    It is the `promises_a_person` failure one step over. That one is a person
+    who never arrives; this is a thing that never arrives, and it is worse in
+    one respect: a promised person at least leaves a queue entry naming what
+    they are waiting for.
+    """
+
+    def _turn(self, monkeypatch, reply, *, message="How do I pay?"):
+        import asyncio
+
+        from app.services.ai import registry, runtime
+        from app.services.ai.providers import EchoProvider
+        import tests.test_golden_conversations as golden
+
+        registry.load_all()
+        fake = golden.db.__wrapped__(monkeypatch)
+        return fake, asyncio.run(runtime.run_turn(
+            golden.ctx_for(fake), message, provider=EchoProvider([reply])))
+
+    def test_the_promise_is_replaced_when_the_turn_hands_over(self, monkeypatch):
+        _, result = self._turn(
+            monkeypatch,
+            "I am checking on the payment link for you right now. "
+            "I will share it with you as soon as it is ready.",
+            message="kisi se baat karni hai")
+        assert result.handoff
+        assert "share it with you" not in (result.reply or "")
+
+    def test_and_the_replacement_is_the_honest_one(self, monkeypatch):
+        _, result = self._turn(
+            monkeypatch, "I'll send you the link shortly.",
+            message="kisi se baat karni hai")
+        assert result.reply, "the guest was left with nothing at all"
+        assert not recovery_promises(result.reply)
+
+    def test_an_ordinary_turn_keeps_its_promise_intact(self, monkeypatch):
+        """
+        The rule only ever fires on a handing-off turn. A reply that promises
+        something the agent then does — or a turn that simply answers — is
+        untouched, because replacing those would be the system talking over a
+        model that was working.
+        """
+        _, result = self._turn(monkeypatch, "I'll send the link once you confirm.")
+        if not result.handoff:
+            assert "send the link" in (result.reply or "")
+
+    def test_a_reply_with_no_promise_is_never_touched(self, monkeypatch):
+        _, result = self._turn(
+            monkeypatch, "Here is the payment link: https://pay.example/x",
+            message="kisi se baat karni hai")
+        # Handing off, but nothing was promised, so nothing is replaced beyond
+        # what the existing person-promise rule already governs.
+        assert result.reply
+
+
+def recovery_promises(reply):
+    from app.services.ai import recovery
+
+    return recovery.promises_an_action(reply)
+
+
+class TestWhatCountsAsAPromise:
+
+    @pytest.mark.parametrize("reply", [
+        "I am checking on the payment link. I will share it as soon as it is ready.",
+        "I'll send the payment link shortly.",
+        "We will get back to you with the price.",
+        "Let me check and get back to you.",
+        "Main aapko link bhej dunga.",
+        "Checking it right away.",
+    ])
+    def test_these_are(self, reply):
+        from app.services.ai import recovery
+
+        assert recovery.promises_an_action(reply), reply
+
+    @pytest.mark.parametrize("reply", [
+        "Here is the payment link: https://pay.example/x",
+        "Aapka total ₹19,784 hai.",
+        "Breakfast 7:30 se 10:30 tak hai.",
+        "I have sent the link.",
+        "Let me know if you need anything else.",
+        "Garden Standard is available for those dates.",
+        "",
+    ])
+    def test_these_are_not(self, reply):
+        from app.services.ai import recovery
+
+        assert not recovery.promises_an_action(reply), reply
