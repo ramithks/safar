@@ -37,7 +37,8 @@ from datetime import datetime, timezone
 from app.config import settings
 from app.db.client import get_db, run_db
 from app.services.ai import (
-    classify, model_router, prompts, registry, required_actions, usage as usage_mod,
+    classify, model_router, prompts, recovery, registry, required_actions,
+    usage as usage_mod,
 )
 from app.services.ai.context import AgentContext
 from app.services.ai.errors import AgentError, ProviderError
@@ -368,7 +369,6 @@ async def run_turn(
     seq = 0
     reply: str | None = None
     handoff = False
-    retried_empty = False
     status = "succeeded"
     error: str | None = None
 
@@ -440,31 +440,129 @@ async def run_turn(
         assert last is not None
         raise last
 
+    # ── the recovery ladder ──────────────────────────────────────────────────
+    #
+    # **"The model produced no reply" was the largest reliability signal in the
+    # system, and it was four different failures under one error string.**
+    # Traced run by run across ninety days: 80 of 94 were `provider = 'echo'`,
+    # our own e2e scripts whose scripted provider had run out; of the 14 real
+    # ones, 5 had already answered the guest through `send_message`. The nine
+    # that remain are a malformed tool call (3), a blank candidate (3), and a
+    # turn whose tools did real work and whose model then said nothing (3).
+    #
+    # Each wants a different answer, which is why "no reply → handoff" was the
+    # wrong shape. This climbs: ask again, ask a different model, say what the
+    # tools established, and only then fetch a person.
+    #
+    # **Retrying the model is side-effect safe by construction.** A retry
+    # re-issues the *model* call; the tool results already in `messages` are not
+    # re-executed. If the retried model asks for a tool it already called,
+    # `called_writes` refuses it for the rest of the turn, and across turns the
+    # message-scoped idempotency key in `registry.execute` refuses it again. See
+    # tests/test_silent_recovery.py, which asserts both.
+    recovery_log: list[dict] = []
+
+    async def _answering_step(*, messages: list[dict], tools: list[dict]) -> ModelStep:
+        """One model step, and the ladder behind it if nothing usable comes back."""
+        nonlocal model_in_use
+
+        step = await _step(messages=messages, tools=tools)
+        turn_usage.add_tokens(step.tokens_in, step.tokens_out, step.tokens_thought)
+        turn_usage.used_model(model_in_use)
+
+        failure = recovery.classify(step)
+        if failure == recovery.USABLE:
+            return step
+
+        # **Recovery costs time, and out of time is the one state where it must
+        # not be spent.**
+        #
+        # The budget path below already tells the model plainly that the guest
+        # is waiting and gives it one last chance to say something true with
+        # what it has. If *that* comes back empty, climbing a ladder on top of
+        # it makes a slow turn into a timed-out one — which is the failure the
+        # budget exists to prevent, arrived at by the machinery meant to prevent
+        # a different one. Past the deadline the honest move is the handoff.
+        if time.monotonic() > deadline:
+            logger.info("run %s: %s, but the budget is spent — not recovering",
+                        run_id, failure)
+            recovery_log.append(
+                recovery.Attempt(failure, model_in_use, "out of budget").as_dict())
+            return step
+
+        if failure not in recovery.RETRYABLE:
+            # A filtered completion is not a bad sample. The same prompt filtered
+            # once will filter again, and asking a second time only spends the
+            # guest's patience on the same answer.
+            logger.warning("run %s: %s — not retrying", run_id, failure)
+            recovery_log.append(
+                recovery.Attempt(failure, model_in_use, "not retryable").as_dict())
+            return step
+
+        # Rung one: the same model, once. What failed was a sample rather than a
+        # system, and asking again is the cheapest thing on this ladder.
+        #
+        # **Immediately, and that is deliberate rather than an omission.** §2
+        # asks for exponential backoff with jitter, and it belongs one layer
+        # down: `vertex.py` already spaces its retries and rotates regions when
+        # the *transport* fails, which is the case backoff is for — a service
+        # under load, where waiting is what helps. This is not that case. Vertex
+        # returned 200, a candidate and a finish reason; the service is healthy
+        # and the sample was bad. Sleeping here would add latency to a guest's
+        # turn and change nothing about the next draw.
+        logger.info("run %s: %s on %s — asking again", run_id, failure, model_in_use)
+        recovery_log.append(recovery.Attempt(failure, model_in_use, "retry").as_dict())
+        retried = await _step(messages=messages, tools=tools)
+        turn_usage.add_tokens(retried.tokens_in, retried.tokens_out, retried.tokens_thought)
+        if recovery.classify(retried) == recovery.USABLE:
+            return retried
+
+        # Rung two: a different model, and exactly one of them.
+        #
+        # **The most established, not the adjacent one.** `choice.fallbacks` is
+        # the degradation ladder — 3.6-flash → 3.5-flash → 2.5-flash — and it is
+        # walked in order by `_step` when the *transport* fails, because there
+        # the question is "which region will answer". Here the question is
+        # different: this model has now returned nothing twice, and what is
+        # wanted is the model least likely to do the same. That is the end of the
+        # list, the one that served production for a year, not the sibling that
+        # shares its generation.
+        #
+        # One, because each rung costs a full model call carrying the whole
+        # catalogue. Walking the list would put five model calls between a blank
+        # answer and a person, and the guest is already waiting.
+        #
+        # Not for a business failure, an authorisation failure or a tool
+        # rejection: none of those reach here. Only a model that would not
+        # answer gets a second model.
+        proven = next((m for m in reversed(choice.fallbacks) if m != model_in_use), None)
+        if proven and time.monotonic() <= deadline:
+            logger.warning("run %s: %s twice on %s — falling back to %s",
+                           run_id, failure, model_in_use, proven)
+            recovery_log.append(recovery.Attempt(failure, proven, "fallback").as_dict())
+            model_in_use = proven
+            turn_usage.used_model(proven)
+            try:
+                fell_back = await llm.step(
+                    model=proven, messages=messages, tools=tools, params=params
+                )
+            except ProviderError as exc:
+                logger.warning("run %s: fallback %s also failed (%s)",
+                               run_id, proven, exc.reason)
+            else:
+                turn_usage.add_tokens(fell_back.tokens_in, fell_back.tokens_out,
+                                      fell_back.tokens_thought)
+                retried = fell_back
+                if recovery.classify(fell_back) == recovery.USABLE:
+                    return fell_back
+        elif proven:
+            logger.warning("run %s: out of budget before falling back", run_id)
+
+        return retried
+
     try:
         for _turn in range(settings.agent_max_tool_turns):
-            step: ModelStep = await _step(messages=messages, tools=tools)
-            turn_usage.add_tokens(step.tokens_in, step.tokens_out, step.tokens_thought)
-            turn_usage.used_model(choice.model)
-
-            # An empty completion: no text, no tool call, no error.
-            #
-            # Twelve turns in three days ended here, and each one showed a
-            # guest "someone will reply shortly" for a question the agent could
-            # have answered — the model simply returned nothing that time.
-            # `vertex.py` retries transport failures across regions, but this is
-            # not one: the call succeeded and came back blank, so nothing below
-            # it has anything to retry.
-            #
-            # Asking again is cheap and usually works, because what failed was
-            # a sample rather than a system. Once per run: a model that answers
-            # empty twice is having a bad minute, and the honest end of that is
-            # a person. The second answer goes through the ordinary path below,
-            # tool calls and all, rather than a shortcut of its own.
-            if not step.wants_tools and not (step.reply or "").strip() and not retried_empty:
-                retried_empty = True
-                logger.info("run %s: empty completion, asking once more", run_id)
-                step = await _step(messages=messages, tools=tools)
-                turn_usage.add_tokens(step.tokens_in, step.tokens_out, step.tokens_thought)
+            step: ModelStep = await _answering_step(messages=messages, tools=tools)
 
             if not step.wants_tools:
                 reply = (step.reply or "").strip() or None
@@ -483,16 +581,52 @@ async def run_turn(
                 for call in step.tool_calls:
                     messages.append(llm.tool_result_message(call, json.dumps({
                         "refused": True,
+                        # **This used to end "…or say you are checking and call
+                        # request_human_handoff", and the step below is given no
+                        # tools at all.**
+                        #
+                        # The model did what it was told, as far as it could. On
+                        # a live eval turn it answered a ten-room enquiry with
+                        # *"I am checking the group rates with our team right
+                        # now. One of our team members will get back to you
+                        # shortly"* — and called nothing, because it had nothing
+                        # to call. `handoff` stayed false, the conversation
+                        # stayed with the AI, and the guest was left waiting for
+                        # a person nobody had asked for.
+                        #
+                        # An instruction that names an action the model cannot
+                        # take is worse than no instruction: it produces the
+                        # *words* of the action without the action. So the
+                        # sentence no longer mentions a tool, and the runtime
+                        # takes responsibility for the handoff below — which is
+                        # where it belonged, because running out of time is the
+                        # runtime's fact about the turn, not the model's.
                         "reason": (
                             "This turn has taken too long and the guest is "
-                            "waiting. Do not call any more tools. Answer with "
-                            "what you already have, or say you are checking and "
-                            "call request_human_handoff."
+                            "waiting. You have no tools left. Answer with what "
+                            "you already have. If that is not enough to answer "
+                            "them, say plainly that you are checking — do not "
+                            "promise a time, and do not say the booking or the "
+                            "price is settled."
                         ),
                     })))
-                final = await _step(messages=messages, tools=[])
-                turn_usage.add_tokens(final.tokens_in, final.tokens_out, final.tokens_thought)
+                final = await _answering_step(messages=messages, tools=[])
                 reply = (final.reply or "").strip() or None
+
+                # **Out of time with nothing to show for it goes to a person.**
+                #
+                # Deterministic, because the condition is a fact the runtime
+                # owns: did any tool on this turn actually succeed? If some did,
+                # the model has real results to summarise and its answer stands.
+                # If none did, whatever it just wrote is a holding sentence — and
+                # a holding sentence with nobody behind it is the one outcome a
+                # hotel cannot explain.
+                if not any(o.ok for o in outcomes):
+                    logger.warning(
+                        "run %s: out of time with no successful tool — handing over",
+                        run_id,
+                    )
+                    handoff = True
                 break
 
             messages.append(step.raw or {"role": "assistant", "content": None})
@@ -708,8 +842,7 @@ async def run_turn(
                         for o in outcomes[-len(forced):]
                     ],
                 }, default=str)})
-                final = await _step(messages=messages, tools=[])
-                turn_usage.add_tokens(final.tokens_in, final.tokens_out, final.tokens_thought)
+                final = await _answering_step(messages=messages, tools=[])
                 spoken_now = (final.reply or "").strip()
                 if spoken_now:
                     reply = spoken_now
@@ -832,9 +965,64 @@ async def run_turn(
             # model correctly declining to say the same thing twice.
             spoke = any(o.tool == "send_message" and o.ok for o in outcomes)
             if not spoke:
-                reply = prompts.handoff_reply(ctx)
-                handoff = True
-                status = "escalated"
+                # **Rung three: say what the tools established.**
+                #
+                # The model has been asked twice and asked on a second model,
+                # and it still has nothing to say — but the turn is not empty.
+                # Three runs in ninety days look like this: a hotelier asked how
+                # last month went, `compare_with_previous_period` and
+                # `create_revenue_recommendation` both ran, and the answer to
+                # their question was computed and then never spoken.
+                #
+                # Built only from display strings a tool returned, and put
+                # through the same guardrail as any model reply below — so a
+                # sentence carrying a figure no tool result contains is refused
+                # by the rule that refuses an invented one. It cannot fabricate
+                # business truth by construction rather than by review.
+                salvaged = recovery.deterministic_reply(
+                    outcomes, staff=not ctx.guest_scoped
+                )
+                # **Checked here, and not by the block above.**
+                #
+                # The reply guardrail runs earlier in this function, on the
+                # model's own prose, and this rung produces its reply *after*
+                # that — so a salvaged sentence would otherwise be the one thing
+                # in the system that reaches a guest unchecked. Running it
+                # explicitly keeps the guarantee local and visible rather than
+                # dependent on the order of two blocks a hundred lines apart.
+                #
+                # It should never fail: `deterministic_reply` only quotes
+                # display strings the tools returned. If it ever does, that is
+                # the check earning its place, and the turn takes the handoff it
+                # would have taken anyway.
+                if salvaged:
+                    checked = guardrails.check_reply(
+                        salvaged,
+                        tool_outputs=outcomes,
+                        trusted_hosts=await _trusted_hosts(ctx),
+                        history=history or [],
+                    )
+                    if not checked.ok:
+                        logger.error(
+                            "run %s: the salvaged reply did not pass the guardrail "
+                            "(%s) — handing over instead", run_id, checked.reason,
+                        )
+                        salvaged = None
+                if salvaged:
+                    logger.info("run %s: model said nothing; answering from %d "
+                                "verified tool results", run_id, len(outcomes))
+                    recovery_log.append(recovery.Attempt(
+                        "no_prose_after_tools", model_in_use, "deterministic").as_dict())
+                    reply = salvaged
+                    status = "succeeded"
+                    error = ("the model produced no reply; answered from verified "
+                             "tool results" + (f" ({detail})" if detail else ""))
+                else:
+                    recovery_log.append(recovery.Attempt(
+                        "no_reply", model_in_use, "handoff").as_dict())
+                    reply = prompts.handoff_reply(ctx)
+                    handoff = True
+                    status = "escalated"
             else:
                 # **And it is not a failure either.**
                 #
@@ -893,6 +1081,19 @@ async def run_turn(
         # is the turn's story, it is absent on virtually every turn, and a
         # column that is null 99% of the time is a column nobody queries.
         summary_of_requirements["language_slips"] = language_slips[:10]
+    # §10 asks for `tools_available` per turn. One integer rather than the list:
+    # the names are derivable from the agent's grants and the task, and what
+    # nobody could answer before is "how big was the menu on this turn" — which
+    # is the number the greeting narrowing moves and the number that explains a
+    # turn's input tokens.
+    summary_of_requirements["tools_available"] = len(tools)
+    if recovery_log:
+        # Every rung climbed this turn, and what came of it. §10 asks for
+        # `attempt`, `fallback_used`, `failure_class` and `recovery_method` to
+        # be answerable per turn; this is all four, in the same jsonb the rest
+        # of the turn's story lives in. Absent on the turns that worked, which
+        # is nearly all of them.
+        summary_of_requirements["recovery"] = recovery_log[:8]
     if ctx.turn.handoff_rejections:
         # Every handoff the model asked for this turn and what the arbiter made
         # of it — accepted and rejected alike. §21: a handoff that was turned

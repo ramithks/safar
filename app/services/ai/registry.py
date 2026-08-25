@@ -324,6 +324,20 @@ async def execute(
     """
     started = time.monotonic()
 
+    # Computed once the arguments are validated, and stamped on *every* outcome
+    # from that point — refusals and failures included, not only successes.
+    #
+    # **Found by mutation testing.** Deleting `.eq("status", "executed")` from
+    # `_already_done` broke no test, because no refused outcome carried a key
+    # for the lookup to find: the filter was redundant by accident rather than
+    # by design. That is a guard nobody would notice losing.
+    #
+    # Recording it on a refusal is also the better audit trail. "Was this the
+    # same call we turned down two minutes ago" is a question the action rows
+    # could not answer, and it is exactly the question somebody asks when a
+    # permission looks wrong.
+    key: str | None = None
+
     def elapsed() -> int:
         return int((time.monotonic() - started) * 1000)
 
@@ -341,6 +355,7 @@ async def execute(
             guest_message=exc.guest_message,
             latency_ms=elapsed(),
             error=exc.reason if exc.action_status == "failed" else None,
+            idempotency_key=key,
         )
 
     try:
@@ -373,6 +388,11 @@ async def execute(
             await spec.precheck(args, ctx)
         except AgentError as exc:
             return refusal(exc)
+
+    # Named before the gates so a refusal carries it; looked up after them, so
+    # a replay is a shortcut past the work and never past a rule.
+    if spec.mutating and ctx.answering:
+        key = idempotency_key(ctx.answering, spec.name, args.model_dump(mode="json"))
 
     verdict = autonomy.EXECUTE if approved else autonomy.decide(spec, ctx)
     if verdict == autonomy.REFUSE:
@@ -419,9 +439,7 @@ async def execute(
     # *work*, never past a rule — so a grant revoked between the two attempts
     # still refuses, and the guard can only ever answer a call that would have
     # been allowed to run anyway.
-    key: str | None = None
-    if spec.mutating and ctx.answering:
-        key = idempotency_key(ctx.answering, spec.name, args.model_dump(mode="json"))
+    if key is not None:
         try:
             done = await run_db(_already_done, key, ctx)
         except Exception:  # noqa: BLE001

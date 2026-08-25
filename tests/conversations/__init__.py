@@ -130,6 +130,13 @@ class Played:
     # the end, because "what did the guest's third message establish" is the
     # question these scenarios exist to ask and the final state cannot answer it.
     sessions: list[dict]
+    # And as it stood *before* each turn, which is what the requirement layer
+    # actually saw. Reading the final session instead was a bug in this runner:
+    # a journey whose fourth turn moves the dates clears the rate plan, so the
+    # first three turns' haggles were being re-detected against a session that
+    # no longer had anything to haggle over, and reported as missing
+    # requirements the system had raised correctly at the time.
+    before_sessions: list[dict]
 
     @property
     def all_tools(self) -> list[str]:
@@ -164,10 +171,11 @@ def play(db, scenario: Scenario) -> Played:
     if scenario.starting_session:
         db.rows("conversations")[0]["guest_profile"] = dict(scenario.starting_session)
 
-    results, per_turn, snapshots = [], [], []
+    results, per_turn, snapshots, priors = [], [], [], []
     for turn in scenario.turns:
         if turn.before is not None:
             turn.before(db)
+        priors.append(dict(db.rows("conversations")[0].get("guest_profile") or {}))
         script: list = []
         if turn.calls:
             script.append(list(turn.calls))
@@ -189,7 +197,7 @@ def play(db, scenario: Scenario) -> Played:
         results.append(result)
         per_turn.append(fresh)
         snapshots.append(dict(db.rows("conversations")[0].get("guest_profile") or {}))
-    return Played(scenario, results, per_turn, snapshots)
+    return Played(scenario, results, per_turn, snapshots, priors)
 
 
 def profile(db) -> dict:
@@ -213,8 +221,10 @@ def check(db, played: Played) -> list[str]:
     for index, (turn, ran) in enumerate(zip(scenario.turns, played.actions_per_turn), 1):
         where = f"turn {index} ({turn.guest[:40]!r})"
 
+        # Against the session the requirement layer actually saw on this turn.
         detected = {r.tool for r in required_actions.detect(turn.guest, {})} | {
-            r.tool for r in required_actions.detect(turn.guest, profile(db))
+            r.tool for r in required_actions.detect(
+                turn.guest, played.before_sessions[index - 1])
         }
         for tool in turn.requires:
             if tool not in detected:

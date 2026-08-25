@@ -105,10 +105,31 @@ def tool_rows(db, name: str) -> list[dict]:
     return [a for a in actions(db) if a["tool"] == name]
 
 
+# **This script gained a third step, and the reason is a bug it was hiding.**
+#
+# The turn is three model steps, not two: the handoff attempt, the prose after
+# it, and — because the required-action layer forces `negotiate_rate` on a
+# haggle — the prose step that reports what the engine said. The script only
+# ever had two, so the third call fell off the end.
+#
+# `EchoProvider` used to answer an exhausted script with
+# `ModelStep(reply="", tokens_in=1, tokens_out=1)`, which is silently
+# indistinguishable from a model that returned nothing. The turn carried on with
+# the reply from step two and the test passed, for a reason that had nothing to
+# do with what it was written to check. The same silence, in the e2e scripts,
+# was 80 of the 94 runs recorded as "the model produced no reply" — nine to one
+# against the real ones.
+#
+# The provider now raises when its script runs out, so a short script says so.
+# Nothing about the assertions below changed.
 HANDOFF_ON_A_HAGGLE = [
     [("request_human_handoff", {"reason": "guest_asked",
                                 "note": "Guest wants a discount."})],
     "Main dekhti hoon.",
+    # No figure in it, deliberately: this step's job is to exist, and a rupee
+    # amount no tool returned would be refused by the reply guardrail — which
+    # would make the test fail for a reason that has nothing to do with handoffs.
+    "Maine hotel se check kar liya hai, batati hoon.",
 ]
 
 
@@ -462,7 +483,12 @@ def test_a_haggle_is_still_not_a_request_for_a_person(db):
     """
     result = run(runtime.run_turn(
         make_ctx(session=QUOTED_SESSION), "thoda kam karo na",
-        provider=EchoProvider(["Main dekhti hoon."]),
+        # Two steps: the model's own answer, and the prose step the runtime asks
+        # for after it forces `negotiate_rate`. The script had one, and the
+        # missing second call used to be absorbed silently by `EchoProvider` —
+        # see the note on HANDOFF_ON_A_HAGGLE above.
+        provider=EchoProvider(["Main dekhti hoon.",
+                               "Maine hotel se check kar liya hai."]),
     ))
     assert result.handoff is False
     assert "request_human_handoff" not in result.requirements["forced"]

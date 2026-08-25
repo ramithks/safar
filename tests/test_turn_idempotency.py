@@ -203,3 +203,95 @@ class TestTheGuardIsNotAWayToSkipAGate:
         run(runtime.run_turn(ctx_for(db), "Towels bhej do",
                              provider=EchoProvider(list(TASK))))
         assert len(db.rows("tasks")) == 1
+
+    def test_a_tool_that_failed_is_reachable_again_and_not_replayed_as_done(self, db):
+        """
+        **The case that makes the `status = 'executed'` filter load-bearing.**
+
+        Found by mutation testing, and it took two attempts to find the right
+        case, which is worth recording. Deleting the filter broke no test at
+        first because the only refusal the suite exercised — a revoked grant —
+        happens *before* the arguments are validated, so its outcome carries no
+        key for the lookup to find. Then a queued approval, which does carry a
+        key, also failed to kill it: the autonomy gate returns
+        `awaiting_approval` above the lookup, so a second attempt never reaches
+        it. That ordering is its own guarantee and has its own test below.
+
+        What the filter actually guards is a tool that ran and *failed* — a
+        Razorpay timeout on `create_booking_payment_link`, a 500 from the PMS.
+        That outcome is produced below the gate, so it carries a key and the
+        lookup does find it. Without the filter the retry is told the work is
+        done, with the failed row's empty output, and the guest is left with a
+        payment link that was never created.
+
+        A failure must stay reachable. That is the whole difference between a
+        guard against duplication and a guard against ever trying again.
+        """
+        from app.services.ai.errors import ToolUnavailable
+
+        broken = {"title": "Extra blankets please", "category": "housekeeping"}
+        spec = registry.REGISTRY["create_task"]
+        original = spec.fn
+
+        async def _explodes(_args, _ctx):
+            raise ToolUnavailable("the ticket system is down")
+
+        object.__setattr__(spec, "fn", _explodes)
+        try:
+            first = run(runtime.run_turn(
+                ctx_for(db), "blankets bhejo",
+                provider=EchoProvider([[("create_task", broken)], "Dekhta hoon."])))
+        finally:
+            object.__setattr__(spec, "fn", original)
+
+        failed = [a for a in first.actions if a.tool == "create_task"][0]
+        assert failed.status == "failed"
+        assert failed.idempotency_key, "a failure below the gate must carry the key"
+
+        # The ticket system is back. The same message, answered again, must
+        # actually raise the ticket.
+        second = run(runtime.run_turn(
+            ctx_for(db), "blankets bhejo",
+            provider=EchoProvider([[("create_task", broken)], "Ho jayega."])))
+        again = [a for a in second.actions if a.tool == "create_task"][0]
+        assert again.status == "executed", (
+            f"a failed call was replayed as {again.status} — the guest never "
+            f"gets the thing they asked for"
+        )
+        assert len(db.rows("tasks")) == 1
+
+    def test_an_action_waiting_for_a_human_never_reaches_the_lookup_at_all(self, db):
+        """
+        The gate order, asserted as its own guarantee.
+
+        `create_booking` always requires approval, so the autonomy verdict
+        returns above the idempotency lookup and a second attempt queues behind
+        the same human rather than being told it is done. Replaying an
+        `awaiting_approval` row as a success would hand the model a booking that
+        does not exist — the single worst sentence this product can send,
+        arrived at through the machinery meant to prevent duplicates.
+        """
+        booking = ("create_booking",
+                   {"quote_id": "40000000-0000-4000-8000-000000000001",
+                    "guest_name": "Nisha Kapoor", "guest_phone": "+919812345678"})
+        script = [[booking], "Main team se confirm karwa raha hoon."]
+
+        # Through the runtime, not `registry.execute` directly: the action row
+        # the lookup reads is written by `runtime._write_action`, so a direct
+        # call leaves nothing for a replay to find and the test would pass
+        # whatever the filter said.
+        first = run(runtime.run_turn(ctx_for(db), "book kar do",
+                                     provider=EchoProvider(list(script))))
+        queued = [a for a in first.actions if a.tool == "create_booking"][0]
+        assert queued.status == "awaiting_approval", queued.refusal_reason
+        assert queued.idempotency_key, (
+            "a queued action must carry the key, or the filter below is untested"
+        )
+
+        second = run(runtime.run_turn(ctx_for(db), "book kar do",
+                                      provider=EchoProvider(list(script))))
+        again = [a for a in second.actions if a.tool == "create_booking"][0]
+        assert again.status == "awaiting_approval", (
+            f"a booking waiting for a human was replayed as {again.status}"
+        )
+        assert not again.output, "a booking that has not happened has no result"

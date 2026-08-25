@@ -169,7 +169,12 @@ def test_a_turn_that_said_nothing_at_all_reaches_a_person(db):
     empty reply and skipped the handoff because nothing had set it, so the
     conversation sat with the AI nominally on it and nothing sent.
     """
-    provider = EchoProvider(["", ""])
+    # Three blanks, not two, and the count is the recovery ladder rather than a
+    # detail: the model is asked, asked again, and then asked on a different
+    # model before anybody fetches a person. A turn reaches this test's ending
+    # only when all three come back empty — which is the point of the ladder and
+    # is what makes the handoff below the last resort rather than the first.
+    provider = EchoProvider(["", "", ""])
     result = run(runtime.run_turn(make_ctx(), "price kya hai", provider=provider))
 
     assert result.handoff is True

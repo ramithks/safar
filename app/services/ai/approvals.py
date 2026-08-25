@@ -89,6 +89,53 @@ def _conversation(conversation_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
+def _claim_for(action_id: str, property_id: str, approver: str | None) -> dict | None:
+    """Positional shim: `run_db` forwards args, not keywords."""
+    return claim(action_id, property_id, approver=approver)
+
+
+def claim(action_id: str, property_id: str, *, approver: str | None) -> dict | None:
+    """
+    Take the action, or find it already taken. Returns the row, or None.
+
+    **A compare-and-set, because the read-then-run below is not atomic.**
+    `execute_approved` used to load the action, check its status, and then run
+    the tool — with a whole booking, folio charge or negotiated rate between the
+    check and the write, and nothing holding the row. Two requests that both read
+    `awaiting_approval` both proceeded, and the second settled over the first.
+
+    That is not exotic. A hotel's approvals sit in a shared inbox; two people see
+    the same pending item on their phones and both press it. And the approval
+    path is the one place in this system where a mutating tool is *guaranteed*
+    to run — every `create_booking`, every `post_folio_charge` — so it had the
+    weakest protection where the consequences are heaviest.
+
+    The message-scoped idempotency key in `registry.execute` does not cover it:
+    that is scoped to the guest message a turn is answering, and an approval has
+    no guest message. It is a person pressing a button an hour later.
+
+    `.eq("status", "awaiting_approval")` in the UPDATE is the whole fix. Postgres
+    serialises the two writes; the loser matches no row and gets None. It needs
+    no new column and no migration, and it makes the state machine enforce its
+    own transitions rather than describe them.
+
+    It also closes a crash window in the other direction: a process that dies
+    between running the tool and settling the row leaves `approved`, which is not
+    claimable — so a retry cannot run the tool a second time.
+    """
+    patch = {"status": "approved"}
+    if approver:
+        patch["approved_by"] = approver
+    rows = (
+        get_db().table("agent_actions").update(patch)
+        .eq("id", action_id)
+        .eq("property_id", property_id)
+        .eq("status", "awaiting_approval")
+        .execute().data
+    )
+    return rows[0] if rows else None
+
+
 def _settle(action_id: str, patch: dict) -> dict | None:
     rows = get_db().table("agent_actions").update(patch).eq("id", action_id).execute().data
     return rows[0] if rows else None
@@ -111,11 +158,16 @@ async def execute_approved(
                                "That action does not belong to this property.")
     action, run = loaded
 
-    if action["status"] not in ("awaiting_approval", "approved"):
+    # **Claimed before anything runs.** The status check that used to live here
+    # was a read, and the tool executes between it and the write — see `claim`.
+    claimed = await run_db(_claim_for, action_id, property_id, member.profile_id)
+    if claimed is None:
+        current = (await run_db(_load, action_id, property_id) or (action, {}))[0]
         return ExecutionResult(
-            False, action["status"], "ALREADY_DECIDED",
-            f"This action is already {action['status'].replace('_', ' ')}.",
+            False, current["status"], "ALREADY_DECIDED",
+            f"This action is already {current['status'].replace('_', ' ')}.",
         )
+    action = {**action, **claimed}
 
     async def refuse(code: str, detail: str) -> ExecutionResult:
         # Terminal. The recovery is a fresh proposal against the hotel as it is

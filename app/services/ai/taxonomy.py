@@ -143,6 +143,21 @@ def _field(row, name, default=None):
     return getattr(row, name, default)
 
 
+# Providers that are a list of scripted answers rather than a model.
+#
+# `EchoProvider` and its kin serve the e2e suites, and when their script runs out
+# they return `ModelStep(reply="", tokens_in=1, tokens_out=1)` — which reaches
+# this table as "the model produced no reply" and is indistinguishable from a
+# production failure. It was 80 of the 94 runs in that class, nine to one against
+# the real ones, and it made the largest reliability signal in the system a
+# measurement of our own test scripts.
+_SCRIPTED_PROVIDERS = frozenset({"echo", "scripted", "static"})
+
+
+def _is_scripted(run) -> bool:
+    return str(_field(run, "provider") or "").lower() in _SCRIPTED_PROVIDERS
+
+
 def diagnose(run, actions=None) -> Diagnosis:
     """
     Read a run and its actions and name the failure.
@@ -175,7 +190,20 @@ def diagnose(run, actions=None) -> Diagnosis:
         return Diagnosis(CONFIGURATION_ERROR, error[:200])
 
     # 4. The model said nothing usable.
+    #
+    # **Unless there was no model.** A scripted provider running out of script is
+    # a test bug, and counting it as a model failure is how this class came to be
+    # 39% of the taxonomy while the product's real share of it was nine runs.
+    #
+    # Deliberately narrow, and this is the line that keeps it from being a way to
+    # hide anything: only the *model-level* verdict is suppressed. A scripted run
+    # that hits a refused tool, a guardrail block, an inventory conflict or a
+    # broken configuration is a real finding about the product and is classified
+    # exactly as it would be on Vertex — every rule above and below this one runs
+    # on it unchanged.
     if _NO_REPLY.search(error):
+        if _is_scripted(run):
+            return Diagnosis(NONE, f"scripted provider ran out of script — {error[:120]}")
         return Diagnosis(MODEL_FAILURE, error[:200])
 
     # 4. What the tools themselves reported, most specific first. A refusal
@@ -229,6 +257,8 @@ def diagnose(run, actions=None) -> Diagnosis:
                              f"required but never called: {unmet}"[:200])
 
     if status == "failed" and error:
+        if _is_scripted(run):
+            return Diagnosis(NONE, f"scripted provider — {error[:120]}")
         return Diagnosis(MODEL_FAILURE, error[:200])
 
     # **An escalation is not a failure, and calling it one buries the number
@@ -251,8 +281,65 @@ def diagnose(run, actions=None) -> Diagnosis:
     if status == "escalated":
         return Diagnosis(NONE, "handed to a person, with nothing recorded against it")
     if status == "failed":
+        if _is_scripted(run):
+            return Diagnosis(NONE, "scripted provider, no error recorded")
         return Diagnosis(MODEL_FAILURE, "failed with no error recorded")
     return Diagnosis(NONE, "")
+
+
+# ── how a turn ended, as one word ───────────────────────────────────────────
+#
+# §10 asks for metrics that distinguish these, and it asks for one thing
+# specifically: *"do not call successful handoffs failures."* `diagnose` above
+# answers "what went wrong"; this answers "how did it end", which is the
+# question a dashboard actually shows.
+#
+# `RECOVERED` is the one that did not exist before the ladder. A turn that got a
+# blank answer, asked again, and then answered the guest is not a success in the
+# same sense as one that never stumbled — the guest cannot tell, but the rate is
+# how anybody knows the ladder is doing anything, and folding it into SUCCESS
+# would make the work invisible on the day it stops working.
+
+SUCCESS = "SUCCESS"          # answered, first time
+RECOVERED = "RECOVERED"      # answered, but the ladder was climbed to get there
+HANDOFF = "HANDOFF"          # a person has it, correctly
+SAFETY_BLOCK = "SAFETY_BLOCK"  # the guardrail stopped the reply
+FAILURE = "FAILURE"          # everything diagnose() calls a real fault
+NOT_PRODUCT = "NOT_PRODUCT"  # an e2e script, not a guest
+
+OUTCOMES = (SUCCESS, RECOVERED, HANDOFF, SAFETY_BLOCK, FAILURE, NOT_PRODUCT)
+
+
+def outcome(run, actions=None) -> str:
+    """
+    How this turn ended, in the vocabulary a dashboard groups by.
+
+    **`NOT_PRODUCT` is its own answer and not a kind of success**, which is the
+    correction that made this function worth writing. Suppressing a scripted
+    run's *failure* and then letting it land in SUCCESS replaces "we counted our
+    test scripts as failures" with "we counted them as wins" — the same mistake
+    inverted, and harder to notice because the graph looks better. A run on a
+    scripted provider is not a guest turn at all, and the honest thing is to say
+    so and let the dashboard filter it.
+    """
+    if _is_scripted(run):
+        return NOT_PRODUCT
+
+    diagnosis = diagnose(run, actions)
+    if diagnosis.category == GUARDRAIL_BLOCK:
+        return SAFETY_BLOCK
+
+    status = str(_field(run, "status") or "")
+    if diagnosis.category not in (NONE,):
+        return FAILURE
+    if status == "escalated":
+        return HANDOFF
+
+    required = _field(run, "required_actions") or _field(run, "requirements") or {}
+    climbed = (required or {}).get("recovery") if isinstance(required, dict) else None
+    if climbed:
+        return RECOVERED
+    return SUCCESS
 
 
 def tally(rows) -> dict[str, int]:

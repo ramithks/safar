@@ -153,3 +153,66 @@ class TestTally:
         """
         assert set(t.OWNER) == set(t.ALL)
         assert all(t.OWNER[c] for c in t.ALL if c != t.NONE)
+
+
+# ── how a turn ended, as one word ───────────────────────────────────────────
+
+class TestTheOutcomeVocabulary:
+    """
+    §10 asks for metrics that distinguish these, and asks for one thing
+    specifically: *"do not call successful handoffs failures."*
+    """
+
+    def test_a_plain_answer_is_a_success(self):
+        assert t.outcome(run("succeeded")) == t.SUCCESS
+
+    def test_a_correct_handoff_is_not_a_failure(self):
+        assert t.outcome(run("escalated")) == t.HANDOFF
+
+    def test_a_guardrail_block_is_its_own_thing(self):
+        """
+        Neither a success nor a model failure: the system worked, and the reply
+        it stopped is a fact about the model worth counting separately.
+        """
+        assert t.outcome(run("escalated", "guardrail: reply quoted ['4000']")) \
+            == t.SAFETY_BLOCK
+
+    def test_a_turn_that_climbed_the_ladder_is_recorded_as_recovered(self):
+        """
+        The state that did not exist before the recovery work. A guest cannot
+        tell the difference, but the rate is how anybody knows the ladder is
+        doing anything — and folding it into SUCCESS would make it invisible on
+        the day it stops working.
+        """
+        recovered = run("succeeded", required_actions={
+            "recovery": [{"failure": "empty_completion", "method": "retry"}]})
+        assert t.outcome(recovered) == t.RECOVERED
+
+    def test_a_scripted_run_is_not_a_success_either(self):
+        """
+        **The correction that made this function worth writing.** Suppressing a
+        scripted run's failure and letting it land in SUCCESS replaces "we
+        counted our test scripts as failures" with "we counted them as wins" —
+        the same mistake inverted, and harder to notice because the graph looks
+        better.
+        """
+        scripted = run("failed", "the model produced no reply", provider="echo")
+        assert t.outcome(scripted) == t.NOT_PRODUCT
+        assert t.outcome(scripted) != t.SUCCESS
+
+    def test_a_real_model_failure_is_a_failure(self):
+        real = run("failed", "the model produced no reply", provider="vertex_ai")
+        assert t.outcome(real) == t.FAILURE
+
+    def test_every_outcome_is_reachable(self):
+        """A vocabulary with an unreachable word is a word nobody trusts."""
+        seen = {
+            t.outcome(run("succeeded")),
+            t.outcome(run("escalated")),
+            t.outcome(run("escalated", "guardrail: x")),
+            t.outcome(run("succeeded", required_actions={"recovery": [{}]})),
+            t.outcome(run("failed", "the model produced no reply",
+                          provider="vertex_ai")),
+            t.outcome(run("failed", "x", provider="echo")),
+        }
+        assert seen == set(t.OUTCOMES)
