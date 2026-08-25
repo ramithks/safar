@@ -1340,6 +1340,22 @@ async def main() -> int:
                 matrix[name]["turns"] = rows
             finally:
                 settings.hotel_models_v3 = was_v3
+                # **Give the rooms back before the next family runs.**
+                #
+                # The sweep books real rooms, and it used to hand them back
+                # once, at the very end. So the family that ran second met a
+                # property the first had partly sold out — 2.5 saw zero
+                # sold-out replies and 3.x saw four, and nine of 3.x's twenty
+                # missed required actions were `payment_link_ask` turns where
+                # the model *correctly* declined to issue a link for a room
+                # that was gone.
+                #
+                # It made the sweep order a variable in a comparison whose
+                # whole premise is that nothing varies but the model. Handed
+                # back between families, so both start from the same hotel.
+                returned = await hand_back_bookings()
+                if returned:
+                    print(f"   handed back {returned} bookings before the next model")
 
         # **Reported by who actually answered, before anything is compared.**
         #

@@ -99,3 +99,51 @@ class TestATurnKnowsWhoServedIt:
             provider=EchoProvider(["", "", "Subah 7 se 10 tak."])))
         assert len(set(result.served_by)) >= 2, (
             f"a turn that fell back names only {result.served_by}")
+
+
+# ── the sweep must not change the hotel it is measuring ─────────────────────
+
+class TestTheSweepDoesNotEatItsOwnProperty:
+    """
+    **The sweep order was a variable in a comparison whose premise is that
+    nothing varies but the model.**
+
+    A 560-turn matrix books real rooms. Bookings were handed back once, at the
+    very end — so the family that ran second met a property the first had
+    partly sold out. Measured: Gemini 2.5 ran first and saw *zero* sold-out
+    replies; Gemini 3.x ran second and saw four, and nine of its twenty missed
+    required actions were `payment_link_ask` turns where the model correctly
+    declined to issue a payment link for a room that was gone.
+
+    The headline accuracy gap that produced — 90.7% against 84.8% — was
+    entirely harness artefact. On every scenario other than that one and
+    `negotiation_english` (a bug in our own detector, 10/10 on both families),
+    the two models scored 99.2% and 99.1%.
+    """
+
+    def test_bookings_are_returned_between_families(self):
+        import ast
+        from pathlib import Path
+
+        source = (Path(__file__).resolve().parent.parent
+                  / "scripts" / "agent_eval.py").read_text()
+        tree = ast.parse(source)
+        # The `finally` that restores the model flag must also hand rooms back.
+        found = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try) or not node.finalbody:
+                continue
+            body = "\n".join(ast.unparse(stmt) for stmt in node.finalbody)
+            if "hotel_models_v3" in body and "hand_back_bookings" in body:
+                found = True
+        assert found, (
+            "the per-family sweep no longer returns its bookings, so whichever "
+            "model runs second is measured against a property the first sold out")
+
+    def test_and_still_at_the_end(self):
+        from pathlib import Path
+
+        source = (Path(__file__).resolve().parent.parent
+                  / "scripts" / "agent_eval.py").read_text()
+        assert source.count("hand_back_bookings()") >= 2, (
+            "the final sweep's bookings are left behind")

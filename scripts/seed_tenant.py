@@ -527,7 +527,10 @@ def _seed_bookings(db, record: dict) -> None:
         check_in = today + timedelta(days=offset)
         row = {
             "id": ident(record["tag"], f"reservation-{i}"),
-            "ref": f"{_MARKER[:2]}-{record['tag'][:3].upper()}{i}{i}{i}",
+            # `reservations.ref` is globally unique, not per property — so
+            # three characters of the tag collided the moment two tenants were
+            # seeded whose names both begin "iso". The whole tag goes in.
+            "ref": f"{_MARKER[:2]}-{record['tag'].upper()}{i}",
             "property_id": property_id, "partner_id": partner_id,
             "room_type_id": room_type_id, "rate_plan_id": rate_plan_id,
             "guest_name": f"{_MARKER} Guest {i}",

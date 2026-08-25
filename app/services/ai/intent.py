@@ -193,6 +193,21 @@ _ASKS_FOR_LESS = re.compile(
     r"best price|best rate|best you can|"
     r"kam kar|kam karo|kam kijiye|kam ho|thoda kam|sasta|"
     r"offer|deal|bargain|negotiate|"
+    # **The polite English haggle, which is most of them.** "That's a bit
+    # above our budget — can you do anything on the rate?" matched nothing
+    # here, so the turn read as a quote request; the model ran negotiate_rate,
+    # correctly, and the evaluation scored it as a required action that never
+    # ran — on 10 of 10 runs across *both* model families. Identical on both
+    # is the signature of a system bug being charged to a model, and this is
+    # the third time that signature has appeared in this work.
+    #
+    # An indirect ask names the price as a problem rather than naming a
+    # discount: over budget, too expensive, a stretch, more than we hoped.
+    r"above (?:our|my|the) budget|over (?:our|my|the) budget|out of (?:our|my) budget|"
+    r"beyond (?:our|my) budget|bit (?:much|steep|high|pricey)|too (?:much|expensive|"
+    r"pricey|steep|high)|a stretch|more than (?:we|i) (?:hoped|wanted|expected)|"
+    r"can you do anything|anything you can do|any (?:flexibility|room|leeway)|"
+    r"flexible on|meet us|work with us|help us out|"
     r"waive|waiver|"
     # A guest naming their own figure is haggling, whatever else the
     # sentence does. "4000 mein ho jayega?" is an offer.

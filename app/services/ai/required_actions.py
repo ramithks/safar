@@ -641,8 +641,29 @@ def offered_price(message: str) -> int | None:
 
 
 def wants_discount(message: str) -> bool:
-    """Is the guest pushing on the price?"""
+    """
+    Is the guest pushing on the price?
+
+    **Two vocabularies for one concept, and they disagreed.** `_NEGOTIATION`
+    here and `intent._ASKS_FOR_LESS` both answer "is this a haggle", and the
+    560-turn sweep found the gap between them: "That's a bit above our budget —
+    can you do anything on the rate?" is a polite English haggle that the
+    speech-act layer now reads and this one did not. The model ran
+    `negotiate_rate`, correctly, and the report scored a required action that
+    never ran — on 10 of 10 runs across *both* model families, which is the
+    third time in this work that identical-on-both has meant the bug was ours.
+
+    So this defers rather than duplicating. `intent.category` is the canonical
+    speech-act layer; a message it calls NEGOTIATION is one, and the two can no
+    longer drift apart because there is only one list to change.
+
+    `_NEGOTIATION` survives underneath it: the category is decided over the
+    whole message, and a haggle buried in a clause of a longer one still has to
+    be caught here.
+    """
     text = message or ""
+    if intent.category(text) == intent.NEGOTIATION:
+        return True
     if any(pattern.search(text) for pattern in _NEGOTIATION):
         return True
     # A bare figure with a rate word is a haggle even without a haggling word:
