@@ -56,18 +56,15 @@ class TestInProduction:
         assert "https://travbuddy.in" in origins
         assert "https://app.hostos.in" in origins
 
-    def test_the_old_pms_origin_survives_the_rename(self):
+    def test_the_retired_pms_origin_is_not_served(self):
         """
-        The PMS moved from `partner.travbuddy.in` to `app.hostos.in`, and the
-        old host redirects — which is enough for a browser that makes a request
-        and nothing at all for a desk that installed the PWA on the old origin.
-        Its service worker answers navigations from cache, so it never sees the
-        redirect and goes on calling this API from a hostname that appears
-        nowhere else in the configuration. Dropping it here fails those desks
-        on preflight, silently.
+        `partner.travbuddy.in` is gone, not redirected — the hostname is not
+        claimed by any Vercel project any more. Leaving it in the fallback
+        would grant CORS to a name we no longer control the DNS story for,
+        which is the wrong direction to be lenient in.
         """
         origins = resolve_cors_origins("*", "production")
-        assert "https://partner.travbuddy.in" in origins
+        assert "https://partner.travbuddy.in" not in origins
 
     def test_a_wildcard_hidden_in_a_list_is_refused_too(self):
         """`*` alongside real origins is still `*` to CORSMiddleware."""

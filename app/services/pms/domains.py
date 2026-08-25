@@ -74,9 +74,9 @@ DOH_ENDPOINTS = (
 #
 # `hostos.in` and its subdomains are ours: a hotel that claimed `app.hostos.in`
 # would be claiming the PMS itself, and host resolution would then hand the
-# staff app to a booking page. `travbuddy.in` is on the list for the same
-# reason and stays there after the move — `partner.travbuddy.in` still resolves
-# to this app, so it is still ours to refuse. The rest are the accidents —
+# staff app to a booking page. `travbuddy.in` stays on the list even though the
+# PMS no longer lives there — the marketplace does, and a hotel that claimed a
+# name on it would be claiming a site we run. The rest are the accidents —
 # `localhost` and bare IPs are not domains and reach nothing.
 RESERVED_SUFFIXES = ("hostos.in", "travbuddy.in", "vercel.app", "localhost")
 

@@ -76,7 +76,7 @@ def post(url: str, body: bytes, secret: str) -> tuple[int, str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--base", default="https://stayos-backend.travbuddy.in")
+    ap.add_argument("--base", default="https://api.hostos.in")
     ap.add_argument("--wait", type=int, default=90,
                     help="seconds to wait for the worker to answer")
     ap.add_argument("--message", default="What time is check-in?")

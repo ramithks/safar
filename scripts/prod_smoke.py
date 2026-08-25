@@ -25,7 +25,7 @@ import sys
 import urllib.error
 import urllib.request
 
-BACKEND = "https://stayos-backend.travbuddy.in"
+BACKEND = "https://api.hostos.in"
 WEBSITE = "https://travbuddy.in"
 PARTNER = "https://partner.travbuddy.in"
 

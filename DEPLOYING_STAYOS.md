@@ -51,7 +51,7 @@ changing.
 | `SUPABASE_ANON_KEY` | the **hotel-OS** anon key | same page |
 | `ENABLE_HOTEL_OS` | `true` | mounts `/api/v1/pms/*` and the messaging webhooks |
 | `APP_ENV` | `production` | |
-| `ALLOWED_ORIGINS` | `https://app.hostos.in,https://partner.travbuddy.in` | the PWA's origin, plus the one it moved from — a desk that installed the PWA on the old host serves its shell from a service worker, never sees the redirect, and still calls this API from there |
+| `ALLOWED_ORIGINS` | `https://app.hostos.in` | the only browser origin that calls this service. `partner.travbuddy.in` is retired, not redirected, and is deliberately absent |
 | `REDIS_URL` | **do not set it in Coolify** — `docker-compose.stayos.yml` sets it to this stack's own Redis. See *Redis* below | |
 
 ### Set explicitly to off
