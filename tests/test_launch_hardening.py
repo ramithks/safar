@@ -220,6 +220,7 @@ def test_what_people_paste_is_accepted_as_a_hostname(typed, expected):
 
 @pytest.mark.parametrize("bad", [
     "", "   ", "localhost", "hotel", "-hotel.com", "hotel..com",
+    "hostos.in", "app.hostos.in", "api.hostos.in",
     "partner.travbuddy.in", "travbuddy.in", "anything.vercel.app",
 ])
 def test_what_may_not_be_claimed(bad):
@@ -229,17 +230,24 @@ def test_what_may_not_be_claimed(bad):
 
 def test_our_own_hostnames_are_reserved_by_name_not_by_luck():
     """
-    A hotel that claimed `partner.travbuddy.in` would be claiming the staff app
+    A hotel that claimed `app.hostos.in` would be claiming the staff app
     itself, and host resolution would then serve a booking page to everyone who
     tried to log in.
+
+    `travbuddy.in` is still on the list after the rename because
+    `partner.travbuddy.in` still resolves to this app — a name we redirect is
+    still a name we own, and still one no hotel may claim.
     """
+    assert "hostos.in" in domains.RESERVED_SUFFIXES
     assert "travbuddy.in" in domains.RESERVED_SUFFIXES
+    with pytest.raises(domains.DomainError):
+        domains.validate("staff.hostos.in")
     with pytest.raises(domains.DomainError):
         domains.validate("staff.travbuddy.in")
 
 
 def test_a_refusal_is_a_sentence_a_hotel_owner_can_act_on():
-    for bad in ("not-a-domain", "partner.travbuddy.in", ""):
+    for bad in ("not-a-domain", "app.hostos.in", "partner.travbuddy.in", ""):
         try:
             domains.validate(bad)
         except domains.DomainError as exc:

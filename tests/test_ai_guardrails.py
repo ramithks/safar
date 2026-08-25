@@ -34,7 +34,7 @@ class FakeOutcome:
     ok: bool = True
 
 
-TRUSTED = {"partner.travbuddy.in", "travbuddy.in"}
+TRUSTED = {"app.hostos.in", "travbuddy.in"}
 
 
 def check(reply, outcomes, history=None):
@@ -55,12 +55,12 @@ class TestInventedLinks:
 
     def test_a_link_a_tool_actually_returned_is_allowed(self):
         verdict = check(
-            "Your total is ₹7,168. Pay here: https://partner.travbuddy.in/pay/order_TS6",
+            "Your total is ₹7,168. Pay here: https://app.hostos.in/pay/order_TS6",
             [
                 FakeOutcome("get_quote", {"totalPaise": 716800}),
                 FakeOutcome(
                     "create_booking_payment_link",
-                    {"payUrl": "https://partner.travbuddy.in/pay/order_TS6"},
+                    {"payUrl": "https://app.hostos.in/pay/order_TS6"},
                 ),
             ],
         )
@@ -94,10 +94,10 @@ class TestInventedLinks:
 
     def test_a_link_the_agent_itself_sent_earlier_may_be_repeated(self):
         history = [
-            {"role": "assistant", "content": "Pay here: https://partner.travbuddy.in/pay/order_A"}
+            {"role": "assistant", "content": "Pay here: https://app.hostos.in/pay/order_A"}
         ]
         verdict = check(
-            "Here's that link again: https://partner.travbuddy.in/pay/order_A",
+            "Here's that link again: https://app.hostos.in/pay/order_A",
             [FakeOutcome("get_property_knowledge", {"answer": "ok"})],
             history,
         )
