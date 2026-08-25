@@ -169,3 +169,90 @@ def sweep_waiting_guests_task(self) -> dict:
             logger.exception("the waiting-guest sweep failed")
             return {"examined": 0, "waiting": 0, "raised": 0, "notified": 0,
                     "error": "sweep failed"}
+
+
+# ── inventory drift, noticed rather than discovered ─────────────────────────
+
+@celery_app.task(
+    name="travbuddy.pms.reconcile_inventory",
+    # No retry. It runs again in an hour and the next run sees the same drift —
+    # a retry would only report it twice.
+    max_retries=0,
+    acks_late=True,
+)
+def reconcile_inventory_task() -> dict:
+    """
+    Does `room_inventory` still agree with the reservations that exist?
+
+    **The reconciliation existed and nothing ran it.** `scripts/reconcile_
+    inventory.py` has found real drift twice — 377 room-nights sold to nobody
+    at Casa Mandala, then eighteen units oversold from fixture rows that were
+    INSERTed straight into `reservations` and never moved the counter. Both were
+    found because somebody happened to run it by hand.
+
+    Drift is the one class of defect here that does not announce itself. An
+    oversold night sells a room the hotel does not have and nobody learns until
+    two guests arrive for it; a stranded night quietly takes a sellable room off
+    the market and looks like a slow week.
+
+    **It reports and never corrects.** Recomputing the counter from live
+    reservations is the right answer for a *report* and a dangerous one for a
+    write: a hold in flight, a webhook mid-delivery and a booking being made in
+    the same second all look like disagreement for a moment, and a task that
+    "fixed" them would take a room off a guest who is paying for it. So this
+    logs, loudly and structurally, and a person decides.
+    """
+    import logging
+    import sys
+    from pathlib import Path
+
+    from app.db.client import get_db
+
+    logger = logging.getLogger(__name__)
+    scripts = Path(__file__).resolve().parent.parent.parent / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    from reconcile_inventory import disagreements  # noqa: E402
+
+    db = get_db()
+    try:
+        properties = (
+            db.table("properties").select("id,name")
+            .eq("status", "active").execute().data or []
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("could not list properties to reconcile", exc_info=True)
+        return {"checked": 0, "drifting": 0}
+
+    drifting = []
+    for row in properties:
+        try:
+            found = disagreements(db, row["id"])
+        except Exception:  # noqa: BLE001
+            # One property that cannot be read must not stop the rest being
+            # checked — the whole point is the sweep across all of them.
+            logger.warning("could not reconcile %s", row["id"], exc_info=True)
+            continue
+
+        if not (found.get("oversold") or found.get("stranded") or found.get("wrong")):
+            continue
+
+        drifting.append(row["id"])
+        logger.error(
+            "[inventory-drift] %s",
+            {
+                "property_id": row["id"],
+                "property": row.get("name"),
+                # Rooms sold that nothing is counting. The dangerous direction:
+                # the hotel can sell them again.
+                "oversold": found.get("oversold"),
+                # The counter says sold and no live reservation agrees. Rooms
+                # the hotel has taken off the market for nobody.
+                "stranded": found.get("stranded"),
+                "nights_affected": len(found.get("wrong") or []),
+            },
+        )
+
+    logger.info("reconciled %d properties, %d drifting", len(properties), len(drifting))
+    return {"checked": len(properties), "drifting": len(drifting),
+            "properties": drifting}

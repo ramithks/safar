@@ -76,6 +76,17 @@ _STAYOS_SCHEDULE = {
     "stayos-waiting-guests": {
         "task": "travbuddy.messaging.sweep_waiting_guests", "schedule": 300,
     },
+    # Inventory drift is the one class of defect here that does not announce
+    # itself. An oversold night sells a room the hotel does not have and nobody
+    # learns until two guests arrive for it; a stranded night takes a sellable
+    # room off the market and looks like a slow week.
+    #
+    # Hourly, and it reports rather than corrects — see the task. The
+    # reconciliation has existed all along and nothing ran it, which is how both
+    # of the real incidents were found by hand.
+    "stayos-inventory-drift": {
+        "task": "travbuddy.pms.reconcile_inventory", "schedule": 3600,
+    },
 }
 
 
