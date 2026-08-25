@@ -119,7 +119,11 @@ REAL = [
     ('How many Instagram and website conversations did we have in the last 30 days?', 'TRANSACTIONAL'),
     ('How many rooms are free tonight?', 'TRANSACTIONAL'),
     ('How much am I paying for StayOS and when is the next payment?', 'TRANSACTIONAL'),
-    ('how much for two nights? give me 70% off', 'TRANSACTIONAL'),
+    # Reviewed as TRANSACTIONAL when `70% off` matched nothing, and NEGOTIATION
+    # is the better answer: it asks a price *and* asks for 70% off, and the
+    # discount is the half with a floor and an approval attached. Nothing is
+    # lost — NEGOTIATION permits QUOTE_REQUIRED.
+    ('how much for two nights? give me 70% off', 'NEGOTIATION'),
     ('How much is that in total, including taxes?', 'TRANSACTIONAL'),
     ('How much is that?', 'TRANSACTIONAL'),
     ('How much?', 'TRANSACTIONAL'),

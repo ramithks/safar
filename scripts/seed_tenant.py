@@ -296,6 +296,20 @@ async def build(tag: str, *, minimal: bool = False) -> dict:
         _seed_conversations(db, record)
         _seed_escalations(db, record)
 
+    # ── the website, published ──────────────────────────────────────────────
+    #
+    # Not decoration: `web_chat.ask` resolves a hotel by slug through
+    # `public_booking.resolve_published`, which refuses anything whose site is
+    # not published. So the fresh-account journey cannot reach the production
+    # entrypoint at all without this, and a seed that skipped it would have
+    # forced the test to call an internal function instead — which is precisely
+    # the shortcut §18 rules out.
+    from app.services.pms import website as website_service
+
+    await website_service.get_config(property_id)          # creates the draft
+    if not minimal:
+        await website_service.publish(property_id, profile_id)
+
     await onboarding.activate(property_id)
     record["status"] = (db.table("properties").select("status")
                         .eq("id", property_id).limit(1).execute().data or [{}])[0].get("status")

@@ -178,6 +178,30 @@ _NUMBER_WORDS = {
 
 _NUMBER = r"(?:\d{1,3}|" + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r")"
 
+# **`do` is two in Hindi and an auxiliary verb in English**, and the first
+# question a guest asked a brand-new hotel was "What rooms do you have?" —
+# which parsed as *two rooms*, raised a group booking, and forced a quote for a
+# stay nobody had described.
+#
+# It is not a spelling that can be dropped: "do kamre chahiye" is the commonest
+# way a Hinglish guest asks for two rooms, and `sab_words` cannot tell the two
+# apart. What distinguishes them is the next word — an English auxiliary is
+# always followed by a subject pronoun or `not`, and a Hindi numeral never is.
+#
+# Handled here rather than in each caller because `room_count`, `people_count`
+# and the group detector all read the same number, and a guard in one of them
+# would have left the other two counting an auxiliary verb.
+_DO_AS_A_VERB = re.compile(
+    r"(?<![a-z0-9])do(?:es)?\s+(?:you|i|we|they|he|she|it|not|n't|the|these|those)"
+    r"(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _strip_auxiliaries(message: str | None) -> str:
+    """`do you` out, so the numeral reader never sees an English verb."""
+    return _DO_AS_A_VERB.sub(" ", message or "")
+
 # The nouns that make a number a number *of rooms*.
 _ROOM_NOUN = r"(?:rooms?|kamre|kamra|kamrey|kamron|कमरे|कमरा|suites?|villas?|cottages?|tents?)"
 # …and the ones that make it a number of people. Guests state party size at
@@ -355,7 +379,7 @@ def room_count(message: str) -> int | None:
     Rooms first and people second: a guest who says "5 kamre chahiye, 10 log aa
     rahe hain" has told us both, and the number they chose is the one to use.
     """
-    text = message or ""
+    text = _strip_auxiliaries(message)
     # A door is not a quantity. "204 wala room" reads as a count to the pattern
     # below — a number, then a word, then a room noun, which is the shape of
     # "2 Deluxe rooms" — so the room-number reading is settled first.
@@ -379,7 +403,7 @@ def room_count(message: str) -> int | None:
 
 def people_count(message: str) -> int | None:
     """How many people this message mentions, or None."""
-    text = message or ""
+    text = _strip_auxiliaries(message)
     for pattern in (_PEOPLE_BEFORE, _PEOPLE_AFTER):
         for match in pattern.finditer(text):
             value = _to_int(match.group(1))

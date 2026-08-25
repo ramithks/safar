@@ -198,12 +198,35 @@ _ASKS_FOR_LESS = re.compile(
     # sentence does. "4000 mein ho jayega?" is an offer.
     # A guest naming their own figure is haggling, whatever else the sentence
     # does. "4000 mein ho jayega?" is an offer with a question mark on it.
+    # **"Can you do 10% off?" is the commonest way to ask in English** and
+    # matched nothing here — `off` was not a discount word, `do` was not a
+    # request, and the whole sentence came back TRANSACTIONAL. Found by the
+    # first-guest journey, on turn six.
+    r"knock off|take off|come down|kuch to kam|"
     r"kar do na|de do na|de dijiye na|"
     r"mein ho jayega|me ho jayega|mein ho jaye|mein kar do|mein de do"
     r")(?![a-z0-9])",
     re.IGNORECASE,
 )
 _ASKS_FOR_LESS_HI = re.compile(r"छूट|सस्ता|कम कर|मुफ़्त|मुफ्त")
+
+# **"Can you do 10% off?" is the commonest way to ask in English**, and it
+# matched nothing: `off` is not a discount word on its own, `do` is not a
+# request, and the whole sentence came back TRANSACTIONAL. Found by the
+# first-guest journey, on turn six, against a hotel with real negotiation rules.
+#
+# Its own pattern rather than another branch of `_ASKS_FOR_LESS`, because that
+# one is wrapped in `(?<![a-z0-9])` and the character before a `%` is a digit —
+# so every percentage form failed the lookbehind and only the spelled-out
+# "percent" worked. Fighting the wrapper would have made both patterns harder
+# to read than having two.
+#
+# The number has to be *next to* the asking. A bare percentage is not a
+# discount request: "18% GST lagega kya?" is a question about tax.
+_PERCENT_OFF = re.compile(
+    r"\d+\s*(?:%|percent|per ?cent)\s*(?:off|discount|down|kam|less|chh?oo?t)",
+    re.IGNORECASE,
+)
 
 # **"How many rooms are free tonight?" is an availability question.**
 #
@@ -376,8 +399,9 @@ def _of_one_clause(text: str) -> str:
     # It only reorders messages that match *both*. "meri booking cancel karni
     # hai" and "Can I upgrade to a suite?" contain no discount words and are
     # unaffected.
-    if (_matches(text, _ASKS_FOR_LESS, _ASKS_FOR_LESS_HI)
-            and not _FREE_MEANS_VACANT.search(text)):
+    if ((_matches(text, _ASKS_FOR_LESS, _ASKS_FOR_LESS_HI)
+         and not _FREE_MEANS_VACANT.search(text))
+            or _PERCENT_OFF.search(text)):
         return NEGOTIATION
     if _matches(text, _CHANGES_A_BOOKING, _CHANGES_A_BOOKING_HI):
         return MUTATION

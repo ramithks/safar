@@ -5,7 +5,7 @@
  "partner_id": "6d9be2ce-d135-4547-b154-ac2fcdc951e8",
  "property_id": "d9064c94-7789-41db-8016-962591bafdc2",
  "name": "ZZ-SEED Alpha House",
- "created_at": "2026-08-25T13:35:43.220890+00:00",
+ "created_at": "2026-08-25T13:53:55.537030+00:00",
  "room_types": {
   "Garden Deluxe": "b85cb284-07f1-4802-902a-9cf99654162e",
   "Suite 1": "8a0e525f-4cae-417b-995c-9dd4f6f493cc",
@@ -57,11 +57,11 @@
   "rooms": 18,
   "room_inventory": 540,
   "reservations": 6,
-  "conversations": 2,
+  "conversations": 5,
   "group_rate_tiers": 2,
   "negotiation_rules": 2,
   "agents": 5,
   "agent_escalations": 2,
-  "quotes": 0
+  "quotes": 1
  }
 }
