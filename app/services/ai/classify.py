@@ -41,7 +41,7 @@ routing decision: getting it wrong costs tokens, not correctness.
 import logging
 from dataclasses import dataclass
 
-from app.services.ai import model_router
+from app.services.ai import intent, model_router
 from app.services.ai.providers import Provider, for_name
 
 logger = logging.getLogger(__name__)
@@ -289,6 +289,31 @@ class ModelClassifier:
             task = opening_task(agent_type)
             return Classification(task=task, tier=model_router.tier_of(task),
                                   source="default", opening=True)
+
+        # **"Breakfast kitne baje tak milta hai?" does not need a model to route
+        # it either**, and it is the commonest kind of message a hotel receives
+        # after a greeting.
+        #
+        # `intent.category` already computes this deterministically, for free,
+        # to decide whether the turn owes a business action — and INFORMATIONAL
+        # is only returned on positive identification: a facility or policy
+        # noun, a factual question, and nothing asked for. That is the same
+        # population `guest_faq` exists for, so the two cannot disagree about
+        # what such a turn needs without one of them being wrong.
+        #
+        # It saves the classify call outright — about 2.3 seconds measured on
+        # the greeting path, and its tokens — on a turn that then also carries
+        # the narrowest useful catalogue rather than the widest.
+        #
+        # Conservative in the one direction that matters: an unreadable message
+        # is TRANSACTIONAL, not INFORMATIONAL, so this can only fire where the
+        # sentence was understood. And `source` stays honest — this is a
+        # deterministic route, and the report's "the model chose it" number must
+        # not quietly include turns no model saw.
+        if "guest_faq" in allowed and intent.category(message) == intent.INFORMATIONAL:
+            return Classification(task="guest_faq",
+                                  tier=model_router.tier_of("guest_faq"),
+                                  source="default")
 
         choice = model_router.select(
             agent_type=agent_type, task="intent_classification"
