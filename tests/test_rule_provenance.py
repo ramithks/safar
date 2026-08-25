@@ -365,3 +365,77 @@ class TestItReachesTheRunRecord:
             golden.ctx_for(fake), "breakfast included hai?",
             provider=EchoProvider(["Haan ji."])))
         assert "provenance" not in (result.requirements or {})
+
+
+
+# ── the refused reply, kept ─────────────────────────────────────────────────
+
+class TestAGuardrailBlockLeavesADiagnosis:
+    """
+    **Thirty guardrail blocks in production and not one retains what was
+    refused.** The row holds the phrase that matched and nothing else, so the
+    largest failure class on product traffic — 35% — cannot be diagnosed after
+    the fact, and §17's question, *why did StayOS say this?*, has no answer
+    without a log search against a run id nobody has.
+
+    It matters most where the rule is subtle. Several of those blocks matched
+    the phrase `booking confirm`, which the mood rule now correctly *allows* in
+    "booking confirm karne ke liye pay kijiye" and correctly refuses in "booking
+    confirm ho gayi". Which of the two each run was is unknowable from the row —
+    so the effect of that fix on real traffic cannot be measured at all.
+    """
+
+    def _blocked_turn(self, monkeypatch):
+        import asyncio
+
+        from app.services.ai import registry, runtime
+        from app.services.ai.providers import EchoProvider
+        import tests.test_golden_conversations as golden
+
+        registry.load_all()
+        fake = golden.db.__wrapped__(monkeypatch)
+        return fake, asyncio.run(runtime.run_turn(
+            golden.ctx_for(fake), "kitna hua?",
+            # A figure no tool on this run produced.
+            provider=EchoProvider(["Aapka total ₹99,999 hai."])))
+
+    def test_the_refused_sentence_is_on_the_run(self, monkeypatch):
+        _, result = self._blocked_turn(monkeypatch)
+        blocked = ((result.requirements or {}).get("provenance") or {}).get("guardrail")
+        assert blocked, "a guardrail block left no record of what it refused"
+        assert "₹99,999" in blocked[0]["refused_reply"]
+
+    def test_and_the_reason_beside_it(self, monkeypatch):
+        _, result = self._blocked_turn(monkeypatch)
+        blocked = (result.requirements["provenance"])["guardrail"][0]
+        assert "99999" in blocked["reason"] or "no tool result" in blocked["reason"]
+
+    def test_it_reaches_the_row_a_dashboard_reads(self, monkeypatch):
+        fake, _ = self._blocked_turn(monkeypatch)
+        row = fake.rows("agent_runs")[0]
+        stored = (row.get("required_actions") or {}).get("provenance") or {}
+        assert stored.get("guardrail"), "the row kept no diagnosis"
+
+    def test_the_guest_never_sees_it(self, monkeypatch):
+        """
+        The refused sentence is internal. What the guest gets is the handoff
+        reply — and putting the refused text anywhere near them would be
+        delivering exactly the thing the guardrail stopped.
+        """
+        _, result = self._blocked_turn(monkeypatch)
+        assert "99,999" not in (result.reply or "")
+
+    def test_an_ordinary_turn_records_no_guardrail_entry(self, monkeypatch):
+        import asyncio
+
+        from app.services.ai import registry, runtime
+        from app.services.ai.providers import EchoProvider
+        import tests.test_golden_conversations as golden
+
+        registry.load_all()
+        fake = golden.db.__wrapped__(monkeypatch)
+        result = asyncio.run(runtime.run_turn(
+            golden.ctx_for(fake), "breakfast?",
+            provider=EchoProvider(["Haan ji, breakfast hai."])))
+        provenance = (result.requirements or {}).get("provenance") or {}
+        assert "guardrail" not in provenance

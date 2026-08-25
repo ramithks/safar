@@ -912,6 +912,30 @@ async def run_turn(
                     "run %s refused by guardrails: %s | reply=%r",
                     run_id, verdict.reason, reply[:300],
                 )
+                # **Kept, because the log line is not a record.**
+                #
+                # Thirty guardrail blocks in production and not one of them
+                # retains what was actually refused — the row holds the phrase
+                # that matched and nothing else. So the largest failure class on
+                # product traffic (35%) cannot be diagnosed after the fact, and
+                # §17's question — *why did StayOS say this?* — has no answer
+                # without a log search against a run id nobody has.
+                #
+                # It matters most where the rule is subtle. Several blocks
+                # matched the phrase 'booking confirm', which the mood rule now
+                # correctly *allows* in "booking confirm karne ke liye pay
+                # kijiye" and correctly refuses in "booking confirm ho gayi".
+                # Which of those each run was is unknowable from the row, so the
+                # effect of that fix on real traffic cannot be measured.
+                #
+                # Internal only: this never reaches a guest, and the reply is
+                # our own text about their booking, already stored in
+                # `conversation_messages` whenever it is delivered. A refused
+                # one is the only kind that leaves no trace at all.
+                ctx.turn.telemetry.setdefault("guardrail", []).append({
+                    "reason": verdict.reason[:200],
+                    "refused_reply": reply[:400],
+                })
                 reply = prompts.handoff_reply(ctx)
                 handoff = True
                 error = f"guardrail: {verdict.reason}"
