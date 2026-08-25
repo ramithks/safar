@@ -143,6 +143,21 @@ def _field(row, name, default=None):
     return getattr(row, name, default)
 
 
+# Providers that are a list of scripted answers rather than a model.
+#
+# `EchoProvider` and its kin serve the e2e suites, and when their script runs out
+# they return `ModelStep(reply="", tokens_in=1, tokens_out=1)` — which reaches
+# this table as "the model produced no reply" and is indistinguishable from a
+# production failure. It was 80 of the 94 runs in that class, nine to one against
+# the real ones, and it made the largest reliability signal in the system a
+# measurement of our own test scripts.
+_SCRIPTED_PROVIDERS = frozenset({"echo", "scripted", "static"})
+
+
+def _is_scripted(run) -> bool:
+    return str(_field(run, "provider") or "").lower() in _SCRIPTED_PROVIDERS
+
+
 def diagnose(run, actions=None) -> Diagnosis:
     """
     Read a run and its actions and name the failure.
@@ -175,7 +190,20 @@ def diagnose(run, actions=None) -> Diagnosis:
         return Diagnosis(CONFIGURATION_ERROR, error[:200])
 
     # 4. The model said nothing usable.
+    #
+    # **Unless there was no model.** A scripted provider running out of script is
+    # a test bug, and counting it as a model failure is how this class came to be
+    # 39% of the taxonomy while the product's real share of it was nine runs.
+    #
+    # Deliberately narrow, and this is the line that keeps it from being a way to
+    # hide anything: only the *model-level* verdict is suppressed. A scripted run
+    # that hits a refused tool, a guardrail block, an inventory conflict or a
+    # broken configuration is a real finding about the product and is classified
+    # exactly as it would be on Vertex — every rule above and below this one runs
+    # on it unchanged.
     if _NO_REPLY.search(error):
+        if _is_scripted(run):
+            return Diagnosis(NONE, f"scripted provider ran out of script — {error[:120]}")
         return Diagnosis(MODEL_FAILURE, error[:200])
 
     # 4. What the tools themselves reported, most specific first. A refusal
@@ -229,6 +257,8 @@ def diagnose(run, actions=None) -> Diagnosis:
                              f"required but never called: {unmet}"[:200])
 
     if status == "failed" and error:
+        if _is_scripted(run):
+            return Diagnosis(NONE, f"scripted provider — {error[:120]}")
         return Diagnosis(MODEL_FAILURE, error[:200])
 
     # **An escalation is not a failure, and calling it one buries the number
@@ -251,6 +281,8 @@ def diagnose(run, actions=None) -> Diagnosis:
     if status == "escalated":
         return Diagnosis(NONE, "handed to a person, with nothing recorded against it")
     if status == "failed":
+        if _is_scripted(run):
+            return Diagnosis(NONE, "scripted provider, no error recorded")
         return Diagnosis(MODEL_FAILURE, "failed with no error recorded")
     return Diagnosis(NONE, "")
 

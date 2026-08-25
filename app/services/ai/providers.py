@@ -23,7 +23,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from app.services.ai.errors import ProviderError
+from app.services.ai.errors import AgentError, ProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -347,6 +347,7 @@ class EchoProvider:
 
     def __init__(self, script: list):
         self.script = list(script)
+        self.served = 0
         self.seen_messages: list[list[dict]] = []
         self.seen_tools: list[list[str]] = []
         self.seen_models: list[str] = []
@@ -357,8 +358,29 @@ class EchoProvider:
         self.seen_models.append(model)
 
         if not self.script:
-            return ModelStep(reply="", tokens_in=1, tokens_out=1)
+            # **An exhausted script is a test bug, and it used to look exactly
+            # like a production failure.**
+            #
+            # This returned `ModelStep(reply="", tokens_in=1, tokens_out=1)`,
+            # which the runtime reads as an empty completion and records as
+            # "the model produced no reply". Across ninety days that accounted
+            # for 80 of the 94 runs in that class — nine to one against the real
+            # ones — and it made the largest reliability signal in the system a
+            # measurement of our own e2e scripts. `tokens_in=1` was the only
+            # tell, and nothing was reading it.
+            #
+            # Raising is the fix, and it is the *smaller* change than it looks:
+            # `run_turn` catches everything, so a script that under-provides
+            # still ends in the same handoff it did before. What changes is that
+            # the run says why — a sentence naming the script rather than one
+            # blaming a model that was never called.
+            raise AgentError(
+                f"the scripted provider ran out after {self.served} step(s) — "
+                "the script is short, the model did not fail",
+                "I'm just checking on that — one moment.",
+            )
 
+        self.served += 1
         nxt = self.script.pop(0)
         if isinstance(nxt, str):
             return ModelStep(reply=nxt, tokens_in=10, tokens_out=5)
