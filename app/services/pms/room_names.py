@@ -255,6 +255,36 @@ def resolve(message: str, rooms: list[dict]) -> Resolution:
         return Resolution(candidates=tuple(contenders),
                           ask=_clarify([c.name for c in contenders]))
 
+    # **A name whose distinguishing words are also another room's is not
+    # distinguishing.**
+    #
+    # One real property in this database sells `deluxe room` and `deluxe king
+    # bed`. "room" is a stop word, so the first reduces to the single
+    # significant token `deluxe` — and a guest writing "deluxe chahiye" matched
+    # it completely, scored 1.0, and was sold `deluxe room` with no question
+    # asked. The second room needs three tokens and never entered the scoring at
+    # all, so there was no contender to trigger the margin rule.
+    #
+    # It is the exact situation the `exact` branch above already handles for
+    # "Garden Standard" inside "Garden Standard Twin" — the shorter name is not
+    # automatically the intended one — and the scored branch had no equivalent.
+    # The guest said a word that is true of two rooms. They have named neither.
+    #
+    # Only when the *other* room's significant tokens are a strict superset: a
+    # room whose name merely shares an adjective is already handled by the
+    # margin, and widening this further would start asking about "Pool Villa"
+    # because some other room happens to contain the word pool.
+    wanted_best = set(_significant(best.name))
+    also_true_of = [
+        room.get("name") for room in rooms
+        if str(room.get("id")) != best.room_type_id and room.get("name")
+        and wanted_best and wanted_best < set(_significant(room["name"]))
+    ]
+    if also_true_of:
+        return Resolution(
+            candidates=tuple(scored[:3]),
+            ask=_clarify([best.name, *(n for n in also_true_of if n)]))
+
     return Resolution(best.room_type_id, best.name, "fuzzy", tuple(scored[:3]))
 
 
