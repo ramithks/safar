@@ -201,6 +201,36 @@ _PEOPLE_BEFORE = re.compile(rf"(?<![a-z0-9])({_NUMBER})\s*{_PEOPLE_NOUN}", re.IG
 _PEOPLE_AFTER = re.compile(rf"{_PEOPLE_NOUN}\s*(?:hain?|hai|ke liye|for)?\s*({_NUMBER})(?![a-z0-9])",
                            re.IGNORECASE)
 
+# **"there are 12 of us", "we're 10 of us", "12 of us are coming".**
+#
+# The commonest way an English-speaking group says its size, and it names no
+# noun at all — so both patterns above, which are built around a word for
+# people, miss it entirely. A twelve-person enquiry raised no requirement and
+# reached no group pricing.
+#
+# Found by a long journey rather than a unit test: the guest opened with "we're
+# 10 people" (which was detected) and then corrected to "actually 12 of us now"
+# (which was not), so the band silently stopped following the party.
+#
+# `of us` is the whole signal, and it is unambiguous above one — there is no
+# other thing a hotel guest counts that way.
+#
+# **`one of us` is excluded, and it is not a rounding error.** It is idiomatic
+# English for "a member of our group" — *"one of us is vegetarian"*, *"one of us
+# arrives late"* — and reading it as a party of one would overwrite a party of
+# twelve on the session with a 1. A guest who really is alone says "just me" or
+# "1 adult", never "1 of us".
+_PEOPLE_OF_US = re.compile(rf"(?<![a-z0-9])({_NUMBER})\s+of\s+us(?![a-z0-9])",
+                           re.IGNORECASE)
+
+
+def _of_us(text: str) -> int | None:
+    for match in _PEOPLE_OF_US.finditer(text or ""):
+        value = _to_int(match.group(1))
+        if value and value > 1:
+            return value
+    return None
+
 # "group booking", "shaadi", "bulk" — a group with no number in the sentence.
 # It still requires the tool, because the answer is the hotel's bands and its
 # minimum, neither of which the model may state from memory.
@@ -264,7 +294,7 @@ def people_count(message: str) -> int | None:
             value = _to_int(match.group(1))
             if value:
                 return value
-    return None
+    return _of_us(text)
 
 
 # ── negotiation, as guests write it ──────────────────────────────────────────

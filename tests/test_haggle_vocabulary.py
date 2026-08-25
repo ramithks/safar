@@ -234,6 +234,38 @@ class TestAskingForAHuman:
 
 # ── the guest wants more than one room ──────────────────────────────────────
 
+COUNTS_PEOPLE = [
+    ("we are 10 people", 10), ("10 log hain", 10), ("4 adults", 4),
+    # "there are 12 of us" — the commonest way an English group says its size,
+    # and it names no noun at all, so both of the patterns built around a word
+    # for people missed it. A twelve-person enquiry raised no requirement and
+    # reached no group pricing. Found by a long journey: the guest opened with
+    # "we're 10 people" (detected) and corrected to "actually 12 of us now"
+    # (not), so the band silently stopped following the party.
+    ("there are 12 of us", 12), ("actually 12 of us now", 12),
+    ("we're 10 of us", 10), ("12 of us are coming", 12), ("2 of us", 2),
+]
+
+NOT_A_PARTY_SIZE = [
+    # Idiomatic English for "a member of our group". Reading it as a party of
+    # one would overwrite a party of twelve on the session with a 1, and a guest
+    # who really is alone says "just me" or "1 adult".
+    "one of us is vegetarian",
+    "1 of us needs a cot",
+    "one of us arrives late",
+]
+
+
+class TestCountingPeople:
+    @pytest.mark.parametrize("message,expected", COUNTS_PEOPLE)
+    def test_the_party_size_is_read(self, message, expected):
+        assert ra.people_count(message) == expected, message
+
+    @pytest.mark.parametrize("message", NOT_A_PARTY_SIZE)
+    def test_and_an_idiom_is_not_a_count(self, message):
+        assert ra.people_count(message) is None, message
+
+
 WANTS_ROOMS = [
     ("5 rooms chahiye", 5), ("5 kamre chahiye", 5), ("5 room chaye", 5),
     ("need 5 rooms", 5), ("humein 5 rooms chahiye", 5),
