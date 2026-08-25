@@ -717,6 +717,14 @@ async def negotiate_rate(args: NegotiateArgs, ctx: AgentContext) -> tuple[dict, 
 
     payload = decision.as_dict()
     payload["currency"] = "INR"
+    # Which scope's rule priced this, for the record. Deliberately not in
+    # `payload`: it names our configuration, which is not a thing to put in a
+    # model's context. See ToolOutcome.telemetry.
+    ctx.turn.telemetry.setdefault("negotiation", []).append({
+        "rule_source": decision.rule_source,
+        "verdict": decision.verdict,
+        "degraded": decision.rule_source in negotiation.DEGRADED,
+    })
     # What the guest asked for, returned rather than dropped.
     #
     # Not for the model's benefit — it just said it — but for the reply

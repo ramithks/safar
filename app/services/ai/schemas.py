@@ -270,6 +270,21 @@ class ToolOutcome:
     # services/ai/registry.execute.
     idempotency_key: str | None = None
 
+    # Facts about *how* this result was arrived at, for the record and never for
+    # the model.
+    #
+    # **The distinction is the point.** `output` goes into the model's context
+    # and into the audit row; this goes only into the row. Which negotiation
+    # rule priced a stay — the rate plan's, the room's, the hotel's ceiling, or
+    # the conservative default because a read failed — is exactly the kind of
+    # fact somebody needs six weeks later and the model must never see: it is a
+    # sentence about our configuration, and the guardrail refuses those in a
+    # reply for good reason.
+    #
+    # A dict rather than a column, folded into `agent_runs.required_actions` by
+    # the runtime, so a new kind of provenance needs no migration.
+    telemetry: dict = field(default_factory=dict)
+
     # Who decided this call happened: the model, or the application forcing a
     # requirement the model did not meet.
     #

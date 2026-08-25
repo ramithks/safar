@@ -32,7 +32,7 @@ manager pressed a button on without reading.
 Nothing here is a table. See migration 16, §4, for why.
 """
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from app.db.client import get_db, run_db
 from app.services.pms.pricing import DEFAULT_MAX_DISCOUNT_PCT, resolve_property_limits
@@ -72,6 +72,10 @@ class NegotiationPolicy:
     approved_max_pct: int
     reasons: tuple[str, ...]
     token_pct: int
+    # True when this policy is the conservative default because a read failed,
+    # rather than because the hotel configured it. Carried so a fallback is
+    # observable and not merely safe — see EMERGENCY_DEFAULT.
+    degraded: bool = False
 
     @property
     def negotiable(self) -> bool:
@@ -82,7 +86,7 @@ class NegotiationPolicy:
         return self.approved_max_pct if approved else self.auto_max_pct
 
 
-def resolve(settings: dict | None) -> NegotiationPolicy:
+def resolve(settings: dict | None, *, degraded: bool = False) -> NegotiationPolicy:
     """
     Read the policy off `properties.settings`, forgivingly.
 
@@ -131,6 +135,7 @@ def resolve(settings: dict | None) -> NegotiationPolicy:
         approved_max_pct=approved,
         reasons=reasons,
         token_pct=token,
+        degraded=degraded,
     )
 
 
@@ -153,10 +158,12 @@ async def for_property(property_id: str) -> NegotiationPolicy:
     try:
         return resolve(await run_db(_read_settings, property_id))
     except Exception:  # noqa: BLE001
-        logger.warning("could not read negotiation policy for %s", property_id, exc_info=True)
+        logger.warning("could not read negotiation policy for %s — falling back to "
+                       "the conservative default", property_id, exc_info=True)
         # The conservative default, not the property's. A settings read that
         # failed must never widen what the agent may do.
-        return resolve({"max_discount_pct": DEFAULT_MAX_DISCOUNT_PCT})
+        return resolve({"max_discount_pct": DEFAULT_MAX_DISCOUNT_PCT},
+                       degraded=True)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -291,7 +298,34 @@ def _as_date(value) -> date | None:
         return None
 
 
-def rules_from_settings(policy: NegotiationPolicy) -> Rules:
+# ── where a rule came from ───────────────────────────────────────────────────
+#
+# **A safe fallback has to be observable, and this one was not.** For weeks every
+# call to `_read_rules` raised `AttributeError` in the test fixture and fell
+# through to `rules_from_settings` — deliberately, because a failed read must
+# never widen what the agent may give away. Nothing broke, nothing failed, and
+# the per-room-type and per-rate-plan rules had no test in the suite that
+# reached them. It was found in a debugging trace, not by anything watching.
+#
+# The failure mode this makes visible is worse in production than in a fixture:
+# a hotel that has configured a strict floor on its suites, and a database read
+# that fails, gets the *hotel-wide* ceiling instead — a safe direction, and
+# still not the rules the hotelier set. Silently.
+#
+# So the source is named, it distinguishes "nobody configured anything" from
+# "we could not find out", and it rides out with the decision.
+RATE_PLAN_RULE = "rate_plan"          # this plan's own rule
+ROOM_TYPE_RULE = "room_type"          # this room's own rule
+PROPERTY_RULE = "property"            # a hotel-wide rule row
+HOTEL_DEFAULT = "settings"            # no rule row; the hotel's ceiling
+EMERGENCY_DEFAULT = "emergency"       # we could not read, and fell back
+
+# The sources that mean the answer is not the one the hotelier configured.
+DEGRADED = frozenset({EMERGENCY_DEFAULT})
+
+
+def rules_from_settings(policy: NegotiationPolicy,
+                        source: str = HOTEL_DEFAULT) -> Rules:
     """
     The rules a hotel has when it has configured none.
 
@@ -302,7 +336,7 @@ def rules_from_settings(policy: NegotiationPolicy) -> Rules:
     """
     return Rules(
         enabled=True,
-        source="settings",
+        source=source,
         floor_pct=None,
         floor_paise=None,
         target_pct=None,
@@ -381,11 +415,21 @@ async def rules_for(
     away.
     """
     fallback = resolve(settings) if settings is not None else await for_property(property_id)
+    if fallback.degraded:
+        # The *settings* read failed, so there is no point asking for rule rows
+        # against a policy we could not establish. One failure, one honest
+        # answer, rather than a rule row applied on top of a ceiling we guessed.
+        return rules_from_settings(fallback, EMERGENCY_DEFAULT)
     try:
         rows = await run_db(_read_rules, property_id, rate_plan_id, room_type_id)
     except Exception:  # noqa: BLE001
-        logger.warning("could not read negotiation rules for %s", property_id, exc_info=True)
-        return rules_from_settings(fallback)
+        # **Named, not just logged.** The fallback direction is unchanged — a
+        # read that failed must never widen what may be given away — and now the
+        # decision carries the fact that it is a fallback, so a hotel whose
+        # suite rules stopped applying is visible rather than merely safe.
+        logger.warning("could not read negotiation rules for %s — falling back to "
+                       "the hotel ceiling", property_id, exc_info=True)
+        return rules_from_settings(fallback, EMERGENCY_DEFAULT)
     return select_rules(rows, rate_plan_id, room_type_id, fallback)
 
 
@@ -445,6 +489,18 @@ class Decision:
     # above. A boolean, never a number: "a manager might do better" is safe to
     # act on, "a manager could go to ₹4,100" is the floor with extra steps.
     approval_available: bool = False
+    # **Which rule produced this, and whether it is the one the hotelier set.**
+    #
+    # `rule_source` is one of RATE_PLAN_RULE, ROOM_TYPE_RULE, PROPERTY_RULE,
+    # HOTEL_DEFAULT or EMERGENCY_DEFAULT. A hotel that has configured a strict
+    # floor on its suites and gets the hotel-wide ceiling instead — because a
+    # read failed — is a safe outcome and still the wrong rules, and until this
+    # existed the two were indistinguishable in every record we keep.
+    #
+    # Not a number and not the floor: this is the *name of a scope*, which
+    # leaks nothing a guest could use. See the note on this class about why no
+    # field here is the floor.
+    rule_source: str = HOTEL_DEFAULT
 
     nights: int = 0
     units: int = 0
@@ -722,7 +778,7 @@ async def negotiate(
             verdict="rejected", reason=refusal,
             published_total_paise=gross,
             published_nightly_paise=round(gross / nights / units),
-            nights=nights, units=units,
+            nights=nights, units=units, rule_source=rules.source,
         )
 
     # Negotiating a room nobody can have is worse than refusing to: the guest
@@ -756,13 +812,17 @@ async def negotiate(
         # that, through the same branch, with no special case to keep in step.
         wanted = 0
 
-    return decide(
+    priced = decide(
         gross_paise=gross,
         requested_total_paise=wanted,
         rules=rules,
         nights=nights,
         units=units,
     )
+    # `decide` is pure and knows the rules but not where they came from — the
+    # scope resolution happened two frames up. Stamped here, once, so every
+    # branch of `decide` carries it without each one having to remember.
+    return replace(priced, rule_source=rules.source)
 
 
 def _read_plan(property_id: str, rate_plan_id: str) -> list[dict]:

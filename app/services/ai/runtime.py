@@ -349,6 +349,10 @@ async def run_turn(
     # than in the tool's arguments. See services/ai/arbiter.py and
     # services/ai/context.py:TurnState.
     ctx.turn.live = True
+    # Cleared, not appended to. A context reused across turns — which the
+    # console does — would otherwise report the previous turn's rule scopes
+    # against this one's run.
+    ctx.turn.telemetry = {}
     ctx.turn.message = message
     ctx.turn.requirements = tuple(requirements)
     ctx.turn.outcomes = outcomes
@@ -1087,6 +1091,12 @@ async def run_turn(
     # is the number the greeting narrowing moves and the number that explains a
     # turn's input tokens.
     summary_of_requirements["tools_available"] = len(tools)
+    if ctx.turn.telemetry:
+        # How the turn's business facts were arrived at — which negotiation rule
+        # scope applied, and whether any of it was a fallback because a read
+        # failed. §4: a safe fallback has to be observable, and this is the
+        # column somebody queries to see one.
+        summary_of_requirements["provenance"] = ctx.turn.telemetry
     if recovery_log:
         # Every rung climbed this turn, and what came of it. §10 asks for
         # `attempt`, `fallback_used`, `failure_class` and `recovery_method` to
