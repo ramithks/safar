@@ -21,6 +21,10 @@ problem. **P2** is performance, UX or maintainability.
 | 6 | P1 | `"thanks"` loading all 38 tool schemas | 7,607 tokens measured on one of the commonest turns | **Closed.** 823 tokens. `"ok"` deliberately excluded — it can mean *yes, book it* |
 | 7 | P1 | Test double cannot express what production queries | `or_` and `lt` were missing and made whole paths untestable — twice | **Bounded.** Every operator the StayOS guest path uses is now expressible. `maybe_single` (51 sites) is marketplace-only |
 | 8 | P2 | Beat guards assumed one task prefix | My own new task tripped three of them | **Closed.** Both StayOS prefixes accepted; the task is routed |
+| 9 | P1 | A guardrail block keeps no record of what it refused | 0 of 30 blocks retain the reply text. §17 asks *why did StayOS say this?* and for the largest failure class on product traffic there is no answer without a log search on a run id nobody has | **Closed.** The refused reply rides the internal telemetry channel into `agent_runs.required_actions`; never in model context, never sent |
+| 10 | P1 | The evaluation marked a model unsafe by a rule the product does not enforce | Gemini 2.5 failed the promotion gate on `leaked_ids = 2`; both were payment links, which the guardrail deliberately allows by masking URLs first | **Closed.** The scorer calls `_internal_leak` rather than re-walking the pattern list; a test asserts the two never disagree on any reply |
+| 11 | P1 | A quarter of the 3.x column was not 3.x | 11 of 44 turns finished on the fallback tier after two empty completions, all stamped with the configured model | **Closed.** `RunResult.served_by` carries every model the turn touched |
+| 12 | P1 | `"checkout kitne baje hai?"` read as a request for a price | The matrix's *control* turn required a business action on 4/4 runs on **both** model families — the signature of a system bug charged to a model | **Closed.** The clock phrase is stripped before price words are looked for, so a message asking both still asks a price |
 
 ---
 
@@ -104,3 +108,14 @@ its own definition, and the report says so.
 - Whether the redundant-call fix moved the real `search_availability → get_stay_options` pair count.
 - Guardrail block rate after the upstream fixes.
 - Real p50/p95 under production concurrency rather than a serial evaluation.
+- **Whether Gemini 3.x's empty-completion rate holds at production volume.** It needed the
+  fallback tier on 11 of 44 evaluation turns against 3 of 44 for Gemini 2.5 — roughly
+  3.5×, on 44 turns each. Guest-visible outcome was nothing: every one recovered and no
+  turn failed. But the ladder is the whole of what stands between that rate and a silent
+  turn, and 44 turns cannot tell you whether the rate is 25% or noise.
+- Whether the promotion gate's `invalid_handoff_rate ≤ 2%` is measurable at all at the
+  sample sizes actually run. At n=43 the smallest non-zero value the metric can take is
+  2.3%, so the gate is not a 2% threshold on that sweep — it is a demand for zero. Gemini
+  3.x failed it on exactly one turn, an adversarial jailbreak on which the arbiter refused
+  a handoff *correctly*. Either the gate needs a sample that can resolve it, or the metric
+  needs to stop counting the arbiter's refusals against the model on adversarial turns.
