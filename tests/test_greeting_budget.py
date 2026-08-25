@@ -181,3 +181,81 @@ class TestTheFlagComesFromTheClassifier:
             agent_type="guest", message="hi", history=None,
         ))
         assert decided.opening is False
+
+
+# ── and the turn that closes ────────────────────────────────────────────────
+
+class TestAClosingCostsNothingEither:
+    """
+    **"thanks" cost the full catalogue** — 38 tool schemas, about 7,600 input
+    tokens, on a word that asks for nothing. It is not a greeting, so the
+    opening shortcut never saw it; it classifies as `guest_conversation`, which
+    narrows nothing on purpose because that task is also the fallback for
+    anything the classifier could not read. It is among the commonest turns a
+    hotel receives.
+    """
+
+    @pytest.mark.parametrize("message", [
+        "thanks", "thank you", "Thanks!", "thx", "ty",
+        "shukriya", "dhanyawad", "धन्यवाद",
+        "bye", "goodbye", "alvida", "ok thanks",
+    ])
+    def test_gratitude_and_farewell_need_no_tools(self, message):
+        assert classify.is_closing(message), message
+        assert toolsets.for_task("guest_conversation", GRANTED,
+                                 opening=True) == (GRANTED & toolsets.CORE)
+
+    @pytest.mark.parametrize("message", [
+        # **The list is narrow and the narrowness is doing real work.** A bare
+        # "ok" after "shall I send you the payment link?" means yes, and a menu
+        # cut to CORE would have taken the payment tool off that turn.
+        "ok", "okay", "haan", "theek hai", "sure", "yes", "hmm",
+        # And anything carrying a question is not a closing at all.
+        "thanks, and what time is check-in?",
+        "thanks but actually 3 rooms",
+        "ok book it",
+    ])
+    def test_but_an_acknowledgement_is_not_a_closing(self, message):
+        assert not classify.is_closing(message), message
+
+    def test_a_closing_still_has_what_it_needs_to_answer(self):
+        """
+        "You're welcome, see you on the 14th" needs the hotel's own name and a
+        way to send. It does not need nineteen ways to price a stay.
+        """
+        kept = toolsets.for_task("guest_conversation", GRANTED, opening=True)
+        assert {"send_message", "request_human_handoff", "get_property"} <= kept
+
+    def test_the_saving_is_the_size_it_was_claimed_to_be(self):
+        before = tokens(registry.describe_for_provider(ctx(), task="guest_conversation"))
+        after = tokens(registry.describe_for_provider(ctx(), task="guest_conversation",
+                                                      opening=True))
+        assert after < before * 0.25, f"{before} → {after}"
+
+    def test_a_closing_needs_no_model_to_route_it(self):
+        """
+        Same shortcut as a greeting: no classifier call, so the cheapest turn in
+        the system also stops paying for a round trip to decide what it is.
+        """
+        import asyncio
+
+        class Exploding:
+            name = "never"
+
+            async def step(self, **_kwargs):  # pragma: no cover - must not run
+                raise AssertionError("a closing must not reach the model")
+
+        decided = asyncio.run(classify.ModelClassifier(Exploding()).classify(
+            agent_type="guest", message="thanks",
+            history=[{"role": "assistant", "content": "Booking confirm ho gayi."}]))
+        assert decided.opening is True
+        assert decided.source == "default"
+
+    def test_and_unlike_a_greeting_it_does_not_need_an_empty_thread(self):
+        """
+        A greeting is only a greeting on turn one — "hi" later may be answering
+        something. A closing has history by definition, so what makes it safe is
+        the list rather than the thread being empty.
+        """
+        assert classify.is_closing("thanks")
+        assert not classify.is_opening("thanks")

@@ -259,6 +259,14 @@ MUTANTS = [
            "rooms on a guest reporting a fault",
            "tests/test_room_numbers.py"),
 
+    Mutant("catalogue", "an acknowledgement is treated as a closing",
+           "app/services/ai/classify.py",
+           '    "ok thanks", "okay thanks", "thanks bhai", "thank you so much",',
+           '    "ok thanks", "okay thanks", "thanks bhai", "thank you so much", "ok", "haan",',
+           "\"ok\" after \"shall I send the payment link?\" loses the payment "
+           "tool from the menu, and the sale stops there",
+           "tests/test_greeting_budget.py"),
+
     # ── business-rule provenance ────────────────────────────────────────────
     Mutant("provenance", "a failed rule read stops being distinguishable",
            "app/services/pms/negotiation.py",
