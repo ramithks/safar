@@ -287,6 +287,61 @@ def diagnose(run, actions=None) -> Diagnosis:
     return Diagnosis(NONE, "")
 
 
+# ── how a turn ended, as one word ───────────────────────────────────────────
+#
+# §10 asks for metrics that distinguish these, and it asks for one thing
+# specifically: *"do not call successful handoffs failures."* `diagnose` above
+# answers "what went wrong"; this answers "how did it end", which is the
+# question a dashboard actually shows.
+#
+# `RECOVERED` is the one that did not exist before the ladder. A turn that got a
+# blank answer, asked again, and then answered the guest is not a success in the
+# same sense as one that never stumbled — the guest cannot tell, but the rate is
+# how anybody knows the ladder is doing anything, and folding it into SUCCESS
+# would make the work invisible on the day it stops working.
+
+SUCCESS = "SUCCESS"          # answered, first time
+RECOVERED = "RECOVERED"      # answered, but the ladder was climbed to get there
+HANDOFF = "HANDOFF"          # a person has it, correctly
+SAFETY_BLOCK = "SAFETY_BLOCK"  # the guardrail stopped the reply
+FAILURE = "FAILURE"          # everything diagnose() calls a real fault
+NOT_PRODUCT = "NOT_PRODUCT"  # an e2e script, not a guest
+
+OUTCOMES = (SUCCESS, RECOVERED, HANDOFF, SAFETY_BLOCK, FAILURE, NOT_PRODUCT)
+
+
+def outcome(run, actions=None) -> str:
+    """
+    How this turn ended, in the vocabulary a dashboard groups by.
+
+    **`NOT_PRODUCT` is its own answer and not a kind of success**, which is the
+    correction that made this function worth writing. Suppressing a scripted
+    run's *failure* and then letting it land in SUCCESS replaces "we counted our
+    test scripts as failures" with "we counted them as wins" — the same mistake
+    inverted, and harder to notice because the graph looks better. A run on a
+    scripted provider is not a guest turn at all, and the honest thing is to say
+    so and let the dashboard filter it.
+    """
+    if _is_scripted(run):
+        return NOT_PRODUCT
+
+    diagnosis = diagnose(run, actions)
+    if diagnosis.category == GUARDRAIL_BLOCK:
+        return SAFETY_BLOCK
+
+    status = str(_field(run, "status") or "")
+    if diagnosis.category not in (NONE,):
+        return FAILURE
+    if status == "escalated":
+        return HANDOFF
+
+    required = _field(run, "required_actions") or _field(run, "requirements") or {}
+    climbed = (required or {}).get("recovery") if isinstance(required, dict) else None
+    if climbed:
+        return RECOVERED
+    return SUCCESS
+
+
 def tally(rows) -> dict[str, int]:
     """
     Counts by category, in a fixed order.

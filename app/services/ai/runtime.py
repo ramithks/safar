@@ -1035,6 +1035,12 @@ async def run_turn(
         # is the turn's story, it is absent on virtually every turn, and a
         # column that is null 99% of the time is a column nobody queries.
         summary_of_requirements["language_slips"] = language_slips[:10]
+    # §10 asks for `tools_available` per turn. One integer rather than the list:
+    # the names are derivable from the agent's grants and the task, and what
+    # nobody could answer before is "how big was the menu on this turn" — which
+    # is the number the greeting narrowing moves and the number that explains a
+    # turn's input tokens.
+    summary_of_requirements["tools_available"] = len(tools)
     if recovery_log:
         # Every rung climbed this turn, and what came of it. §10 asks for
         # `attempt`, `fallback_used`, `failure_class` and `recovery_method` to
