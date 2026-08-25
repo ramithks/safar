@@ -642,6 +642,11 @@ async def run_turn(
                 outcome = await registry.execute(
                     requirement.tool, dict(requirement.arguments or {}), ctx
                 )
+                # Stamped on the outcome, not only on the row that records it.
+                # `session.patch_from` reads the outcomes and has to know which
+                # of them are the guest speaking and which are the application
+                # repeating itself.
+                outcome.decision_source = "application"
                 seq += 1
                 outcomes.append(outcome)
                 forced.append(requirement.tool)
@@ -665,7 +670,7 @@ async def run_turn(
                     turn_usage.count(spec.usage_type)
                 action_id = await run_db(
                     _write_action, ctx, run_id, seq, outcome,
-                    "application", requirement.intent,
+                    outcome.decision_source, requirement.intent,
                 )
                 await run_db(link_result, outcome, action_id)
                 if spec and action_id:

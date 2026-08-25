@@ -77,9 +77,35 @@ def patch_from(outcomes: list) -> dict:
     patch: dict = {}
     stage: str | None = None
 
-    for outcome in outcomes or []:
-        if not getattr(outcome, "ok", False):
-            continue
+    # **A forced call may fill a gap; it may never overwrite.**
+    #
+    # The bug: a guest three turns into a booking wrote *"actually 4 tareekh se
+    # 6 tareekh kar do"*. The model called `get_stay_options` with the new
+    # dates, correctly. Then the required-action layer forced `negotiate_rate`,
+    # whose arguments it had built from the *stored* session — the old dates —
+    # and because this loop takes the last value it sees, the patch carried the
+    # September dates the guest had just moved away from. The session went
+    # backwards, and every later prompt told the model the guest was staying on
+    # nights they had already changed.
+    #
+    # Ordering is the wrong rule here, and so is ignoring forced calls
+    # altogether: `get_group_rates` is forced with `units: 5` read straight out
+    # of "5 kamre chahiye", which is the freshest fact on the turn and must
+    # land. What separates the two is not the tool but where the argument came
+    # from — the guest's sentence, or the session the guest is contradicting.
+    #
+    # So the model's own calls are processed first and in order, and the forced
+    # ones afterwards fill only what nothing else established this turn. A
+    # forced argument taken from stale state then loses to the fresh one beside
+    # it, and a forced argument nobody else supplied still lands.
+    ordered = sorted(
+        (o for o in (outcomes or []) if getattr(o, "ok", False)),
+        key=lambda o: getattr(o, "decision_source", "model") == "application",
+    )
+    established: set[str] = set()
+
+    for outcome in ordered:
+        forced = getattr(outcome, "decision_source", "model") == "application"
         tool = getattr(outcome, "tool", "") or ""
 
         if tool in _BUSINESS_TOOLS:
@@ -91,8 +117,13 @@ def patch_from(outcomes: list) -> dict:
 
         args = getattr(outcome, "input", None) or {}
         for field in _STAY_ARGS:
-            if args.get(field) is not None:
-                patch[field] = args[field]
+            if args.get(field) is None:
+                continue
+            if forced and field in established:
+                continue
+            patch[field] = args[field]
+            if not forced:
+                established.add(field)
 
         # The room this turn was about, whichever tool was asked.
         #
@@ -102,8 +133,10 @@ def patch_from(outcomes: list) -> dict:
         # between choosing a room and pricing it are exactly where the choice
         # used to be lost. A later `get_quote` overwrites it, which is right:
         # a priced room outranks a discussed one.
-        if args.get("room_type_id"):
+        if args.get("room_type_id") and not (forced and "room_type_id" in established):
             patch["room_type_id"] = args["room_type_id"]
+            if not forced:
+                established.add("room_type_id")
 
         output = getattr(outcome, "output", None)
         if not isinstance(output, dict):

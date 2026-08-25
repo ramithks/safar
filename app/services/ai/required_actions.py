@@ -304,7 +304,25 @@ _NEGOTIATION = (
         r"sasta|saste|kam se kam|negotiat\w*|"
         r"koi offer|kuch offer|any offer|special offer|offer chal|"
         r"special rate|special price|"
-        r"adjust kar|kar do|kardo)(?![a-z0-9])",
+        # **`kar do` alone was here and it is simply "do it".**
+        #
+        # Measured against the ways guests actually use it: "book kar do",
+        # "cancel kar do", "confirm kar do", "check in 2 baje kar do",
+        # "breakfast add kar do" and a date change written as "4 tareekh se 6
+        # tareekh kar do" were every one of them read as a haggle. Each opens a
+        # negotiation, takes a hold, and can volunteer a discount to a guest who
+        # never asked for one.
+        #
+        # Nothing is lost by removing it, which is the test of a pattern this
+        # loose: every genuine haggle in that set is already matched by a word
+        # that is actually about lowering a price — `kam kar` for "kam kar do",
+        # `discount` for "discount kar do", and `_OFFERED_PRICE_BEFORE_VERB`
+        # for "4000 kar do". The bare verb was carrying only false positives.
+        #
+        # Found by tests/test_conversation_corpus.py, where a guest changing
+        # their dates triggered a negotiation and the negotiation then wrote
+        # the *old* dates back over the new ones.
+        r"adjust kar)(?![a-z0-9])",
         re.IGNORECASE,
     ),
     re.compile(r"कम कर|छूट|सस्ता|महंगा|कम से कम|आखिरी (?:रेट|दाम)"),

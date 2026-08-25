@@ -270,6 +270,18 @@ class ToolOutcome:
     # services/ai/registry.execute.
     idempotency_key: str | None = None
 
+    # Who decided this call happened: the model, or the application forcing a
+    # requirement the model did not meet.
+    #
+    # It was already written to `agent_actions.decision_source` by the runtime,
+    # which knew it at the call site and did not put it anywhere the *outcome*
+    # could be read from later. That mattered: a forced call's arguments are
+    # built from the stored session, so they are the system repeating what it
+    # already believed rather than evidence of what the guest just said — and
+    # `messaging/session.patch_from` had no way to tell the two apart. See the
+    # comment there.
+    decision_source: str = "model"
+
     @property
     def ok(self) -> bool:
         return self.status in ("executed", "replayed")
