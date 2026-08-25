@@ -782,6 +782,42 @@ def _valid_dates(stay: dict) -> bool:
         return False
 
 
+# Somewhere to sleep. What has to be present before a headcount may become a
+# room count — see `_group_requirement`.
+_STAY_WORDS = re.compile(
+    r"(?<![a-z0-9])(?:room|rooms|kamra|kamre|kamrey|suite|villa|cottage|"
+    r"stay|staying|night|nights|raat|raate|book|booking|reservation|"
+    r"check-?in|accommodation|thehr|rukna|rukenge)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _headcount_is_about_a_facility(message: str | None) -> bool:
+    """
+    Is this number of people about somewhere to sleep, or about the restaurant?
+
+    **A headcount is not a room count, and two detectors have to know it.**
+    `room_number` established the rule for "room 204 mein AC nahi chal raha".
+    This is the other end: "5 log breakfast ke liye aayenge" — five people
+    coming *to breakfast* — raised a group booking for three rooms, a quote to
+    price them, and a party-size change on the session.
+
+    Both detectors reach the same wrong conclusion from the same inference, so
+    the guard lives in one place rather than twice. It applies only to the
+    *inferred* leap: a guest who names rooms has named rooms, and a guest who
+    says "group" has said what they mean. It is turning people into rooms that
+    needs them to be talking about a stay, and a sentence whose only other
+    subject is a facility is talking about the facility.
+    """
+    from app.services.ai import intent as intent_mod
+
+    text = message or ""
+    return bool(
+        intent_mod._matches(text, intent_mod._AMENITY, intent_mod._AMENITY_HI)
+        and not _STAY_WORDS.search(text)
+    )
+
+
 def _group_requirement(message: str, session: dict | None) -> Requirement | None:
     rooms = room_count(message)
     people = people_count(message)
@@ -800,6 +836,24 @@ def _group_requirement(message: str, session: dict | None) -> Requirement | None
     )
     if not enough:
         return None
+
+    # **A headcount is not a room count, and this is the second place that has
+    # to be true.**
+    #
+    # `room_number` established the rule for "room 204 mein AC nahi chal raha".
+    # This is the other end of it: "5 log breakfast ke liye aayenge" — five
+    # people are coming *to breakfast* — raised a group booking for three rooms
+    # and a quote to price them, because a headcount above the threshold is
+    # normally the strongest signal there is.
+    #
+    # It is only ever inferred. A guest who says a number of *rooms* has named
+    # rooms, and a guest who used a group word has said what they mean. It is
+    # the leap from people to rooms that needs the guest to be talking about
+    # somewhere to sleep, and a sentence whose only other subject is a facility
+    # is talking about the facility.
+    if source == "people" and rooms is None and not worded:
+        if _headcount_is_about_a_facility(message):
+            return None
 
     if units is None:
         # "group booking ke liye baat karni hai" with no number. The stay we
@@ -1205,7 +1259,8 @@ def detect(message: str, session: dict | None = None) -> list[Requirement]:
                               "negotiate_rate", "get_group_rates"},
                              "guest named dates"))
 
-    if people_count(text) is not None and not group:
+    if (people_count(text) is not None and not group
+            and not _headcount_is_about_a_facility(text)):
         found.append(_simple(GUEST_COUNT_CHANGE, "get_stay_options",
                              {"get_stay_options", "search_availability", "get_quote",
                               "get_group_rates", "get_room_types"},

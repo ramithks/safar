@@ -310,3 +310,108 @@ class TestTwoQuestionsInOneMessage:
     def test_a_person_asked_for_alongside_anything_else_wins(self):
         assert intent.category(
             "rate kya hai? aur kisi se baat karni hai") == intent.ESCALATION
+
+
+# ── the audit: every detector, probed with its own keywords ─────────────────
+
+class TestNoDetectorFiresOnAKeywordAlone:
+    """
+    The brief asks for the whole required_action system to be audited for the
+    failure the breakfast turn exposed. This is that audit, kept as a test:
+    each detector is given messages containing exactly the words it looks for,
+    used in a sense that requires no business action.
+
+    Five of thirty-four probes survived the first pass. Three were real and are
+    fixed. Two are deliberately left, and are asserted here as they stand so
+    that a future change to either is a decision rather than an accident.
+    """
+
+    @pytest.mark.parametrize("message", [
+        # escalation words, no request for a person
+        "the manager was lovely",
+        "reception staff were helpful",
+        "I'll call you later",
+        # cancellation words, no cancellation
+        "what is your cancellation policy?",
+        "refund policy kya hai?",
+        "I cancelled my flight, not the hotel",
+        "cancellation charges kitne hote hain generally?",
+        # status words, no booking question
+        "payment counter kahan hai?",
+        # group words, no group booking
+        "10 log ka restaurant mein table milega?",
+        "5 log breakfast ke liye aayenge",
+        # negotiation words, no haggle
+        "free wifi hai?",
+        "is parking free?",
+        "complimentary breakfast hai?",
+        # payment words, no payment
+        "kya card payment accept karte ho?",
+        "payment ke liye kya options hain?",
+        # date words, no stay
+        "is the pool open tomorrow?",
+        "kal breakfast milega?",
+        "tomorrow ka weather kaisa hai?",
+        # headcount words, no party
+        "2 log restaurant mein baith sakte hain?",
+        # price words, no stay to price
+        "laundry ka charge kitna hai?",
+        "airport kitni door hai?",
+    ])
+    def test_a_keyword_in_an_innocent_sentence_requires_nothing(self, message):
+        found = required_actions.detect(message)
+        assert found == [], f"{message!r} required {[r.intent for r in found]}"
+
+    def test_a_headcount_beside_a_facility_is_not_a_group_booking(self):
+        """
+        The rule `room_number` established, from the other end. "5 log
+        breakfast ke liye aayenge" is five people coming *to breakfast*, and it
+        raised a group booking for three rooms plus a quote to price them.
+
+        Only the *inferred* leap is blocked. A guest who names rooms has named
+        rooms, and a guest who says "group" has said what they mean.
+        """
+        assert "GROUP_BOOKING" not in {
+            r.intent for r in required_actions.detect("5 log breakfast ke liye aayenge")}
+        for still_a_group in ("5 kamre chahiye, 10 log aa rahe hain",
+                              "we need rooms for 10 people next month",
+                              "group booking ke liye baat karni hai",
+                              "10 people staying, breakfast included?",
+                              "हमें 5 कमरे चाहिए, 10 लोग आ रहे हैं"):
+            assert "GROUP_BOOKING" in {
+                r.intent for r in required_actions.detect(still_a_group)}, still_a_group
+
+
+class TestTheTwoLeftAlone:
+    """
+    Two probes still raise a requirement and both are judgement calls rather
+    than defects. Asserted as they are so a change to either is deliberate.
+    """
+
+    def test_an_unattached_group_of_ten_still_offers_group_rates(self):
+        """
+        "we are a group of 10 sightseeing tomorrow" raises GROUP_BOOKING.
+
+        Strictly it is a statement, not a request. Left because the cost is
+        asymmetric in the useful direction: `get_group_rates` is a read that
+        takes no hold and moves no stock, and a hotel told that ten people are
+        coming would rather its agent knew the band than not. The failure it
+        risks is an unprompted offer; the failure it prevents is missing the
+        largest booking of the week.
+        """
+        assert "GROUP_BOOKING" in {r.intent for r in required_actions.detect(
+            "we are a group of 10 sightseeing tomorrow")}
+
+    def test_asking_the_fee_to_change_rooms_still_prices_the_stay(self):
+        """
+        "room change karne ka charge?" raises QUOTE_REQUIRED.
+
+        The guest asked for a change fee and what they will be handed is a stay
+        price, which is not the same number. Left because the category is
+        MUTATION and a modification does genuinely need re-pricing — the tool
+        that answers a change fee properly does not exist yet, and forcing the
+        nearest read is better than forcing nothing while the model invents a
+        figure. Worth revisiting when there is a fee tool to route it to.
+        """
+        assert "QUOTE_REQUIRED" in {r.intent for r in required_actions.detect(
+            "room change karne ka charge?")}

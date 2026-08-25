@@ -107,8 +107,16 @@ _AMENITY = re.compile(
     # asked the front desk a question, not the booking engine.
     r"shuttle|cab|taxi|airport|station|atm|bank|pharmacy|chemist|"
     r"hospital|market|mall|temple|beach|nearby|near by|paas mein|aas ?paas|"
-    r"smoking|alcohol|"
-    r"cancellation policy|refund policy|policy|policies|niyam|"
+    # Things a guest asks a front desk that have nothing to do with a
+    # booking. "tomorrow ka weather kaisa hai?" was forcing an availability
+    # search, because "tomorrow" is a date.
+    r"smoking|alcohol|weather|mausam|temperature|garmi|thand|barish|rain|"
+    # The *terms*, which are a property fact. Cancelling is a mutation and
+    # is matched by `_CHANGES_A_BOOKING`; asking what it would cost in
+    # general is a question the front desk answers.
+    r"cancellation policy|cancellation charge|cancellation charges|"
+    r"cancellation fee|cancellation ke charge|refund policy|policy|"
+    r"policies|niyam|terms|"
     r"address|location|located|pata|kahan hai|how to reach|reach the|directions|hotel"
     r")(?![a-z0-9])",
     re.IGNORECASE,
