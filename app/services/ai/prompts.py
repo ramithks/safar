@@ -631,6 +631,25 @@ def _today(ctx: AgentContext) -> str:
         return "unknown"
 
 
+def no_handoff_reply(ctx: AgentContext) -> str:
+    """
+    What to say when we could not put a person on it after all.
+
+    **The one sentence in this file nobody wants to send**, and the alternative
+    is worse. The handoff sentence promises somebody will be along; if the
+    UPDATE that queues the conversation fails, nobody will, and the sweep that
+    would have caught it reads the very column that did not get written.
+
+    So the guest is given something they can act on themselves rather than a
+    promise the hotel will not keep. No apology for an internal failure and no
+    description of it — neither is any use to somebody who wants a room.
+    """
+    return (
+        "I'm not able to get you an answer on this just now. Please call the "
+        "hotel directly and they'll pick it up straight away."
+    )
+
+
 def handoff_reply(ctx: AgentContext) -> str:
     """
     What the runtime says when the model itself is unavailable.

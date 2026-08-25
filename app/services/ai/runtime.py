@@ -1079,6 +1079,39 @@ async def run_turn(
     # before it could negotiate is exactly the turn somebody investigating a
     # lost sale needs to find, and a summary written only on success would hide
     # it. §21 — every question about a turn answerable from the two tables.
+    # ── a promise of a person has to be true ─────────────────────────────────
+    #
+    # **§12's invariant, enforced rather than intended.** Two ways it was
+    # breakable, and both had happened.
+    #
+    # The model can write the promise itself: a live evaluation turn produced
+    # *"one of our team members will get back to you shortly"* having called
+    # nothing, with `handoff` false — the words of a handoff without the
+    # handoff. So a reply that promises somebody *becomes* a handoff, rather
+    # than being refused. A guest told a person is coming should get one;
+    # taking the sentence away and leaving them with nothing is the worse
+    # repair.
+    if reply and not handoff and recovery.promises_a_person(reply):
+        logger.warning("run %s: the reply promised a person and nothing had "
+                       "handed over — creating the handoff", run_id)
+        handoff = True
+        if status == "succeeded":
+            status = "escalated"
+        recovery_log.append(
+            recovery.Attempt("promised_a_person", model_in_use, "handoff").as_dict())
+
+    if handoff and ctx.conversation_id:
+        # And the other way: the sentence is composed before this runs, and this
+        # used to swallow its own failure — a database blip left the guest
+        # promised and the conversation still on `ai`, where the sweep never
+        # looks. If it cannot be made true, the promise is withdrawn.
+        marked = await run_db(_ensure_human, ctx)
+        if not marked and reply and recovery.promises_a_person(reply):
+            logger.error("run %s: could not create the handoff a reply promised "
+                         "— withdrawing the promise", run_id)
+            reply = prompts.no_handoff_reply(ctx)
+            error = (error or "") + " | handoff could not be recorded"
+
     summary_of_requirements = required_actions.summarise(requirements, outcomes, forced)
     if language_slips:
         # Folded into the same jsonb rather than given a column of its own: it
@@ -1183,9 +1216,6 @@ async def run_turn(
     # A handoff always leaves the conversation with a human, even when the
     # handoff came from a crash rather than from the tool. The rule is that an
     # unattended conversation is never left believing an agent is still on it.
-    if handoff and ctx.conversation_id:
-        await run_db(_ensure_human, ctx)
-
     return RunResult(
         run_id=run_id,
         status=status,
@@ -1201,7 +1231,7 @@ async def run_turn(
     )
 
 
-def _ensure_human(ctx: AgentContext) -> None:
+def _ensure_human(ctx: AgentContext) -> bool:
     """
     Stop the agent answering, whatever the reason it stopped.
 
@@ -1215,8 +1245,19 @@ def _ensure_human(ctx: AgentContext) -> None:
         ).eq("id", ctx.conversation_id).eq("property_id", ctx.property_id).eq(
             "handler", "ai"
         ).execute()
+        return True
     except Exception:  # noqa: BLE001
-        logger.warning("could not mark conversation %s for a human", ctx.conversation_id)
+        # **Escalated from a warning, because the guest has already been told.**
+        #
+        # The handoff sentence is composed before this runs, so a failure here
+        # leaves a guest who has been promised a person on a conversation the
+        # sweep will never pick up — `waiting.reason_waiting` reads the handler.
+        # The caller repairs the promise; this makes sure somebody is paged
+        # about why it had to.
+        logger.error("could not mark conversation %s for a human — a guest may "
+                     "have been told somebody is coming", ctx.conversation_id,
+                     exc_info=True)
+        return False
 
 
 def agent_is_handling(conversation: dict) -> bool:

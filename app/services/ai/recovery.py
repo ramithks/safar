@@ -53,6 +53,7 @@ figure by construction, not by review.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -231,3 +232,55 @@ def _join(items: list[str]) -> str:
     if len(items) == 1:
         return items[0]
     return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+# ── a promise of a person has to be true ────────────────────────────────────
+#
+# **The invariant §12 asks for**: do not tell a guest a human will contact them
+# unless a real handoff was actually created.
+#
+# Two ways it was breakable. The runtime's own handoff sentence — *"I've passed
+# this to the hotel team and someone will be with you shortly"* — is composed
+# before `_ensure_human` runs, and `_ensure_human` swallowed its own failure. A
+# database blip on that one UPDATE left the conversation on `ai`, the sweep
+# looks at the handler, and the guest waited for somebody nobody had told.
+#
+# And the model can write the promise itself. A live evaluation turn produced
+# *"one of our team members will get back to you shortly"* with no tool called
+# and `handoff` false — the words of a handoff without the handoff.
+#
+# The fix is to make the promise true rather than to refuse the reply. A guest
+# who has been told a person is coming should get one; taking the sentence away
+# and leaving them with nothing is the worse of the two repairs.
+_PROMISED_A_PERSON = re.compile(
+    r"(?xi)"
+    r"("
+    # English
+    r"  (?:someone|somebody|a\s+(?:member|colleague)|the\s+(?:team|hotel|staff)|"
+    r"     our\s+team|a\s+human|a\s+person|the\s+manager)"
+    r"  [^.!?]{0,40}?"
+    r"  (?:will|going\s+to|shall)\s+(?:be\s+)?"
+    r"  (?:with|contact|call|reach|get\s+back|follow\s+up|assist|help)"
+    r"| (?:passed|passing|handed|handing|transferr?(?:ed|ing)|escalat(?:ed|ing))"
+    r"  \s+(?:this|it|you|your\s+\w+)?\s*(?:on\s+)?to\s+"
+    r"  (?:the\s+)?(?:team|hotel|staff|manager|someone|a\s+colleague)"
+    r"| (?:connecting|putting)\s+you\s+(?:through|in\s+touch)"
+    # "let me get somebody from the hotel to look at it with you" — the
+    # sentence several tools already hand back when they refuse. An offer to
+    # fetch a person is a promise of one.
+    r"| let\s+me\s+(?:get|bring|ask|find)\s+"
+    r"  (?:somebody|someone|a\s+colleague|the\s+team|the\s+manager|"
+    r"     the\s+hotel|hotel\s+team)"
+    # Hinglish
+    r"| team\s+(?:ko|se)\s+(?:bhej|bata|bula|forward|connect)"
+    r"| (?:koi|kisi|hamara|humara)\s+\w{0,12}\s*(?:aapse|aap\s*se)\s+"
+    r"  (?:baat|contact|sampark)"
+    r"| team\s+(?:aapse|aap\s*se)\s+(?:baat|contact|sampark)"
+    r"| main\s+team\s+ko\s+(?:bula|bhej|bata)"
+    r")"
+)
+
+
+def promises_a_person(reply: str | None) -> bool:
+    """Does this reply tell the guest that somebody will come?"""
+    return bool(_PROMISED_A_PERSON.search(reply or ""))

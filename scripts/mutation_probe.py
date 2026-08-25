@@ -229,6 +229,28 @@ MUTANTS = [
            "from the guest saying it themselves",
            "tests/test_business_authority.py"),
 
+    # ── the handoff invariant ───────────────────────────────────────────────
+    Mutant("handoff", "a promised person is never actually fetched",
+           "app/services/ai/runtime.py",
+           '    if reply and not handoff and recovery.promises_a_person(reply):',
+           '    if False:',
+           "the model says somebody will get back to the guest and nobody is "
+           "asked — the turn that failed the promotion gate, as a class",
+           "tests/test_promised_a_person.py"),
+    Mutant("handoff", "a promise that cannot be kept is sent anyway",
+           "app/services/ai/runtime.py",
+           '        if not marked and reply and recovery.promises_a_person(reply):',
+           '        if False:',
+           "a failed UPDATE leaves the guest promised a person on a thread the "
+           "sweep never looks at",
+           "tests/test_promised_a_person.py"),
+    Mutant("handoff", "the handoff failure is swallowed again",
+           "app/services/ai/runtime.py",
+           '        return True\n    except Exception:  # noqa: BLE001',
+           '        pass\n    except Exception:  # noqa: BLE001',
+           "_ensure_human stops reporting success, so the withdrawal never fires",
+           "tests/test_promised_a_person.py"),
+
     # ── business-rule provenance ────────────────────────────────────────────
     Mutant("provenance", "a failed rule read stops being distinguishable",
            "app/services/pms/negotiation.py",
