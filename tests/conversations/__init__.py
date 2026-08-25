@@ -59,6 +59,14 @@ class Turn:
 
     guest: str
 
+    # The world changing underneath the conversation, before this turn runs.
+    #
+    # `before(db)` — a room selling out between two of a guest's messages, a
+    # payment landing, a rate moving. §7 and §26 are both about what the agent
+    # does when the facts change mid-thread, and without this a scenario can
+    # only ever describe a hotel that stood still.
+    before: object = None
+
     # What the scripted model does. A tuple of (tool, arguments) runs those
     # tools; a string is what it says. `EchoProvider` takes them in order.
     calls: tuple = ()
@@ -158,6 +166,8 @@ def play(db, scenario: Scenario) -> Played:
 
     results, per_turn, snapshots = [], [], []
     for turn in scenario.turns:
+        if turn.before is not None:
+            turn.before(db)
         script: list = []
         if turn.calls:
             script.append(list(turn.calls))
