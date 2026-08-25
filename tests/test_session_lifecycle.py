@@ -171,16 +171,41 @@ def test_the_guests_language_survives_a_change_of_stay(db):
 
 def test_correcting_the_party_size_is_not_a_new_stay(db):
     """
-    "Actually make it three of us" must not throw away the quote they are three
-    messages into. Dates are the signal, because dates are what a guest always
-    restates when they mean a different trip.
+    "Actually make it three of us" is a correction to the stay being discussed,
+    not a different trip. Dates are the signal for that, because dates are what
+    a guest always restates when they mean a different one.
+
+    **One assertion here changed, from keeping the quote to dropping it, and it
+    is the opposite of a weakening.**
+
+    It used to read `assert now["quote_id"] == "q-september"`, on the reasoning
+    that a guest three messages into a quote should not lose it. That reasoning
+    conflates two questions the session has to answer separately:
+
+        is this a different trip?     no — and everything below still asserts so
+        is the quote still true?      no. It priced two adults.
+
+    A quote is derived state and its inputs are the exact stay it priced. Kept
+    after the party changes, it goes into the next prompt as *"there is a live
+    quote for ₹11,400"* and the model offers a three-person party a price
+    calculated for two — on a room that may not even sleep three. That is the
+    whole class of failure `DERIVED_FROM` was added for, and this test was
+    pinning one instance of it.
+
+    What is asserted instead is both halves: the stay survives, and the price
+    for a different party does not.
     """
     session.merge(CONVERSATION, {"adults": 3})
 
     now = profile(db)
     assert now["adults"] == 3
-    assert now["quote_id"] == "q-september"
+    # Not a new trip: the dates and the room they chose are still theirs.
     assert now["check_in"] == "2026-09-10"
+    assert now.get("room_type_id") == profile(db).get("room_type_id")
+    # But the price is not. It was for two.
+    assert "quote_id" not in now, (
+        "a quote priced for two adults survived the guest saying there are three"
+    )
 
 
 def test_the_same_dates_arriving_again_change_nothing(db):

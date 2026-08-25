@@ -924,6 +924,39 @@ _PRIORITY = (
 MAX_FORCED = 2
 
 
+def stated_facts(message: str) -> dict:
+    """
+    What the guest said about their stay, in their own words, this turn.
+
+    **The highest-priority source there is, and until now there was no path for
+    it into the session at all.** Session facts were written from *tool
+    arguments* — whatever the model happened to pass — so "Actually 4 log hain"
+    updated the party only if some tool ran carrying it. Whether a correction
+    stuck depended on which requirement happened to fire, which is not a
+    property anybody designed.
+
+    It matters because of what the session then feeds: `prompts` tells the model
+    what the guest has settled on, and `session.DERIVED_FROM` decides what stops
+    being true when they change it. Both need the correction to arrive, and a
+    guest correcting themselves in prose — with no tool call on the turn — is
+    the ordinary way it happens.
+
+    Counts only, deliberately. Rooms and people are read straight out of the
+    sentence by patterns that already exist and are already tested on 274
+    phrasings. Dates need a parser and a timezone and would be guessing; a room
+    name needs the property's own room list, which this module has no database
+    to ask. Both arrive through tool arguments as they always have.
+    """
+    facts: dict = {}
+    rooms = room_count(message)
+    if rooms is not None:
+        facts["units"] = rooms
+    people = people_count(message)
+    if people is not None:
+        facts["adults"] = people
+    return facts
+
+
 def detect(message: str, session: dict | None = None) -> list[Requirement]:
     """
     Everything this turn owes, most pressing first.

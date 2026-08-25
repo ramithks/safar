@@ -368,7 +368,10 @@ async def process_conversation(conversation_id: str, *, provider=None, classifie
         # services/messaging/obligations.py — and folding them into this patch
         # rather than adding a second update keeps one read-modify-write per
         # turn on a column three things now share.
-        patch = session.patch_from(result.actions)
+        # The guest's own sentence goes in with the tool results: what they
+        # stated about their stay outranks whatever a tool happened to be called
+        # with. See `session.patch_from`.
+        patch = session.patch_from(result.actions, _agent_text(message))
         patch["obligations"] = obligations.open_from(
             _agent_text(message),
             result.actions,

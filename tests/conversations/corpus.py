@@ -12,7 +12,8 @@ runs, and which tools were never allowed to happen. See `tests/conversations/
 __init__.py`.
 """
 from tests.conversations import (
-    CHECK_IN, CHECK_OUT, DELUXE, GARDEN, LATER_IN, LATER_OUT, RATE_PLAN,
+    CHECK_IN, CHECK_OUT, DELUXE, GARDEN, LATER_IN, LATER_OUT, OTHER_PLAN,
+    RATE_PLAN,
     Scenario, Turn,
 )
 
@@ -692,9 +693,120 @@ JOURNEYS = [
     ),
 ]
 
+# ── Q · corrections that invalidate what was derived from them ──────────────
+#
+# The multi-turn half of `tests/test_corrections_invalidate.py`. Those assert the
+# graph; these assert that a real turn through the real runtime carries it — that
+# what the *next* turn's prompt is told about is the stay the guest is actually
+# describing.
+
+CORRECTIONS = [
+    Scenario(
+        name="two rooms become three and the old price goes with them",
+        category="Q · corrections",
+        turns=(
+            Turn(f"{D_IN} se {D_OUT}, 2 kamre, 2 log",
+                 calls=(("get_stay_options", {"check_in": D_IN, "check_out": D_OUT,
+                                              "units": 2, "adults": 2}),),
+                 says="Ye options hain.",
+                 session_holds={"units": 2}),
+            Turn("Deluxe Balcony",
+                 calls=(("get_quote", {"room_type_id": DELUXE, "rate_plan_id": RATE_PLAN,
+                                       "check_in": D_IN, "check_out": D_OUT,
+                                       "units": 2, "adults": 2}),),
+                 says="Rate ye raha.",
+                 session_holds={"room_type_id": DELUXE, "stage": "quoted"}),
+            # The correction. A quote priced for two rooms is not true of three,
+            # and leaving it on the session puts it in the next prompt.
+            # The quote must not *survive*; it may well be replaced. The turn
+            # re-prices for three rooms in the same breath — which is better
+            # than dropping it and asking the guest to ask again — and what
+            # matters is that the ₹ figure on the session is no longer the one
+            # calculated for two.
+            Turn("Actually 3 kamre chahiye", says="Theek hai, 3 ke liye dekhta hoon.",
+                 session_holds={"units": 3},
+                 session_replaced=("quote_id",)),
+        ),
+        final_session={"units": 3, "check_in": D_IN, "room_type_id": DELUXE},
+        never_ran=("create_booking",),
+    ),
+
+    Scenario(
+        name="a different room drops the old room's rate plan",
+        category="Q · corrections",
+        turns=(
+            Turn(f"{D_IN} se {D_OUT}, 2 log", calls=(OPTIONS,), says="Ye rahe."),
+            Turn("Deluxe Balcony", calls=(QUOTE,), says="Rate ye raha.",
+                 session_holds={"room_type_id": DELUXE, "rate_plan_id": RATE_PLAN}),
+            # The subtlest of the three, and the one that ends in a wrong *tool
+            # call* rather than a wrong price: a rate plan belongs to a room
+            # type, so the Deluxe's plan is not one the Garden Standard has.
+            # Kept, it goes into the next get_quote as an argument and the tool
+            # refuses.
+            # **Through `get_quote`, and the reason is a real boundary rather
+            # than a convenience.**
+            #
+            # My first draft passed `room_type_id` to `get_stay_options`, which
+            # does not accept one — pydantic dropped it silently and the room
+            # never changed. Nothing in this system resolves a room *by name*:
+            # "Garden Standard" is a string, the session holds uuids, and a
+            # guest naming a room in prose reaches the session only when the
+            # model puts the id into a tool that takes one.
+            #
+            # That is the honest boundary and it is not a gap the correction
+            # graph can close — inventing a room-name resolver here would be
+            # guessing at which of a hotel's rooms a guest meant. What the graph
+            # must do is the part after: once the room *has* changed, the old
+            # room's rate plan and the quote priced with it stop being true.
+            Turn("Nahi, Garden Standard chahiye",
+                 calls=(("get_quote", {"room_type_id": GARDEN,
+                                       "rate_plan_id": OTHER_PLAN,
+                                       "check_in": D_IN, "check_out": D_OUT,
+                                       "units": 1, "adults": 2}),),
+                 says="Garden Standard ka rate ye raha.",
+                 session_holds={"room_type_id": GARDEN},
+                 session_replaced=("quote_id", "rate_plan_id")),
+        ),
+        never_ran=("create_booking",),
+    ),
+
+    Scenario(
+        name="the party grows and the price for the smaller one is dropped",
+        category="Q · corrections",
+        turns=(
+            Turn(f"{D_IN} se {D_OUT}, 2 log", calls=(OPTIONS,), says="Ye rahe."),
+            Turn("Deluxe Balcony", calls=(QUOTE,), says="Rate ye raha.",
+                 session_holds={"adults": 2, "stage": "quoted"}),
+            Turn("Sorry, 4 log hain",
+                 calls=(("get_stay_options", {"check_in": D_IN, "check_out": D_OUT,
+                                              "units": 1, "adults": 4}),),
+                 says="4 logon ke liye dekhta hoon.",
+                 session_holds={"adults": 4},
+                 session_lacks=("quote_id",)),
+        ),
+        never_ran=("create_booking",),
+    ),
+
+    Scenario(
+        name="an ordinary question changes nothing it should not",
+        category="Q · corrections",
+        turns=(
+            Turn(f"{D_IN} se {D_OUT}, 2 log", calls=(OPTIONS,), says="Ye rahe."),
+            Turn("Deluxe Balcony", calls=(QUOTE,), says="Rate ye raha.",
+                 session_holds={"room_type_id": DELUXE}),
+            # The control, and the failure a graph like this most easily
+            # introduces: a turn about breakfast must not invalidate a price.
+            Turn("Breakfast included hai?",
+                 calls=(("get_meal_info", {}),), says="Haan, breakfast hai.",
+                 session_holds={"room_type_id": DELUXE, "stage": "quoted"}),
+        ),
+        final_session={"room_type_id": DELUXE, "stage": "quoted"},
+    ),
+]
+
 ALL: list[Scenario] = (
     NORMAL_BOOKING + OUT_OF_ORDER + CONTEXT_SWITCHING + NEGOTIATION
     + GROUP + ESCALATION + INTERRUPTION + LANGUAGE + ADVERSARIAL
     + CANCELLATION + PAYMENT + AVAILABILITY + AMBIGUITY + LEAKAGE
-    + JOURNEYS
+    + JOURNEYS + CORRECTIONS
 )

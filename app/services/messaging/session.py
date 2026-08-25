@@ -66,9 +66,14 @@ _BUSINESS_TOOLS = frozenset({
 })
 
 
-def patch_from(outcomes: list) -> dict:
+def patch_from(outcomes: list, message: str | None = None) -> dict:
     """
     What one turn established. Empty when it established nothing.
+
+    `message` is the guest's own sentence, and what it states outranks
+    everything a tool was called with — see the end of this function. Optional
+    because several callers legitimately have only outcomes; passing it is what
+    makes a correction land on a turn where no tool carried it.
 
     Empty is the common case and deliberately cheap: most turns are a question
     and an answer, and writing a row for every one of them would put this
@@ -207,6 +212,23 @@ def patch_from(outcomes: list) -> dict:
 
     if stage:
         patch["stage"] = stage
+
+    # **The guest's own words win, over any tool argument on this turn.**
+    #
+    # Session facts have always been written from tool *arguments* — whatever
+    # the model happened to pass — so "Actually 4 log hain" updated the party
+    # only if some tool ran carrying it. On a turn where the model answered in
+    # prose, or where a forced call was built from the stale session, the
+    # correction simply did not land, and the next prompt went on describing the
+    # stay the guest had just changed.
+    #
+    # Last, so it overrides both the model's arguments and a forced call's. A
+    # guest who says three rooms has said three rooms, and nothing a tool was
+    # invoked with is better evidence of that than the sentence itself.
+    if message:
+        from app.services.ai import required_actions
+
+        patch.update(required_actions.stated_facts(message))
     return patch
 
 
@@ -233,6 +255,108 @@ _PRICED = ("quote_id", "rate_plan_id", "negotiation", "payment", "stage")
 # this has almost certainly come back about something else, and the dates they
 # gave in September are not an answer to a question asked in November.
 STALE_AFTER_HOURS = 72
+
+
+# ── what depends on what ─────────────────────────────────────────────────────
+#
+# **The session is derived state, and derived state goes stale when its inputs
+# change.** Until now exactly one case of that was handled: `_superseded` below
+# noticed new *dates* and `move_dates` dropped the priced fields. Every other
+# correction a guest can make went unhandled, and the failures are the same
+# shape each time —
+#
+#     "actually 3 rooms, not 2"     the quote for two rooms stays on the session
+#     "make it 4 adults"            the same quote, priced for two, stays
+#     "the Garden Standard then"    the rate plan from the Deluxe stays, and the
+#                                   next quote is asked for a plan that belongs
+#                                   to a different room
+#
+# — a `quote_id` or a `rate_plan_id` that is true of a stay the guest has just
+# stopped describing. The prompt then tells the model about a price that no
+# longer applies, and the model quotes it.
+#
+# So the relationship is declared once instead of being rediscovered per field.
+# `DERIVED_FROM[x]` is the set of facts `x` is only true of: change any of them
+# and `x` is no longer known.
+#
+# Read it as sentences:
+#
+#   a quote is only true of the exact stay it priced — those nights, that many
+#   rooms, that many people, that room type, that rate plan;
+#   a rate plan belongs to a room type, so choosing a different room invalidates
+#   it;
+#   a negotiation and a payment state are about a specific quote;
+#   the stage a conversation has reached is about the quote it reached it with.
+#
+# **`room_type_id` is deliberately absent as a dependent.** A guest who moves
+# their dates has not changed their mind about the room, and dropping it would
+# make the agent ask a question they answered two turns ago — a real regression
+# this codebase already fixed once. It is carried forward *unverified* instead,
+# with `room_needs_recheck`, which `describe()` turns into an instruction to
+# confirm the room is free for the new nights before promising it.
+DERIVED_FROM: dict[str, frozenset[str]] = {
+    "quote_id": frozenset({"check_in", "check_out", "units", "adults", "children",
+                           "room_type_id", "rate_plan_id"}),
+    "rate_plan_id": frozenset({"room_type_id"}),
+    "negotiation": frozenset({"quote_id"}),
+    "payment": frozenset({"quote_id"}),
+    "stage": frozenset({"quote_id"}),
+    # What the agent still owes the guest is about the stay being discussed. A
+    # guest who changes the stay has not necessarily had their question answered
+    # — but the *answer* they were owed was about the old one.
+    "obligations": frozenset({"check_in", "check_out", "units", "adults"}),
+    "awaiting_hotel": frozenset({"check_in", "check_out", "units", "adults"}),
+}
+
+# Facts a guest can correct. Everything else on the profile is ours — a stage we
+# derived, a room we recorded — and a guest does not "correct" those.
+CORRECTABLE = frozenset({"check_in", "check_out", "units", "adults", "children",
+                         "room_type_id", "rate_plan_id"})
+
+
+def corrections(profile: dict, patch: dict) -> set[str]:
+    """
+    Facts this turn *changed*, as opposed to facts it filled in.
+
+    A blank becoming a value is the conversation progressing — the guest naming
+    their dates for the first time invalidates nothing. A value becoming a
+    *different* value is a correction, and everything computed from it is now
+    describing a stay nobody is asking about.
+    """
+    changed = set()
+    for key in CORRECTABLE:
+        if key not in patch:
+            continue
+        before, after = profile.get(key), patch.get(key)
+        if before in (None, "") or after in (None, ""):
+            continue
+        if str(before) != str(after):
+            changed.add(key)
+    return changed
+
+
+def invalidated_by(changed: set[str]) -> set[str]:
+    """
+    Everything that stops being known when `changed` changes, transitively.
+
+    Transitive because the graph has depth: correcting the room invalidates the
+    rate plan, and the rate plan invalidates the quote, and the quote
+    invalidates the negotiation and the payment state. Doing one hop would leave
+    a quote on the session that was priced against a rate plan we had just
+    dropped.
+    """
+    dead: set[str] = set()
+    frontier = set(changed)
+    while frontier:
+        nxt = set()
+        for field, sources in DERIVED_FROM.items():
+            if field in dead or field in frontier:
+                continue
+            if sources & frontier:
+                nxt.add(field)
+        dead |= nxt
+        frontier = nxt
+    return dead
 
 
 def _superseded(profile: dict, patch: dict) -> bool:
@@ -382,7 +506,36 @@ def merge(conversation_id: str, patch: dict) -> None:
             # about last month, the room included.
             profile = clear_stay(profile)
         elif _superseded(profile, patch):
+            # New *dates* are the one correction that also means "a different
+            # trip", so the whole stay is rebuilt rather than pruned — see
+            # `_superseded`.
             profile = move_dates(profile)
+        else:
+            # **Every other correction, through the declared graph.**
+            #
+            # A guest who says "actually 3 rooms" or "the Garden Standard then"
+            # has invalidated the quote priced for two rooms, or the rate plan
+            # that belongs to the Deluxe. Before this only dates were handled,
+            # and every other correction left a `quote_id` on the session that
+            # was true of a stay the guest had stopped describing — which the
+            # prompt then told the model about, and the model quoted.
+            #
+            # `corrections` is the trigger and it is deliberately narrow: a
+            # blank becoming a value is the conversation progressing, not a
+            # correction. See DERIVED_FROM.
+            changed = corrections(profile, patch)
+            if changed:
+                dead = invalidated_by(changed)
+                if dead:
+                    logger.info(
+                        "conversation %s corrected %s; dropping %s",
+                        conversation_id, sorted(changed), sorted(dead),
+                    )
+                    profile = {k: v for k, v in profile.items() if k not in dead}
+                    if profile.get("room_type_id") and "room_type_id" not in changed:
+                        # Carried forward unverified, exactly as a date change
+                        # does: a preference is not availability.
+                        profile["room_needs_recheck"] = True
 
         merged = _revalidate_room({**profile, **patch})
         if merged == profile:

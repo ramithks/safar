@@ -42,6 +42,7 @@ CONVERSATION = "c0c0c0c0-0001-4001-8001-000000000001"
 ROOM_TYPE = "22222222-2222-4222-8222-222222222222"
 OTHER_ROOM = "33333333-3333-4333-8333-333333333333"
 RATE_PLAN = "11111111-1111-4111-8111-111111111111"
+OTHER_PLAN = "44444444-4444-4444-8444-444444444444"
 
 CHECK_IN = date.today() + timedelta(days=30)
 CHECK_OUT = CHECK_IN + timedelta(days=2)
@@ -102,6 +103,23 @@ def db(monkeypatch) -> FakeDb:
         "room_type_id": ROOM_TYPE, "code": "DLX-RO", "name": "Room only",
         "meal_plan": "RO", "audience": "public", "refundable": True,
         "inclusions": None, "base_price_paise": 450000, "min_stay": 1,
+        "derived_from_plan_id": None, "derive_discount_pct": None,
+        "valid_from": None, "valid_to": None, "days_of_week": None,
+        "allocation_units": None, "is_active": True,
+        "cancellation_cutoff_hours": 48, "cancellation_policy": None,
+    })
+    # **The Garden Standard's own plan, and the fixture was wrong without it.**
+    #
+    # A hotel sells every room it lists, and this fixture listed two room types
+    # and priced one — so any scenario where a guest switches rooms could only
+    # fail, for a reason that was about the fixture rather than the product. A
+    # rate plan belongs to a room type, which is exactly what
+    # `session.DERIVED_FROM` encodes.
+    fake.seed("rate_plans", {
+        "id": OTHER_PLAN, "property_id": PROPERTY, "partner_id": PARTNER,
+        "room_type_id": OTHER_ROOM, "code": "STD-RO", "name": "Room only",
+        "meal_plan": "RO", "audience": "public", "refundable": True,
+        "inclusions": None, "base_price_paise": 320000, "min_stay": 1,
         "derived_from_plan_id": None, "derive_discount_pct": None,
         "valid_from": None, "valid_to": None, "days_of_week": None,
         "allocation_units": None, "is_active": True,
