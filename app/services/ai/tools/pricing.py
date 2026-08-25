@@ -222,7 +222,7 @@ async def get_quote(args: QuoteArgs, ctx: AgentContext) -> tuple[dict, str]:
     # ₹19,784 — thirty per cent of a ₹65,946 total, which the model had
     # multiplied out itself because nothing had given it the figure.
     # `get_group_rates` returns `depositPct: 30`, this returns the total, and
-    # between them they invited exactly the arithmetic §24 rule 3 forbids.
+    # between them they invited exactly the arithmetic §8 forbids.
     #
     # A percentage and a total together in a model's context is a
     # multiplication waiting to happen, and the answer is not a firmer
@@ -230,21 +230,54 @@ async def get_quote(args: QuoteArgs, ctx: AgentContext) -> tuple[dict, str]:
     # quote, so there is nothing left to work out. Same reasoning as `total`
     # above; see `money.display`.
     #
-    # Only when the booking actually is a group. A single room carries no
-    # deposit, and a `deposit: ₹0` on every quote is a field the model would
-    # eventually mention to somebody.
+    # **The first version of this only did it for groups, and that was the bug
+    # rather than the fix.** It read: *"a single room carries no deposit, and a
+    # `deposit: ₹0` on every quote is a field the model would eventually mention
+    # to somebody."* The first half is false wherever the property has set a
+    # token percentage, which Casa Mandala has at 20. Caught on the live model by
+    # `scripts/replay_e2e.py`, on a two-room quote against a group minimum of
+    # three:
+    #
+    #     Pool Villa ke 2 rooms ka total price tax ke sath ₹84,016 hai. Isme se
+    #     abhi aapko sirf 20% advance (₹16,803) dena hoga…
+    #
+    # ₹84,016 × 0.20 = ₹16,803.20, rounded, by the model. The outbound guardrail
+    # refused it, so the guest was handed to a person at the moment they were
+    # being told how to pay — the identical shape as the group failure, one
+    # month-old fix away from being caught.
+    #
+    # Nothing had to be computed to close it: `price_stay` already returns
+    # `token_paise` and `balance_paise` from the property's own `token_pct`, and
+    # this payload simply never carried them. The group percentage still
+    # overrides where the hotel set one, because a twenty-room block is the case
+    # a hotel most wants a bigger commitment on.
+    #
+    # The second half of that comment is still right, and is why the fields are
+    # conditional: a property that takes nothing up front gets no deposit field
+    # rather than a `₹0` one for the model to volunteer.
+    deposit_paise = priced.token_paise
+    deposit_pct: int | None = None
+
     group = await rates.group_policy_for(ctx.property_id)
-    if group and group.deposit_pct and args.units >= group.min_units:
+    is_group = bool(group and group.deposit_pct and args.units >= group.min_units)
+    if is_group:
+        deposit_pct = group.deposit_pct
         deposit_paise = round(priced.total_paise * group.deposit_pct / 100)
-        payload["depositPct"] = group.deposit_pct
+
+    deposit_paise = min(max(int(deposit_paise or 0), 0), priced.total_paise)
+    if deposit_paise > 0:
+        balance_paise = priced.total_paise - deposit_paise
+        if deposit_pct is not None:
+            payload["depositPct"] = deposit_pct
         payload["depositPaise"] = deposit_paise
         payload["deposit"] = money.display(deposit_paise)
-        payload["balancePaise"] = priced.total_paise - deposit_paise
-        payload["balance"] = money.display(priced.total_paise - deposit_paise)
+        payload["balancePaise"] = balance_paise
+        payload["balance"] = money.display(balance_paise)
         payload["instruction"] += (
-            " This is a group booking: the deposit is `deposit` and the rest is "
-            "`balance`. Quote both exactly as written — do not work out a "
-            "percentage of anything."
+            (" This is a group booking:" if is_group else " If the guest asks what to pay now:")
+            + " the amount due now is `deposit` and the rest is `balance`. "
+            "Quote both exactly as written — do not work out a percentage of "
+            "anything."
         )
 
     return payload, quote.id
