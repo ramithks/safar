@@ -259,7 +259,20 @@ def test_a_group_request_is_priced_whether_or_not_the_model_asks(db):
                  ["Ji bilkul, main check karti hoon."])
 
     assert "get_group_rates" in tools_used(db)
-    assert result.requirements["forced"] == ["get_group_rates"]
+    # **Two forced tools now, not one, and the second is the fix.**
+    #
+    # `get_group_rates` answers "is this a group and what band applies" — a
+    # discount percentage and a deposit percentage. It does not and cannot
+    # price, because pricing needs a room type it has not been given. A
+    # production turn that forced only this one left the model holding two
+    # percentages and a room count, and it invented five prices: ₹1,65,600,
+    # ₹2,13,600, ₹50,400, ₹59,200, ₹89,600. The guardrail refused the reply and
+    # the guest got a person instead of a quote.
+    #
+    # `get_stay_options` rather than `get_quote` because no room has been
+    # chosen: it prices every room type and takes no hold, where a quote would
+    # take a fifteen-minute hold on a room this guest has not picked.
+    assert result.requirements["forced"] == ["get_group_rates", "get_stay_options"]
     group = [a for a in db.rows("agent_actions") if a["tool"] == "get_group_rates"][-1]
     assert group["decision_source"] == "application"
     assert group["input"]["units"] == 5

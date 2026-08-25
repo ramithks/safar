@@ -802,6 +802,84 @@ def _negotiation_requirement(message: str, session: dict | None) -> Requirement 
     )
 
 
+def _quote_requirement(message: str, session: dict | None,
+                       *, group_enquiry: bool = False) -> Requirement | None:
+    """
+    "Kitna lagega?" — and whether the turn can answer it deterministically.
+
+    **The failure this exists for.** A guest wrote *"Actually 5 kamre chahiye,
+    10 log aa rahe hain"*. `get_group_rates` was forced and ran, and it returns
+    what a band *is* — `discountPct: 8`, `depositPct: 30` — and no prices,
+    because pricing needs a room type it does not have. Nothing else ran. So the
+    model was holding two percentages and a room count, and it invented a whole
+    rate card: ₹1,65,600, ₹2,13,600, ₹50,400, ₹59,200, ₹89,600. The guardrail
+    refused the reply and the guest got a person instead of a price.
+
+    The tool's own instruction was already right — *"get_quote already applies
+    this band, call it and quote what comes back"* — and the model did not, and
+    an instruction the model can ignore is not a control. QUOTE_REQUIRED was
+    detected on that turn and was advisory, so the deterministic layer had an
+    opinion and no power.
+
+    **Which tool, and why not always the quote.** `get_quote` takes a fifteen-
+    minute hold on real inventory. Forcing it on every price question would take
+    holds all day for guests who are still browsing, which is a worse failure
+    than the one being fixed. So:
+
+        room and rate plan chosen   →  get_quote      the guest has picked; a
+                                                      firm price and a hold are
+                                                      what they are asking for
+        dates only                  →  get_stay_options  indicative totals for
+                                                      every room, and no hold
+        neither                     →  recorded only  there is nothing to price
+                                                      and a guessed date is
+                                                      worse than no call
+
+    Both of the forceable branches return money with display strings beside it
+    — see `money.with_display` — so what the model is handed is what it says.
+    """
+    asked_in_words = bool(_QUOTE.search(message or "") or _QUOTE_HI.search(message or ""))
+    if not (asked_in_words or group_enquiry):
+        return None
+
+    stay = _stay_context(session)
+    satisfied_by = frozenset({"get_quote", "get_stay_options", "negotiate_rate",
+                              "get_group_rates", "search_availability"})
+
+    if not _valid_dates(stay):
+        # Advisory, as before. Recorded so the evaluation still reports "the
+        # guest asked what it costs and nothing priced anything", which is how
+        # this was found.
+        return Requirement(
+            intent=QUOTE_REQUIRED, tool="get_quote", satisfied_by=satisfied_by,
+            must_execute=False, arguments=None,
+            detail="guest asked what it costs, with no dates to price",
+        )
+
+    units = room_count(message) or stay.get("units") or 1
+    people = people_count(message) or stay.get("adults") or 2
+    common = {
+        "check_in": stay["check_in"], "check_out": stay["check_out"],
+        "units": int(units), "adults": int(people),
+    }
+
+    if stay.get("room_type_id") and stay.get("rate_plan_id"):
+        return Requirement(
+            intent=QUOTE_REQUIRED, tool="get_quote", satisfied_by=satisfied_by,
+            must_execute=True,
+            arguments={**common, "room_type_id": stay["room_type_id"],
+                       "rate_plan_id": stay["rate_plan_id"]},
+            detail="guest asked what it costs, and has chosen a room",
+        )
+
+    return Requirement(
+        intent=QUOTE_REQUIRED, tool="get_stay_options", satisfied_by=satisfied_by,
+        must_execute=True, arguments=common,
+        detail="guest asked what it costs; pricing every room rather than "
+               "holding one they have not chosen",
+    )
+
+
 def _status_requirement(message: str) -> Requirement | None:
     text = message or ""
     if not (_PAYMENT_STATUS.search(text) or _PAYMENT_STATUS_HI.search(text)):
@@ -938,11 +1016,28 @@ def detect(message: str, session: dict | None = None) -> list[Requirement]:
                               "escalate_to_team"},
                              "guest asked to change an existing booking"))
 
-    if _QUOTE.search(text) or _QUOTE_HI.search(text):
-        found.append(_simple(QUOTE_REQUIRED, "get_quote",
-                             {"get_quote", "get_stay_options", "negotiate_rate",
-                              "get_group_rates", "search_availability"},
-                             "guest asked what it costs"))
+    # **A group enquiry owes a price, whether or not the guest used a price
+    # word.** "5 kamre chahiye, 10 log aa rahe hain" contains no "kitna" and no
+    # "rate", so it raised only GROUP_BOOKING — and `get_group_rates` returns
+    # what a band *is*, not what a stay costs. The model was left holding a
+    # discount percentage and a room count and invented five prices.
+    #
+    # Nobody asks a hotel for five rooms without wanting to know what five rooms
+    # cost. Both requirements together are exactly `MAX_FORCED`, and when no room
+    # has been chosen both are reads that take no hold.
+    #
+    # **Not when a negotiation is already owed.** "Thoda kam karo na, 4000 per
+    # night mein ho jayega?" contains "per night", so it reads as a price
+    # question as well as a haggle — and `negotiate_rate` answers both. It
+    # returns `publishedTotalPaise` and `counterTotalPaise`, which now arrive
+    # with display strings beside them, so the model already has real money to
+    # quote. Forcing a quote on top would take a fifteen-minute hold on the same
+    # rooms to produce a number the turn already has.
+    negotiating = any(r.intent == NEGOTIATION for r in found)
+    quote = (None if negotiating else
+             _quote_requirement(text, session, group_enquiry=group is not None))
+    if quote:
+        found.append(quote)
 
     if _DATES.search(text):
         found.append(_simple(DATE_CHANGE, "search_availability",
