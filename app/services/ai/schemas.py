@@ -270,6 +270,21 @@ class ToolOutcome:
     # services/ai/registry.execute.
     idempotency_key: str | None = None
 
+    # Facts about *how* this result was arrived at, for the record and never for
+    # the model.
+    #
+    # **The distinction is the point.** `output` goes into the model's context
+    # and into the audit row; this goes only into the row. Which negotiation
+    # rule priced a stay — the rate plan's, the room's, the hotel's ceiling, or
+    # the conservative default because a read failed — is exactly the kind of
+    # fact somebody needs six weeks later and the model must never see: it is a
+    # sentence about our configuration, and the guardrail refuses those in a
+    # reply for good reason.
+    #
+    # A dict rather than a column, folded into `agent_runs.required_actions` by
+    # the runtime, so a new kind of provenance needs no migration.
+    telemetry: dict = field(default_factory=dict)
+
     # Who decided this call happened: the model, or the application forcing a
     # requirement the model did not meet.
     #
@@ -314,3 +329,17 @@ class RunResult:
     requirements: dict = field(default_factory=dict)
     # 'none' · 'model' · 'forced' · 'unmet'. The single number this pass moves.
     required_action_status: str = "none"
+
+    # **Every model this turn actually touched, in the order it touched them.**
+    #
+    # A run is not served by one model. Classification is a cheap tier, the
+    # conversation another, and the §12 recovery ladder may end the turn on a
+    # third that neither the operator nor the router chose. Eleven of the
+    # forty-four turns in one 3.x sweep finished on the fallback tier after
+    # two empty completions, and every one of them was scored as a 3.x turn,
+    # because the only model on the result was the configured one.
+    #
+    # Crediting one model with another's work is not a comparison, and §11 asks
+    # that model failures never be blended with anything else. So the turn
+    # carries its own answer.
+    served_by: list[str] = field(default_factory=list)

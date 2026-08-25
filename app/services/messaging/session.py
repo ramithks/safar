@@ -66,9 +66,130 @@ _BUSINESS_TOOLS = frozenset({
 })
 
 
-def patch_from(outcomes: list) -> dict:
+# ── where a fact came from, and which source wins ───────────────────────────
+#
+# **The precedence rule was positional, and positional is fragile.** A guest's
+# own words beat a tool argument because `stated_facts` happened to be applied
+# last in the function, and a forced call filled gaps only because a set of
+# names was threaded through the loop by hand. Both are correct today and both
+# would break the first time somebody reordered two blocks.
+#
+# Named instead, so the rule is a table rather than a shape. Every fact the
+# session carries arrives from one of four places, and a lower-ranked source
+# never overwrites a higher-ranked one *within the same turn*:
+#
+#   GUEST_SAID     the guest's own sentence, read by `required_actions` and
+#                  `date_facts`. Nothing is better evidence of what the guest
+#                  wants than what they just said.
+#   TOOL_RESULT    an id or a name a tool returned — a quote's room, a rate
+#                  plan. The system's own answer about its own records.
+#   TOOL_ARGUMENT  what the *model* called a tool with. A reading of the guest,
+#                  one remove away.
+#   CARRIED        what a *forced* call was invoked with, which the application
+#                  built out of the session — so it is the session repeating
+#                  itself, not new evidence, and must never overwrite the turn.
+GUEST_SAID = "guest_said"
+TOOL_RESULT = "tool_result"
+TOOL_ARGUMENT = "tool_argument"
+CARRIED = "carried"
+
+SOURCE_RANK = {GUEST_SAID: 3, TOOL_RESULT: 2, TOOL_ARGUMENT: 1, CARRIED: 0}
+
+# ── conversational precedence is not business authority ─────────────────────
+#
+# **Two different hierarchies, and confusing them is how a guest talks a hotel
+# into a booking that does not exist.**
+#
+# The ranks above answer *"whose account of the conversation wins"*, and there
+# the guest is the best evidence there is: nobody knows better than they do how
+# many rooms they want. That is why GUEST_SAID sits at the top.
+#
+# It must not be the top of the other hierarchy. A guest who writes
+#
+#     "my booking is confirmed"
+#
+# has made the highest-precedence *conversational* statement on the turn and has
+# said nothing whatever about `payment_status`. The booking system decides that,
+# and if it says `pending` then it is pending — however firmly the guest states
+# otherwise, and however plainly the model relays them.
+#
+# So the fields below are ones only the system of record may set. A source that
+# is not a verified tool result cannot claim one, whatever its rank. Today
+# nothing feeds a guest statement into these — `stated_facts` returns counts and
+# the resolvers return a room and dates — and that is exactly why the guard is
+# worth having: it is one plausible line ("payment hogyi" → payment="paid")
+# away from being real, and that line would look like a feature.
+BUSINESS_AUTHORITY = frozenset({
+    "quote_id",             # the pricing engine issued it
+    "stage",                # derived from what actually executed
+    "payment",              # the payment provider and the webhook decide
+    "negotiation",          # the negotiation engine's verdict
+    "last_business_action", # what ran, not what was discussed
+    "reservation_id",       # the booking system
+    "booking_ref",          # created when money lands, never before
+    "room_unavailable",     # an availability read, not an opinion
+})
+
+# The sources that may speak for the system of record. A tool *result* is the
+# system reporting its own state; a tool *argument* is a reading of the guest,
+# and a forced call's argument is the session repeating itself.
+AUTHORITATIVE_SOURCES = frozenset({TOOL_RESULT})
+
+
+class _Facts:
+    """
+    One turn's findings, each with where it came from.
+
+    `set` is the whole mechanism: a fact only lands if nothing better-sourced
+    has already claimed it this turn. Equal ranks overwrite, which keeps the
+    within-rank behaviour that was there before — a model that searches one week
+    and then quotes another has changed its mind about the same turn.
+    """
+
+    def __init__(self) -> None:
+        self.values: dict = {}
+        self.sources: dict[str, str] = {}
+        # How sure we are of each, in the vocabulary the layer that read it
+        # uses: `exact`/`fuzzy` for a room name, `explicit`/`inferred`/`derived`
+        # for a date, `stated` for everything a tool simply carried. The brief
+        # asks for source, confidence, turn, value and dependencies per fact;
+        # this is the third of the five.
+        self.confidence: dict[str, str] = {}
+
+    def set(self, field: str, value, source: str, confidence: str = "stated") -> None:
+        if value is None:
+            return
+        if field in BUSINESS_AUTHORITY and source not in AUTHORITATIVE_SOURCES:
+            # Conversational precedence stops at the edge of business truth.
+            # See BUSINESS_AUTHORITY — a guest saying their booking is confirmed
+            # is not the booking system saying so, and the rank table has no
+            # opinion about which is right because that is not its question.
+            logger.info(
+                "refused %s for %s: only a verified tool result may set it",
+                source, field)
+            return
+        held = self.sources.get(field)
+        if held is not None and SOURCE_RANK[source] < SOURCE_RANK[held]:
+            return
+        self.values[field] = value
+        self.sources[field] = source
+        self.confidence[field] = confidence
+
+    def update(self, values: dict, source: str, confidence: str = "stated") -> None:
+        for field, value in (values or {}).items():
+            self.set(field, value, source, confidence)
+
+
+def patch_from(outcomes: list, message: str | None = None,
+               rooms: list[dict] | None = None, today=None,
+               known: dict | None = None) -> dict:
     """
     What one turn established. Empty when it established nothing.
+
+    `message` is the guest's own sentence, and what it states outranks
+    everything a tool was called with — see the end of this function. Optional
+    because several callers legitimately have only outcomes; passing it is what
+    makes a correction land on a turn where no tool carried it.
 
     Empty is the common case and deliberately cheap: most turns are a question
     and an answer, and writing a row for every one of them would put this
@@ -94,18 +215,16 @@ def patch_from(outcomes: list) -> dict:
     # land. What separates the two is not the tool but where the argument came
     # from — the guest's sentence, or the session the guest is contradicting.
     #
-    # So the model's own calls are processed first and in order, and the forced
-    # ones afterwards fill only what nothing else established this turn. A
-    # forced argument taken from stale state then loses to the fresh one beside
-    # it, and a forced argument nobody else supplied still lands.
-    ordered = sorted(
-        (o for o in (outcomes or []) if getattr(o, "ok", False)),
-        key=lambda o: getattr(o, "decision_source", "model") == "application",
-    )
-    established: set[str] = set()
+    # So a forced call's arguments are `CARRIED` — the session repeating itself,
+    # not new evidence — and the rank table refuses to let them overwrite
+    # anything the turn actually established. `get_group_rates` forced with
+    # `units: 5` read out of "5 kamre chahiye" still lands, because nothing else
+    # claimed `units` on that turn.
+    facts = _Facts()
 
-    for outcome in ordered:
+    for outcome in (o for o in (outcomes or []) if getattr(o, "ok", False)):
         forced = getattr(outcome, "decision_source", "model") == "application"
+        argument_source = CARRIED if forced else TOOL_ARGUMENT
         tool = getattr(outcome, "tool", "") or ""
 
         if tool in _BUSINESS_TOOLS:
@@ -117,13 +236,7 @@ def patch_from(outcomes: list) -> dict:
 
         args = getattr(outcome, "input", None) or {}
         for field in _STAY_ARGS:
-            if args.get(field) is None:
-                continue
-            if forced and field in established:
-                continue
-            patch[field] = args[field]
-            if not forced:
-                established.add(field)
+            facts.set(field, args.get(field), argument_source)
 
         # The room this turn was about, whichever tool was asked.
         #
@@ -133,10 +246,7 @@ def patch_from(outcomes: list) -> dict:
         # between choosing a room and pricing it are exactly where the choice
         # used to be lost. A later `get_quote` overwrites it, which is right:
         # a priced room outranks a discussed one.
-        if args.get("room_type_id") and not (forced and "room_type_id" in established):
-            patch["room_type_id"] = args["room_type_id"]
-            if not forced:
-                established.add("room_type_id")
+        facts.set("room_type_id", args.get("room_type_id"), argument_source)
 
         output = getattr(outcome, "output", None)
         if not isinstance(output, dict):
@@ -166,11 +276,19 @@ def patch_from(outcomes: list) -> dict:
                            # So a later turn can say "Deluxe Balcony" rather
                            # than reciting a uuid or asking again.
                            ("roomName", "room_name")):
-            if output.get(key):
-                patch[field] = output[key]
+            # A tool's *result* is the system answering about its own records,
+            # which outranks a reading of the guest but not the guest.
+            facts.set(field, output.get(key),
+                      CARRIED if forced else TOOL_RESULT)
         if tool in ("get_quote",) and args.get("room_type_id"):
-            patch["room_type_id"] = args["room_type_id"]
-            patch["rate_plan_id"] = args.get("rate_plan_id")
+            # **At argument rank, not result rank.** These are the *arguments*
+            # `get_quote` was called with, kept as a fallback for a payload that
+            # does not name the room — so they must lose to a payload that
+            # does. Ranking them as a result made a quote's own `roomTypeId`
+            # lose to the id the model had asked with, which is the system
+            # deferring to a reading of the guest over its own record.
+            facts.set("room_type_id", args.get("room_type_id"), argument_source)
+            facts.set("rate_plan_id", args.get("rate_plan_id"), argument_source)
 
         # Where the price argument has got to.
         #
@@ -207,6 +325,106 @@ def patch_from(outcomes: list) -> dict:
 
     if stage:
         patch["stage"] = stage
+
+    # **The guest's own words win, over any tool argument on this turn.**
+    #
+    # Session facts have always been written from tool *arguments* — whatever
+    # the model happened to pass — so "Actually 4 log hain" updated the party
+    # only if some tool ran carrying it. On a turn where the model answered in
+    # prose, or where a forced call was built from the stale session, the
+    # correction simply did not land, and the next prompt went on describing the
+    # stay the guest had just changed.
+    #
+    # Last, so it overrides both the model's arguments and a forced call's. A
+    # guest who says three rooms has said three rooms, and nothing a tool was
+    # invoked with is better evidence of that than the sentence itself.
+    if message:
+        from app.services.ai import required_actions
+
+        facts.update(required_actions.stated_facts(message), GUEST_SAID)
+
+        # **And the room they named, resolved against this hotel's own list.**
+        #
+        # The gap a comment in the conversation corpus recorded as an honest
+        # boundary: *"nothing in this system resolves a room by name"*, so
+        # "Actually Garden Standard chahiye" on a turn where the model answered
+        # in prose changed nothing, and the next quote priced the room the guest
+        # had just moved away from.
+        #
+        # `rooms` is passed in rather than read here, so this module keeps no
+        # database of its own and a caller with no room list simply gets the
+        # behaviour it had before. See services/pms/room_names.
+        if rooms:
+            from app.services.pms import room_names
+
+            named = room_names.resolve(message, rooms)
+            if named.resolved:
+                facts.set("room_type_id", named.room_type_id, GUEST_SAID,
+                          named.confidence)
+                facts.set("room_name", named.name, GUEST_SAID, named.confidence)
+                # A room named in prose is a *preference*, not an availability
+                # check — the same rule a date change follows. The prompt turns
+                # this into an instruction to confirm the room is free before
+                # promising it.
+                patch["room_needs_recheck"] = True
+            elif named.ask:
+                # Several rooms plausibly match and guessing between them is the
+                # one thing this must not do. Carried to the prompt as a
+                # question for the model to ask, not as a state change.
+                patch["room_ambiguous"] = named.ask
+
+        # **And the nights, when the sentence settles them beyond doubt.**
+        #
+        # `today` is the *hotel's* business date and has no default here either:
+        # every relative date — "Friday", "the 25th" — is computed from it, and
+        # a caller that forgot the timezone would resolve against the server's
+        # day. A caller with no clock gets no date reading, which is the
+        # behaviour before this existed.
+        if today is not None:
+            from app.services.pms import date_facts
+
+            # The arrival already agreed, which is the only thing "make it 3
+            # nights instead" can be measured from. It comes off the *session*,
+            # not the patch: a turn where the guest says only a length has no
+            # tool call carrying a date, so the patch is empty and the anchor
+            # would be too.
+            anchor = facts.values.get("check_in") or (known or {}).get("check_in")
+            if isinstance(anchor, str):
+                try:
+                    from datetime import date as _date
+
+                    anchor = _date.fromisoformat(anchor)
+                except ValueError:
+                    anchor = None
+            nights = date_facts.read(message, today, check_in=anchor)
+            if nights.usable:
+                facts.set("check_in", nights.check_in.isoformat(), GUEST_SAID,
+                          nights.confidence)
+                facts.set("check_out", nights.check_out.isoformat(), GUEST_SAID,
+                          nights.confidence)
+                patch["dates_from"] = nights.basis
+                # Private, consumed by `merge`: it is what tells an earlier
+                # "which month did you mean" that it has been answered.
+                patch["_dates_settled"] = True
+                if nights.needs_confirming:
+                    # Read from a day of the month or a weekday with no month in
+                    # the sentence. Almost certainly right, and "almost" is why
+                    # the model is told to say them back rather than book on
+                    # them silently.
+                    patch["dates_need_confirming"] = True
+            elif nights.ask:
+                patch["dates_unclear"] = nights.ask
+    # The ranked facts, folded in with where each came from.
+    #
+    # `_sources` is private and consumed by `merge`, which keeps only what
+    # the session ends up holding — a per-turn map of every field the turn
+    # *tried* to set would grow without bound on a long thread.
+    patch.update(facts.values)
+    if facts.sources:
+        patch["_sources"] = {
+            field: {"source": source, "confidence": facts.confidence.get(field)}
+            for field, source in facts.sources.items()
+        }
     return patch
 
 
@@ -220,7 +438,12 @@ _TRANSACTIONAL = _STAY_ARGS + (
     # and an `awaiting_hotel` left behind would have the agent telling them
     # it is waiting on a question nobody asked about this trip.
     "negotiation", "payment", "awaiting_hotel", "obligations",
-    "last_business_action", "room_needs_recheck",
+    "last_business_action", "room_needs_recheck", "room_ambiguous",
+    "dates_need_confirming", "dates_unclear", "dates_from",
+    # The door an in-house guest is standing at. Transactional because it is
+    # about *this* stay: a guest who comes back next month is in another room.
+    "room_number",
+    "_sources", "_sources_turn",
 )
 
 # What a *price* was true of. When the guest moves the dates, these are wrong
@@ -233,6 +456,130 @@ _PRICED = ("quote_id", "rate_plan_id", "negotiation", "payment", "stage")
 # this has almost certainly come back about something else, and the dates they
 # gave in September are not an answer to a question asked in November.
 STALE_AFTER_HOURS = 72
+
+
+# ── what depends on what ─────────────────────────────────────────────────────
+#
+# **The session is derived state, and derived state goes stale when its inputs
+# change.** Until now exactly one case of that was handled: `_superseded` below
+# noticed new *dates* and `move_dates` dropped the priced fields. Every other
+# correction a guest can make went unhandled, and the failures are the same
+# shape each time —
+#
+#     "actually 3 rooms, not 2"     the quote for two rooms stays on the session
+#     "make it 4 adults"            the same quote, priced for two, stays
+#     "the Garden Standard then"    the rate plan from the Deluxe stays, and the
+#                                   next quote is asked for a plan that belongs
+#                                   to a different room
+#
+# — a `quote_id` or a `rate_plan_id` that is true of a stay the guest has just
+# stopped describing. The prompt then tells the model about a price that no
+# longer applies, and the model quotes it.
+#
+# So the relationship is declared once instead of being rediscovered per field.
+# `DERIVED_FROM[x]` is the set of facts `x` is only true of: change any of them
+# and `x` is no longer known.
+#
+# Read it as sentences:
+#
+#   a quote is only true of the exact stay it priced — those nights, that many
+#   rooms, that many people, that room type, that rate plan;
+#   a rate plan belongs to a room type, so choosing a different room invalidates
+#   it;
+#   a negotiation and a payment state are about a specific quote;
+#   the stage a conversation has reached is about the quote it reached it with.
+#
+# **`room_type_id` is deliberately absent as a dependent.** A guest who moves
+# their dates has not changed their mind about the room, and dropping it would
+# make the agent ask a question they answered two turns ago — a real regression
+# this codebase already fixed once. It is carried forward *unverified* instead,
+# with `room_needs_recheck`, which `describe()` turns into an instruction to
+# confirm the room is free for the new nights before promising it.
+DERIVED_FROM: dict[str, frozenset[str]] = {
+    "quote_id": frozenset({"check_in", "check_out", "units", "adults", "children",
+                           "room_type_id", "rate_plan_id"}),
+    "rate_plan_id": frozenset({"room_type_id"}),
+    "negotiation": frozenset({"quote_id"}),
+    "payment": frozenset({"quote_id"}),
+    "stage": frozenset({"quote_id"}),
+    # What the agent still owes the guest is about the stay being discussed. A
+    # guest who changes the stay has not necessarily had their question answered
+    # — but the *answer* they were owed was about the old one.
+    "obligations": frozenset({"check_in", "check_out", "units", "adults"}),
+    "awaiting_hotel": frozenset({"check_in", "check_out", "units", "adults"}),
+}
+
+# Facts a guest can correct. Everything else on the profile is ours — a stage we
+# derived, a room we recorded — and a guest does not "correct" those.
+CORRECTABLE = frozenset({"check_in", "check_out", "units", "adults", "children",
+                         "room_type_id", "rate_plan_id", "room_number"})
+
+
+def corrections(profile: dict, patch: dict) -> set[str]:
+    """
+    Facts this turn *changed*, as opposed to facts it filled in.
+
+    A blank becoming a value is the conversation progressing — the guest naming
+    their dates for the first time invalidates nothing. A value becoming a
+    *different* value is a correction, and everything computed from it is now
+    describing a stay nobody is asking about.
+
+    **Unless something has already been computed from that blank.** The rule
+    above is right while nothing derives from the field and wrong the moment
+    something does, because a quote issued while `adults` was unknown did not
+    price *nothing* — it priced whatever the tool assumed. A guest who is
+    quoted, then says "oh, and two kids are coming", was leaving a blank and is
+    now filling it, and the quote in the session is a price for a different
+    party.
+
+    Found by a twenty-journey replay: "quoted, then children arrive" and
+    "quoted, then the party size is named" both kept a quote priced before
+    either fact existed. Neither is a correction by the letter of the rule and
+    both are stale by the meaning of it.
+
+    So a blank being filled counts as a change exactly when some field that
+    derives from it is currently set. Nothing derived, nothing to invalidate,
+    and the first-mention case is untouched.
+    """
+    changed = set()
+    for key in CORRECTABLE:
+        if key not in patch:
+            continue
+        before, after = profile.get(key), patch.get(key)
+        if after in (None, ""):
+            continue
+        if before in (None, ""):
+            if any(profile.get(field) not in (None, "")
+                   for field, sources in DERIVED_FROM.items() if key in sources):
+                changed.add(key)
+            continue
+        if str(before) != str(after):
+            changed.add(key)
+    return changed
+
+
+def invalidated_by(changed: set[str]) -> set[str]:
+    """
+    Everything that stops being known when `changed` changes, transitively.
+
+    Transitive because the graph has depth: correcting the room invalidates the
+    rate plan, and the rate plan invalidates the quote, and the quote
+    invalidates the negotiation and the payment state. Doing one hop would leave
+    a quote on the session that was priced against a rate plan we had just
+    dropped.
+    """
+    dead: set[str] = set()
+    frontier = set(changed)
+    while frontier:
+        nxt = set()
+        for field, sources in DERIVED_FROM.items():
+            if field in dead or field in frontier:
+                continue
+            if sources & frontier:
+                nxt.add(field)
+        dead |= nxt
+        frontier = nxt
+    return dead
 
 
 def _superseded(profile: dict, patch: dict) -> bool:
@@ -273,7 +620,7 @@ def _stale(profile: dict, now: datetime | None = None) -> bool:
     return (now or datetime.now(timezone.utc)) - at > timedelta(hours=STALE_AFTER_HOURS)
 
 
-def move_dates(profile: dict) -> dict:
+def move_dates(profile: dict, patch: dict | None = None) -> dict:
     """
     The guest is talking about different nights. Keep the room, drop the price.
 
@@ -291,8 +638,35 @@ def move_dates(profile: dict) -> dict:
     difference between them is the whole reason this is two keys and not one.
     """
     moved = {k: v for k, v in (profile or {}).items() if k not in _PRICED}
-    for field in _STAY_ARGS:
-        moved.pop(field, None)
+
+    # **The party goes only when the guest is re-describing the stay.**
+    #
+    # This dropped `units`, `adults` and `children` on *any* date change, and
+    # the reasoning was sound for the case it was written for: a guest who booked
+    # September for four adults and comes back about October has not implicitly
+    # kept the four.
+    #
+    # It is wrong for the case this pass added. A guest three turns into a
+    # conversation who says "actually 3 rooms" and then "and the 2nd to the 5th"
+    # has not changed their mind about the rooms — and dropping the count meant
+    # the next quote priced one room, then the agent asked how many they wanted,
+    # which is the question they had just answered. Found by an eleven-turn
+    # journey doing exactly that.
+    #
+    # The two cases are told apart by the patch rather than by a clock: a guest
+    # describing a *different* stay states its size, and a guest correcting
+    # their nights states only nights. When they do restate it, the old party is
+    # dropped whole — otherwise a September "1 child" survives into an October
+    # request that mentioned only adults.
+    restating = bool(patch) and any(
+        patch.get(field) is not None for field in ("units", "adults", "children"))
+    if restating:
+        for field in _STAY_ARGS:
+            moved.pop(field, None)
+    else:
+        moved.pop("check_in", None)
+        moved.pop("check_out", None)
+
     moved.pop("awaiting_hotel", None)
     moved.pop("obligations", None)
     if moved.get("room_type_id"):
@@ -309,6 +683,64 @@ def clear_stay(profile: dict) -> dict:
     somebody stores on it should not be silently deleted by a booking ending.
     """
     return {k: v for k, v in (profile or {}).items() if k not in _TRANSACTIONAL}
+
+
+def _record_sources(merged: dict, profile: dict, patch: dict) -> dict:
+    """
+    Where each fact the session now holds came from, and on which turn.
+
+    **Kept for the facts that survived, not for the ones a turn tried to set.**
+    A per-turn map of every attempt would grow without bound on a long thread;
+    what is useful six weeks later is "the guest told us three rooms, on turn
+    four" — one entry per canonical fact, replaced when the fact is.
+
+    Read by nothing in the hot path today, which is stated plainly rather than
+    dressed up: this is a debugging record and an inspectable form of the
+    precedence rule, and the rule itself is enforced by `_Facts` and tested
+    directly.
+    """
+    incoming = patch.pop("_sources", None) or {}
+    if not incoming:
+        return merged
+
+    turn = int((profile.get("_sources_turn") or 0)) + 1
+    history = dict(profile.get("_sources") or {})
+    for field, entry in incoming.items():
+        if field in merged:
+            history[field] = {**entry, "turn": turn}
+    # Facts that have since gone — dropped by a correction, or by a date move —
+    # take their provenance with them.
+    history = {k: v for k, v in history.items() if k in merged}
+    merged = dict(merged)
+    merged["_sources"] = history
+    merged["_sources_turn"] = turn
+    return merged
+
+
+def _clear_answered_ambiguity(merged: dict) -> dict:
+    """
+    A question that has been answered stops being asked.
+
+    Without this the prompt would go on asking a guest to choose between two
+    rooms one turn after they chose — which reads, correctly, as not listening.
+    The same for dates: once a sentence settles them beyond doubt, the earlier
+    "which month did you mean" is answered.
+    """
+    merged = dict(merged)
+    if merged.get("room_ambiguous") and merged.get("room_type_id"):
+        merged.pop("room_ambiguous", None)
+    if merged.get("dates_unclear") and merged.get("_dates_settled"):
+        # **Only when *this* turn settled them.** Keyed on the patch rather than
+        # on "the session has dates", because a guest asking to change dates
+        # already has dates — the old ones — and clearing the question because
+        # they exist would drop it on the very turn it was raised.
+        merged.pop("dates_unclear", None)
+    merged.pop("_dates_settled", None)
+    if merged.get("dates_need_confirming") and \
+            merged.get("dates_from", "").startswith(("two dates", "a date")):
+        # Spelled out this time. Nothing left to confirm.
+        merged.pop("dates_need_confirming", None)
+    return merged
 
 
 def _revalidate_room(merged: dict) -> dict:
@@ -382,9 +814,39 @@ def merge(conversation_id: str, patch: dict) -> None:
             # about last month, the room included.
             profile = clear_stay(profile)
         elif _superseded(profile, patch):
-            profile = move_dates(profile)
+            # New *dates* are the one correction that also means "a different
+            # trip", so the whole stay is rebuilt rather than pruned — see
+            # `_superseded`.
+            profile = move_dates(profile, patch)
+        else:
+            # **Every other correction, through the declared graph.**
+            #
+            # A guest who says "actually 3 rooms" or "the Garden Standard then"
+            # has invalidated the quote priced for two rooms, or the rate plan
+            # that belongs to the Deluxe. Before this only dates were handled,
+            # and every other correction left a `quote_id` on the session that
+            # was true of a stay the guest had stopped describing — which the
+            # prompt then told the model about, and the model quoted.
+            #
+            # `corrections` is the trigger and it is deliberately narrow: a
+            # blank becoming a value is the conversation progressing, not a
+            # correction. See DERIVED_FROM.
+            changed = corrections(profile, patch)
+            if changed:
+                dead = invalidated_by(changed)
+                if dead:
+                    logger.info(
+                        "conversation %s corrected %s; dropping %s",
+                        conversation_id, sorted(changed), sorted(dead),
+                    )
+                    profile = {k: v for k, v in profile.items() if k not in dead}
+                    if profile.get("room_type_id") and "room_type_id" not in changed:
+                        # Carried forward unverified, exactly as a date change
+                        # does: a preference is not availability.
+                        profile["room_needs_recheck"] = True
 
-        merged = _revalidate_room({**profile, **patch})
+        merged = _clear_answered_ambiguity(_revalidate_room({**profile, **patch}))
+        merged = _record_sources(merged, profile, patch)
         if merged == profile:
             # Nothing new. Returning here rather than stamping `touched_at`
             # anyway is what keeps the staleness clock honest: it should measure
@@ -447,20 +909,47 @@ def describe(conversation: dict | None) -> str | None:
     if not isinstance(profile, dict):
         return None
 
+    # **Dates are no longer the price of admission.**
+    #
+    # This returned None unless both dates were known, which meant everything
+    # below it — the room the guest chose, the room they half-named, the room
+    # that has gone — was invisible on any turn before dates were settled. A
+    # guest whose *first* message is "Deluxe Balcony chahiye" had it recorded on
+    # the session and never mentioned in the prompt, so the agent asked which
+    # room they wanted one turn after they said.
+    #
+    # The stay line is still only written when there is a stay to describe. What
+    # changed is that its absence no longer suppresses the rest.
     check_in, check_out = profile.get("check_in"), profile.get("check_out")
-    if not (check_in and check_out):
-        return None
+    lines: list[str] = []
+    if check_in and check_out:
+        party = f"{profile.get('adults') or 1} adults"
+        if profile.get("children"):
+            party += f" and {profile['children']} children"
+        rooms = profile.get("units") or 1
+        lines += [
+            "Earlier in this conversation the guest gave these dates. Do not ask "
+            "for them again unless they change the subject to different nights:",
+            f"  {check_in} to {check_out}, {rooms} room(s), {party}",
+        ]
+    elif (profile.get("room_type_id") or profile.get("room_ambiguous")
+            or profile.get("dates_unclear")):
+        lines.append("Earlier in this conversation:")
 
-    party = f"{profile.get('adults') or 1} adults"
-    if profile.get("children"):
-        party += f" and {profile['children']} children"
-    rooms = profile.get("units") or 1
-
-    lines = [
-        "Earlier in this conversation the guest gave these dates. Do not ask for "
-        "them again unless they change the subject to different nights:",
-        f"  {check_in} to {check_out}, {rooms} room(s), {party}",
-    ]
+    if profile.get("dates_need_confirming") and check_in and check_out:
+        # Read from a day of the month or a weekday, with no month in the
+        # sentence — see `date_facts`. Right almost always, and the model says
+        # them back rather than booking on them silently.
+        lines.append(
+            "  Those nights were worked out from what they said rather than "
+            "spelled out — say the two dates back to them in your reply so they "
+            "can correct you."
+        )
+    if profile.get("dates_unclear"):
+        lines.append(
+            f"  Their dates are not clear. Ask them: "
+            f"\"{profile['dates_unclear']}\" — do not guess at a month."
+        )
 
     # The room they have already settled on.
     #
@@ -489,6 +978,16 @@ def describe(conversation: dict | None) -> str | None:
                 "before promising it, and re-price it — the old price does not "
                 "apply to new dates."
             )
+    elif profile.get("room_ambiguous"):
+        # Several of this hotel's rooms plausibly match what the guest wrote,
+        # and the resolver refused to pick between them — see
+        # `services/pms/room_names`. The question is handed to the model
+        # already written, because it names this hotel's own rooms and the
+        # model would otherwise have to reconstruct the list.
+        lines.append(
+            f"  They named a room but it is not clear which. Ask them: "
+            f"\"{profile['room_ambiguous']}\" — do not choose for them."
+        )
     elif profile.get("room_unavailable"):
         # The room they had chosen has gone. Said plainly, because the
         # alternative is an agent that behaves as though they never chose one
@@ -498,4 +997,8 @@ def describe(conversation: dict | None) -> str | None:
             "so, and offer what search_availability actually returns."
         )
 
+    # Nothing worth spending tokens on. The stay line alone is not enough to
+    # keep — a header with no facts under it is noise in every prompt.
+    if not lines or (len(lines) == 1 and lines[0].endswith("conversation:")):
+        return None
     return "\n".join(lines)

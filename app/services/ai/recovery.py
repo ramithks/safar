@@ -53,6 +53,7 @@ figure by construction, not by review.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -112,14 +113,45 @@ def classify(step) -> str:
 
 @dataclass
 class Attempt:
-    """One rung of the ladder, for the record."""
+    """
+    One rung of the ladder, for the record.
+
+    **`error_class` and `latency_ms` were not here, and §17 needs both.** The
+    row said a fallback happened and which model it landed on; it did not say
+    what the provider had actually done or how long the failed attempt cost.
+    Those are the two questions an operator asks about a fallback — *is this
+    the provider or is this us*, and *what is this costing the guest in
+    latency* — and neither could be answered without a log search on a run id
+    nobody has.
+
+    `error_class` is the provider's own exception type, not our classification
+    of it: `classify` already collapses a hundred provider errors into a
+    handful of behaviours, which is right for deciding what to do next and
+    lossy for deciding whether to raise a ticket with Google.
+    """
 
     failure: str
     model: str
     method: str          # 'retry' · 'fallback' · 'deterministic' · 'handoff'
+    error_class: str | None = None
+    latency_ms: int | None = None
+    # What the transport went through underneath this attempt: how many times
+    # it retried (a 429 rotation counts), and the status it ended on.
+    provider_retries: int = 0
+    provider_status: str | None = None
 
     def as_dict(self) -> dict:
-        return {"failure": self.failure, "model": self.model, "method": self.method}
+        record = {"failure": self.failure, "model": self.model,
+                  "method": self.method}
+        if self.error_class:
+            record["error_class"] = self.error_class
+        if self.latency_ms is not None:
+            record["latency_ms"] = self.latency_ms
+        if self.provider_retries:
+            record["provider_retries"] = self.provider_retries
+        if self.provider_status:
+            record["provider_status"] = self.provider_status
+        return record
 
 
 # ── saying what the tools established ────────────────────────────────────────
@@ -231,3 +263,98 @@ def _join(items: list[str]) -> str:
     if len(items) == 1:
         return items[0]
     return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+# ── a promise of a person has to be true ────────────────────────────────────
+#
+# **The invariant §12 asks for**: do not tell a guest a human will contact them
+# unless a real handoff was actually created.
+#
+# Two ways it was breakable. The runtime's own handoff sentence — *"I've passed
+# this to the hotel team and someone will be with you shortly"* — is composed
+# before `_ensure_human` runs, and `_ensure_human` swallowed its own failure. A
+# database blip on that one UPDATE left the conversation on `ai`, the sweep
+# looks at the handler, and the guest waited for somebody nobody had told.
+#
+# And the model can write the promise itself. A live evaluation turn produced
+# *"one of our team members will get back to you shortly"* with no tool called
+# and `handoff` false — the words of a handoff without the handoff.
+#
+# The fix is to make the promise true rather than to refuse the reply. A guest
+# who has been told a person is coming should get one; taking the sentence away
+# and leaving them with nothing is the worse of the two repairs.
+_PROMISED_A_PERSON = re.compile(
+    r"(?xi)"
+    r"("
+    # English
+    r"  (?:someone|somebody|a\s+(?:member|colleague)|the\s+(?:team|hotel|staff)|"
+    r"     our\s+team|a\s+human|a\s+person|the\s+manager)"
+    r"  [^.!?]{0,40}?"
+    r"  (?:will|going\s+to|shall)\s+(?:be\s+)?"
+    r"  (?:with|contact|call|reach|get\s+back|follow\s+up|assist|help)"
+    r"| (?:passed|passing|handed|handing|transferr?(?:ed|ing)|escalat(?:ed|ing))"
+    r"  \s+(?:this|it|you|your\s+\w+)?\s*(?:on\s+)?to\s+"
+    r"  (?:the\s+)?(?:team|hotel|staff|manager|someone|a\s+colleague)"
+    r"| (?:connecting|putting)\s+you\s+(?:through|in\s+touch)"
+    # "let me get somebody from the hotel to look at it with you" — the
+    # sentence several tools already hand back when they refuse. An offer to
+    # fetch a person is a promise of one.
+    r"| let\s+me\s+(?:get|bring|ask|find)\s+"
+    r"  (?:somebody|someone|a\s+colleague|the\s+team|the\s+manager|"
+    r"     the\s+hotel|hotel\s+team)"
+    # Hinglish
+    r"| team\s+(?:ko|se)\s+(?:bhej|bata|bula|forward|connect)"
+    r"| (?:koi|kisi|hamara|humara)\s+\w{0,12}\s*(?:aapse|aap\s*se)\s+"
+    r"  (?:baat|contact|sampark)"
+    r"| team\s+(?:aapse|aap\s*se)\s+(?:baat|contact|sampark)"
+    r"| main\s+team\s+ko\s+(?:bula|bhej|bata)"
+    r")"
+)
+
+
+# **"I will share it with you as soon as it is ready", and then a handoff.**
+#
+# `promises_a_person` covers a reply that says a human is coming. This is the
+# same failure one step over: a reply that promises a *thing* is coming — a
+# link, a price, a confirmation — on a turn that then hands the conversation to
+# somebody. The guest is left waiting for something nobody has undertaken to
+# send, and unlike the person case there is not even a queue entry that names
+# what they are waiting for.
+#
+# Found on turn 8 of the first-guest journey, on the second of three runs:
+# "I am checking on the payment link for you right now. I will share it with
+# you as soon as it is ready." The turn escalated, the promise stood, and the
+# guest's next three messages got the handoff sentence.
+#
+# Deliberately narrow — a *future-tense first-person promise*. "Here is the
+# link" is not one; "I'll send the link" is. The check is only ever consulted
+# on a turn that is already handing off, so a promise the agent goes on to keep
+# in the same turn never reaches it.
+_PROMISED_AN_ACTION = re.compile(
+    r"(?xi)"
+    r"(?:"
+    r"  (?:i|we)\s*(?:'ll|\s+will|\s+shall|\s+am\s+going\s+to|\s+are\s+going\s+to)"
+    r"  [^.!?]{0,60}?"
+    r"  (?:send|share|get|give|provide|create|generate|confirm|check|arrange|"
+    r"     update|revert|come\s+back|let\s+you\s+know|update\s+you)"
+    r"| (?:main|hum)\s+[^.!?]{0,40}?"
+    r"  (?:bhej|bhejta|bhejti|bhejunga|bhej\s+dunga|de\s+dunga|kar\s+dunga|"
+    r"     bata\s+dunga|bata\s+dungi|check\s+kar)"
+    r"| (?:sharing|sending|generating|creating|checking)\s+(?:it|this|that|the)"
+    r"  [^.!?]{0,30}?(?:shortly|soon|right\s+away|in\s+a\s+moment|now)"
+    # "Let me check and get back to you" — an undertaking without
+    # a first-person future, and one of the commonest ways to make one.
+    r"| let\s+me\s+[^.!?]{0,40}?(?:check|find\s+out|confirm|look|see)"
+    r"| (?:shortly|soon|in\s+a\s+moment|right\s+away)\s*[.!]?\s*$"
+    r")"
+)
+
+
+def promises_an_action(reply: str | None) -> bool:
+    """Does this reply undertake to do something later?"""
+    return bool(_PROMISED_AN_ACTION.search(reply or ""))
+
+
+def promises_a_person(reply: str | None) -> bool:
+    """Does this reply tell the guest that somebody will come?"""
+    return bool(_PROMISED_A_PERSON.search(reply or ""))

@@ -84,7 +84,20 @@ def test_a_stayos_beat_schedules_nothing_that_writes_to_a_marketplace_table(role
     is the one outcome worse than the sweep not running at all.
     """
     tasks = {entry["task"] for entry in role("stayos").values()}
-    assert tasks == {SWEEP}
+
+    # **Asserted as a property, not as a fixed set.** This read
+    # `== {SWEEP}`, true while the sweep was the only StayOS scheduled task,
+    # which turned every *addition* into a failure — including the inventory
+    # reconciliation, which is exactly the kind of thing that belongs here.
+    #
+    # What the test is for is marketplace tasks staying off a beat pointed at
+    # a hotel database. That is what it checks now, and the line below still
+    # fails on the one entry the docstring names.
+    assert SWEEP in tasks
+    for task in tasks:
+        assert task.startswith(("travbuddy.messaging.", "travbuddy.pms.")), (
+            f"{task} is on the StayOS beat and belongs to neither the "
+            f"messaging nor the hotel side")
     assert not any("partners" in task for task in tasks)
 
 

@@ -349,6 +349,10 @@ async def run_turn(
     # than in the tool's arguments. See services/ai/arbiter.py and
     # services/ai/context.py:TurnState.
     ctx.turn.live = True
+    # Cleared, not appended to. A context reused across turns — which the
+    # console does — would otherwise report the previous turn's rule scopes
+    # against this one's run.
+    ctx.turn.telemetry = {}
     ctx.turn.message = message
     ctx.turn.requirements = tuple(requirements)
     ctx.turn.outcomes = outcomes
@@ -404,6 +408,11 @@ async def run_turn(
     # the fallback and continues rather than starting again.
     model_in_use = choice.model
     fallback_count = 0
+    # Every provider-level attempt on this turn, successful or not. Separate
+    # from `recovery_log`, which records the *ladder's* decisions: this is the
+    # transport underneath it, where a model can be tried and fail without the
+    # ladder ever being consulted.
+    model_attempts: list[dict] = []
     tool_failures = 0
     # (tool, arguments) already executed on this turn. Two sets, because a
     # repeated read and a repeated write are different problems — see the loop.
@@ -417,12 +426,27 @@ async def run_turn(
         ]
         last: Exception | None = None
         for i, model in enumerate(candidates):
+            started = time.monotonic()
             try:
                 out = await llm.step(
                     model=model, messages=messages, tools=tools, params=params
                 )
             except ProviderError as exc:
                 last = exc
+                # **Recorded whether or not there is another rung.** The last
+                # candidate failing is the turn ending, which is the case an
+                # operator most wants to see in the row — and it was the one
+                # case that logged nothing, because the record was written
+                # inside the "there is somewhere else to go" branch.
+                model_attempts.append(recovery.Attempt(
+                    failure=exc.reason or "provider_error",
+                    model=model,
+                    method="fallback" if i + 1 < len(candidates) else "exhausted",
+                    error_class=getattr(exc, "error_class", None),
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                    provider_retries=getattr(exc, "provider_retries", 0),
+                    provider_status=getattr(exc, "provider_status", None),
+                ).as_dict())
                 if i + 1 < len(candidates):
                     fallback_count += 1
                     logger.warning(
@@ -430,6 +454,21 @@ async def run_turn(
                         run_id, model, exc.reason, candidates[i + 1],
                     )
                 continue
+            # **A successful call that cost three region rotations is still
+            # information.** Recorded whether or not anything failed, because
+            # the question "was the provider under pressure on this turn" has
+            # to be answerable on the turns that succeeded — otherwise a report
+            # sees only the turns that broke and concludes the rest were fine.
+            if getattr(out, "provider_retries", 0):
+                model_attempts.append(recovery.Attempt(
+                    failure="provider_retry",
+                    model=model,
+                    method="succeeded",
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                    provider_retries=out.provider_retries,
+                    provider_status=getattr(out, "provider_status", None),
+                ).as_dict())
+
             if model != model_in_use:
                 # Stick with it for the rest of the turn. Flapping back to a
                 # model that just failed would spend the budget rediscovering it.
@@ -908,6 +947,30 @@ async def run_turn(
                     "run %s refused by guardrails: %s | reply=%r",
                     run_id, verdict.reason, reply[:300],
                 )
+                # **Kept, because the log line is not a record.**
+                #
+                # Thirty guardrail blocks in production and not one of them
+                # retains what was actually refused — the row holds the phrase
+                # that matched and nothing else. So the largest failure class on
+                # product traffic (35%) cannot be diagnosed after the fact, and
+                # §17's question — *why did StayOS say this?* — has no answer
+                # without a log search against a run id nobody has.
+                #
+                # It matters most where the rule is subtle. Several blocks
+                # matched the phrase 'booking confirm', which the mood rule now
+                # correctly *allows* in "booking confirm karne ke liye pay
+                # kijiye" and correctly refuses in "booking confirm ho gayi".
+                # Which of those each run was is unknowable from the row, so the
+                # effect of that fix on real traffic cannot be measured.
+                #
+                # Internal only: this never reaches a guest, and the reply is
+                # our own text about their booking, already stored in
+                # `conversation_messages` whenever it is delivered. A refused
+                # one is the only kind that leaves no trace at all.
+                ctx.turn.telemetry.setdefault("guardrail", []).append({
+                    "reason": verdict.reason[:200],
+                    "refused_reply": reply[:400],
+                })
                 reply = prompts.handoff_reply(ctx)
                 handoff = True
                 error = f"guardrail: {verdict.reason}"
@@ -1075,6 +1138,63 @@ async def run_turn(
     # before it could negotiate is exactly the turn somebody investigating a
     # lost sale needs to find, and a summary written only on success would hide
     # it. §21 — every question about a turn answerable from the two tables.
+    # ── a promise of a person has to be true ─────────────────────────────────
+    #
+    # **§12's invariant, enforced rather than intended.** Two ways it was
+    # breakable, and both had happened.
+    #
+    # The model can write the promise itself: a live evaluation turn produced
+    # *"one of our team members will get back to you shortly"* having called
+    # nothing, with `handoff` false — the words of a handoff without the
+    # handoff. So a reply that promises somebody *becomes* a handoff, rather
+    # than being refused. A guest told a person is coming should get one;
+    # taking the sentence away and leaving them with nothing is the worse
+    # repair.
+    if reply and not handoff and recovery.promises_a_person(reply):
+        logger.warning("run %s: the reply promised a person and nothing had "
+                       "handed over — creating the handoff", run_id)
+        handoff = True
+        if status == "succeeded":
+            status = "escalated"
+        recovery_log.append(
+            recovery.Attempt("promised_a_person", model_in_use, "handoff").as_dict())
+
+    # **A turn that hands off must not leave a promise standing.**
+    #
+    # `promises_a_person` above covers the reply that says a human is coming.
+    # This is the same failure one step over: a reply that undertakes to send a
+    # *thing* — a link, a price, a confirmation — on a turn that then hands the
+    # conversation to somebody. The guest is left waiting for something nobody
+    # has undertaken to send.
+    #
+    # Found on turn 8 of the first-guest journey: "I am checking on the payment
+    # link for you right now. I will share it with you as soon as it is ready."
+    # The turn escalated, the promise stood, and the guest's next three messages
+    # got the handoff sentence — so from their side a link was coming and then
+    # the conversation went quiet.
+    #
+    # Only on a handing-off turn, which is what keeps this from touching the
+    # ordinary case: a promise the agent goes on to keep in the same turn never
+    # reaches here.
+    if handoff and reply and recovery.promises_an_action(reply):
+        logger.warning("run %s: the reply promised an action and the turn is "
+                       "handing over — replacing it", run_id)
+        reply = prompts.handoff_reply(ctx)
+        recovery_log.append(
+            recovery.Attempt("promised_an_action", model_in_use, "handoff").as_dict())
+
+    if handoff and ctx.conversation_id:
+        # And the other way: the sentence is composed before this runs, and this
+        # used to swallow its own failure — a database blip left the guest
+        # promised and the conversation still on `ai`, where the sweep never
+        # looks. If it cannot be made true, the promise is withdrawn.
+        marked = await run_db(_ensure_human, ctx)
+        if not marked and reply and recovery.promises_a_person(reply):
+            logger.error("run %s: could not create the handoff a reply promised "
+                         "— withdrawing the promise", run_id)
+            reply = prompts.no_handoff_reply(ctx)
+            error = (error or "") + " | handoff could not be recorded"
+
     summary_of_requirements = required_actions.summarise(requirements, outcomes, forced)
     if language_slips:
         # Folded into the same jsonb rather than given a column of its own: it
@@ -1087,6 +1207,12 @@ async def run_turn(
     # is the number the greeting narrowing moves and the number that explains a
     # turn's input tokens.
     summary_of_requirements["tools_available"] = len(tools)
+    if ctx.turn.telemetry:
+        # How the turn's business facts were arrived at — which negotiation rule
+        # scope applied, and whether any of it was a fallback because a read
+        # failed. §4: a safe fallback has to be observable, and this is the
+        # column somebody queries to see one.
+        summary_of_requirements["provenance"] = ctx.turn.telemetry
     if recovery_log:
         # Every rung climbed this turn, and what came of it. §10 asks for
         # `attempt`, `fallback_used`, `failure_class` and `recovery_method` to
@@ -1102,6 +1228,33 @@ async def run_turn(
         # than it is. This is also the only way to answer "how often does the
         # arbiter fire", which is the number that decides whether it is helping.
         summary_of_requirements["handoff_judgements"] = ctx.turn.handoff_rejections[:6]
+
+    # **The turn's model record, on every turn rather than on the odd ones.**
+    #
+    # §17 asks that a turn answer, without a log search: which model was
+    # configured, which one served it, how many fallbacks fired and why, how
+    # many attempts it took, how long they cost, and what class of provider
+    # error caused each. The log line below carries most of that and only on
+    # turns that went wrong, which makes the denominator unknowable — a
+    # fallback rate needs the turns that did *not* fall back as much as the
+    # ones that did.
+    #
+    # Written unconditionally for that reason. It is six small fields on a
+    # jsonb that already exists, and it is what makes PRIMARY_ONLY /
+    # FALLBACK_USED / FALLBACK_ONLY computable from the rows rather than
+    # inferred from an absence.
+    summary_of_requirements["model"] = {
+        "configured": choice.model,
+        "served_by": list(turn_usage.models),
+        "finished_on": model_in_use,
+        "fallback_count": fallback_count,
+        # Provider-level attempts, each with its own error class and latency.
+        # Trimmed, because a pathological turn should not write an unbounded
+        # array into a row every dashboard reads.
+        "attempts": model_attempts[:8],
+        "fallback_reasons": sorted({
+            a["failure"] for a in model_attempts if a.get("failure")}),
+    }
 
     # **Which model actually answered, not which one was chosen.**
     #
@@ -1173,9 +1326,6 @@ async def run_turn(
     # A handoff always leaves the conversation with a human, even when the
     # handoff came from a crash rather than from the tool. The rule is that an
     # unattended conversation is never left believing an agent is still on it.
-    if handoff and ctx.conversation_id:
-        await run_db(_ensure_human, ctx)
-
     return RunResult(
         run_id=run_id,
         status=status,
@@ -1188,10 +1338,11 @@ async def run_turn(
         error=error,
         requirements=summary_of_requirements,
         required_action_status=required_actions.status_of(summary_of_requirements),
+        served_by=list(turn_usage.models),
     )
 
 
-def _ensure_human(ctx: AgentContext) -> None:
+def _ensure_human(ctx: AgentContext) -> bool:
     """
     Stop the agent answering, whatever the reason it stopped.
 
@@ -1205,8 +1356,19 @@ def _ensure_human(ctx: AgentContext) -> None:
         ).eq("id", ctx.conversation_id).eq("property_id", ctx.property_id).eq(
             "handler", "ai"
         ).execute()
+        return True
     except Exception:  # noqa: BLE001
-        logger.warning("could not mark conversation %s for a human", ctx.conversation_id)
+        # **Escalated from a warning, because the guest has already been told.**
+        #
+        # The handoff sentence is composed before this runs, so a failure here
+        # leaves a guest who has been promised a person on a conversation the
+        # sweep will never pick up — `waiting.reason_waiting` reads the handler.
+        # The caller repairs the promise; this makes sure somebody is paged
+        # about why it had to.
+        logger.error("could not mark conversation %s for a human — a guest may "
+                     "have been told somebody is coming", ctx.conversation_id,
+                     exc_info=True)
+        return False
 
 
 def agent_is_handling(conversation: dict) -> bool:

@@ -558,3 +558,56 @@ class TestThePercentageAGuestNamesThemselves:
         """The turn as it actually arrived, end to end through `detect`."""
         found = ra.detect("how much for two nights? give me 70% off", {})
         assert "NEGOTIATION" in [r.intent for r in found]
+
+
+# ── a clock is not a price ──────────────────────────────────────────────────
+
+class TestKitneBajeIsAnHour:
+    """
+    **The evaluation's own control scenario failed on both models.**
+
+    "Breakfast kitne baje tak milta hai?" is the one turn in the model matrix
+    chosen to require no business action at all, and it came back as a required
+    action on 4 of 4 runs on Gemini 2.5 *and* 4 of 4 on Gemini 3.x. Identical on
+    both families is the signature of a system bug being charged to a model.
+
+    `kitne` is a quantity word and `_QUOTE` is right to look for it. Followed by
+    `baje` it asks the hour, and the two commonest questions a booked guest
+    asks are exactly that: what time is checkout, and how late is breakfast.
+
+    It cost twice — §18, because a question about breakfast carried the whole
+    pricing tool set; and the answer itself, because a model that obliges quotes
+    a stay the guest never asked to price.
+    """
+
+    def test_breakfast_hours_are_not_a_price_question(self):
+        from app.services.ai import required_actions
+        assert required_actions.detect("Breakfast kitne baje tak milta hai?") == []
+
+    def test_nor_is_checkout_time(self):
+        from app.services.ai import required_actions
+        assert required_actions.detect("checkout kitne baje hai?") == []
+
+    def test_nor_in_devanagari(self):
+        from app.services.ai import required_actions
+        assert required_actions.detect("कितने बजे checkout hai?") == []
+
+    def test_how_long_is_not_how_much(self):
+        from app.services.ai import required_actions
+        assert required_actions.detect("kitni der lagegi?") == []
+
+    def test_a_message_asking_both_still_asks_a_price(self):
+        """
+        The reason the clock phrase is stripped rather than used as a veto: one
+        message can carry both questions, and the price half must survive.
+        """
+        from app.services.ai import required_actions
+        intents = [r.intent for r in required_actions.detect(
+            "rate kya hai, aur checkout kitne baje hai?")]
+        assert "QUOTE_REQUIRED" in intents
+
+    def test_the_plain_price_question_is_untouched(self):
+        from app.services.ai import required_actions
+        for asking in ("kitna hua?", "per night kitna?", "total kitna hoga?",
+                       "what's the rate?", "kitne ka hai?"):
+            assert [r.intent for r in required_actions.detect(asking)], asking

@@ -47,6 +47,7 @@ from app.services.ai.errors import OutOfScope, PermissionDenied, ToolUnavailable
 from app.services.ai.ids import ResourceId
 from app.services.ai.registry import tool
 from app.db.client import get_db, run_db
+from app.services.pms import money
 from app.services.pms import analytics
 from app.services.pms import recommendations as recs
 
@@ -763,7 +764,10 @@ async def get_plan_and_credits(args: BillingArgs, ctx: AgentContext) -> dict:
         "planName": state["planName"],
         "planStatus": state["status"],
         "planSays": state["headline"],
-        "monthlyText": f"₹{state['pricePaise'] / 100:,.0f}",
+        # Through `money.display`, not an f-string. It is the same arithmetic
+        # today and it is the arithmetic that must live in one place — a second
+        # copy is a second thing to get wrong the day the format changes.
+        "monthlyText": money.display(state["pricePaise"]),
         "nextPaymentDate": state["currentPeriodEnd"],
         "cancelAtPeriodEnd": state["cancelAtPeriodEnd"],
         "creditsRemaining": balance,

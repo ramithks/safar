@@ -115,10 +115,10 @@ MUTANTS = [
     # ── required actions ────────────────────────────────────────────────────
     Mutant("required", "a forced call overwrites the turn's fresh facts",
            "app/services/messaging/session.py",
-           'if forced and field in established:\n                continue',
-           'if False:\n                continue',
+           '            facts.set(field, args.get(field), argument_source)',
+           '            facts.values[field] = args.get(field) or facts.values.get(field)',
            "a guest changes their dates and the session changes them back",
-           "tests/test_conversation_corpus.py"),
+           "tests/test_conversation_corpus.py tests/test_fact_precedence.py"),
     Mutant("required", "a year is read as a budget again",
            "app/services/ai/required_actions.py",
            'if 2020 <= value <= 2035 and pattern in (_OFFERED_PRICE, _OFFERED_PRICE_AFTER):',
@@ -137,6 +137,167 @@ MUTANTS = [
            '',
            "'human se baat karni hai' is answered by a machine",
            "tests/test_haggle_vocabulary.py"),
+
+    # ── the catalogue ───────────────────────────────────────────────────────
+    Mutant("catalogue", "the redundant-call instruction comes back",
+           "app/services/ai/tools/read.py",
+           '"rate plans that apply and an indicative total. This already includes "\n'
+           '        "availability — do NOT call search_availability first. For a firm "',
+           '"rate plans that apply and an indicative total. Use after "\n'
+           '        "search_availability when the guest asks what the options are. For a firm "',
+           "56% of the turns that reach get_stay_options pay for a preceding "
+           "call — ~5,000 tokens and 3.5s each",
+           "tests/test_tool_catalogue_audit.py"),
+    Mutant("catalogue", "a tool stops handing the model its display strings",
+           "app/services/ai/registry.py",
+           '    result = money.with_display(result)',
+           '    pass',
+           "the model formats paise itself again — the largest class of the 30 "
+           "guardrail-blocked production replies",
+           "tests/test_money_is_never_formatted_by_the_model.py"),
+
+    # ── conversation state ──────────────────────────────────────────────────
+    Mutant("state", "a correction stops invalidating what it derived",
+           "app/services/messaging/session.py",
+           '            changed = corrections(profile, patch)',
+           '            changed = set()',
+           "a quote priced for two rooms survives the guest saying three, and "
+           "goes into the next prompt",
+           "tests/test_corrections_invalidate.py"),
+    Mutant("state", "the guest's own words stop outranking tool arguments",
+           "app/services/messaging/session.py",
+           '        facts.update(required_actions.stated_facts(message), GUEST_SAID)',
+           '        pass',
+           "\"actually 4 log hain\" lands only if some tool happened to carry it",
+           "tests/test_corrections_invalidate.py tests/test_conversation_corpus.py"),
+
+    # ── entity resolution ───────────────────────────────────────────────────
+    Mutant("entities", "the resolver guesses between two matching rooms",
+           "app/services/pms/room_names.py",
+           '    if len(contenders) > 1:',
+           '    if False:',
+           "a hotel with a Deluxe Balcony and a Deluxe Garden has 'the deluxe "
+           "one' silently resolved to whichever sorted first",
+           "tests/test_room_name_resolution.py"),
+    Mutant("entities", "a partial word becomes a room selection",
+           "app/services/pms/room_names.py",
+           '        if any(h == 0.0 for h in hits):\n            # **Every significant token has to be there.**',
+           '        if False:\n            # **Every significant token has to be there.**',
+           "'is there a pool?' selects the Pool Villa",
+           "tests/test_room_name_resolution.py"),
+    Mutant("entities", "an ambiguous slash date is parsed anyway",
+           "app/services/pms/date_facts.py",
+           '    if slashed and int(slashed.group(1)) <= 12 and int(slashed.group(2)) <= 12:',
+           '    if False:',
+           "5/9 is read as one of its two meanings and the guest arrives four "
+           "weeks late",
+           "tests/test_date_corrections.py"),
+    Mutant("entities", "each date stops being resolved from the one before it",
+           "app/services/pms/date_facts.py",
+           '        resolved = _next_with_day(day, anchor)',
+           '        resolved = _next_with_day(day, today)',
+           "'25th to 28th' said on the 26th comes out backwards and is refused, "
+           "when the guest was perfectly clear",
+           "tests/test_date_corrections.py"),
+
+    Mutant("state", "the source table stops outranking anything",
+           "app/services/messaging/session.py",
+           '        if held is not None and SOURCE_RANK[source] < SOURCE_RANK[held]:',
+           '        if False:',
+           "a forced call built from the stale session overwrites the dates the "
+           "guest just gave",
+           "tests/test_fact_precedence.py"),
+    Mutant("state", "a forced call is ranked as fresh evidence",
+           "app/services/messaging/session.py",
+           '        argument_source = CARRIED if forced else TOOL_ARGUMENT',
+           '        argument_source = TOOL_ARGUMENT',
+           "the session repeating itself outranks the guest correcting it",
+           "tests/test_fact_precedence.py tests/test_conversation_corpus.py"),
+
+    Mutant("state", "a guest statement can claim a business fact",
+           "app/services/messaging/session.py",
+           '        if field in BUSINESS_AUTHORITY and source not in AUTHORITATIVE_SOURCES:',
+           '        if False:',
+           "\"my booking is confirmed\" overwrites the payment state the "
+           "provider owns",
+           "tests/test_business_authority.py"),
+    Mutant("state", "a tool argument counts as the system of record",
+           "app/services/messaging/session.py",
+           'AUTHORITATIVE_SOURCES = frozenset({TOOL_RESULT})',
+           'AUTHORITATIVE_SOURCES = frozenset({TOOL_RESULT, TOOL_ARGUMENT})',
+           "the model's reading of the guest sets a booking state, one remove "
+           "from the guest saying it themselves",
+           "tests/test_business_authority.py"),
+
+    # ── the handoff invariant ───────────────────────────────────────────────
+    Mutant("handoff", "a promised person is never actually fetched",
+           "app/services/ai/runtime.py",
+           '    if reply and not handoff and recovery.promises_a_person(reply):',
+           '    if False:',
+           "the model says somebody will get back to the guest and nobody is "
+           "asked — the turn that failed the promotion gate, as a class",
+           "tests/test_promised_a_person.py"),
+    Mutant("handoff", "a promise that cannot be kept is sent anyway",
+           "app/services/ai/runtime.py",
+           '        if not marked and reply and recovery.promises_a_person(reply):',
+           '        if False:',
+           "a failed UPDATE leaves the guest promised a person on a thread the "
+           "sweep never looks at",
+           "tests/test_promised_a_person.py"),
+    Mutant("handoff", "the handoff failure is swallowed again",
+           "app/services/ai/runtime.py",
+           '        return True\n    except Exception:  # noqa: BLE001',
+           '        pass\n    except Exception:  # noqa: BLE001',
+           "_ensure_human stops reporting success, so the withdrawal never fires",
+           "tests/test_promised_a_person.py"),
+
+    Mutant("entities", "a room number is counted as a room quantity",
+           "app/services/ai/required_actions.py",
+           '            if door and value == int(door):',
+           '            if False:',
+           "\"room 204 mein AC nahi chal raha\" forces group pricing for 204 "
+           "rooms on a guest reporting a fault",
+           "tests/test_room_numbers.py"),
+
+    Mutant("catalogue", "an acknowledgement is treated as a closing",
+           "app/services/ai/classify.py",
+           '    "ok thanks", "okay thanks", "thanks bhai", "thank you so much",',
+           '    "ok thanks", "okay thanks", "thanks bhai", "thank you so much", "ok", "haan",',
+           "\"ok\" after \"shall I send the payment link?\" loses the payment "
+           "tool from the menu, and the sale stops there",
+           "tests/test_greeting_budget.py"),
+
+    # ── business-rule provenance ────────────────────────────────────────────
+    Mutant("provenance", "a failed rule read stops being distinguishable",
+           "app/services/pms/negotiation.py",
+           '        return rules_from_settings(fallback, EMERGENCY_DEFAULT)',
+           '        return rules_from_settings(fallback)',
+           "a hotel whose configured rules stopped applying is invisible again "
+           "— the exact bug that started this pass",
+           "tests/test_rule_provenance.py"),
+    Mutant("provenance", "provenance stops reaching the run row",
+           "app/services/ai/runtime.py",
+           '        summary_of_requirements["provenance"] = ctx.turn.telemetry',
+           '        pass',
+           "the fallback is named and nobody can query it",
+           "tests/test_rule_provenance.py"),
+    Mutant("provenance", "the rule scope leaks into the model's context",
+           "app/services/pms/negotiation.py",
+           "        return out",
+           '        out["ruleSource"] = self.rule_source\n        return out',
+           "the name of our configuration scope goes into every negotiation "
+           "result the model sees — the class of thing the leak guardrail "
+           "refuses in a reply",
+           "tests/test_rule_provenance.py"),
+
+    Mutant("provenance", "a quote stops supplying the rupees behind its percentage",
+           "app/services/ai/tools/pricing.py",
+           '        payload["depositPaise"] = deposit_paise\n'
+           '        payload["deposit"] = money.display(deposit_paise)',
+           '        pass',
+           "the model is handed a deposit percentage beside a total and works "
+           "the rupees out itself — the ₹19,784 fabrication, exactly",
+           "tests/test_business_truth_provenance.py"),
 
     # ── the negotiation floor ───────────────────────────────────────────────
     Mutant("negotiation", "the approval ceiling stops being clamped",

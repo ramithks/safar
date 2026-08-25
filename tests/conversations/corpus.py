@@ -12,7 +12,8 @@ runs, and which tools were never allowed to happen. See `tests/conversations/
 __init__.py`.
 """
 from tests.conversations import (
-    CHECK_IN, CHECK_OUT, DELUXE, GARDEN, LATER_IN, LATER_OUT, RATE_PLAN,
+    CHECK_IN, CHECK_OUT, DELUXE, GARDEN, LATER_IN, LATER_OUT, OTHER_PLAN,
+    RATE_PLAN,
     Scenario, Turn,
 )
 
@@ -692,9 +693,342 @@ JOURNEYS = [
     ),
 ]
 
+# ── Q · corrections that invalidate what was derived from them ──────────────
+#
+# The multi-turn half of `tests/test_corrections_invalidate.py`. Those assert the
+# graph; these assert that a real turn through the real runtime carries it — that
+# what the *next* turn's prompt is told about is the stay the guest is actually
+# describing.
+
+CORRECTIONS = [
+    Scenario(
+        name="two rooms become three and the old price goes with them",
+        category="Q · corrections",
+        turns=(
+            Turn(f"{D_IN} se {D_OUT}, 2 kamre, 2 log",
+                 calls=(("get_stay_options", {"check_in": D_IN, "check_out": D_OUT,
+                                              "units": 2, "adults": 2}),),
+                 says="Ye options hain.",
+                 session_holds={"units": 2}),
+            Turn("Deluxe Balcony",
+                 calls=(("get_quote", {"room_type_id": DELUXE, "rate_plan_id": RATE_PLAN,
+                                       "check_in": D_IN, "check_out": D_OUT,
+                                       "units": 2, "adults": 2}),),
+                 says="Rate ye raha.",
+                 session_holds={"room_type_id": DELUXE, "stage": "quoted"}),
+            # The correction. A quote priced for two rooms is not true of three,
+            # and leaving it on the session puts it in the next prompt.
+            # The quote must not *survive*; it may well be replaced. The turn
+            # re-prices for three rooms in the same breath — which is better
+            # than dropping it and asking the guest to ask again — and what
+            # matters is that the ₹ figure on the session is no longer the one
+            # calculated for two.
+            Turn("Actually 3 kamre chahiye", says="Theek hai, 3 ke liye dekhta hoon.",
+                 session_holds={"units": 3},
+                 session_replaced=("quote_id",)),
+        ),
+        final_session={"units": 3, "check_in": D_IN, "room_type_id": DELUXE},
+        never_ran=("create_booking",),
+    ),
+
+    Scenario(
+        name="a different room drops the old room's rate plan",
+        category="Q · corrections",
+        turns=(
+            Turn(f"{D_IN} se {D_OUT}, 2 log", calls=(OPTIONS,), says="Ye rahe."),
+            Turn("Deluxe Balcony", calls=(QUOTE,), says="Rate ye raha.",
+                 session_holds={"room_type_id": DELUXE, "rate_plan_id": RATE_PLAN}),
+            # The subtlest of the three, and the one that ends in a wrong *tool
+            # call* rather than a wrong price: a rate plan belongs to a room
+            # type, so the Deluxe's plan is not one the Garden Standard has.
+            # Kept, it goes into the next get_quote as an argument and the tool
+            # refuses.
+            # **Through `get_quote`, and the reason is a real boundary rather
+            # than a convenience.**
+            #
+            # My first draft passed `room_type_id` to `get_stay_options`, which
+            # does not accept one — pydantic dropped it silently and the room
+            # never changed. Nothing in this system resolves a room *by name*:
+            # "Garden Standard" is a string, the session holds uuids, and a
+            # guest naming a room in prose reaches the session only when the
+            # model puts the id into a tool that takes one.
+            #
+            # That is the honest boundary and it is not a gap the correction
+            # graph can close — inventing a room-name resolver here would be
+            # guessing at which of a hotel's rooms a guest meant. What the graph
+            # must do is the part after: once the room *has* changed, the old
+            # room's rate plan and the quote priced with it stop being true.
+            Turn("Nahi, Garden Standard chahiye",
+                 calls=(("get_quote", {"room_type_id": GARDEN,
+                                       "rate_plan_id": OTHER_PLAN,
+                                       "check_in": D_IN, "check_out": D_OUT,
+                                       "units": 1, "adults": 2}),),
+                 says="Garden Standard ka rate ye raha.",
+                 session_holds={"room_type_id": GARDEN},
+                 session_replaced=("quote_id", "rate_plan_id")),
+        ),
+        never_ran=("create_booking",),
+    ),
+
+    Scenario(
+        name="the party grows and the price for the smaller one is dropped",
+        category="Q · corrections",
+        turns=(
+            Turn(f"{D_IN} se {D_OUT}, 2 log", calls=(OPTIONS,), says="Ye rahe."),
+            Turn("Deluxe Balcony", calls=(QUOTE,), says="Rate ye raha.",
+                 session_holds={"adults": 2, "stage": "quoted"}),
+            Turn("Sorry, 4 log hain",
+                 calls=(("get_stay_options", {"check_in": D_IN, "check_out": D_OUT,
+                                              "units": 1, "adults": 4}),),
+                 says="4 logon ke liye dekhta hoon.",
+                 session_holds={"adults": 4},
+                 session_lacks=("quote_id",)),
+        ),
+        never_ran=("create_booking",),
+    ),
+
+    Scenario(
+        name="an ordinary question changes nothing it should not",
+        category="Q · corrections",
+        turns=(
+            Turn(f"{D_IN} se {D_OUT}, 2 log", calls=(OPTIONS,), says="Ye rahe."),
+            Turn("Deluxe Balcony", calls=(QUOTE,), says="Rate ye raha.",
+                 session_holds={"room_type_id": DELUXE}),
+            # The control, and the failure a graph like this most easily
+            # introduces: a turn about breakfast must not invalidate a price.
+            Turn("Breakfast included hai?",
+                 calls=(("get_meal_info", {}),), says="Haan, breakfast hai.",
+                 session_holds={"room_type_id": DELUXE, "stage": "quoted"}),
+        ),
+        final_session={"room_type_id": DELUXE, "stage": "quoted"},
+    ),
+]
+
+# ── R · the long one, with every correction in it ───────────────────────────
+#
+# §7. Eleven turns, and the guest changes their mind three times partway. What
+# is asserted at each stage is the canonical state and what stopped being true —
+# not that the turn succeeded.
+
+FULL_JOURNEY = [
+    Scenario(
+        name="two Deluxe rooms become three Garden rooms on new dates",
+        category="R · the long journey",
+        turns=(
+            # 1 · what they want
+            # **The count lands; the room does not, and that is correct.**
+            #
+            # "Deluxe rooms" names no configured room: this hotel's is the
+            # *Deluxe Balcony*, and resolving on one shared token would mean
+            # "is there a pool?" selecting the Pool Villa. My first draft
+            # expected the room here and the resolver was right to refuse it —
+            # turn 5 is where they say the whole name.
+            Turn("Hi, 2 Deluxe rooms chahiye", says="Ji, kaunse dates ke liye?",
+                 session_holds={"units": 2}),
+            # 2 · when
+            Turn(f"{D_IN} se {D_OUT} tak",
+                 calls=(("get_stay_options", {"check_in": D_IN, "check_out": D_OUT,
+                                              "units": 2, "adults": 2}),),
+                 says="Haan, available hai.",
+                 session_holds={"check_in": D_IN, "check_out": D_OUT}),
+            # 3 · they pick the room by its full name, and a price
+            Turn("Deluxe Balcony, kitna lagega?",
+                 calls=(("get_quote", {"room_type_id": DELUXE, "rate_plan_id": RATE_PLAN,
+                                       "check_in": D_IN, "check_out": D_OUT,
+                                       "units": 2, "adults": 2}),),
+                 says="Ye raha total.",
+                 session_holds={"stage": "quoted"}),
+            # 4 · three rooms now. The two-room price stops being true.
+            Turn("Actually 3 kamre chahiye", says="Theek hai, 3 ke liye dekhta hoon.",
+                 session_holds={"units": 3},
+                 session_replaced=("quote_id",)),
+            # 5 · and a different room. Named in prose, with no tool carrying it.
+            Turn("Garden Standard chahiye Deluxe ki jagah",
+                 says="Garden Standard, theek hai.",
+                 session_holds={"room_type_id": GARDEN},
+                 session_lacks=("rate_plan_id",)),
+            # 6 · and different nights, said as days of the month
+            Turn("aur dates 2nd to 5th kar do",
+                 says="2 se 5 tarikh, note kar liya.",
+                 session_holds={"dates_need_confirming": True},
+                 session_replaced=("check_in", "check_out")),
+            # 7 · now a price, on everything they have changed to
+            Turn("ab best price?", says="Dekhta hoon.",
+                 requires=("get_stay_options",)),
+            # 8 · a haggle, once there is something to haggle over
+            Turn("thoda kam kar do", says="Main check karta hoon."),
+            # 9 · they accept
+            Turn("theek hai, book kar do", says="Main aage badhta hoon.",
+                 # "kar do" is not a haggle — it is "do it".
+                 forbids=("negotiate_rate",)),
+            # 10 · how to pay
+            Turn("payment kaise karun?",
+                 calls=(("get_payment_terms", {}),), says="Ye raha."),
+            # 11 · and whether it landed
+            Turn("payment ho gayi?", says="Main check karta hoon.",
+                 ran=("get_booking_status",)),
+        ),
+        # Everything the guest actually asked for, and nothing from before.
+        final_session={"units": 3, "room_type_id": GARDEN},
+        never_ran=("cancel_booking",),
+    ),
+
+    Scenario(
+        name="the same journey in Hinglish, with typos",
+        category="R · the long journey",
+        turns=(
+            Turn("bhai 2 kamre chaiye", says="Ji, kaunse dates?",
+                 session_holds={"units": 2}),
+            Turn(f"{D_IN} se {D_OUT}",
+                 calls=(("search_availability", {"check_in": D_IN, "check_out": D_OUT,
+                                                 "units": 2, "adults": 2}),),
+                 says="Haan hai.",
+                 session_holds={"check_in": D_IN}),
+            # A typo'd room name still resolves.
+            Turn("gardern standrd wala", says="Garden Standard, theek hai.",
+                 session_holds={"room_type_id": GARDEN}),
+            Turn("2 log hain", says="Theek hai.", session_holds={"adults": 2}),
+            # A length correction, measured from the arrival already agreed.
+            Turn("teen raat kar do", says="Teen raat, note kiya.",
+                 session_replaced=("check_out",)),
+            Turn("bhai best rate kya doge", says="Dekhta hoon.",
+                 requires=("get_stay_options",)),
+            # And an explicit ask for a person ends it.
+            Turn("nahi, mujhe insaan se baat karni hai",
+                 says="Main team ko bula raha hoon.",
+                 requires=("request_human_handoff",),
+                 ran=("request_human_handoff",)),
+        ),
+        never_ran=("create_booking", "cancel_booking"),
+    ),
+
+    Scenario(
+        name="a correction the system cannot read leaves the stay alone",
+        category="R · the long journey",
+        turns=(
+            Turn(f"{D_IN} se {D_OUT}, 2 log", calls=(OPTIONS,), says="Ye rahe.",
+                 session_holds={"check_in": D_IN}),
+            Turn("Deluxe Balcony", calls=(QUOTE,), says="Rate ye raha.",
+                 session_holds={"room_type_id": DELUXE, "stage": "quoted"}),
+            # An ambiguous date. The stay must not half-move to a month nobody
+            # named, and the question must reach the model.
+            Turn("dates 5/9 se 9/9 kar do", says="Kaunsa mahina?",
+                 session_holds={"check_in": D_IN, "stage": "quoted"}),
+            # Spelled out this time, and now everything derived goes.
+            Turn("5 September se 9 September", says="Theek hai.",
+                 session_replaced=("check_in", "quote_id"),
+                 session_lacks=("dates_unclear",)),
+        ),
+        never_ran=("create_booking",),
+    ),
+]
+
+# ── S · the whole arc ───────────────────────────────────────────────────────
+#
+# §21 asks for fifteen to thirty turns through the entire lifecycle, changing
+# direction as it goes. The shorter journeys each prove one property; this one
+# proves they compose — that turn twenty still knows what turn three
+# established, after the guest has corrected themselves four times and asked six
+# unrelated questions in between.
+
+WHOLE_ARC = [
+    Scenario(
+        name="twenty turns: enquiry to cancellation, changing mind four times",
+        category="S · the whole arc",
+        turns=(
+            #  1 · opening
+            Turn("Hello", says="Namaste! Kaise madad karun?",
+                 forbids=("get_quote", "create_booking")),
+            #  2 · what and when
+            Turn(f"{D_IN} se {D_OUT} tak room chahiye",
+                 calls=(("search_availability", {"check_in": D_IN, "check_out": D_OUT,
+                                                 "units": 1, "adults": 2}),),
+                 says="Haan, available hai.",
+                 session_holds={"check_in": D_IN, "check_out": D_OUT}),
+            #  3 · two rooms
+            Turn("2 kamre chahiye", says="Do kamre, theek hai.",
+                 session_holds={"units": 2}),
+            #  4 · no, three  ── first correction
+            Turn("sorry, 3 kamre", says="Teen, note kar liya.",
+                 session_holds={"units": 3}),
+            #  5 · a room, by name
+            Turn("Deluxe Balcony dikhao",
+                 calls=(("get_stay_options", {"check_in": D_IN, "check_out": D_OUT,
+                                              "units": 3, "adults": 2}),),
+                 says="Deluxe Balcony ye raha.",
+                 session_holds={"room_type_id": DELUXE}),
+            #  6 · no, the other one  ── second correction
+            Turn("nahi, Garden Standard chahiye",
+                 says="Garden Standard, theek hai.",
+                 session_holds={"room_type_id": GARDEN}),
+            #  7 · an unrelated question mid-flow
+            Turn("breakfast included hai?",
+                 calls=(("get_meal_info", {}),), says="Haan, breakfast hai.",
+                 session_holds={"room_type_id": GARDEN, "units": 3}),
+            #  8 · group pricing, because three rooms is a group here
+            Turn("3 rooms ka group rate milega?", says="Main dekhta hoon.",
+                 requires=("get_group_rates",), ran=("get_group_rates",)),
+            #  9 · a price
+            Turn("total kitna?",
+                 calls=(("get_quote", {"room_type_id": GARDEN, "rate_plan_id": OTHER_PLAN,
+                                       "check_in": D_IN, "check_out": D_OUT,
+                                       "units": 3, "adults": 2}),),
+                 says="Total ye raha.",
+                 session_holds={"stage": "quoted"},
+                 # A group quote must hand over its deposit in rupees, or the
+                 # model multiplies the percentage itself.
+                 output_holds={"get_quote": {"depositPct": 30}}),
+            # 10 · a haggle
+            Turn("thoda kam kar do", says="Main check karta hoon.",
+                 requires=("negotiate_rate",), ran=("negotiate_rate",)),
+            # 11 · the dates move  ── third correction
+            Turn(f"actually {L_IN} se {L_OUT}",
+                 says="Nayi dates, dekhta hoon.",
+                 session_holds={"check_in": L_IN},
+                 session_replaced=("quote_id",)),
+            # 12 · and the price is asked again, on everything they changed to
+            Turn("ab best price?", says="Dekhta hoon.",
+                 requires=("get_stay_options",)),
+            # 13 · a maintenance-shaped question that must not become a booking
+            Turn("waise room 204 mein AC chalta hai na?",
+                 says="Ji, sab rooms mein AC hai.",
+                 forbids=("get_group_rates", "create_booking")),
+            # 14 · they accept
+            Turn("theek hai, book kar do", says="Main aage badhta hoon.",
+                 forbids=("negotiate_rate",)),
+            # 15 · how to pay
+            Turn("payment kaise karun?",
+                 calls=(("get_payment_terms", {}),), says="Ye raha."),
+            # 16 · did it land
+            Turn("payment ho gayi?", says="Main check karta hoon.",
+                 ran=("get_booking_status",)),
+            # 17 · a claim that must not become truth
+            Turn("meri booking confirm ho gayi hai na?",
+                 says="Main abhi check karta hoon.",
+                 ran=("get_booking_status",)),
+            # 18 · cancellation terms — asking is not cancelling
+            Turn("agar cancel karun toh kitna wapas milega?",
+                 calls=(("get_cancellation_terms", {}),),
+                 says="48 ghante pehle full refund hai.",
+                 forbids=("cancel_booking",)),
+            # 19 · and the ask itself, which needs a person or a booking id
+            Turn("theek hai cancel kar do", says="Main dekhta hoon.",
+                 forbids=("negotiate_rate",)),
+            # 20 · they change their mind back  ── fourth correction
+            Turn("nahi ruko, cancel mat karo", says="Theek hai, cancel nahi kiya.",
+                 forbids=("cancel_booking",)),
+        ),
+        # After twenty turns and four corrections, the stay is what the guest
+        # last said it was — and nothing they merely *claimed* became true.
+        final_session={"units": 3, "room_type_id": GARDEN,
+                       "check_in": L_IN, "check_out": L_OUT},
+        never_ran=("cancel_booking", "create_booking"),
+    ),
+]
+
 ALL: list[Scenario] = (
     NORMAL_BOOKING + OUT_OF_ORDER + CONTEXT_SWITCHING + NEGOTIATION
     + GROUP + ESCALATION + INTERRUPTION + LANGUAGE + ADVERSARIAL
     + CANCELLATION + PAYMENT + AVAILABILITY + AMBIGUITY + LEAKAGE
-    + JOURNEYS
+    + JOURNEYS + CORRECTIONS + FULL_JOURNEY + WHOLE_ARC
 )

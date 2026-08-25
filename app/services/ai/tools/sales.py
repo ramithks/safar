@@ -342,7 +342,7 @@ async def propose_rate_exception(args: RateExceptionArgs, ctx: AgentContext) -> 
             "approvedCeilingPct": policy.approved_max_pct,
             "instruction": (
                 "This price exists because a manager approved it. Quote "
-                "totalPaise and say the hold lasts 15 minutes. "
+                "`total` exactly as written and say the hold lasts 15 minutes. "
                 + (
                     f"The discount was set to {priced.discount_pct_applied}% rather "
                     f"than the {args.discount_pct}% asked for — say so plainly."

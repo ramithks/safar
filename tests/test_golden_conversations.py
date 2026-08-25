@@ -42,6 +42,7 @@ CONVERSATION = "c0c0c0c0-0001-4001-8001-000000000001"
 ROOM_TYPE = "22222222-2222-4222-8222-222222222222"
 OTHER_ROOM = "33333333-3333-4333-8333-333333333333"
 RATE_PLAN = "11111111-1111-4111-8111-111111111111"
+OTHER_PLAN = "44444444-4444-4444-8444-444444444444"
 
 CHECK_IN = date.today() + timedelta(days=30)
 CHECK_OUT = CHECK_IN + timedelta(days=2)
@@ -102,6 +103,23 @@ def db(monkeypatch) -> FakeDb:
         "room_type_id": ROOM_TYPE, "code": "DLX-RO", "name": "Room only",
         "meal_plan": "RO", "audience": "public", "refundable": True,
         "inclusions": None, "base_price_paise": 450000, "min_stay": 1,
+        "derived_from_plan_id": None, "derive_discount_pct": None,
+        "valid_from": None, "valid_to": None, "days_of_week": None,
+        "allocation_units": None, "is_active": True,
+        "cancellation_cutoff_hours": 48, "cancellation_policy": None,
+    })
+    # **The Garden Standard's own plan, and the fixture was wrong without it.**
+    #
+    # A hotel sells every room it lists, and this fixture listed two room types
+    # and priced one — so any scenario where a guest switches rooms could only
+    # fail, for a reason that was about the fixture rather than the product. A
+    # rate plan belongs to a room type, which is exactly what
+    # `session.DERIVED_FROM` encodes.
+    fake.seed("rate_plans", {
+        "id": OTHER_PLAN, "property_id": PROPERTY, "partner_id": PARTNER,
+        "room_type_id": OTHER_ROOM, "code": "STD-RO", "name": "Room only",
+        "meal_plan": "RO", "audience": "public", "refundable": True,
+        "inclusions": None, "base_price_paise": 320000, "min_stay": 1,
         "derived_from_plan_id": None, "derive_discount_pct": None,
         "valid_from": None, "valid_to": None, "days_of_week": None,
         "allocation_units": None, "is_active": True,
@@ -259,7 +277,20 @@ def test_a_group_request_is_priced_whether_or_not_the_model_asks(db):
                  ["Ji bilkul, main check karti hoon."])
 
     assert "get_group_rates" in tools_used(db)
-    assert result.requirements["forced"] == ["get_group_rates"]
+    # **Two forced tools now, not one, and the second is the fix.**
+    #
+    # `get_group_rates` answers "is this a group and what band applies" — a
+    # discount percentage and a deposit percentage. It does not and cannot
+    # price, because pricing needs a room type it has not been given. A
+    # production turn that forced only this one left the model holding two
+    # percentages and a room count, and it invented five prices: ₹1,65,600,
+    # ₹2,13,600, ₹50,400, ₹59,200, ₹89,600. The guardrail refused the reply and
+    # the guest got a person instead of a quote.
+    #
+    # `get_stay_options` rather than `get_quote` because no room has been
+    # chosen: it prices every room type and takes no hold, where a quote would
+    # take a fifteen-minute hold on a room this guest has not picked.
+    assert result.requirements["forced"] == ["get_group_rates", "get_stay_options"]
     group = [a for a in db.rows("agent_actions") if a["tool"] == "get_group_rates"][-1]
     assert group["decision_source"] == "application"
     assert group["input"]["units"] == 5

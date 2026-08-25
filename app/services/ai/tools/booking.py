@@ -338,8 +338,61 @@ async def release_hold(args: HoldArgs, ctx: AgentContext) -> tuple[dict, str]:
 # ── closing the sale ─────────────────────────────────────────────────────────
 
 
+def live_quote_id(conversation_id: str | None) -> str | None:
+    """
+    The active, unexpired quote on this conversation, if there is one.
+
+    **Why a tool argument became optional.** Two production replies were refused
+    for *"asked the guest for an internal identifier ('quote ID')"* — the model,
+    needing a `quote_id` it could not see, asked the guest to supply one. A guest
+    has never seen a quote id and never will; it is a uuid in our database.
+
+    The model was not being obtuse. The argument was required and it did the only
+    thing left. `get_booking_status` solved the same problem by taking no
+    arguments at all — *"the subject of this tool is the conversation, which the
+    model cannot name, cannot guess and cannot be talked into changing"* — and
+    this is that idea applied to the quote.
+
+    `status = 'active'` and unexpired, the same window `prompts._live_quote` uses
+    to decide what the model is *told* about, so the quote in the prompt and the
+    quote this charges cannot be different ones.
+    """
+    if not conversation_id:
+        return None
+    from datetime import datetime, timezone
+
+    try:
+        rows = (
+            get_db().table("quotes").select("id,expires_at")
+            .eq("conversation_id", conversation_id)
+            .eq("status", "active")
+            .order("created_at", desc=True).limit(1)
+            .execute().data or []
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("could not read the live quote for %s", conversation_id,
+                       exc_info=True)
+        return None
+    if not rows:
+        return None
+    try:
+        expires = datetime.fromisoformat(
+            str(rows[0]["expires_at"]).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return rows[0]["id"] if expires > datetime.now(timezone.utc) else None
+
+
 class BookingPaymentLinkArgs(BaseModel):
-    quote_id: ResourceId = Field(description="The quote the guest agreed to.")
+    quote_id: ResourceId | None = Field(
+        default=None,
+        description=(
+            "Leave this out — the live quote on this conversation is used. Set "
+            "it only when the guest is paying for a quote other than the most "
+            "recent one, and NEVER ask the guest for it: a quote id is ours, "
+            "not something they have ever seen."
+        ),
+    )
     guest_name: str | None = Field(
         default=None, max_length=120,
         description=(
@@ -398,6 +451,15 @@ class BookingPaymentLinkArgs(BaseModel):
 async def create_booking_payment_link(
     args: BookingPaymentLinkArgs, ctx: AgentContext
 ) -> tuple[dict, str]:
+    # The conversation's own quote, when the model did not name one — which is
+    # what it should do. See `live_quote_id`.
+    quote_id = args.quote_id or await run_db(live_quote_id, ctx.conversation_id)
+    if not quote_id:
+        raise OutOfScope(
+            "no live quote on this conversation to charge for",
+            "Let me price those dates for you first — one moment.",
+        )
+
     from app.services.pms import quote_payment
 
     # The name on the thread, when the model was not given one.
@@ -418,7 +480,7 @@ async def create_booking_payment_link(
         link = await quote_payment.create_link(
             property_id=ctx.property_id,
             partner_id=ctx.partner_id,
-            quote_id=args.quote_id,
+            quote_id=quote_id,
             guest_name=name,
             guest_phone=args.guest_phone or ctx.guest_phone,
             guest_email=args.guest_email,
@@ -431,7 +493,7 @@ async def create_booking_payment_link(
         # Already written for a guest to read — see the module. Raised as
         # OutOfScope so the runtime hands the sentence to the model rather than
         # turning it into a failed run the guest sees nothing from.
-        raise OutOfScope(f"quote {args.quote_id}: {exc}", str(exc)) from exc
+        raise OutOfScope(f"quote {quote_id}: {exc}", str(exc)) from exc
 
     # Three amounts, and only one of them is what the link charges.
     #
@@ -451,14 +513,17 @@ async def create_booking_payment_link(
     # instruction is to use it rather than to compose one. The fields stay for
     # a question like "what's the total?", which the model should still be able
     # to answer without another tool call.
-    amount_text = f"₹{link.amount_paise / 100:,.0f}"
-    total_text = f"₹{link.total_paise / 100:,.0f}"
+    # Through `money.display`, not an f-string. Same arithmetic today, and it
+    # is the arithmetic that must live in one place — a second copy is a second
+    # thing to get wrong the day the format changes.
+    amount_text = money.display(link.amount_paise)
+    total_text = money.display(link.total_paise)
     due_at_hotel = link.total_paise - link.amount_paise
 
     if due_at_hotel > 0:
         say = (
             f"{amount_text} to confirm now, and the balance of "
-            f"₹{due_at_hotel / 100:,.0f} at the hotel — total {total_text}."
+            f"{money.display(due_at_hotel)} at the hotel — total {total_text}."
         )
     else:
         say = f"{amount_text}, which is the full amount."
@@ -470,12 +535,32 @@ async def create_booking_payment_link(
             "payNowText": amount_text,
             "payNowPaise": link.amount_paise,
             "totalText": total_text,
-            "dueAtHotelText": f"₹{due_at_hotel / 100:,.0f}",
+            "dueAtHotelText": money.display(due_at_hotel),
             "instruction": (
                 "Send the guest the payUrl and say sayThis, close to word for "
                 "word. The link charges payNowText and nothing else — never "
                 "tell them to pay totalText through it. Say the booking is "
-                "confirmed as soon as the payment goes through."
+                "confirmed as soon as the payment goes through. "
+                # **There is no reference yet, and saying so stops the model
+                # inventing one.**
+                #
+                # Two production replies were refused for exposing
+                # `order_TTNlZOqsCGlaWH` — the Razorpay order id, which the model
+                # mined out of the payUrl and offered the guest as a booking
+                # reference. It was not being careless: a guest being asked to
+                # pay expects a reference, the model had none, and the only
+                # identifier in view was the one inside the link.
+                #
+                # The honest answer is that no reference exists until the money
+                # lands: the reservation, and its TB- ref, are created by
+                # `_fulfil_booking` when the webhook arrives. Telling the model
+                # that is the fix; the guardrail refusing the id afterwards is
+                # the backstop, and it stays exactly as it is.
+                "There is no booking reference yet — it does not exist until "
+                "the payment lands. Do NOT offer the guest a reference, an "
+                "order id, or anything out of the link's address. Tell them "
+                "they will get their reference the moment the payment goes "
+                "through."
             ),
         },
         link.order_id,
@@ -650,7 +735,8 @@ _GUIDANCE = {
     "CONFIRMED": (
         "The payment has landed and this booking is real. Tell the guest it is "
         "confirmed, give them the reference, and give them bookingUrl. If "
-        "balancePaise is above zero, say that amount is due at the hotel."
+        "balance is above zero, say `balance` exactly as written is due at "
+        "the hotel — never convert a paise figure yourself."
     ),
     "CHECKED_IN": "The guest is currently staying. Answer about their stay, not about booking it.",
     "CHECKED_OUT": "This stay has ended.",

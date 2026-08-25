@@ -53,6 +53,19 @@ class ModelStep:
     # role/content does not require a runtime change.
     raw: dict | None = None
 
+    # **What the transport went through to get this.**
+    #
+    # `vertex.CallTrace` has recorded retries, region rotations and the final
+    # status since it was written, and nothing above the transport could see
+    # any of it — so a turn that spent 131 seconds bouncing off 429s in three
+    # regions was, one layer up, indistinguishable from a model that thought
+    # for 131 seconds. The first is somebody else's quota and the second is a
+    # model-quality signal, and a report that cannot tell them apart will
+    # eventually blame a model for a rate limit.
+    provider_retries: int = 0
+    provider_status: str = "ok"
+    locations_tried: tuple[str, ...] = ()
+
     @property
     def wants_tools(self) -> bool:
         return bool(self.tool_calls)
@@ -253,12 +266,13 @@ class VertexGeminiProvider:
         tools: list[dict],
         params: dict,
     ) -> ModelStep:
-        from app.services.vertex import vertex_generate_call
+        from app.services.vertex import CallTrace, vertex_generate_call
 
         system, contents = self._to_contents(messages)
         if not contents:
             raise ProviderError("nothing to send to the model")
 
+        call = CallTrace()
         try:
             data = await vertex_generate_call(
                 contents,
@@ -269,15 +283,33 @@ class VertexGeminiProvider:
                 max_output_tokens=params.get("max_output_tokens"),
                 thinking_budget=params.get("thinking_budget"),
                 timeout=self.timeout,
+                trace=call,
             )
         except Exception as exc:  # noqa: BLE001 — every upstream failure is one thing here
             # The runtime's contract is that a ProviderError means "the model is
             # gone, hand off". Vertex raises httpx errors, RuntimeError from the
             # circuit breaker, and KeyError from a malformed body; the runtime
             # should not have to know the difference.
-            raise ProviderError(f"Vertex call failed: {type(exc).__name__}: {exc}") from exc
+            failed = ProviderError(
+                f"Vertex call failed: {type(exc).__name__}: {exc}")
+            # The provider's own exception type, kept structurally rather than
+            # only inside the message. `recovery.classify` collapses a hundred
+            # upstream errors into a handful of behaviours, which is right for
+            # deciding what to do next and lossy for deciding whether this is
+            # Google's problem or ours — the first question an operator asks
+            # about a fallback, and one a log-message substring cannot answer.
+            failed.error_class = type(exc).__name__
+            # The transport's own account of the failure, so a quota exhaustion
+            # is not read as a model that would not answer.
+            failed.provider_retries = call.retries
+            failed.provider_status = call.status or "error"
+            raise failed from exc
 
-        return self._read(data)
+        step = self._read(data)
+        step.provider_retries = call.retries
+        step.provider_status = call.status or "ok"
+        step.locations_tried = tuple(call.locations_tried)
+        return step
 
     @staticmethod
     def _read(data: dict) -> ModelStep:
@@ -287,7 +319,9 @@ class VertexGeminiProvider:
             # refused upstream — a safety filter, usually. Not a network
             # failure, but equally not an answer, so it routes to a human.
             reason = ((data.get("promptFeedback") or {}).get("blockReason")) or "no candidate"
-            raise ProviderError(f"Vertex returned no candidate: {reason}")
+            refused = ProviderError(f"Vertex returned no candidate: {reason}")
+            refused.error_class = f"no_candidate:{reason}"
+            raise refused
 
         candidate = candidates[0]
         content = candidate.get("content") or {}

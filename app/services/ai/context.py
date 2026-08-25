@@ -119,6 +119,10 @@ class TurnState:
     # Set once the arbiter has turned a handoff down. A second request is let
     # through: the arbiter may delay a stop by one step so the model can take
     # the business path instead, and it may never prevent one outright.
+    # Provenance the tools record as they go: which business rule applied, and
+    # whether it was the one the hotelier configured. Folded onto the run by
+    # `runtime`, never shown to the model. See ToolOutcome.telemetry.
+    telemetry: dict = field(default_factory=dict)
     handoff_rejected: bool = False
     # Why it was turned down, for the run record.
     handoff_rejections: list = field(default_factory=list)

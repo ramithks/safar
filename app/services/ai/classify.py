@@ -41,7 +41,7 @@ routing decision: getting it wrong costs tokens, not correctness.
 import logging
 from dataclasses import dataclass
 
-from app.services.ai import model_router
+from app.services.ai import intent, model_router
 from app.services.ai.providers import Provider, for_name
 
 logger = logging.getLogger(__name__)
@@ -153,10 +153,45 @@ _OPENINGS = frozenset({
 })
 
 
+# A message that closes rather than asks.
+#
+# **"thanks" cost the full catalogue** — 38 tool schemas, about 7,600 input
+# tokens, on a word that asks for nothing. It is not a greeting, so the opening
+# shortcut never saw it, and it classifies as `guest_conversation`, which
+# narrows nothing on purpose because it is also the fallback for anything the
+# classifier could not read. It is among the commonest turns a hotel receives.
+#
+# **Gratitude and farewell only, and the narrowness is doing real work.** A bare
+# "ok", "haan" or "theek hai" looks like the same kind of turn and is not: after
+# *"shall I send you the payment link?"* it means yes, and a menu narrowed to
+# CORE would have taken the payment tool off it. Nobody has ever said "thanks"
+# to mean "book it", which is the whole test for what belongs on this list.
+_CLOSINGS = frozenset({
+    "thanks", "thank you", "thankyou", "thanks a lot", "thanks!", "thank you!",
+    "thx", "tysm", "ty", "thanku", "thank u",
+    "dhanyawad", "dhanyavaad", "shukriya", "shukriyaa",
+    "bye", "goodbye", "bye bye", "alvida", "tata",
+    "ok thanks", "okay thanks", "thanks bhai", "thank you so much",
+    "धन्यवाद", "शुक्रिया",
+})
+
+
 def is_opening(message: str | None) -> bool:
     """Is this only a greeting — nothing to route on?"""
     cleaned = " ".join((message or "").strip().lower().split())
     return cleaned in _OPENINGS
+
+
+def is_closing(message: str | None) -> bool:
+    """
+    Is this only thanks or goodbye — a turn that asks for nothing?
+
+    Unlike an opening this has history behind it by definition, so it cannot
+    lean on "the thread is empty" for safety. What makes it safe is the list:
+    every entry is a word that cannot be an instruction to act.
+    """
+    cleaned = " ".join((message or "").strip().lower().split())
+    return cleaned in _CLOSINGS
 
 
 def opening_task(agent_type: str | None) -> str:
@@ -245,6 +280,40 @@ class ModelClassifier:
             task = opening_task(agent_type)
             return Classification(task=task, tier=model_router.tier_of(task),
                                   source="default", opening=True)
+
+        # A closing needs no model to route it either, and needs no tools to
+        # answer. Reported as an `opening` because that is what the flag means
+        # downstream — "this turn is asking for nothing" — and giving it a
+        # second name would mean two ways to say one thing to `toolsets`.
+        if is_closing(message):
+            task = opening_task(agent_type)
+            return Classification(task=task, tier=model_router.tier_of(task),
+                                  source="default", opening=True)
+
+        # **"Breakfast kitne baje tak milta hai?" does not need a model to route
+        # it either**, and it is the commonest kind of message a hotel receives
+        # after a greeting.
+        #
+        # `intent.category` already computes this deterministically, for free,
+        # to decide whether the turn owes a business action — and INFORMATIONAL
+        # is only returned on positive identification: a facility or policy
+        # noun, a factual question, and nothing asked for. That is the same
+        # population `guest_faq` exists for, so the two cannot disagree about
+        # what such a turn needs without one of them being wrong.
+        #
+        # It saves the classify call outright — about 2.3 seconds measured on
+        # the greeting path, and its tokens — on a turn that then also carries
+        # the narrowest useful catalogue rather than the widest.
+        #
+        # Conservative in the one direction that matters: an unreadable message
+        # is TRANSACTIONAL, not INFORMATIONAL, so this can only fire where the
+        # sentence was understood. And `source` stays honest — this is a
+        # deterministic route, and the report's "the model chose it" number must
+        # not quietly include turns no model saw.
+        if "guest_faq" in allowed and intent.category(message) == intent.INFORMATIONAL:
+            return Classification(task="guest_faq",
+                                  tier=model_router.tier_of("guest_faq"),
+                                  source="default")
 
         choice = model_router.select(
             agent_type=agent_type, task="intent_classification"

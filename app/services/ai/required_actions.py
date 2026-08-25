@@ -62,6 +62,8 @@ on a price.
 import logging
 import os
 import re
+
+from app.services.ai import intent
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -176,6 +178,30 @@ _NUMBER_WORDS = {
 
 _NUMBER = r"(?:\d{1,3}|" + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r")"
 
+# **`do` is two in Hindi and an auxiliary verb in English**, and the first
+# question a guest asked a brand-new hotel was "What rooms do you have?" —
+# which parsed as *two rooms*, raised a group booking, and forced a quote for a
+# stay nobody had described.
+#
+# It is not a spelling that can be dropped: "do kamre chahiye" is the commonest
+# way a Hinglish guest asks for two rooms, and `sab_words` cannot tell the two
+# apart. What distinguishes them is the next word — an English auxiliary is
+# always followed by a subject pronoun or `not`, and a Hindi numeral never is.
+#
+# Handled here rather than in each caller because `room_count`, `people_count`
+# and the group detector all read the same number, and a guard in one of them
+# would have left the other two counting an auxiliary verb.
+_DO_AS_A_VERB = re.compile(
+    r"(?<![a-z0-9])do(?:es)?\s+(?:you|i|we|they|he|she|it|not|n't|the|these|those)"
+    r"(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _strip_auxiliaries(message: str | None) -> str:
+    """`do you` out, so the numeral reader never sees an English verb."""
+    return _DO_AS_A_VERB.sub(" ", message or "")
+
 # The nouns that make a number a number *of rooms*.
 _ROOM_NOUN = r"(?:rooms?|kamre|kamra|kamrey|kamron|कमरे|कमरा|suites?|villas?|cottages?|tents?)"
 # …and the ones that make it a number of people. Guests state party size at
@@ -186,7 +212,18 @@ _PEOPLE_NOUN = (
     r"log|logo|logon|jane|bande|लोग|व्यक्ति|मेहमान)"
 )
 
-_ROOMS_BEFORE = re.compile(rf"(?<![a-z0-9])({_NUMBER})\s*{_ROOM_NOUN}", re.IGNORECASE)
+# **A room's name can sit between the number and the noun.**
+#
+# "2 Deluxe rooms", "3 Garden Standard rooms", "5 sea view kamre" — an entirely
+# ordinary way to ask, and the pattern required the number to touch the noun, so
+# every one of them counted no rooms at all. Found by a long journey whose very
+# first turn was "Hi, 2 Deluxe rooms chahiye".
+#
+# Up to three words between, and none of them a digit: `{_NUMBER}` would let
+# "2 rooms for 4 people" match "2 … people" and count four rooms, which is the
+# failure `_ROOMS_AFTER`'s guard already exists for.
+_ROOMS_BEFORE = re.compile(
+    rf"(?<![a-z0-9])({_NUMBER})\s*(?:[a-z]+\s+){{0,3}}{_ROOM_NOUN}", re.IGNORECASE)
 # The number *after* the noun — "rooms 4 chahiye", "kamre 3".
 #
 # With a guard that earns its keep: "rooms for 10 people" put ten rooms on a
@@ -197,6 +234,71 @@ _ROOMS_AFTER = re.compile(
     rf"{_ROOM_NOUN}\s*(?:ki|ke|for)?\s*({_NUMBER})(?![a-z0-9])(?!\s*{_PEOPLE_NOUN})",
     re.IGNORECASE,
 )
+
+# **"room 204" is a door, not an order for two hundred rooms.**
+#
+# `_ROOMS_AFTER` reads the number beside a room noun, which is right for "kamre
+# 3 chahiye" and catastrophic for "room 204 mein AC nahi chal raha" — a guest
+# reporting a broken air conditioner raised a GROUP_BOOKING requirement and
+# forced `get_group_rates(units=204)`.
+#
+# Nobody books three figures of rooms through a chat window, and every hotel
+# numbers its doors that way, so the number itself decides. Applied only to the
+# noun-first form: "204 rooms chahiye" is at least stated as a count, and is
+# left alone rather than second-guessed.
+_ROOM_NUMBER_FROM = 100
+
+# **A door, named as one.** The brief's own example:
+#
+#     "room 204 mein AC nahi chal raha"   → room_number 204, a complaint
+#     "204 wala room"                     → room_number 204
+#     "204 rooms chahiye"                 → room_count 204
+#
+# The first two used to read as a *count*, and the second still did after the
+# last pass widened the count pattern to allow a room name between the number
+# and the noun ("2 Deluxe rooms"). "204 wala room" fits that shape exactly.
+#
+# Refusing to count them was half the job. The other half is capturing what the
+# number actually is, because `create_task` takes a `room_number` and a guest
+# reporting a broken air conditioner has just told us which door.
+#
+# Two shapes, and both put the number beside the noun rather than in front of a
+# quantity: `room 204` and `204 wala room`. A bare number with no room noun
+# anywhere near it is not a room number either — that is a price, a year, or a
+# phone.
+_ROOM_NUMBER = re.compile(
+    rf"(?<![a-z0-9])(?:{_ROOM_NOUN}\s*(?:no\.?|number|#)?\s*(\d{{1,4}})"
+    rf"|(\d{{1,4}})\s*(?:wala|wale|wali|vala|vale)\s*{_ROOM_NOUN})"
+    r"(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def room_number(message: str) -> str | None:
+    """
+    The door the guest is talking about, or None.
+
+    Returned as a string because a room number is a label, not a quantity: a
+    hotel with rooms "04" and "4" has two different doors, and `int` would make
+    them one.
+    """
+    for match in _ROOM_NUMBER.finditer(message or ""):
+        raw = match.group(1) or match.group(2)
+        if not raw:
+            continue
+        # A leading zero settles it whatever the magnitude: "room 04" is a
+        # label and nobody has ever written "04 rooms". Without this the
+        # threshold below rejects it, and a hotel numbering its ground floor
+        # 01–09 loses every complaint from it.
+        if raw.startswith("0") and len(raw) > 1:
+            return raw
+        # Otherwise the threshold. Below it the reading is ambiguous with a
+        # count — "room 5" is as likely to be five rooms as door five — and
+        # `room_count` already claims those. Above it, no hotel is being asked
+        # for that many rooms in a chat window.
+        if int(raw) >= _ROOM_NUMBER_FROM:
+            return raw
+    return None
 _PEOPLE_BEFORE = re.compile(rf"(?<![a-z0-9])({_NUMBER})\s*{_PEOPLE_NOUN}", re.IGNORECASE)
 _PEOPLE_AFTER = re.compile(rf"{_PEOPLE_NOUN}\s*(?:hain?|hai|ke liye|for)?\s*({_NUMBER})(?![a-z0-9])",
                            re.IGNORECASE)
@@ -277,18 +379,31 @@ def room_count(message: str) -> int | None:
     Rooms first and people second: a guest who says "5 kamre chahiye, 10 log aa
     rahe hain" has told us both, and the number they chose is the one to use.
     """
-    text = message or ""
+    text = _strip_auxiliaries(message)
+    # A door is not a quantity. "204 wala room" reads as a count to the pattern
+    # below — a number, then a word, then a room noun, which is the shape of
+    # "2 Deluxe rooms" — so the room-number reading is settled first.
+    door = room_number(text)
     for pattern in (_ROOMS_BEFORE, _ROOMS_AFTER):
         for match in pattern.finditer(text):
             value = _to_int(match.group(1))
-            if value:
-                return value
+            if not value:
+                continue
+            # Compared as numbers, not as strings: the door may be written
+            # "04" and the count pattern reads it as 4, so a string comparison
+            # lets the same digits be both a label and a quantity.
+            if door and value == int(door):
+                continue
+            if pattern is _ROOMS_AFTER and value >= _ROOM_NUMBER_FROM:
+                # A door, not an order. See `_ROOM_NUMBER_FROM`.
+                continue
+            return value
     return None
 
 
 def people_count(message: str) -> int | None:
     """How many people this message mentions, or None."""
-    text = message or ""
+    text = _strip_auxiliaries(message)
     for pattern in (_PEOPLE_BEFORE, _PEOPLE_AFTER):
         for match in pattern.finditer(text):
             value = _to_int(match.group(1))
@@ -525,9 +640,48 @@ def offered_price(message: str) -> int | None:
     return None
 
 
+def asks_for_a_person(message: str | None) -> bool:
+    """
+    Is the guest asking to be put through to a human?
+
+    The canonical answer, and deliberately the *narrow* one. This forces a
+    handoff and stops the agent, and the arbiter reads the same pattern — so a
+    sentence that forces a stop can never be one the arbiter turns down.
+
+    Named and made public because `intent.category` needs it. That module's
+    first cut carried its own list of person-nouns, which meant "the manager
+    was lovely" and "the staff were rude" both read as ESCALATION — and
+    ESCALATION owes nothing, so a complaint would have silenced every business
+    action on the turn. A bare noun deciding a speech act is the exact failure
+    `intent` was written to fix, made inside `intent`.
+    """
+    return bool(_ESCALATION_ASK.search(message or ""))
+
+
 def wants_discount(message: str) -> bool:
-    """Is the guest pushing on the price?"""
+    """
+    Is the guest pushing on the price?
+
+    **Two vocabularies for one concept, and they disagreed.** `_NEGOTIATION`
+    here and `intent._ASKS_FOR_LESS` both answer "is this a haggle", and the
+    560-turn sweep found the gap between them: "That's a bit above our budget —
+    can you do anything on the rate?" is a polite English haggle that the
+    speech-act layer now reads and this one did not. The model ran
+    `negotiate_rate`, correctly, and the report scored a required action that
+    never ran — on 10 of 10 runs across *both* model families, which is the
+    third time in this work that identical-on-both has meant the bug was ours.
+
+    So this defers rather than duplicating. `intent.category` is the canonical
+    speech-act layer; a message it calls NEGOTIATION is one, and the two can no
+    longer drift apart because there is only one list to change.
+
+    `_NEGOTIATION` survives underneath it: the category is decided over the
+    whole message, and a haggle buried in a clause of a longer one still has to
+    be caught here.
+    """
     text = message or ""
+    if intent.category(text) == intent.NEGOTIATION:
+        return True
     if any(pattern.search(text) for pattern in _NEGOTIATION):
         return True
     # A bare figure with a rate word is a haggle even without a haggling word:
@@ -615,6 +769,31 @@ _ESCALATION_ASK = re.compile(
     re.IGNORECASE,
 )
 
+# **`kitne baje` is *what time*, not *how much*.**
+#
+# `kitne` is a quantity word and the pattern below is right to look for it, but
+# followed by `baje` it asks the hour, and the two most common questions a
+# guest asks a hotel after booking are "checkout kitne baje hai?" and "breakfast
+# kitne baje tak milta hai?". Both were read as a request for a price. The model
+# evaluation's own *control* scenario — the one turn in it chosen to require no
+# business action at all — came back as a required action on 4 of 4 runs, on
+# both model families, which is how a system bug looks when it is charged to a
+# model.
+#
+# It costs twice. The turn carries the whole pricing tool set into a question
+# about breakfast, against §18; and the answer, if the model obliges, is a rate
+# for a stay the guest never asked to price.
+#
+# The phrase is the unit, not the word: `kitne baje` and `kitni der` come out
+# together, so a message that asks a price *and* the time still asks a price.
+# The quantity word and the hour word together, removed as a phrase: `kitne
+# baje`, `kitni der`, and the Devanagari of the first.
+_CLOCK = re.compile(
+    r"(?<![a-z0-9])(?:kitne|kitna|kitni)\s+(?:baje|der)(?![a-z0-9])"
+    r"|कितने\s*बजे",
+    re.IGNORECASE,
+)
+
 _QUOTE = re.compile(
     r"(?<![a-z0-9])(?:price|rate|rates|tariff|cost|charge|charges|"
     r"kitna|kitne|kitni|daam|keemat|how much|per night|total kitna|"
@@ -666,6 +845,42 @@ def _valid_dates(stay: dict) -> bool:
         return False
 
 
+# Somewhere to sleep. What has to be present before a headcount may become a
+# room count — see `_group_requirement`.
+_STAY_WORDS = re.compile(
+    r"(?<![a-z0-9])(?:room|rooms|kamra|kamre|kamrey|suite|villa|cottage|"
+    r"stay|staying|night|nights|raat|raate|book|booking|reservation|"
+    r"check-?in|accommodation|thehr|rukna|rukenge)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _headcount_is_about_a_facility(message: str | None) -> bool:
+    """
+    Is this number of people about somewhere to sleep, or about the restaurant?
+
+    **A headcount is not a room count, and two detectors have to know it.**
+    `room_number` established the rule for "room 204 mein AC nahi chal raha".
+    This is the other end: "5 log breakfast ke liye aayenge" — five people
+    coming *to breakfast* — raised a group booking for three rooms, a quote to
+    price them, and a party-size change on the session.
+
+    Both detectors reach the same wrong conclusion from the same inference, so
+    the guard lives in one place rather than twice. It applies only to the
+    *inferred* leap: a guest who names rooms has named rooms, and a guest who
+    says "group" has said what they mean. It is turning people into rooms that
+    needs them to be talking about a stay, and a sentence whose only other
+    subject is a facility is talking about the facility.
+    """
+    from app.services.ai import intent as intent_mod
+
+    text = message or ""
+    return bool(
+        intent_mod._matches(text, intent_mod._AMENITY, intent_mod._AMENITY_HI)
+        and not _STAY_WORDS.search(text)
+    )
+
+
 def _group_requirement(message: str, session: dict | None) -> Requirement | None:
     rooms = room_count(message)
     people = people_count(message)
@@ -684,6 +899,24 @@ def _group_requirement(message: str, session: dict | None) -> Requirement | None
     )
     if not enough:
         return None
+
+    # **A headcount is not a room count, and this is the second place that has
+    # to be true.**
+    #
+    # `room_number` established the rule for "room 204 mein AC nahi chal raha".
+    # This is the other end of it: "5 log breakfast ke liye aayenge" — five
+    # people are coming *to breakfast* — raised a group booking for three rooms
+    # and a quote to price them, because a headcount above the threshold is
+    # normally the strongest signal there is.
+    #
+    # It is only ever inferred. A guest who says a number of *rooms* has named
+    # rooms, and a guest who used a group word has said what they mean. It is
+    # the leap from people to rooms that needs the guest to be talking about
+    # somewhere to sleep, and a sentence whose only other subject is a facility
+    # is talking about the facility.
+    if source == "people" and rooms is None and not worded:
+        if _headcount_is_about_a_facility(message):
+            return None
 
     if units is None:
         # "group booking ke liye baat karni hai" with no number. The stay we
@@ -802,6 +1035,88 @@ def _negotiation_requirement(message: str, session: dict | None) -> Requirement 
     )
 
 
+def _quote_requirement(message: str, session: dict | None,
+                       *, group_enquiry: bool = False) -> Requirement | None:
+    """
+    "Kitna lagega?" — and whether the turn can answer it deterministically.
+
+    **The failure this exists for.** A guest wrote *"Actually 5 kamre chahiye,
+    10 log aa rahe hain"*. `get_group_rates` was forced and ran, and it returns
+    what a band *is* — `discountPct: 8`, `depositPct: 30` — and no prices,
+    because pricing needs a room type it does not have. Nothing else ran. So the
+    model was holding two percentages and a room count, and it invented a whole
+    rate card: ₹1,65,600, ₹2,13,600, ₹50,400, ₹59,200, ₹89,600. The guardrail
+    refused the reply and the guest got a person instead of a price.
+
+    The tool's own instruction was already right — *"get_quote already applies
+    this band, call it and quote what comes back"* — and the model did not, and
+    an instruction the model can ignore is not a control. QUOTE_REQUIRED was
+    detected on that turn and was advisory, so the deterministic layer had an
+    opinion and no power.
+
+    **Which tool, and why not always the quote.** `get_quote` takes a fifteen-
+    minute hold on real inventory. Forcing it on every price question would take
+    holds all day for guests who are still browsing, which is a worse failure
+    than the one being fixed. So:
+
+        room and rate plan chosen   →  get_quote      the guest has picked; a
+                                                      firm price and a hold are
+                                                      what they are asking for
+        dates only                  →  get_stay_options  indicative totals for
+                                                      every room, and no hold
+        neither                     →  recorded only  there is nothing to price
+                                                      and a guessed date is
+                                                      worse than no call
+
+    Both of the forceable branches return money with display strings beside it
+    — see `money.with_display` — so what the model is handed is what it says.
+    """
+    # The clock phrases come out first, and the price words are looked for in
+    # what is left — so "rate kya hai, aur checkout kitne baje hai?" still asks
+    # a price, while "checkout kitne baje hai?" no longer does.
+    text = _CLOCK.sub(" ", message or "")
+    asked_in_words = bool(_QUOTE.search(text) or _QUOTE_HI.search(text))
+    if not (asked_in_words or group_enquiry):
+        return None
+
+    stay = _stay_context(session)
+    satisfied_by = frozenset({"get_quote", "get_stay_options", "negotiate_rate",
+                              "get_group_rates", "search_availability"})
+
+    if not _valid_dates(stay):
+        # Advisory, as before. Recorded so the evaluation still reports "the
+        # guest asked what it costs and nothing priced anything", which is how
+        # this was found.
+        return Requirement(
+            intent=QUOTE_REQUIRED, tool="get_quote", satisfied_by=satisfied_by,
+            must_execute=False, arguments=None,
+            detail="guest asked what it costs, with no dates to price",
+        )
+
+    units = room_count(message) or stay.get("units") or 1
+    people = people_count(message) or stay.get("adults") or 2
+    common = {
+        "check_in": stay["check_in"], "check_out": stay["check_out"],
+        "units": int(units), "adults": int(people),
+    }
+
+    if stay.get("room_type_id") and stay.get("rate_plan_id"):
+        return Requirement(
+            intent=QUOTE_REQUIRED, tool="get_quote", satisfied_by=satisfied_by,
+            must_execute=True,
+            arguments={**common, "room_type_id": stay["room_type_id"],
+                       "rate_plan_id": stay["rate_plan_id"]},
+            detail="guest asked what it costs, and has chosen a room",
+        )
+
+    return Requirement(
+        intent=QUOTE_REQUIRED, tool="get_stay_options", satisfied_by=satisfied_by,
+        must_execute=True, arguments=common,
+        detail="guest asked what it costs; pricing every room rather than "
+               "holding one they have not chosen",
+    )
+
+
 def _status_requirement(message: str) -> Requirement | None:
     text = message or ""
     if not (_PAYMENT_STATUS.search(text) or _PAYMENT_STATUS_HI.search(text)):
@@ -844,6 +1159,46 @@ _PRIORITY = (
 # conversation and started being a batch job, and the latency the guest waits
 # through is the same latency either way.
 MAX_FORCED = 2
+
+
+def stated_facts(message: str) -> dict:
+    """
+    What the guest said about their stay, in their own words, this turn.
+
+    **The highest-priority source there is, and until now there was no path for
+    it into the session at all.** Session facts were written from *tool
+    arguments* — whatever the model happened to pass — so "Actually 4 log hain"
+    updated the party only if some tool ran carrying it. Whether a correction
+    stuck depended on which requirement happened to fire, which is not a
+    property anybody designed.
+
+    It matters because of what the session then feeds: `prompts` tells the model
+    what the guest has settled on, and `session.DERIVED_FROM` decides what stops
+    being true when they change it. Both need the correction to arrive, and a
+    guest correcting themselves in prose — with no tool call on the turn — is
+    the ordinary way it happens.
+
+    Counts only, deliberately. Rooms and people are read straight out of the
+    sentence by patterns that already exist and are already tested on 274
+    phrasings. Dates need a parser and a timezone and would be guessing; a room
+    name needs the property's own room list, which this module has no database
+    to ask. Both arrive through tool arguments as they always have.
+    """
+    facts: dict = {}
+    rooms = room_count(message)
+    if rooms is not None:
+        facts["units"] = rooms
+    people = people_count(message)
+    if people is not None:
+        facts["adults"] = people
+    # The door they are standing at, when they named one. `create_task` takes a
+    # `room_number`, and a guest reporting a broken air conditioner has just
+    # said which room — carrying it means the ticket goes to the right door
+    # rather than to whichever one the model remembered.
+    door = room_number(message)
+    if door is not None:
+        facts["room_number"] = door
+    return facts
 
 
 def detect(message: str, session: dict | None = None) -> list[Requirement]:
@@ -938,11 +1293,28 @@ def detect(message: str, session: dict | None = None) -> list[Requirement]:
                               "escalate_to_team"},
                              "guest asked to change an existing booking"))
 
-    if _QUOTE.search(text) or _QUOTE_HI.search(text):
-        found.append(_simple(QUOTE_REQUIRED, "get_quote",
-                             {"get_quote", "get_stay_options", "negotiate_rate",
-                              "get_group_rates", "search_availability"},
-                             "guest asked what it costs"))
+    # **A group enquiry owes a price, whether or not the guest used a price
+    # word.** "5 kamre chahiye, 10 log aa rahe hain" contains no "kitna" and no
+    # "rate", so it raised only GROUP_BOOKING — and `get_group_rates` returns
+    # what a band *is*, not what a stay costs. The model was left holding a
+    # discount percentage and a room count and invented five prices.
+    #
+    # Nobody asks a hotel for five rooms without wanting to know what five rooms
+    # cost. Both requirements together are exactly `MAX_FORCED`, and when no room
+    # has been chosen both are reads that take no hold.
+    #
+    # **Not when a negotiation is already owed.** "Thoda kam karo na, 4000 per
+    # night mein ho jayega?" contains "per night", so it reads as a price
+    # question as well as a haggle — and `negotiate_rate` answers both. It
+    # returns `publishedTotalPaise` and `counterTotalPaise`, which now arrive
+    # with display strings beside them, so the model already has real money to
+    # quote. Forcing a quote on top would take a fifteen-minute hold on the same
+    # rooms to produce a number the turn already has.
+    negotiating = any(r.intent == NEGOTIATION for r in found)
+    quote = (None if negotiating else
+             _quote_requirement(text, session, group_enquiry=group is not None))
+    if quote:
+        found.append(quote)
 
     if _DATES.search(text):
         found.append(_simple(DATE_CHANGE, "search_availability",
@@ -950,13 +1322,30 @@ def detect(message: str, session: dict | None = None) -> list[Requirement]:
                               "negotiate_rate", "get_group_rates"},
                              "guest named dates"))
 
-    if people_count(text) is not None and not group:
+    if (people_count(text) is not None and not group
+            and not _headcount_is_about_a_facility(text)):
         found.append(_simple(GUEST_COUNT_CHANGE, "get_stay_options",
                              {"get_stay_options", "search_availability", "get_quote",
                               "get_group_rates", "get_room_types"},
                              "guest named a party size"))
 
-    order = {intent: i for i, intent in enumerate(_PRIORITY)}
+    # **What the guest is doing, filtering what the detectors found.**
+    #
+    # Each detector above recognises its own case and none of them knows what
+    # the sentence as a whole was *for*. That is how "Breakfast kitne baje tak
+    # milta hai?" — the matrix's own control turn, chosen to require nothing —
+    # came back owing a quote on 4 of 4 runs on both model families: `kitne` is
+    # a quantity word and `_QUOTE` is a keyword detector.
+    #
+    # The gate runs here, after detection rather than before it, for two
+    # reasons. The detectors stay exactly as they are, each still the single
+    # authority on its own case; and a detector added tomorrow is gated without
+    # its author having to remember to ask. See `services/ai/intent.py` for the
+    # six categories and what each may owe.
+    speech_act = intent.category(text)
+    found = [r for r in found if intent.permits(speech_act, r.intent)]
+
+    order = {intent_name: i for i, intent_name in enumerate(_PRIORITY)}
     found.sort(key=lambda r: order.get(r.intent, 99))
 
     # One requirement per intent — the vocabularies overlap by design and a

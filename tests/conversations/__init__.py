@@ -44,10 +44,16 @@ CONVERSATION = "c0c0c0c0-0001-4001-8001-000000000001"
 DELUXE = "22222222-2222-4222-8222-222222222222"
 GARDEN = "33333333-3333-4333-8333-333333333333"
 RATE_PLAN = "11111111-1111-4111-8111-111111111111"
+# The Garden Standard's plan. A rate plan belongs to a room type — see
+# `session.DERIVED_FROM` — so a scenario that switches rooms needs both.
+OTHER_PLAN = "44444444-4444-4444-8444-444444444444"
 
 # Far enough out that no test's dates collide with another's, and a round
 # number of days so a scenario can say "+2" and mean something readable.
-CHECK_IN = date.today() + timedelta(days=30)
+# The hotel's today. Fixed rather than `date.today()` so a scenario that says
+# "Friday" resolves to the same night in January as it does in June.
+TODAY = date(2026, 8, 25)
+CHECK_IN = TODAY + timedelta(days=30)
 CHECK_OUT = CHECK_IN + timedelta(days=2)
 LATER_IN = CHECK_IN + timedelta(days=10)
 LATER_OUT = LATER_IN + timedelta(days=2)
@@ -94,6 +100,14 @@ class Turn:
     """`{tool: {key: value}}` — a subset of what that tool returned. This is
     how a scenario asserts about *money*: that the band applied is the one the
     property set, that a deposit is present, that a discount was clamped."""
+
+    session_replaced: tuple[str, ...] = ()
+    """Keys that must hold a *different* value than they did before this turn.
+
+    The distinction `session_lacks` cannot make. A guest who corrects the room
+    count invalidates the quote priced for the old count — but the same turn may
+    re-price and land a new one, which is the better outcome and not a failure.
+    What must never survive is the *old* value."""
 
     output_lacks: dict = field(default_factory=dict)
     """`{tool: (key, ...)}` — keys the tool's output must NOT carry. A band on
@@ -187,7 +201,16 @@ def play(db, scenario: Scenario) -> Played:
         ))
         fresh = [a["tool"] for a in db.rows("agent_actions")[before:]]
 
-        patch = session.patch_from(result.actions)
+        patch = session.patch_from(
+            result.actions, turn.guest,
+            # The hotel's own rooms and today, so a room named in prose and a
+            # date corrected in prose reach the session exactly as they do in
+            # `messaging/pipeline`. A scenario runner that skipped these would
+            # be testing a different product from the one that ships.
+            rooms=[dict(r) for r in db.rows("room_types")],
+            today=TODAY,
+            known=dict(db.rows("conversations")[0].get("guest_profile") or {}),
+        )
         patch["obligations"] = obligations.open_from(
             turn.guest, result.actions,
             (db.rows("conversations")[0].get("guest_profile") or {}).get("obligations"),
@@ -256,6 +279,14 @@ def check(db, played: Played) -> list[str]:
             if after.get(key) != expected:
                 problems.append(
                     f"{where}: session {key} is {after.get(key)!r}, expected {expected!r}")
+        before = played.before_sessions[index - 1]
+        for key in turn.session_replaced:
+            was, now_ = before.get(key), after.get(key)
+            if was is not None and str(was) == str(now_):
+                problems.append(
+                    f"{where}: session {key} still holds {was!r}, which was true "
+                    f"of the stay before this correction")
+
         for key in turn.session_lacks:
             if after.get(key) not in (None, "", [], {}):
                 problems.append(

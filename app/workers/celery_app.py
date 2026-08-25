@@ -76,6 +76,17 @@ _STAYOS_SCHEDULE = {
     "stayos-waiting-guests": {
         "task": "travbuddy.messaging.sweep_waiting_guests", "schedule": 300,
     },
+    # Inventory drift is the one class of defect here that does not announce
+    # itself. An oversold night sells a room the hotel does not have and nobody
+    # learns until two guests arrive for it; a stranded night takes a sellable
+    # room off the market and looks like a slow week.
+    #
+    # Hourly, and it reports rather than corrects — see the task. The
+    # reconciliation has existed all along and nothing ran it, which is how both
+    # of the real incidents were found by hand.
+    "stayos-inventory-drift": {
+        "task": "travbuddy.pms.reconcile_inventory", "schedule": 3600,
+    },
 }
 
 
@@ -184,6 +195,11 @@ celery_app.conf.update(
     task_routes={
         "travbuddy.messaging.*": {"queue": "hotelos"},
         "travbuddy.marketing.*": {"queue": "hotelos"},
+        # The hotel's own operational tasks. Same deployment as messaging —
+        # `pms` is the hotel side of this codebase, and a reconciliation that
+        # ran on the marketplace worker would be reading a hotel database from
+        # a process that has no business with one.
+        "travbuddy.pms.*": {"queue": "hotelos"},
     },
     # Recommendation-engine nightly/weekly maintenance (docs/recommendation_engine.md
     # Part 9.3 / 14.3). Defined here — not in reco_tasks — so `celery beat` sees the

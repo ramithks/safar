@@ -278,3 +278,62 @@ def rows_from_state(folio: dict | None) -> list[dict]:
 def due_from_state(stay: dict, folio: dict | None) -> int:
     """`amount_due` for a caller holding a grouped `folio_states` row."""
     return amount_due(stay, rows_from_state(folio))
+
+
+# ── every paise a model can see, beside the words for it ────────────────────
+
+_SUFFIX = "Paise"
+
+
+def _spoken_name(key: str) -> str:
+    """`balancePaise` → `balance`, `totalPaise` → `total`."""
+    return key[: -len(_SUFFIX)] or "amount"
+
+
+def with_display(payload, *, depth: int = 0):
+    """
+    Add a display sibling for every paise figure in a tool result.
+
+    **Why this is one function at the boundary rather than a line in each tool.**
+    Thirty guardrail-blocked production runs were traced to the model formatting
+    money itself, and the shape was always the same: a tool returned
+    `balancePaise: 3440640` and nothing that said `₹34,406`, so the model divided
+    by a hundred and wrote the paise out as decimals — *"₹34,406.40"*. The figure
+    was right. It was the *rendering* the model had to invent, and inventing a
+    rendering is one keystroke from inventing a number.
+
+    `get_quote` was given display strings by hand after the first of these. The
+    other money-returning tools were not, and a survey found `frontdesk` with ten
+    paise fields and no display calls at all, `sales` with four. Fixing them one
+    at a time would leave the next tool somebody writes in exactly the same
+    state, which is the §10 lesson about one regex in a different room.
+
+    So it happens once, in `registry.execute`, on the way out. Every tool that
+    exists is covered and so is every tool that will.
+
+    Three rules, each of which matters:
+
+      * a sibling that already exists is left alone, so a tool that formats its
+        own money — a group deposit, a cancellation quote — keeps its wording;
+      * only integers are converted, because a float in a paise field is already
+        a bug and quietly rendering it would hide one;
+      * nested structures are walked, because `get_stay_options` carries its
+        money two levels down inside `options[].ratePlans[]` and that is exactly
+        where the model was reaching.
+    """
+    if depth > 6:
+        return payload
+    if isinstance(payload, list):
+        return [with_display(item, depth=depth + 1) for item in payload]
+    if not isinstance(payload, dict):
+        return payload
+
+    out = {key: with_display(value, depth=depth + 1) for key, value in payload.items()}
+    for key, value in list(payload.items()):
+        if not key.endswith(_SUFFIX) or not isinstance(value, int) or isinstance(value, bool):
+            continue
+        spoken = _spoken_name(key)
+        if spoken in out:
+            continue
+        out[spoken] = display(value)
+    return out

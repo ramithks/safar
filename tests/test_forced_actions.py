@@ -425,7 +425,13 @@ def test_enforcement_can_be_switched_off_without_losing_the_measurement(db, monk
 
     assert tool_rows(db, "get_group_rates") == []
     assert result.requirements["forced"] == []
-    assert result.requirements["intents"] == ["GROUP_BOOKING"]
+    # QUOTE_REQUIRED joined this list, and it is the change rather than drift.
+    # A group enquiry now owes a *price* as well as the bands: `get_group_rates`
+    # returns what a band is — a discount percentage and a deposit percentage —
+    # and a production turn holding only those invented five prices for a guest.
+    # Detection still runs with enforcement off, which is what this test is
+    # about, so both intents are recorded and neither is acted on.
+    assert result.requirements["intents"] == ["GROUP_BOOKING", "QUOTE_REQUIRED"]
     assert result.required_action_status == "unmet"
     assert db.rows("agent_runs")[0]["required_action_status"] == "unmet"
 

@@ -68,6 +68,38 @@ class _Query:
         self._filters.append(lambda r, c=col, v=val: str(r.get(c)) == str(v))
         return self
 
+    def or_(self, expression: str):
+        """
+        PostgREST's `or=(a.eq.1,b.eq.2)`, as the fake understands it.
+
+        **Added because its absence was quietly narrowing coverage.** Every call
+        to `negotiation._read_rules` raised `AttributeError: '_Query' object has
+        no attribute 'or_'` — and `rules_for` catches that and falls back to the
+        property's default rules, deliberately, because a failed read must never
+        widen what may be given away. So nothing broke and nothing failed: the
+        per-room-type and per-rate-plan negotiation rules simply had no test in
+        the suite that reached them, on any path, ever.
+
+        A fixture that turns a whole code path into a silent no-op is worse than
+        one that raises. Only the `col.eq.value` form is parsed, which is the
+        only form this codebase builds; anything else raises rather than
+        matching everything, because a filter the fake ignores is how a test
+        comes to pass against rows it should never have seen.
+        """
+        checks = []
+        for clause in expression.split(","):
+            column, _, rest = clause.partition(".")
+            operator, _, value = rest.partition(".")
+            if operator != "eq":
+                raise NotImplementedError(
+                    f"fake_supabase.or_ understands `col.eq.value`, not {clause!r}"
+                )
+            checks.append((column, value))
+        self._filters.append(
+            lambda r, cs=tuple(checks): any(str(r.get(c)) == str(v) for c, v in cs)
+        )
+        return self
+
     def neq(self, col, val):
         self._filters.append(lambda r, c=col, v=val: str(r.get(c)) != str(v))
         return self
@@ -99,6 +131,23 @@ class _Query:
 
     def gte(self, col, val):
         self._filters.append(lambda r, c=col, v=val: str(r.get(c) or "") >= str(v))
+        return self
+
+    def lt(self, col, val):
+        """
+        **Missing, and its absence made `pipeline._history` untestable.**
+
+        `gt`, `gte` and `lte` were all here; `lt` was not, and it is the one
+        `_history` uses to fetch the turns before a message. Any test that ran a
+        real turn through `process_conversation` raised `AttributeError` — which
+        is why no test ran one, and why a missing import in that function went
+        unnoticed by four thousand tests.
+
+        The same shape as the `or_` gap found in the previous pass: a fixture
+        that cannot express a query does not fail loudly, it makes a whole code
+        path untestable and then nobody notices it is untested.
+        """
+        self._filters.append(lambda r, c=col, v=val: str(r.get(c) or "") < str(v))
         return self
 
     def lte(self, col, val):
