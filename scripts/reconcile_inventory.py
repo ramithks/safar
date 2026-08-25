@@ -118,12 +118,42 @@ def disagreements(db, property_id: str) -> dict:
             (row["room_type_id"], row["date"][:10]), 0
         )
     ]
+
+    # **A sold night with no ledger row at all was invisible here.**
+    #
+    # The loop above walks `room_inventory`, so it can only find a night the
+    # ledger already knows about. Three fixture stays at Casa Mandala covered
+    # 2026-09-21 to 09-24 and this reported eighteen oversold units across three
+    # nights — because 09-21 had no `room_inventory` row, and a night that is
+    # not in the table cannot disagree with the table.
+    #
+    # It is the *worst* shape of the two. A row saying `units_booked = 0` is at
+    # least a row; `property_availability` falls back to `room_types.total_units`
+    # when there is none, so the missing night reported twelve of twelve free
+    # while six units were confirmed and paid against it. The under-count was
+    # exactly the nights nobody had ever written down.
+    #
+    # Synthesised as a row so every caller — the report, the beat task, the
+    # e2e assertion — sees one shape and needs no new branch. `id` is None,
+    # which is what marks it as a night that does not exist yet.
+    ledgered = {(row["room_type_id"], row["date"][:10]) for row in inventory}
+    unledgered = [
+        ({"id": None, "room_type_id": room_type, "date": night,
+          "units_booked": 0, "property_id": property_id}, count)
+        for (room_type, night), count in sorted(sold.items())
+        if count and (room_type, night) not in ledgered
+    ]
+    wrong.extend(unledgered)
     return {
         "room_types": len(rooms),
         "reservations": len(reservations),
         "live": len(live),
         "inventory": len(inventory),
         "wrong": wrong,
+        # Nights sold against no ledger row at all. Counted separately because
+        # the repair differs: a wrong counter is corrected, a missing row is
+        # written.
+        "unledgered": unledgered,
         "stranded": sum((row.get("units_booked") or 0) - actual
                         for row, actual in wrong),
         "oversold": sum(actual - (row.get("units_booked") or 0)
