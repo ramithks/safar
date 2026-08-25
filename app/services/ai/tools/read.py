@@ -647,9 +647,11 @@ async def list_guest_tasks(_args: NoArgs, ctx: AgentContext) -> list[dict]:
 @tool(
     name="search_availability",
     description=(
-        "Whether the hotel has rooms free for a stay. Returns how many of each "
-        "room type are left. The only source of availability — never say a room "
-        "is free without calling this."
+        "Whether the hotel has rooms free for a stay, and how many of each room "
+        "type are left. Use this only when the guest asks nothing more than "
+        "'do you have anything'. If they want to see the room options or a "
+        "price, call get_stay_options instead — it returns everything this "
+        "does. Never say a room is free without calling one of the two."
     ),
     input_model=AvailabilityArgs,
     permission=None,
@@ -697,7 +699,9 @@ async def search_availability(args: AvailabilityArgs, ctx: AgentContext) -> dict
             "Nothing is free for those dates. Offer to check other dates or to "
             "put the guest through to the team. Do not suggest a room type that "
             "is not listed here." if not sellable else
-            "Do not state a price from this result. Prices come from get_quote."
+            "Do not state a price from this result. Prices come from get_quote. "
+            "If the guest wants to choose a room, call get_stay_options. "
+            "Do not call this again, it has nothing more to add."
         ),
     }
 
@@ -722,9 +726,10 @@ def _meal_options(property_id: str) -> list[dict]:
 @tool(
     name="get_stay_options",
     description=(
-        "Room types that are free for a stay, each with the rate plans that "
-        "apply and an indicative total. Use after search_availability when the "
-        "guest asks what the options are. For a firm price, use get_quote."
+        "Room types that are free for a stay, each with how many are left, the "
+        "rate plans that apply and an indicative total. This already includes "
+        "availability — do NOT call search_availability first. For a firm "
+        "price, use get_quote."
     ),
     input_model=AvailabilityArgs,
     permission=None,
