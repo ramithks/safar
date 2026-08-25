@@ -237,6 +237,15 @@ MUTANTS = [
            "refuses in a reply",
            "tests/test_rule_provenance.py"),
 
+    Mutant("provenance", "a quote stops supplying the rupees behind its percentage",
+           "app/services/ai/tools/pricing.py",
+           '        payload["depositPaise"] = deposit_paise\n'
+           '        payload["deposit"] = money.display(deposit_paise)',
+           '        pass',
+           "the model is handed a deposit percentage beside a total and works "
+           "the rupees out itself — the ₹19,784 fabrication, exactly",
+           "tests/test_business_truth_provenance.py"),
+
     # ── the negotiation floor ───────────────────────────────────────────────
     Mutant("negotiation", "the approval ceiling stops being clamped",
            "app/services/pms/negotiation.py",
