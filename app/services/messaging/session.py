@@ -66,6 +66,64 @@ _BUSINESS_TOOLS = frozenset({
 })
 
 
+# ── where a fact came from, and which source wins ───────────────────────────
+#
+# **The precedence rule was positional, and positional is fragile.** A guest's
+# own words beat a tool argument because `stated_facts` happened to be applied
+# last in the function, and a forced call filled gaps only because a set of
+# names was threaded through the loop by hand. Both are correct today and both
+# would break the first time somebody reordered two blocks.
+#
+# Named instead, so the rule is a table rather than a shape. Every fact the
+# session carries arrives from one of four places, and a lower-ranked source
+# never overwrites a higher-ranked one *within the same turn*:
+#
+#   GUEST_SAID     the guest's own sentence, read by `required_actions` and
+#                  `date_facts`. Nothing is better evidence of what the guest
+#                  wants than what they just said.
+#   TOOL_RESULT    an id or a name a tool returned — a quote's room, a rate
+#                  plan. The system's own answer about its own records.
+#   TOOL_ARGUMENT  what the *model* called a tool with. A reading of the guest,
+#                  one remove away.
+#   CARRIED        what a *forced* call was invoked with, which the application
+#                  built out of the session — so it is the session repeating
+#                  itself, not new evidence, and must never overwrite the turn.
+GUEST_SAID = "guest_said"
+TOOL_RESULT = "tool_result"
+TOOL_ARGUMENT = "tool_argument"
+CARRIED = "carried"
+
+SOURCE_RANK = {GUEST_SAID: 3, TOOL_RESULT: 2, TOOL_ARGUMENT: 1, CARRIED: 0}
+
+
+class _Facts:
+    """
+    One turn's findings, each with where it came from.
+
+    `set` is the whole mechanism: a fact only lands if nothing better-sourced
+    has already claimed it this turn. Equal ranks overwrite, which keeps the
+    within-rank behaviour that was there before — a model that searches one week
+    and then quotes another has changed its mind about the same turn.
+    """
+
+    def __init__(self) -> None:
+        self.values: dict = {}
+        self.sources: dict[str, str] = {}
+
+    def set(self, field: str, value, source: str) -> None:
+        if value is None:
+            return
+        held = self.sources.get(field)
+        if held is not None and SOURCE_RANK[source] < SOURCE_RANK[held]:
+            return
+        self.values[field] = value
+        self.sources[field] = source
+
+    def update(self, values: dict, source: str) -> None:
+        for field, value in (values or {}).items():
+            self.set(field, value, source)
+
+
 def patch_from(outcomes: list, message: str | None = None,
                rooms: list[dict] | None = None, today=None,
                known: dict | None = None) -> dict:
@@ -101,18 +159,16 @@ def patch_from(outcomes: list, message: str | None = None,
     # land. What separates the two is not the tool but where the argument came
     # from — the guest's sentence, or the session the guest is contradicting.
     #
-    # So the model's own calls are processed first and in order, and the forced
-    # ones afterwards fill only what nothing else established this turn. A
-    # forced argument taken from stale state then loses to the fresh one beside
-    # it, and a forced argument nobody else supplied still lands.
-    ordered = sorted(
-        (o for o in (outcomes or []) if getattr(o, "ok", False)),
-        key=lambda o: getattr(o, "decision_source", "model") == "application",
-    )
-    established: set[str] = set()
+    # So a forced call's arguments are `CARRIED` — the session repeating itself,
+    # not new evidence — and the rank table refuses to let them overwrite
+    # anything the turn actually established. `get_group_rates` forced with
+    # `units: 5` read out of "5 kamre chahiye" still lands, because nothing else
+    # claimed `units` on that turn.
+    facts = _Facts()
 
-    for outcome in ordered:
+    for outcome in (o for o in (outcomes or []) if getattr(o, "ok", False)):
         forced = getattr(outcome, "decision_source", "model") == "application"
+        argument_source = CARRIED if forced else TOOL_ARGUMENT
         tool = getattr(outcome, "tool", "") or ""
 
         if tool in _BUSINESS_TOOLS:
@@ -124,13 +180,7 @@ def patch_from(outcomes: list, message: str | None = None,
 
         args = getattr(outcome, "input", None) or {}
         for field in _STAY_ARGS:
-            if args.get(field) is None:
-                continue
-            if forced and field in established:
-                continue
-            patch[field] = args[field]
-            if not forced:
-                established.add(field)
+            facts.set(field, args.get(field), argument_source)
 
         # The room this turn was about, whichever tool was asked.
         #
@@ -140,10 +190,7 @@ def patch_from(outcomes: list, message: str | None = None,
         # between choosing a room and pricing it are exactly where the choice
         # used to be lost. A later `get_quote` overwrites it, which is right:
         # a priced room outranks a discussed one.
-        if args.get("room_type_id") and not (forced and "room_type_id" in established):
-            patch["room_type_id"] = args["room_type_id"]
-            if not forced:
-                established.add("room_type_id")
+        facts.set("room_type_id", args.get("room_type_id"), argument_source)
 
         output = getattr(outcome, "output", None)
         if not isinstance(output, dict):
@@ -173,11 +220,19 @@ def patch_from(outcomes: list, message: str | None = None,
                            # So a later turn can say "Deluxe Balcony" rather
                            # than reciting a uuid or asking again.
                            ("roomName", "room_name")):
-            if output.get(key):
-                patch[field] = output[key]
+            # A tool's *result* is the system answering about its own records,
+            # which outranks a reading of the guest but not the guest.
+            facts.set(field, output.get(key),
+                      CARRIED if forced else TOOL_RESULT)
         if tool in ("get_quote",) and args.get("room_type_id"):
-            patch["room_type_id"] = args["room_type_id"]
-            patch["rate_plan_id"] = args.get("rate_plan_id")
+            # **At argument rank, not result rank.** These are the *arguments*
+            # `get_quote` was called with, kept as a fallback for a payload that
+            # does not name the room — so they must lose to a payload that
+            # does. Ranking them as a result made a quote's own `roomTypeId`
+            # lose to the id the model had asked with, which is the system
+            # deferring to a reading of the guest over its own record.
+            facts.set("room_type_id", args.get("room_type_id"), argument_source)
+            facts.set("rate_plan_id", args.get("rate_plan_id"), argument_source)
 
         # Where the price argument has got to.
         #
@@ -230,7 +285,7 @@ def patch_from(outcomes: list, message: str | None = None,
     if message:
         from app.services.ai import required_actions
 
-        patch.update(required_actions.stated_facts(message))
+        facts.update(required_actions.stated_facts(message), GUEST_SAID)
 
         # **And the room they named, resolved against this hotel's own list.**
         #
@@ -248,8 +303,8 @@ def patch_from(outcomes: list, message: str | None = None,
 
             named = room_names.resolve(message, rooms)
             if named.resolved:
-                patch["room_type_id"] = named.room_type_id
-                patch["room_name"] = named.name
+                facts.set("room_type_id", named.room_type_id, GUEST_SAID)
+                facts.set("room_name", named.name, GUEST_SAID)
                 # A room named in prose is a *preference*, not an availability
                 # check — the same rule a date change follows. The prompt turns
                 # this into an instruction to confirm the room is free before
@@ -276,7 +331,7 @@ def patch_from(outcomes: list, message: str | None = None,
             # not the patch: a turn where the guest says only a length has no
             # tool call carrying a date, so the patch is empty and the anchor
             # would be too.
-            anchor = patch.get("check_in") or (known or {}).get("check_in")
+            anchor = facts.values.get("check_in") or (known or {}).get("check_in")
             if isinstance(anchor, str):
                 try:
                     from datetime import date as _date
@@ -286,8 +341,8 @@ def patch_from(outcomes: list, message: str | None = None,
                     anchor = None
             nights = date_facts.read(message, today, check_in=anchor)
             if nights.usable:
-                patch["check_in"] = nights.check_in.isoformat()
-                patch["check_out"] = nights.check_out.isoformat()
+                facts.set("check_in", nights.check_in.isoformat(), GUEST_SAID)
+                facts.set("check_out", nights.check_out.isoformat(), GUEST_SAID)
                 patch["dates_from"] = nights.basis
                 # Private, consumed by `merge`: it is what tells an earlier
                 # "which month did you mean" that it has been answered.
@@ -300,6 +355,14 @@ def patch_from(outcomes: list, message: str | None = None,
                     patch["dates_need_confirming"] = True
             elif nights.ask:
                 patch["dates_unclear"] = nights.ask
+    # The ranked facts, folded in with where each came from.
+    #
+    # `_sources` is private and consumed by `merge`, which keeps only what
+    # the session ends up holding — a per-turn map of every field the turn
+    # *tried* to set would grow without bound on a long thread.
+    patch.update(facts.values)
+    if facts.sources:
+        patch["_sources"] = facts.sources
     return patch
 
 
@@ -315,6 +378,7 @@ _TRANSACTIONAL = _STAY_ARGS + (
     "negotiation", "payment", "awaiting_hotel", "obligations",
     "last_business_action", "room_needs_recheck", "room_ambiguous",
     "dates_need_confirming", "dates_unclear", "dates_from",
+    "_sources", "_sources_turn",
 )
 
 # What a *price* was true of. When the guest moves the dates, these are wrong
@@ -534,6 +598,38 @@ def clear_stay(profile: dict) -> dict:
     return {k: v for k, v in (profile or {}).items() if k not in _TRANSACTIONAL}
 
 
+def _record_sources(merged: dict, profile: dict, patch: dict) -> dict:
+    """
+    Where each fact the session now holds came from, and on which turn.
+
+    **Kept for the facts that survived, not for the ones a turn tried to set.**
+    A per-turn map of every attempt would grow without bound on a long thread;
+    what is useful six weeks later is "the guest told us three rooms, on turn
+    four" — one entry per canonical fact, replaced when the fact is.
+
+    Read by nothing in the hot path today, which is stated plainly rather than
+    dressed up: this is a debugging record and an inspectable form of the
+    precedence rule, and the rule itself is enforced by `_Facts` and tested
+    directly.
+    """
+    incoming = patch.pop("_sources", None) or {}
+    if not incoming:
+        return merged
+
+    turn = int((profile.get("_sources_turn") or 0)) + 1
+    history = dict(profile.get("_sources") or {})
+    for field, source in incoming.items():
+        if field in merged:
+            history[field] = {"source": source, "turn": turn}
+    # Facts that have since gone — dropped by a correction, or by a date move —
+    # take their provenance with them.
+    history = {k: v for k, v in history.items() if k in merged}
+    merged = dict(merged)
+    merged["_sources"] = history
+    merged["_sources_turn"] = turn
+    return merged
+
+
 def _clear_answered_ambiguity(merged: dict) -> dict:
     """
     A question that has been answered stops being asked.
@@ -663,6 +759,7 @@ def merge(conversation_id: str, patch: dict) -> None:
                         profile["room_needs_recheck"] = True
 
         merged = _clear_answered_ambiguity(_revalidate_room({**profile, **patch}))
+        merged = _record_sources(merged, profile, patch)
         if merged == profile:
             # Nothing new. Returning here rather than stamping `touched_at`
             # anyway is what keeps the staleness clock honest: it should measure

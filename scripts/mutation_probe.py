@@ -115,10 +115,10 @@ MUTANTS = [
     # ── required actions ────────────────────────────────────────────────────
     Mutant("required", "a forced call overwrites the turn's fresh facts",
            "app/services/messaging/session.py",
-           'if forced and field in established:\n                continue',
-           'if False:\n                continue',
+           '            facts.set(field, args.get(field), argument_source)',
+           '            facts.values[field] = args.get(field) or facts.values.get(field)',
            "a guest changes their dates and the session changes them back",
-           "tests/test_conversation_corpus.py"),
+           "tests/test_conversation_corpus.py tests/test_fact_precedence.py"),
     Mutant("required", "a year is read as a budget again",
            "app/services/ai/required_actions.py",
            'if 2020 <= value <= 2035 and pattern in (_OFFERED_PRICE, _OFFERED_PRICE_AFTER):',
@@ -166,7 +166,7 @@ MUTANTS = [
            "tests/test_corrections_invalidate.py"),
     Mutant("state", "the guest's own words stop outranking tool arguments",
            "app/services/messaging/session.py",
-           '        patch.update(required_actions.stated_facts(message))',
+           '        facts.update(required_actions.stated_facts(message), GUEST_SAID)',
            '        pass',
            "\"actually 4 log hain\" lands only if some tool happened to carry it",
            "tests/test_corrections_invalidate.py tests/test_conversation_corpus.py"),
@@ -199,6 +199,20 @@ MUTANTS = [
            "'25th to 28th' said on the 26th comes out backwards and is refused, "
            "when the guest was perfectly clear",
            "tests/test_date_corrections.py"),
+
+    Mutant("state", "the source table stops outranking anything",
+           "app/services/messaging/session.py",
+           '        if held is not None and SOURCE_RANK[source] < SOURCE_RANK[held]:',
+           '        if False:',
+           "a forced call built from the stale session overwrites the dates the "
+           "guest just gave",
+           "tests/test_fact_precedence.py"),
+    Mutant("state", "a forced call is ranked as fresh evidence",
+           "app/services/messaging/session.py",
+           '        argument_source = CARRIED if forced else TOOL_ARGUMENT',
+           '        argument_source = TOOL_ARGUMENT',
+           "the session repeating itself outranks the guest correcting it",
+           "tests/test_fact_precedence.py tests/test_conversation_corpus.py"),
 
     # ── business-rule provenance ────────────────────────────────────────────
     Mutant("provenance", "a failed rule read stops being distinguishable",
