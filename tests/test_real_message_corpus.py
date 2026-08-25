@@ -111,7 +111,12 @@ REAL = [
     ('Hi, 5 kamre chahiye, 10 log aa rahe hain', 'TRANSACTIONAL'),
     ('Hi, do you have a room for 2 people on 10 October for 2 nights?', 'TRANSACTIONAL'),
     ('hi, what time is breakfast?', 'TRANSACTIONAL'),
-    ('How do I check in online?', 'TRANSACTIONAL'),
+    # Both reviewed when `check in` with a space was not an amenity — only
+    # `check-in` and `checkin` were listed, which is the least likely of the
+    # three spellings. INFORMATIONAL is the better answer for both: how to
+    # check in and what time to check out are process and policy questions,
+    # and INFORMATIONAL routes to guest_faq, which holds get_checkin_options.
+    ('How do I check in online?', 'INFORMATIONAL'),
     ('How do I pay?', 'TRANSACTIONAL'),
     ('How is occupancy this week?', 'TRANSACTIONAL'),
     ('How many credits do I have and how many conversations is that?', 'TRANSACTIONAL'),
@@ -167,7 +172,7 @@ REAL = [
     ('what did I just ask?', 'TRANSACTIONAL'),
     ('What does an Instagram conversation cost me?', 'TRANSACTIONAL'),
     ('What does it cost?', 'TRANSACTIONAL'),
-    ('What time do I have to check out?', 'TRANSACTIONAL'),
+    ('What time do I have to check out?', 'INFORMATIONAL'),
     ("What's included in the rate?", 'TRANSACTIONAL'),
     ('who do you think I am', 'TRANSACTIONAL'),
     ('who is arriving today?', 'TRANSACTIONAL'),

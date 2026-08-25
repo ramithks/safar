@@ -98,7 +98,10 @@ _AMENITY = re.compile(
     r"gym|spa|sauna|massage|"
     r"laundry|dhulai|iron|"
     r"pets?|dogs?|cats?|kutta|"
-    r"check-?in|checkin|check-?out|checkout|"
+    # With a space too: "When can I check in?" is the commonest phrasing
+    # of the commonest question, and only the hyphenated and closed-up
+    # forms were listed.
+    r"check[- ]?in|checkin|check[- ]?out|checkout|"
     r"ac|a\.c\.|air ?conditioning|heater|geyser|"
     r"lift|elevator|balcony|terrace|garden|view|"
     r"towel|toiletries|shampoo|luggage|storage|locker|cloak ?room|"
@@ -361,6 +364,37 @@ def _asks_a_question(text: str) -> bool:
     )
 
 
+# **Asking whether an action is needed is not requesting it.**
+#
+# "Do I need to reserve the restaurant?" is a policy question and read as a
+# request, because `reserve` is a request verb and nothing looked at the frame
+# around it. The same shape covers "do I have to book in advance", "is it
+# necessary to confirm", "should I cancel" — every one a question about the
+# rule rather than an instruction to apply it.
+#
+# General on purpose: it takes the frame off and lets the rest of the sentence
+# decide, so it works for every request verb rather than for the one that
+# happened to be noticed. The verb after it survives — "do I need to cancel and
+# also cancel it for me" is still a request, because the second clause has no
+# frame.
+# The frame *and the verb it governs* — removing only the frame leaves the verb
+# behind, still matching as a request, which is what the first cut did.
+_ASKS_WHETHER_TO = re.compile(
+    r"(?xi)"
+    r"(?:"
+    r"  (?:do|does|did|should|must|would|is|are)\s+"
+    r"  (?:i|we|you|it|they|he|she)?\s*"
+    r"  (?:need|have|required|necessary|possible|ok|okay|fine)\s+to"
+    r"| is\s+it\s+(?:necessary|required|possible)\s+to"
+    r")"
+    r"\s+\w+"
+)
+
+
+def _strips_the_question_frame(text: str) -> str:
+    return _ASKS_WHETHER_TO.sub(" ", text)
+
+
 def _matches(message: str, *patterns) -> bool:
     return any(p.search(message) for p in patterns)
 
@@ -380,12 +414,30 @@ def _of_one_clause(text: str) -> str:
     if not text:
         return INFORMATIONAL
 
-    if _matches(text, _ASKS_FOR_A_PERSON):
+    # **Asking *for* a person, not mentioning one.**
+    #
+    # This was a bare list of person-nouns, so "the manager was lovely" and
+    # "the staff were rude" both read as ESCALATION — and ESCALATION owes
+    # nothing, so a complaint would have silenced every business action on the
+    # turn. A noun deciding a speech act is precisely the failure this module
+    # was written to fix, made inside it.
+    #
+    # `required_actions.asks_for_a_person` is the canonical vocabulary: it is
+    # what *forces* the handoff and what the arbiter reads, so deferring means
+    # the three cannot disagree about what a request for a human is. Imported
+    # inside the function because the dependency runs the other way at module
+    # level.
+    from app.services.ai import required_actions as _required
+
+    if _required.asks_for_a_person(text):
         return ESCALATION
 
     amenity = _matches(text, _AMENITY, _AMENITY_HI)
     asks_a_fact = _asks_a_question(text)
-    requests = _matches(text, _REQUESTS_SOMETHING, _REQUESTS_SOMETHING_HI)
+    # A request verb inside "do I need to …" is a question about the rule, not
+    # an instruction to apply it — see `_ASKS_WHETHER_TO`.
+    requests = _matches(_strips_the_question_frame(text),
+                        _REQUESTS_SOMETHING, _REQUESTS_SOMETHING_HI)
 
     # **A factual question about a facility or a policy, with nothing asked
     # for.** Settled here, ahead of every business-noun pattern below, because
@@ -414,11 +466,29 @@ def _of_one_clause(text: str) -> str:
     # It only reorders messages that match *both*. "meri booking cancel karni
     # hai" and "Can I upgrade to a suite?" contain no discount words and are
     # unaffected.
+    # **"Can you give me a free room?" is a haggle; "how many rooms are free?"
+    # is availability.**
+    #
+    # `_FREE_MEANS_VACANT` was vetoing both, because both contain `free` beside
+    # `room`. The noun does not separate them and neither does the word order —
+    # what separates them is whether the guest is *asking the hotel for*
+    # something. A request plus `free` is a request for something free; a
+    # question plus `free` is a question about vacancy.
+    #
+    # So the vacancy reading only applies to a message that asks rather than
+    # requests, which is the same distinction the informational branch above is
+    # built on rather than a second rule about the word `free`.
+    reads_as_vacancy = _FREE_MEANS_VACANT.search(text) and not requests
     if ((_matches(text, _ASKS_FOR_LESS, _ASKS_FOR_LESS_HI)
-         and not _FREE_MEANS_VACANT.search(text))
+         and not reads_as_vacancy)
             or _PERCENT_OFF.search(text)):
         return NEGOTIATION
-    if _matches(text, _CHANGES_A_BOOKING, _CHANGES_A_BOOKING_HI):
+    # The frame comes off here too. "do I have to remove my shoes" and "what is
+    # the fee to remove a room" are questions about a rule; "remove one room
+    # from my booking" is an instruction. Reading the raw text made all three
+    # mutations, which is the same word-decides-the-act failure one branch down.
+    if _matches(_strips_the_question_frame(text),
+                _CHANGES_A_BOOKING, _CHANGES_A_BOOKING_HI):
         return MUTATION
 
     wants = _matches(text, _WANTS_SOMETHING, _WANTS_SOMETHING_HI)

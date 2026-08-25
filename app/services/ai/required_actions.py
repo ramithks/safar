@@ -640,6 +640,24 @@ def offered_price(message: str) -> int | None:
     return None
 
 
+def asks_for_a_person(message: str | None) -> bool:
+    """
+    Is the guest asking to be put through to a human?
+
+    The canonical answer, and deliberately the *narrow* one. This forces a
+    handoff and stops the agent, and the arbiter reads the same pattern — so a
+    sentence that forces a stop can never be one the arbiter turns down.
+
+    Named and made public because `intent.category` needs it. That module's
+    first cut carried its own list of person-nouns, which meant "the manager
+    was lovely" and "the staff were rude" both read as ESCALATION — and
+    ESCALATION owes nothing, so a complaint would have silenced every business
+    action on the turn. A bare noun deciding a speech act is the exact failure
+    `intent` was written to fix, made inside `intent`.
+    """
+    return bool(_ESCALATION_ASK.search(message or ""))
+
+
 def wants_discount(message: str) -> bool:
     """
     Is the guest pushing on the price?
