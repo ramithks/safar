@@ -201,19 +201,47 @@ class TestWhatMustNotChange:
         })
         assert profile(db)["quote_id"] == "q-2"
 
-    def test_new_dates_still_rebuild_the_stay_rather_than_pruning_it(self, db):
+    def test_moving_the_nights_alone_keeps_the_party(self, db):
         """
-        Dates keep their own path. They are the one correction that also means
-        "a different trip", so the party size goes too — a guest asking about
-        October has not implicitly kept September's four adults.
+        **This assertion was reversed, and the reversal is the fix.**
+
+        It read `assert "adults" not in now` — a date change dropped the party
+        size, on the reasoning that a guest asking about October has not
+        implicitly kept September's four adults. Sound for the case it was
+        written for, and wrong for a live correction: a guest three turns in who
+        says "actually 3 rooms" and then "and the 2nd to the 5th" has not
+        changed their mind about the rooms, and dropping the count made the next
+        quote price one room and the agent ask how many they wanted — the
+        question they had just answered. Found by an eleven-turn journey.
+
+        The two cases are told apart by the patch rather than by a clock, and
+        the test below pins the other half.
         """
         session.merge(CONVERSATION, {"check_in": "2026-10-20",
                                      "check_out": "2026-10-22"})
         now = profile(db)
-        assert "quote_id" not in now
-        assert "adults" not in now, "a new trip does not inherit the old party"
+        assert now["check_in"] == "2026-10-20"
+        assert "quote_id" not in now, "the September price survived"
+        assert now["adults"] == 2, "a correction to the nights lost the party"
+        assert now["units"] == 2
         assert now["room_type_id"] == "rt-deluxe"
         assert now["room_needs_recheck"] is True
+
+    def test_but_re_describing_the_stay_drops_the_old_party_whole(self, db):
+        """
+        The other half. A guest stating a *new* size is describing a different
+        stay, and an unstated field — September's one child — must not survive
+        into an October request that mentioned only adults.
+        """
+        db.rows("conversations")[0]["guest_profile"]["children"] = 1
+        session.merge(CONVERSATION, {
+            "check_in": "2026-10-20", "check_out": "2026-10-22",
+            "adults": 2, "units": 1,
+        })
+        now = profile(db)
+        assert now["adults"] == 2
+        assert now["units"] == 1
+        assert "children" not in now, "the old trip's child came along"
 
 
 # ── the guest's own words outrank any tool argument ─────────────────────────

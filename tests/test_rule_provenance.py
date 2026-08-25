@@ -256,11 +256,24 @@ class TestItIsObservable:
             ceiling_paise=None, auto_pct=10, approval_pct=20,
             valid_from=None, valid_to=None, days_of_week=frozenset(),
             blackout_dates=frozenset(), min_nights=1, min_units=1)
-        decision = negotiation.decide(
-            gross_paise=1000000, requested_total_paise=900000,
-            rules=rule, nights=2, units=1)
-        assert "rule_source" not in decision.as_dict()
-        assert negotiation.EMERGENCY_DEFAULT not in str(decision.as_dict())
+        from dataclasses import replace
+        decision = replace(
+            negotiation.decide(gross_paise=1000000, requested_total_paise=900000,
+                               rules=rule, nights=2, units=1),
+            # Stamped as `negotiate` would, so the assertion is not vacuous:
+            # a decision whose scope is the default proves nothing about a leak.
+            rule_source=negotiation.EMERGENCY_DEFAULT)
+        # **Asserted on the values, not on one spelling of the key.** The first
+        # version checked for `rule_source` while every key in this projection
+        # is camelCase, so a leak spelled `ruleSource` walked straight past it —
+        # found by mutation testing, which added exactly that.
+        projected = decision.as_dict()
+        leaked = [k for k, v in projected.items()
+                  if v in (negotiation.RATE_PLAN_RULE, negotiation.ROOM_TYPE_RULE,
+                           negotiation.PROPERTY_RULE, negotiation.HOTEL_DEFAULT,
+                           negotiation.EMERGENCY_DEFAULT)]
+        assert not leaked, f"the rule scope reached the model under {leaked}"
+        assert not [k for k in projected if "rule" in k.lower()]
 
     def test_the_floor_is_still_not_on_the_object(self):
         """

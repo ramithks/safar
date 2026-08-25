@@ -186,7 +186,18 @@ _PEOPLE_NOUN = (
     r"log|logo|logon|jane|bande|लोग|व्यक्ति|मेहमान)"
 )
 
-_ROOMS_BEFORE = re.compile(rf"(?<![a-z0-9])({_NUMBER})\s*{_ROOM_NOUN}", re.IGNORECASE)
+# **A room's name can sit between the number and the noun.**
+#
+# "2 Deluxe rooms", "3 Garden Standard rooms", "5 sea view kamre" — an entirely
+# ordinary way to ask, and the pattern required the number to touch the noun, so
+# every one of them counted no rooms at all. Found by a long journey whose very
+# first turn was "Hi, 2 Deluxe rooms chahiye".
+#
+# Up to three words between, and none of them a digit: `{_NUMBER}` would let
+# "2 rooms for 4 people" match "2 … people" and count four rooms, which is the
+# failure `_ROOMS_AFTER`'s guard already exists for.
+_ROOMS_BEFORE = re.compile(
+    rf"(?<![a-z0-9])({_NUMBER})\s*(?:[a-z]+\s+){{0,3}}{_ROOM_NOUN}", re.IGNORECASE)
 # The number *after* the noun — "rooms 4 chahiye", "kamre 3".
 #
 # With a guard that earns its keep: "rooms for 10 people" put ten rooms on a
@@ -197,6 +208,19 @@ _ROOMS_AFTER = re.compile(
     rf"{_ROOM_NOUN}\s*(?:ki|ke|for)?\s*({_NUMBER})(?![a-z0-9])(?!\s*{_PEOPLE_NOUN})",
     re.IGNORECASE,
 )
+
+# **"room 204" is a door, not an order for two hundred rooms.**
+#
+# `_ROOMS_AFTER` reads the number beside a room noun, which is right for "kamre
+# 3 chahiye" and catastrophic for "room 204 mein AC nahi chal raha" — a guest
+# reporting a broken air conditioner raised a GROUP_BOOKING requirement and
+# forced `get_group_rates(units=204)`.
+#
+# Nobody books three figures of rooms through a chat window, and every hotel
+# numbers its doors that way, so the number itself decides. Applied only to the
+# noun-first form: "204 rooms chahiye" is at least stated as a count, and is
+# left alone rather than second-guessed.
+_ROOM_NUMBER_FROM = 100
 _PEOPLE_BEFORE = re.compile(rf"(?<![a-z0-9])({_NUMBER})\s*{_PEOPLE_NOUN}", re.IGNORECASE)
 _PEOPLE_AFTER = re.compile(rf"{_PEOPLE_NOUN}\s*(?:hain?|hai|ke liye|for)?\s*({_NUMBER})(?![a-z0-9])",
                            re.IGNORECASE)
@@ -281,8 +305,12 @@ def room_count(message: str) -> int | None:
     for pattern in (_ROOMS_BEFORE, _ROOMS_AFTER):
         for match in pattern.finditer(text):
             value = _to_int(match.group(1))
-            if value:
-                return value
+            if not value:
+                continue
+            if pattern is _ROOMS_AFTER and value >= _ROOM_NUMBER_FROM:
+                # A door, not an order. See `_ROOM_NUMBER_FROM`.
+                continue
+            return value
     return None
 
 

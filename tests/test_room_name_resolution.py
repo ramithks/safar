@@ -113,6 +113,35 @@ class TestItRefusesToGuess:
     NESTED = [{"id": "a", "name": "Garden Standard"},
               {"id": "b", "name": "Garden Standard Twin"}]
 
+    def test_two_rooms_that_score_alike_on_a_typo_produce_a_question(self):
+        """
+        **The fuzzy tie, which mutation testing found untested.** Every
+        ambiguity test above goes through the *partial* path — several rooms
+        matching one token each. This is the other branch: both rooms match
+        every one of their tokens, and neither is far enough ahead to be the
+        answer.
+
+        A hotel with a *Garden Room* and a *Garden Standard* is entirely
+        ordinary, and "gardern standrd" is a phone keyboard. Disabling the
+        margin check resolved it to whichever scored a hundredth higher.
+        """
+        rooms = [{"id": "a", "name": "Garden Room"},
+                 {"id": "b", "name": "Garden Standard"}]
+        resolved = room_names.resolve("gardern standrd chahiye", rooms)
+        assert not resolved.resolved, (
+            f"guessed {resolved.name!r} between two rooms a typo fits equally")
+        assert resolved.ambiguous
+        assert "Garden Room" in resolved.ask and "Garden Standard" in resolved.ask
+
+    def test_and_typing_either_one_correctly_still_resolves(self):
+        """
+        The control. Ambiguity must not swallow a guest who was clear.
+        """
+        rooms = [{"id": "a", "name": "Garden Room"},
+                 {"id": "b", "name": "Garden Standard"}]
+        assert room_names.resolve("garden standard", rooms).room_type_id == "b"
+        assert room_names.resolve("garden room", rooms).room_type_id == "a"
+
     def test_a_shorter_name_that_is_said_exactly_is_not_ambiguous(self):
         """
         **My first draft asserted the opposite and was wrong**, which is worth

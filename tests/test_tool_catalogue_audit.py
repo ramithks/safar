@@ -112,15 +112,20 @@ class TestNoDescriptionAsksForARedundantCall:
     NEGATED = re.compile(r"\b(?:do\s+not|don't|never|no\s+need\s+to)\b[^.]*$", re.I)
 
     # Prerequisites that are real: the named tool returns something this one
-    # does not, and the model needs it to answer well. Listed rather than
-    # pattern-matched, so adding one is a decision somebody records.
+    # does not, and the model needs it to answer well.
     #
-    #   check_out → get_folio   the checkout refuses while money is outstanding
-    #                           and returns no folio of its own, so without this
-    #                           the agent can say "I can't check you out" and
-    #                           not say why. That is a second turn for the
-    #                           guest, which is worse than the call it saves.
-    LEGITIMATE = {("check_out", "get_folio")}
+    # **A dict, so an exception cannot be added without a reason.** A bare set
+    # of pairs is a list somebody appends to when a test goes red; a mapping to
+    # prose is one they have to think about, and `test_every_exception_gives_a
+    # _reason` below refuses an empty one. Suppressing the detector entirely is
+    # the thing this shape exists to prevent.
+    LEGITIMATE = {
+        ("check_out", "get_folio"):
+            "the checkout refuses while money is outstanding and returns no "
+            "folio of its own, so without this the agent can say 'I can't "
+            "check you out' and not say why — a second turn for the guest, "
+            "which costs more than the call it saves",
+    }
 
     @pytest.mark.parametrize("spec", registry.REGISTRY.values(), ids=lambda s: s.name)
     def test_it_does_not_tell_the_model_to_call_another_tool_first(self, spec):
@@ -169,6 +174,8 @@ class TestToolsThatCompeteMustSayHowTheyDiffer:
                              ids=lambda p: f"{p[0]}~{p[1]}")
     def test_each_names_the_other(self, pair):
         first, second, holder = pair
+        if (first, second) in self.ALLOWED_OVERLAP:
+            pytest.skip(self.ALLOWED_OVERLAP[(first, second)])
         a = registry.REGISTRY[first].description
         b = registry.REGISTRY[second].description
         assert second in a and first in b, (
@@ -176,6 +183,39 @@ class TestToolsThatCompeteMustSayHowTheyDiffer:
             f"{holder} agent's menu, and neither says how it differs from the "
             f"other. The model is choosing between them blind, and calling both "
             f"costs a whole extra model step."
+        )
+
+    # Pairs that overlap and are allowed to, each with why.
+    #
+    # Same shape and same reason as LEGITIMATE above: an exception has to be
+    # argued, not appended.
+    ALLOWED_OVERLAP: dict = {}
+
+    def test_every_exception_gives_a_reason(self):
+        """
+        The property that keeps this from becoming a mute button. An entry with
+        no prose behind it is somebody silencing the detector, and this fails on
+        it — including on an entry whose "reason" is a placeholder.
+        """
+        for table in (TestNoDescriptionAsksForARedundantCall.LEGITIMATE,
+                      self.ALLOWED_OVERLAP):
+            for pair, reason in table.items():
+                assert isinstance(reason, str) and len(reason.split()) >= 8, (
+                    f"{pair} is exempted without a reason anybody can weigh"
+                )
+                assert "todo" not in reason.lower() and "fixme" not in reason.lower()
+
+    def test_the_detector_cannot_be_switched_off_wholesale(self):
+        """
+        §8: false positives must be representable as explicit exceptions, and
+        the detector must not be suppressed. If the exception list ever grows to
+        cover everything it finds, it has stopped being an audit.
+        """
+        found = {(a, b) for a, b, _ in overlapping_pairs()}
+        exempted = set(self.ALLOWED_OVERLAP)
+        assert not found <= exempted or not found, (
+            "every overlapping pair is exempted — the detector is off in all "
+            "but name"
         )
 
     def test_the_audit_actually_found_something(self):

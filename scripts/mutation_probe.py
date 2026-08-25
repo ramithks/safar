@@ -171,6 +171,58 @@ MUTANTS = [
            "\"actually 4 log hain\" lands only if some tool happened to carry it",
            "tests/test_corrections_invalidate.py tests/test_conversation_corpus.py"),
 
+    # ── entity resolution ───────────────────────────────────────────────────
+    Mutant("entities", "the resolver guesses between two matching rooms",
+           "app/services/pms/room_names.py",
+           '    if len(contenders) > 1:',
+           '    if False:',
+           "a hotel with a Deluxe Balcony and a Deluxe Garden has 'the deluxe "
+           "one' silently resolved to whichever sorted first",
+           "tests/test_room_name_resolution.py"),
+    Mutant("entities", "a partial word becomes a room selection",
+           "app/services/pms/room_names.py",
+           '        if any(h == 0.0 for h in hits):\n            # **Every significant token has to be there.**',
+           '        if False:\n            # **Every significant token has to be there.**',
+           "'is there a pool?' selects the Pool Villa",
+           "tests/test_room_name_resolution.py"),
+    Mutant("entities", "an ambiguous slash date is parsed anyway",
+           "app/services/pms/date_facts.py",
+           '    if slashed and int(slashed.group(1)) <= 12 and int(slashed.group(2)) <= 12:',
+           '    if False:',
+           "5/9 is read as one of its two meanings and the guest arrives four "
+           "weeks late",
+           "tests/test_date_corrections.py"),
+    Mutant("entities", "each date stops being resolved from the one before it",
+           "app/services/pms/date_facts.py",
+           '        resolved = _next_with_day(day, anchor)',
+           '        resolved = _next_with_day(day, today)',
+           "'25th to 28th' said on the 26th comes out backwards and is refused, "
+           "when the guest was perfectly clear",
+           "tests/test_date_corrections.py"),
+
+    # ── business-rule provenance ────────────────────────────────────────────
+    Mutant("provenance", "a failed rule read stops being distinguishable",
+           "app/services/pms/negotiation.py",
+           '        return rules_from_settings(fallback, EMERGENCY_DEFAULT)',
+           '        return rules_from_settings(fallback)',
+           "a hotel whose configured rules stopped applying is invisible again "
+           "— the exact bug that started this pass",
+           "tests/test_rule_provenance.py"),
+    Mutant("provenance", "provenance stops reaching the run row",
+           "app/services/ai/runtime.py",
+           '        summary_of_requirements["provenance"] = ctx.turn.telemetry',
+           '        pass',
+           "the fallback is named and nobody can query it",
+           "tests/test_rule_provenance.py"),
+    Mutant("provenance", "the rule scope leaks into the model's context",
+           "app/services/pms/negotiation.py",
+           "        return out",
+           '        out["ruleSource"] = self.rule_source\n        return out',
+           "the name of our configuration scope goes into every negotiation "
+           "result the model sees — the class of thing the leak guardrail "
+           "refuses in a reply",
+           "tests/test_rule_provenance.py"),
+
     # ── the negotiation floor ───────────────────────────────────────────────
     Mutant("negotiation", "the approval ceiling stops being clamped",
            "app/services/pms/negotiation.py",

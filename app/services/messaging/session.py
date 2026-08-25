@@ -469,7 +469,7 @@ def _stale(profile: dict, now: datetime | None = None) -> bool:
     return (now or datetime.now(timezone.utc)) - at > timedelta(hours=STALE_AFTER_HOURS)
 
 
-def move_dates(profile: dict) -> dict:
+def move_dates(profile: dict, patch: dict | None = None) -> dict:
     """
     The guest is talking about different nights. Keep the room, drop the price.
 
@@ -487,8 +487,35 @@ def move_dates(profile: dict) -> dict:
     difference between them is the whole reason this is two keys and not one.
     """
     moved = {k: v for k, v in (profile or {}).items() if k not in _PRICED}
-    for field in _STAY_ARGS:
-        moved.pop(field, None)
+
+    # **The party goes only when the guest is re-describing the stay.**
+    #
+    # This dropped `units`, `adults` and `children` on *any* date change, and
+    # the reasoning was sound for the case it was written for: a guest who booked
+    # September for four adults and comes back about October has not implicitly
+    # kept the four.
+    #
+    # It is wrong for the case this pass added. A guest three turns into a
+    # conversation who says "actually 3 rooms" and then "and the 2nd to the 5th"
+    # has not changed their mind about the rooms — and dropping the count meant
+    # the next quote priced one room, then the agent asked how many they wanted,
+    # which is the question they had just answered. Found by an eleven-turn
+    # journey doing exactly that.
+    #
+    # The two cases are told apart by the patch rather than by a clock: a guest
+    # describing a *different* stay states its size, and a guest correcting
+    # their nights states only nights. When they do restate it, the old party is
+    # dropped whole — otherwise a September "1 child" survives into an October
+    # request that mentioned only adults.
+    restating = bool(patch) and any(
+        patch.get(field) is not None for field in ("units", "adults", "children"))
+    if restating:
+        for field in _STAY_ARGS:
+            moved.pop(field, None)
+    else:
+        moved.pop("check_in", None)
+        moved.pop("check_out", None)
+
     moved.pop("awaiting_hotel", None)
     moved.pop("obligations", None)
     if moved.get("room_type_id"):
@@ -607,7 +634,7 @@ def merge(conversation_id: str, patch: dict) -> None:
             # New *dates* are the one correction that also means "a different
             # trip", so the whole stay is rebuilt rather than pruned — see
             # `_superseded`.
-            profile = move_dates(profile)
+            profile = move_dates(profile, patch)
         else:
             # **Every other correction, through the declared graph.**
             #
