@@ -704,6 +704,31 @@ _ESCALATION_ASK = re.compile(
     re.IGNORECASE,
 )
 
+# **`kitne baje` is *what time*, not *how much*.**
+#
+# `kitne` is a quantity word and the pattern below is right to look for it, but
+# followed by `baje` it asks the hour, and the two most common questions a
+# guest asks a hotel after booking are "checkout kitne baje hai?" and "breakfast
+# kitne baje tak milta hai?". Both were read as a request for a price. The model
+# evaluation's own *control* scenario — the one turn in it chosen to require no
+# business action at all — came back as a required action on 4 of 4 runs, on
+# both model families, which is how a system bug looks when it is charged to a
+# model.
+#
+# It costs twice. The turn carries the whole pricing tool set into a question
+# about breakfast, against §18; and the answer, if the model obliges, is a rate
+# for a stay the guest never asked to price.
+#
+# The phrase is the unit, not the word: `kitne baje` and `kitni der` come out
+# together, so a message that asks a price *and* the time still asks a price.
+# The quantity word and the hour word together, removed as a phrase: `kitne
+# baje`, `kitni der`, and the Devanagari of the first.
+_CLOCK = re.compile(
+    r"(?<![a-z0-9])(?:kitne|kitna|kitni)\s+(?:baje|der)(?![a-z0-9])"
+    r"|कितने\s*बजे",
+    re.IGNORECASE,
+)
+
 _QUOTE = re.compile(
     r"(?<![a-z0-9])(?:price|rate|rates|tariff|cost|charge|charges|"
     r"kitna|kitne|kitni|daam|keemat|how much|per night|total kitna|"
@@ -927,7 +952,11 @@ def _quote_requirement(message: str, session: dict | None,
     Both of the forceable branches return money with display strings beside it
     — see `money.with_display` — so what the model is handed is what it says.
     """
-    asked_in_words = bool(_QUOTE.search(message or "") or _QUOTE_HI.search(message or ""))
+    # The clock phrases come out first, and the price words are looked for in
+    # what is left — so "rate kya hai, aur checkout kitne baje hai?" still asks
+    # a price, while "checkout kitne baje hai?" no longer does.
+    text = _CLOCK.sub(" ", message or "")
+    asked_in_words = bool(_QUOTE.search(text) or _QUOTE_HI.search(text))
     if not (asked_in_words or group_enquiry):
         return None
 
