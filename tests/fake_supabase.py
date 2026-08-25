@@ -267,3 +267,38 @@ class _Rpc:
 
     def execute(self) -> _Result:
         return _Result(self.value)
+
+
+def install(monkeypatch, fake: FakeDb, *, extra: tuple[str, ...] = ()) -> FakeDb:
+    """
+    Point every module that holds a database handle at `fake`.
+
+    **Why this is not a list of module names.** Nearly every fixture in this
+    suite carries one, and the codebase has two separate comments recording
+    what happens when a name is missing from it: the module quietly reaches the
+    real Supabase project, and the test passes or fails for a reason that has
+    nothing to do with what it was written to check. One of those cost a session
+    — `get_quote` looked up its rate plan in production, found nothing, and the
+    session-carryover assertions failed with an unrelated error.
+
+    A list that has to be maintained by hand goes stale the next time somebody
+    imports `get_db` somewhere new, which is the §10 lesson about one regex in a
+    different room. So the modules are *found* rather than named: anything under
+    `app.` already imported that took its own reference to `get_db` gets it
+    replaced.
+
+    `extra` is for modules that are not imported yet at fixture time. Passing a
+    name that has no `get_db` is harmless.
+    """
+    import sys
+
+    monkeypatch.setattr("app.db.client.get_db", lambda: fake)
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("app.") or module is None:
+            continue
+        if getattr(module, "get_db", None) is None:
+            continue
+        monkeypatch.setattr(f"{name}.get_db", lambda: fake, raising=False)
+    for name in extra:
+        monkeypatch.setattr(f"{name}.get_db", lambda: fake, raising=False)
+    return fake

@@ -280,16 +280,61 @@ _NEGOTIATION = (
         r"(?<![a-z0-9])(?:discount|concession|rebate|"
         r"best (?:price|rate|deal|offer)|"
         r"last (?:price|rate)|final (?:price|rate|rate batao)|lowest (?:price|rate)|"
-        r"cheaper|cheapest|budget mein|"
+        r"cheaper|cheapest|budget mein|expensive|"
+        # Found by a paraphrase sweep across thirty ways guests ask for the
+        # same thing — see tests/test_haggle_vocabulary.py. Each of these was
+        # a miss, and a miss is a turn where the pricing engine is never asked
+        # and the model answers a price question out of its own head.
+        #
+        # `mehenga` is the same word as `mehnga` with the vowel a guest happens
+        # to type; `deal` needs a qualifier because "deal" alone appears in
+        # "great deal of noise"; "do better" and "kuch aur karo" are the two
+        # commonest ways to push without naming a number.
+        r"mehenga|mahenga|mahanga|mahnga|"
+        r"(?:any|koi|kuch|good|better|best) deal|deal (?:do|dijiye|karo)|"
+        # A rate *class* is a discount ask by another name. "Corporate rate?"
+        # is not a question about the public price — it is a request to be
+        # charged a different one, and it has to reach the engine that decides
+        # whether this property has such a rate at all.
+        r"(?:corporate|company|business|agent|trade|staff|govt|government|"
+        r"senior citizen|student|member|loyalty|repeat guest) (?:rate|price|tariff|discount)|"
+        r"do better|kar sakte ho kya|kuch aur karo|kuch to karo|kuch toh karo|"
         r"kam kar|kam karo|kam kardo|kam karna|kam ho jaye|kam hoga|kam kijiye|"
         r"kuch kam|thoda kam|aur kam|zyada hai|jyada hai|mehnga|mehanga|"
         r"sasta|saste|kam se kam|negotiat\w*|"
         r"koi offer|kuch offer|any offer|special offer|offer chal|"
         r"special rate|special price|"
-        r"adjust kar|kar do|kardo)(?![a-z0-9])",
+        # **`kar do` alone was here and it is simply "do it".**
+        #
+        # Measured against the ways guests actually use it: "book kar do",
+        # "cancel kar do", "confirm kar do", "check in 2 baje kar do",
+        # "breakfast add kar do" and a date change written as "4 tareekh se 6
+        # tareekh kar do" were every one of them read as a haggle. Each opens a
+        # negotiation, takes a hold, and can volunteer a discount to a guest who
+        # never asked for one.
+        #
+        # Nothing is lost by removing it, which is the test of a pattern this
+        # loose: every genuine haggle in that set is already matched by a word
+        # that is actually about lowering a price — `kam kar` for "kam kar do",
+        # `discount` for "discount kar do", and `_OFFERED_PRICE_BEFORE_VERB`
+        # for "4000 kar do". The bare verb was carrying only false positives.
+        #
+        # Found by tests/test_conversation_corpus.py, where a guest changing
+        # their dates triggered a negotiation and the negotiation then wrote
+        # the *old* dates back over the new ones.
+        r"adjust kar)(?![a-z0-9])",
         re.IGNORECASE,
     ),
     re.compile(r"कम कर|छूट|सस्ता|महंगा|कम से कम|आखिरी (?:रेट|दाम)"),
+    # **A one-word message.**
+    #
+    # "Final?" and "Lowest?" are haggles, and they are the two that a
+    # vocabulary of phrases cannot hold: on their own they are ambiguous
+    # enough that matching them anywhere in a sentence would open a
+    # negotiation on "what is the final check-out time". As the *whole*
+    # message, after a price has been quoted, they mean one thing only.
+    re.compile(r"^\s*(?:final|lowest|last|best|minimum|min)\s*[?.!]*\s*$",
+               re.IGNORECASE),
     # **"give me 70% off".**
     #
     # Found in production traffic on 2026-08-24, not here: a real guest turn
@@ -324,18 +369,67 @@ _NEGOTIATION = (
 # anywhere in this system. It becomes an input to a decision, never an output;
 # `negotiate_rate` decides what may be said and the guardrail checks that only
 # what it decided was said. See §20 of the brief and `hotel.negotiate_rate`.
+_AMOUNT = r"(\d{1,3}(?:,\d{3})+|\d{3,6})"
+
+# A number followed by a budget postposition: "4000 mein", "3500 tak".
 _OFFERED_PRICE = re.compile(
-    r"(?:₹|rs\.?|inr)?\s*(\d{1,3}(?:,\d{3})+|\d{3,6})\s*"
+    r"(?:₹|rs\.?|inr)?\s*" + _AMOUNT + r"\s*"
     r"(?:rs\.?|rupees|rupaye|/-)?\s*"
     r"(?:mein|me|main|mai|m|tak|pe|par|ke andar|budget|"
     r"per night|pn|/night|a night|nightly|प्रति रात|में|तक)"
     r"(?![a-z0-9])",
     re.IGNORECASE,
 )
-# The other order: "kar do 4000", "make it 3500", "4000 kar do".
+# The other order: "kar do 4000", "make it 3500", "can you do 4000".
 _OFFERED_PRICE_AFTER = re.compile(
-    r"(?:kar do|kardo|kar dijiye|make it|do it for|kar sakte ho)\s*"
-    r"(?:₹|rs\.?|inr)?\s*(\d{1,3}(?:,\d{3})+|\d{3,6})(?![a-z0-9])",
+    r"(?:kar do|kardo|kar dijiye|make it|do it for|kar sakte ho|"
+    r"can you do|could you do|how about|what about|at|for|kar dena|"
+    # "budget 5000 hai" — the noun leads and the figure follows, which is the
+    # other half of the postposition list below and was missing from both.
+    r"budget|budget is|budget hai)\s*"
+    r"(?:₹|rs\.?|inr)?\s*" + _AMOUNT + r"(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+# And the figure leading its own verb: "3500 kar do", "4000 kar dijiye".
+#
+# Hindi is verb-final, so this is the *commoner* of the two orders and the
+# pattern above only had the English one. Found by the paraphrase sweep.
+_OFFERED_PRICE_BEFORE_VERB = re.compile(
+    r"(?:₹|rs\.?|inr)?\s*" + _AMOUNT + r"\s*"
+    r"(?:rs\.?|rupees|rupaye)?\s*"
+    r"(?:kar\s*do|kardo|kar\s*dijiye|kar\s*dena|kar\s*sakte|lagao|laga do)"
+    r"(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+# **A number a guest marked as money, with no other grammar around it.**
+#
+# "₹4000 possible?", "4,000 rupees?", "Rs 4000?" — six of twelve ways of naming
+# a price were missed before this, because every pattern above needs a
+# postposition or a verb next to the figure. A currency marker is a stronger
+# signal than either: nobody writes ₹ about a room number.
+#
+# Deliberately not a bare number. `\d{3,6}` on its own is a year, a room, a
+# pincode and a phone fragment, and passing one of those to the pricing engine
+# produces a verdict about a stay nobody proposed.
+_OFFERED_PRICE_MARKED = re.compile(
+    r"(?:(?:₹|rs\.?|inr)\s*" + _AMOUNT + r"|"
+    + _AMOUNT + r"\s*(?:₹|rs\b|rupees|rupaye|rupay))(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+# "4k", "4.5k" — a thousands shorthand, which is how a guest types a round
+# number fastest and was the single commonest miss in the sweep.
+_OFFERED_PRICE_K = re.compile(r"(?<![a-z0-9])(?:₹|rs\.?|inr)?\s*(\d{1,3})\s*k(?![a-z0-9])",
+                              re.IGNORECASE)
+
+
+# Words that make the number after them a place or a label rather than money.
+_NOT_MONEY_BEFORE = re.compile(
+    r"(?:room|rooms|kamra|kamre|kamara|suite|flat|floor|manzil|"
+    r"no\.?|number|nmbr|pincode|pin|zip|otp|ref|booking|gst|phone|mobile|"
+    r"whatsapp|call)\s*(?:no\.?|number|#)?\s*$",
     re.IGNORECASE,
 )
 
@@ -348,15 +442,56 @@ def offered_price(message: str) -> int | None:
     a room number or a count, over ₹10,00,000 a night is a typo, and passing
     either to the engine would produce a verdict about a stay nobody proposed.
     """
-    for pattern in (_OFFERED_PRICE, _OFFERED_PRICE_AFTER):
+    for pattern in (_OFFERED_PRICE, _OFFERED_PRICE_AFTER, _OFFERED_PRICE_BEFORE_VERB,
+                    _OFFERED_PRICE_MARKED, _OFFERED_PRICE_K):
         match = pattern.search(message or "")
-        if match:
-            try:
-                value = int(match.group(1).replace(",", ""))
-            except ValueError:
+        if not match:
+            continue
+        raw = next((g for g in match.groups() if g), None)
+        if raw is None:
+            continue
+        try:
+            value = int(raw.replace(",", ""))
+        except ValueError:
+            continue
+        if pattern is _OFFERED_PRICE_K:
+            value *= 1000
+
+        # **A room number is not an offer.**
+        #
+        # "room 204 mein hain" read as ₹204, because `\d{3,6}` followed by
+        # `mein` is how a guest names a budget and also how they say which door
+        # they are behind. A three-digit number is the commonest room number in
+        # this product's hotels and comfortably inside the ₹100 floor.
+        #
+        # Read from the words in front of the figure rather than from a
+        # lookbehind, because the words are different lengths and Python's
+        # lookbehind is fixed-width — stacking six of them would be the same
+        # rule written unreadably.
+        before = (message or "")[max(0, match.start() - 16):match.start()].lower()
+        if _NOT_MONEY_BEFORE.search(before):
+            continue
+
+        # **A year is not an offer**, and "2026 mein" is the shape of both.
+        #
+        # Surfaced by the paraphrase sweep, not by a transcript: *"2026 mein aa
+        # rahe hain"* — we are coming in 2026 — read as an offer of ₹2,026 and
+        # opened a negotiation, because `\d{3,6}` followed by `mein` is exactly
+        # how a guest names a budget and exactly how they name a year.
+        #
+        # Nothing about the number itself separates them; ₹2,026 a night is a
+        # perfectly ordinary rate. What separates them is that a guest naming a
+        # *price* in the next decade's range says so — with a rupee sign, or
+        # with a haggling word beside it. Narrow on purpose: only 2020–2035, and
+        # only when neither marker is present.
+        if 2020 <= value <= 2035 and pattern in (_OFFERED_PRICE, _OFFERED_PRICE_AFTER):
+            marked = _OFFERED_PRICE_MARKED.search(message or "")
+            haggling = any(p.search(message or "") for p in _NEGOTIATION)
+            if not marked and not haggling:
                 continue
-            if 100 <= value <= 1_000_000:
-                return value
+
+        if 100 <= value <= 1_000_000:
+            return value
     return None
 
 
@@ -411,11 +546,42 @@ _MODIFICATION = re.compile(
     re.IGNORECASE,
 )
 
+# **A guest asking for a person, composed rather than listed.**
+#
+# The old pattern was an alternation of whole phrases, and it did not contain
+# *"human se baat karni hai"* — which is the example the reliability brief
+# itself gives, and one of the commonest ways an Indian guest asks. It held
+# `kisi se baat` and `insaan se` and `manager se`, so the shape was known; the
+# noun was simply missing from the list. §33 asks for 100% of explicit human
+# requests recognised, and a hand-maintained list of phrases cannot get there:
+# it has as many holes as there are nouns nobody happened to type.
+#
+# So the two halves are declared separately and multiplied. Adding a word a
+# guest uses for a person now covers every construction at once, instead of one
+# phrase at a time.
+_PERSON = (
+    r"human|insaan|insan|aadmi|admi|banda|bande|"
+    r"manager|owner|malik|manejar|"
+    r"staff|receptionist|reception|team|hotel wale|hotel walo|"
+    r"person|somebody|someone|anybody|anyone|koi|kisi"
+)
+
 _ESCALATION_ASK = re.compile(
-    r"(?<![a-z0-9])(?:talk to (?:a |the )?(?:human|person|manager|someone|staff)|"
-    r"speak to (?:a |the )?(?:human|person|manager|someone|staff)|"
-    r"real person|actual person|manager se|kisi se baat|"
-    r"call me|call kar|phone kar|owner se|insaan se)(?![a-z0-9])",
+    r"(?<![a-z0-9])(?:"
+    # Hinglish, which is postpositional: <person> se baat / <person> ko bulao.
+    # The verb is deliberately open — `karni`, `karna`, `karwao`, `karao`,
+    # `kara do` and a bare `baat` all mean the same request, and the gender
+    # agreement that made `karni` a separate case in the guardrail is exactly
+    # the kind of variation a phrase list keeps losing.
+    rf"(?:{_PERSON})\s+(?:se|ko|si)\s+(?:baat|bat|baate|connect|milwa|milva|bula)|"
+    rf"(?:{_PERSON})\s+(?:ko\s+)?(?:bula\s*(?:do|dijiye|o)|bulao|bulaiye)|"
+    # English, which is prepositional.
+    rf"(?:talk|speak|chat|connect)\s+(?:to|with)\s+(?:a\s+|an\s+|the\s+)?(?:{_PERSON})|"
+    r"(?:connect|transfer|put)\s+me\s+(?:to|through|with|on)|"
+    r"real person|actual person|live agent|human agent|"
+    # A request for a call is a request for a person whoever makes it.
+    r"call me|call kar|phone kar|phone me|ring me|callback|call back"
+    r")(?![a-z0-9])",
     re.IGNORECASE,
 )
 

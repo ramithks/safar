@@ -124,6 +124,10 @@ def _write_action(ctx: AgentContext, run_id: str, seq: int, outcome: ToolOutcome
             # This column answers the same question without the reader having to
             # know that 'awaiting_approval' is the string that means it.
             "human_approval_required": outcome.status == "awaiting_approval",
+            # What the next attempt at this same guest message looks itself up
+            # by. Null for reads, for staff turns and for the approval queue —
+            # see services/ai/registry.execute.
+            "idempotency_key": outcome.idempotency_key,
         }
         return get_db().table("agent_actions").insert(row).execute().data[0]["id"]
 
@@ -312,7 +316,9 @@ async def run_turn(
     # of the base prompt and every step re-sends it, so letting one decision do
     # both jobs is the cheapest optimisation available here. It cannot widen a
     # permission: see services/ai/toolsets.py.
-    tools = registry.describe_for_provider(ctx, task=task)
+    tools = registry.describe_for_provider(
+        ctx, task=task, opening=bool(routed is not None and routed.opening),
+    )
 
     # Declared ahead of the rest of the turn's bookkeeping, because `ctx.turn`
     # is given *this* list object rather than a copy of it. A snapshot of what
@@ -636,6 +642,11 @@ async def run_turn(
                 outcome = await registry.execute(
                     requirement.tool, dict(requirement.arguments or {}), ctx
                 )
+                # Stamped on the outcome, not only on the row that records it.
+                # `session.patch_from` reads the outcomes and has to know which
+                # of them are the guest speaking and which are the application
+                # repeating itself.
+                outcome.decision_source = "application"
                 seq += 1
                 outcomes.append(outcome)
                 forced.append(requirement.tool)
@@ -659,7 +670,7 @@ async def run_turn(
                     turn_usage.count(spec.usage_type)
                 action_id = await run_db(
                     _write_action, ctx, run_id, seq, outcome,
-                    "application", requirement.intent,
+                    outcome.decision_source, requirement.intent,
                 )
                 await run_db(link_result, outcome, action_id)
                 if spec and action_id:

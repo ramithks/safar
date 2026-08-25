@@ -339,26 +339,66 @@ class TestTheQuoteCarriesItsOwnDeposit:
         )
         assert verdict.ok, verdict.reason
 
-    def test_a_single_room_quote_carries_no_deposit_at_all(self):
+    def test_a_quote_with_nothing_due_up_front_carries_no_deposit_at_all(self):
         """
-        Absent rather than zero. A `deposit: ₹0` on every quote is a field the
-        model would eventually mention to somebody who is booking one room.
+        **This assertion changed, and §34 says say what was wrong with it.**
+
+        It used to read the source of `tools/pricing` and require the deposit
+        block to be guarded on `units >= group.min_units` — the booking actually
+        being a group. That structural fact was true when it was written and is
+        now false, because guarding on *group* was the bug rather than the fix.
+
+        `scripts/replay_e2e.py` caught the live model on 2026-08-25 quoting a
+        two-room stay against a group minimum of three:
+
+            Pool Villa ke 2 rooms ka total ₹84,016 hai. Isme se abhi aapko sirf
+            20% advance (₹16,803) dena hoga…
+
+        ₹84,016 × 0.20, multiplied out by the model, because the property's own
+        `token_pct` is 20 and no tool had handed over the product. Exactly the
+        failure the group fix was written for, in the case it excluded.
+
+        **What was being protected is not the guard; it is "absent rather than
+        zero".** A `deposit: ₹0` on every quote is a field the model would
+        eventually mention to somebody who owes nothing. That is a statement
+        about behaviour, and pinning it to the shape of an `if` in the source
+        made it a statement about one particular implementation — so the day the
+        implementation was corrected, the test failed for being right.
+
+        So it is asserted against `policies.deposit_for`, which is the function
+        that decides, rather than against the text that calls it. The
+        end-to-end version — a real quote through `registry.execute`, with and
+        without a token percentage — lives in
+        `tests/test_deposit_is_never_multiplied.py`.
         """
-        import ast
-        import inspect
+        from app.services.pms import policies
 
-        from app.services.ai.tools import pricing
-
-        source = inspect.getsource(pricing)
-        tree = ast.parse(source)
-        # The block is guarded on the booking actually being a group.
-        guarded = [
-            ast.unparse(node.test) for node in ast.walk(tree)
-            if isinstance(node, ast.If) and "deposit" in ast.unparse(node).lower()
-        ]
-        assert any("min_units" in g and "units" in g for g in guarded), (
-            "the deposit is not conditional on the booking being a group"
+        nothing_up_front = policies.deposit_for(8401600, token_pct=0)
+        assert nothing_up_front["depositPaise"] == 0, (
+            "a property that takes nothing up front must produce no deposit"
         )
+
+        takes_a_token = policies.deposit_for(8401600, token_pct=20)
+        assert takes_a_token["depositPaise"] == 1680320
+        assert takes_a_token["balancePaise"] == 8401600 - 1680320, (
+            "the two halves must sum to the total, or a guest is quoted a "
+            "figure that does not add up"
+        )
+
+    def test_a_group_deposit_still_overrides_the_property_token(self):
+        """
+        The half of the group fix that was right: a twenty-room block is the
+        case a hotel most wants a bigger commitment on, which is why
+        `group_policies.deposit_pct` exists at all.
+        """
+        from app.services.pms import policies
+
+        alone = policies.deposit_for(6594560, token_pct=20, group_deposit_pct=30,
+                                     is_group=False)
+        together = policies.deposit_for(6594560, token_pct=20, group_deposit_pct=30,
+                                        is_group=True)
+        assert alone["pct"] == 20
+        assert together["pct"] == 30
 
 
 # ── the path a human has already approved ───────────────────────────────────

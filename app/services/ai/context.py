@@ -175,6 +175,15 @@ class AgentContext:
 
     run_id: str | None = None
 
+    # The inbound message this turn is answering, and the scope every mutating
+    # tool call on it is idempotent within.
+    #
+    # `messaging/pipeline` sets it; the staff console and the approval queue
+    # leave it None, which turns the guard off for them on purpose — a
+    # receptionist pressing a button twice means it twice, and a person's second
+    # press is not a retry of their first. See services/ai/registry.execute.
+    answering: str | None = None
+
     # Per-tool grants from `agent_tools`, keyed by name. Absence is denial.
     tool_grants: dict[str, dict] = field(default_factory=dict)
 

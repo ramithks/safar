@@ -32,7 +32,7 @@ from app.services.ai import registry, runtime
 from app.services.ai.context import AgentContext, AgentPrincipal
 from app.services.ai.providers import EchoProvider
 from app.services.messaging import obligations, session
-from tests.fake_supabase import FakeDb
+from tests.fake_supabase import FakeDb, install
 
 registry.load_all()
 
@@ -132,24 +132,17 @@ def db(monkeypatch) -> FakeDb:
     # rather than a missing stub.
     fake.rpcs["hold_inventory"] = lambda params: "40000000-0000-4000-8000-000000000001"
     fake.rpcs["release_hold"] = lambda params: True
-    monkeypatch.setattr("app.db.client.get_db", lambda: fake)
-    # Every module that reads the database on a guest turn.
+    # Every module that took its own reference to `get_db`, found rather than
+    # named — see `fake_supabase.install`.
     #
-    # A module missing from this list does not fail loudly — it quietly reaches
-    # the *real* database, which is how a fixture stops being a fixture.
-    # `app.services.pms.booking` was missing on the first draft, so `get_quote`
-    # looked up its rate plan in production, found nothing, and returned
-    # "Rate plan not found" — and the session-carryover assertions failed for a
-    # reason that had nothing to do with sessions.
-    for module in ("app.services.ai.runtime", "app.services.ai.context",
-                   "app.services.ai.tools.read", "app.services.ai.tools.hotel",
-                   "app.services.ai.tools.booking", "app.services.ai.tools.pricing",
-                   "app.services.pms.rates", "app.services.pms.booking",
-                   "app.services.pms.availability", "app.services.pms.pricing",
-                   "app.services.pms.policies", "app.services.pms.quote_payment",
-                   "app.services.messaging.session",
-                   "app.services.messaging.service", "app.services.messaging.pipeline"):
-        monkeypatch.setattr(f"{module}.get_db", lambda: fake, raising=False)
+    # This was a hand-kept list of fifteen module names, and the comment on it
+    # recorded what a missing name costs: `app.services.pms.booking` was absent
+    # on the first draft, so `get_quote` looked up its rate plan in production,
+    # found nothing, and the session-carryover assertions failed for a reason
+    # that had nothing to do with sessions. The list was also still short —
+    # `billing.service` was reaching the real project on every turn, which is
+    # most of what made this file slow.
+    install(monkeypatch, fake)
     return fake
 
 

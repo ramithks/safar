@@ -926,7 +926,7 @@ on conflict (instagram_account_id) do update
             # "it will confirm once the payment processes" is this assertion.
             print("\n── \"check karo payment hui?\" — with the money in ──")
             mark = len(actions())
-            say("Ab check karo payment hui ya nahi?")
+            said = say("Ab check karo payment hui ya nahi?")
             fresh = actions()[mark:]
             looked = [a for a in fresh if a["tool"] == "get_booking_status"]
             check("the agent looked again rather than repeating itself",
@@ -937,12 +937,30 @@ on conflict (instagram_account_id) do update
                       found.get("state") == "CONFIRMED", str(found)[:200])
                 check("   with the reference the reservation actually has",
                       found.get("ref") == stay["ref"], str(found.get("ref")))
-            recent = " ".join((m.get("body") or "") for m in messages()[-4:]
-                              if m["direction"] == "outbound").lower()
+            # **This assertion was reading the wrong messages, and §34 says say
+            # so rather than move it quietly.**
+            #
+            # It joined the last *four* outbound messages and refused to find
+            # "ho jayegi" in any of them. Four messages reaches back past the
+            # payment, to the turn that sent the link — where "payment aate hi
+            # booking confirm ho jayegi" is not a hedge but the correct future
+            # tense for something that had not happened yet. So the check failed
+            # on a transcript in which every sentence was true, and it would
+            # have gone on failing however well the agent behaved.
+            #
+            # What it is *for* is the twenty-six-second gap in the reference
+            # transcript, where a confirmed booking was described as one that
+            # "will confirm once the payment processes". That is a claim about
+            # *this* turn, so this turn's outbound messages are what it has to
+            # measure. Scoped to the messages this `say` produced, it is also
+            # strictly harder to pass by accident: it can no longer be satisfied
+            # by an older message that happened to contain the word.
+            fresh_text = " ".join((m.get("body") or "") for m in said
+                                  if m["direction"] == "outbound").lower()
             check("   the guest is told it is confirmed, not that it will be",
-                  "confirm" in recent
-                  and "ho jaayegi" not in recent and "ho jayegi" not in recent,
-                  recent[:200])
+                  "confirm" in fresh_text
+                  and "ho jaayegi" not in fresh_text and "ho jayegi" not in fresh_text,
+                  fresh_text[:200])
             profile = (conversation() or {}).get("guest_profile") or {}
             check("   and the thread carries the state, so the next turn knows",
                   profile.get("payment") == "CONFIRMED", str(profile.get("payment")))
