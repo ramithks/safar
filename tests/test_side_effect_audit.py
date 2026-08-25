@@ -65,10 +65,14 @@ class TestTheThreeGuardsExist:
         moved above the autonomy verdict, a grant revoked between two attempts
         would stop being enforced on the second.
         """
+        # The *lookup*, not the key. The key is now named before the gates so a
+        # refusal can carry it — see `registry.execute` — and only the lookup
+        # has to sit below them. Indexing on the shared condition would find the
+        # naming and assert nothing.
         source = inspect.getsource(registry.execute)
         gate = source.index("verdict = autonomy.EXECUTE")
-        guard = source.index("if spec.mutating and ctx.answering")
-        assert gate < guard, "the idempotency guard moved above the autonomy gate"
+        lookup = source.index("run_db(_already_done")
+        assert gate < lookup, "the idempotency lookup moved above the autonomy gate"
 
     def test_the_message_guard_only_replays_a_success(self):
         """
