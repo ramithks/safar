@@ -133,6 +133,23 @@ class _Query:
         self._filters.append(lambda r, c=col, v=val: str(r.get(c) or "") >= str(v))
         return self
 
+    def lt(self, col, val):
+        """
+        **Missing, and its absence made `pipeline._history` untestable.**
+
+        `gt`, `gte` and `lte` were all here; `lt` was not, and it is the one
+        `_history` uses to fetch the turns before a message. Any test that ran a
+        real turn through `process_conversation` raised `AttributeError` — which
+        is why no test ran one, and why a missing import in that function went
+        unnoticed by four thousand tests.
+
+        The same shape as the `or_` gap found in the previous pass: a fixture
+        that cannot express a query does not fail loudly, it makes a whole code
+        path untestable and then nobody notices it is untested.
+        """
+        self._filters.append(lambda r, c=col, v=val: str(r.get(c) or "") < str(v))
+        return self
+
     def lte(self, col, val):
         self._filters.append(lambda r, c=col, v=val: str(r.get(c) or "") <= str(v))
         return self

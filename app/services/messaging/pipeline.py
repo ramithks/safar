@@ -42,6 +42,7 @@ from app.services import trace
 from app.services.messaging import language as language_module
 from app.services.messaging import obligations
 from app.services.messaging import session
+from app.services.pms import room_names
 from app.services.messaging import service as messaging
 
 logger = logging.getLogger(__name__)
@@ -371,7 +372,11 @@ async def process_conversation(conversation_id: str, *, provider=None, classifie
         # The guest's own sentence goes in with the tool results: what they
         # stated about their stay outranks whatever a tool happened to be called
         # with. See `session.patch_from`.
-        patch = session.patch_from(result.actions, _agent_text(message))
+        # The hotel's own room list, so a room the guest named in prose can be
+        # resolved to an id — see services/pms/room_names. Cached for a minute;
+        # a read that fails resolves nothing rather than failing the turn.
+        rooms = await room_names.for_property(conversation["property_id"])
+        patch = session.patch_from(result.actions, _agent_text(message), rooms)
         patch["obligations"] = obligations.open_from(
             _agent_text(message),
             result.actions,

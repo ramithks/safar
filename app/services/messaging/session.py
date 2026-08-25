@@ -66,7 +66,8 @@ _BUSINESS_TOOLS = frozenset({
 })
 
 
-def patch_from(outcomes: list, message: str | None = None) -> dict:
+def patch_from(outcomes: list, message: str | None = None,
+               rooms: list[dict] | None = None) -> dict:
     """
     What one turn established. Empty when it established nothing.
 
@@ -229,6 +230,35 @@ def patch_from(outcomes: list, message: str | None = None) -> dict:
         from app.services.ai import required_actions
 
         patch.update(required_actions.stated_facts(message))
+
+        # **And the room they named, resolved against this hotel's own list.**
+        #
+        # The gap a comment in the conversation corpus recorded as an honest
+        # boundary: *"nothing in this system resolves a room by name"*, so
+        # "Actually Garden Standard chahiye" on a turn where the model answered
+        # in prose changed nothing, and the next quote priced the room the guest
+        # had just moved away from.
+        #
+        # `rooms` is passed in rather than read here, so this module keeps no
+        # database of its own and a caller with no room list simply gets the
+        # behaviour it had before. See services/pms/room_names.
+        if rooms:
+            from app.services.pms import room_names
+
+            named = room_names.resolve(message, rooms)
+            if named.resolved:
+                patch["room_type_id"] = named.room_type_id
+                patch["room_name"] = named.name
+                # A room named in prose is a *preference*, not an availability
+                # check — the same rule a date change follows. The prompt turns
+                # this into an instruction to confirm the room is free before
+                # promising it.
+                patch["room_needs_recheck"] = True
+            elif named.ask:
+                # Several rooms plausibly match and guessing between them is the
+                # one thing this must not do. Carried to the prompt as a
+                # question for the model to ask, not as a state change.
+                patch["room_ambiguous"] = named.ask
     return patch
 
 
@@ -242,7 +272,7 @@ _TRANSACTIONAL = _STAY_ARGS + (
     # and an `awaiting_hotel` left behind would have the agent telling them
     # it is waiting on a question nobody asked about this trip.
     "negotiation", "payment", "awaiting_hotel", "obligations",
-    "last_business_action", "room_needs_recheck",
+    "last_business_action", "room_needs_recheck", "room_ambiguous",
 )
 
 # What a *price* was true of. When the guest moves the dates, these are wrong
@@ -435,6 +465,19 @@ def clear_stay(profile: dict) -> dict:
     return {k: v for k, v in (profile or {}).items() if k not in _TRANSACTIONAL}
 
 
+def _clear_answered_ambiguity(merged: dict) -> dict:
+    """
+    A room has been settled on, so the question about which one is answered.
+
+    Without this the prompt would go on asking a guest to choose between two
+    rooms one turn after they chose — which reads, correctly, as not listening.
+    """
+    if merged.get("room_ambiguous") and merged.get("room_type_id"):
+        merged = dict(merged)
+        merged.pop("room_ambiguous", None)
+    return merged
+
+
 def _revalidate_room(merged: dict) -> dict:
     """
     Is the room this session holds still one the hotel is offering?
@@ -537,7 +580,7 @@ def merge(conversation_id: str, patch: dict) -> None:
                         # does: a preference is not availability.
                         profile["room_needs_recheck"] = True
 
-        merged = _revalidate_room({**profile, **patch})
+        merged = _clear_answered_ambiguity(_revalidate_room({**profile, **patch}))
         if merged == profile:
             # Nothing new. Returning here rather than stamping `touched_at`
             # anyway is what keeps the staleness clock honest: it should measure
@@ -600,20 +643,31 @@ def describe(conversation: dict | None) -> str | None:
     if not isinstance(profile, dict):
         return None
 
+    # **Dates are no longer the price of admission.**
+    #
+    # This returned None unless both dates were known, which meant everything
+    # below it — the room the guest chose, the room they half-named, the room
+    # that has gone — was invisible on any turn before dates were settled. A
+    # guest whose *first* message is "Deluxe Balcony chahiye" had it recorded on
+    # the session and never mentioned in the prompt, so the agent asked which
+    # room they wanted one turn after they said.
+    #
+    # The stay line is still only written when there is a stay to describe. What
+    # changed is that its absence no longer suppresses the rest.
     check_in, check_out = profile.get("check_in"), profile.get("check_out")
-    if not (check_in and check_out):
-        return None
-
-    party = f"{profile.get('adults') or 1} adults"
-    if profile.get("children"):
-        party += f" and {profile['children']} children"
-    rooms = profile.get("units") or 1
-
-    lines = [
-        "Earlier in this conversation the guest gave these dates. Do not ask for "
-        "them again unless they change the subject to different nights:",
-        f"  {check_in} to {check_out}, {rooms} room(s), {party}",
-    ]
+    lines: list[str] = []
+    if check_in and check_out:
+        party = f"{profile.get('adults') or 1} adults"
+        if profile.get("children"):
+            party += f" and {profile['children']} children"
+        rooms = profile.get("units") or 1
+        lines += [
+            "Earlier in this conversation the guest gave these dates. Do not ask "
+            "for them again unless they change the subject to different nights:",
+            f"  {check_in} to {check_out}, {rooms} room(s), {party}",
+        ]
+    elif profile.get("room_type_id") or profile.get("room_ambiguous"):
+        lines.append("Earlier in this conversation:")
 
     # The room they have already settled on.
     #
@@ -642,6 +696,16 @@ def describe(conversation: dict | None) -> str | None:
                 "before promising it, and re-price it — the old price does not "
                 "apply to new dates."
             )
+    elif profile.get("room_ambiguous"):
+        # Several of this hotel's rooms plausibly match what the guest wrote,
+        # and the resolver refused to pick between them — see
+        # `services/pms/room_names`. The question is handed to the model
+        # already written, because it names this hotel's own rooms and the
+        # model would otherwise have to reconstruct the list.
+        lines.append(
+            f"  They named a room but it is not clear which. Ask them: "
+            f"\"{profile['room_ambiguous']}\" — do not choose for them."
+        )
     elif profile.get("room_unavailable"):
         # The room they had chosen has gone. Said plainly, because the
         # alternative is an agent that behaves as though they never chose one
@@ -651,4 +715,8 @@ def describe(conversation: dict | None) -> str | None:
             "so, and offer what search_availability actually returns."
         )
 
+    # Nothing worth spending tokens on. The stay line alone is not enough to
+    # keep — a header with no facts under it is noise in every prompt.
+    if not lines or (len(lines) == 1 and lines[0].endswith("conversation:")):
+        return None
     return "\n".join(lines)
