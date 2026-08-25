@@ -1,7 +1,7 @@
 """
 A hotel's own address.
 
-    partner.travbuddy.in/stay/anandi-house-udaipur     always, free, instant
+    app.hostos.in/stay/anandi-house-udaipur            always, free, instant
     www.anandihouse.com                                theirs, once DNS points here
 
 **Why a hotel wants the second one.** Direct booking is the whole argument for
@@ -58,6 +58,11 @@ CNAME_TARGET = "cname.vercel-dns.com"
 # The name of the ownership record. Underscore-prefixed by convention — it is
 # not a hostname anybody visits, and registrars sort it away from the records a
 # person edits by hand.
+#
+# Still `_travbuddy` after the rename to HostOS, deliberately: this string is
+# already in the zone file of every hotel that has verified a domain, and
+# renaming it would un-verify all of them at once for a cosmetic gain nobody
+# but us can see. A future rename has to write both names and accept either.
 TXT_NAME = "_travbuddy"
 
 DOH_ENDPOINTS = (
@@ -67,11 +72,13 @@ DOH_ENDPOINTS = (
 
 # Hostnames nobody may claim, whatever their DNS says.
 #
-# `travbuddy.in` and its subdomains are ours: a hotel that claimed
-# `partner.travbuddy.in` would be claiming the PMS itself, and host resolution
-# would then hand the staff app to a booking page. The rest are the
-# accidents — `localhost` and bare IPs are not domains and reach nothing.
-RESERVED_SUFFIXES = ("travbuddy.in", "vercel.app", "localhost")
+# `hostos.in` and its subdomains are ours: a hotel that claimed `app.hostos.in`
+# would be claiming the PMS itself, and host resolution would then hand the
+# staff app to a booking page. `travbuddy.in` is on the list for the same
+# reason and stays there after the move — `partner.travbuddy.in` still resolves
+# to this app, so it is still ours to refuse. The rest are the accidents —
+# `localhost` and bare IPs are not domains and reach nothing.
+RESERVED_SUFFIXES = ("hostos.in", "travbuddy.in", "vercel.app", "localhost")
 
 _HOST = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$")
 

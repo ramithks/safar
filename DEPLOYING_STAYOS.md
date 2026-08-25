@@ -1,4 +1,4 @@
-# Deploying the StayOS backend
+# Deploying the HostOS backend
 
 This repository is deployed **twice**. Same code, same branch, two Coolify
 services, two databases:
@@ -6,7 +6,7 @@ services, two databases:
 | Service | Hostname | `SUPABASE_URL` | `ENABLE_HOTEL_OS` | Serves |
 | --- | --- | --- | --- | --- |
 | Marketplace *(exists)* | `backend.travbuddy.in` | `uabxtdhxbamuhthxnhid` | unset → **false** | travbuddy.in, the apps, the planner |
-| StayOS *(to create)* | `stayos-backend.travbuddy.in` | `rdlozqvuywtgsodunait` | **true** | partner.travbuddy.in |
+| HostOS *(to create)* | `api.hostos.in` | `rdlozqvuywtgsodunait` | **true** | app.hostos.in |
 
 Neither may point at the other's project. One process builds one Supabase
 client from one `SUPABASE_URL` (`app/db/client.py`), so "which database" is a
@@ -26,7 +26,7 @@ Authentication settles it on its own. The hotel OS issues **ES256** tokens and
 `app/deps/auth.py` fetches the signing key from
 `{SUPABASE_URL}/auth/v1/.well-known/jwks.json` — the project named by *this*
 service's configuration. A backend pointed at the marketplace cannot verify a
-StayOS token no matter what else is set.
+HostOS token no matter what else is set.
 
 ## Environment
 
@@ -51,7 +51,7 @@ changing.
 | `SUPABASE_ANON_KEY` | the **hotel-OS** anon key | same page |
 | `ENABLE_HOTEL_OS` | `true` | mounts `/api/v1/pms/*` and the messaging webhooks |
 | `APP_ENV` | `production` | |
-| `ALLOWED_ORIGINS` | `https://partner.travbuddy.in` | the only browser origin that calls this service |
+| `ALLOWED_ORIGINS` | `https://app.hostos.in,https://partner.travbuddy.in` | the PWA's origin, plus the one it moved from — a desk that installed the PWA on the old host serves its shell from a service worker, never sees the redirect, and still calls this API from there |
 | `REDIS_URL` | **do not set it in Coolify** — `docker-compose.stayos.yml` sets it to this stack's own Redis. See *Redis* below | |
 
 ### Set explicitly to off
@@ -73,8 +73,8 @@ changing.
 
 | Variable | Value | Why |
 | --- | --- | --- |
-| `GCS_BUCKET_NAME` | `travbuddy-media-2` | Where a hotel's room photos are stored. **This used to be on the "must not be set" list**, on the reasoning that GCS belonged to the reels pipeline and the marketplace — true until StayOS grew an uploader. |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | the same service account the marketplace uses | Credentials for the bucket above. Already required by the Vertex client, so on a working StayOS deployment it is present. |
+| `GCS_BUCKET_NAME` | `travbuddy-media-2` | Where a hotel's room photos are stored. **This used to be on the "must not be set" list**, on the reasoning that GCS belonged to the reels pipeline and the marketplace — true until HostOS grew an uploader. |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | the same service account the marketplace uses | Credentials for the bucket above. Already required by the Vertex client, so on a working HostOS deployment it is present. |
 
 Without the bucket name, `POST /properties/{id}/media` answers **503** with a
 sentence a hotelier can read and a log line naming the missing variable — rather
@@ -91,7 +91,7 @@ hotel had not put any up.
 
 | Variable | Why |
 | --- | --- |
-| `SUPABASE_JWT_SECRET` | The marketplace's HS256 secret. StayOS tokens are ES256 and verify through JWKS. Copying it means an HS256 token would be checked against the wrong key; leaving it unset makes `app/deps/auth.py` refuse one loudly. |
+| `SUPABASE_JWT_SECRET` | The marketplace's HS256 secret. HostOS tokens are ES256 and verify through JWKS. Copying it means an HS256 token would be checked against the wrong key; leaving it unset makes `app/deps/auth.py` refuse one loudly. |
 | `GOOGLE_MAPS_API_KEY` | The Places client init is wrapped in a try/except and logs "non-fatal" on failure, and no PMS route touches it. A secret a service does not use should not be on it. |
 | `INSTAGRAM_PROXY_URL` | The reels scraper — marketplace only. Not the Instagram inbox; that is `INSTAGRAM_ACCESS_TOKEN`. |
 | `WHATSAPP_TEST_RECIPIENT`, `WHATSAPP_TEST_PHONE_NUMBER_ID` | Only `scripts/meta_smoke.py` reads them, and it sends a real message. |
@@ -134,8 +134,8 @@ Instagram stay unverified until they are real. Nothing else is blocked by that.
 When they are, the callback URLs to register with Meta are on this hostname:
 
 ```
-https://stayos-backend.travbuddy.in/api/v1/messaging/whatsapp/webhook
-https://stayos-backend.travbuddy.in/api/v1/messaging/instagram/webhook
+https://api.hostos.in/api/v1/messaging/whatsapp/webhook
+https://api.hostos.in/api/v1/messaging/instagram/webhook
 ```
 
 Both answer the `GET` verification handshake and take the `POST` deliveries, and
@@ -150,7 +150,7 @@ both verify `X-Hub-Signature-256` against `*_APP_SECRET` before reading a body.
 | Build Pack | **Docker Compose** |
 | Docker Compose Location | `/docker-compose.stayos.yml` |
 | Base Directory | `/` |
-| Domain | `https://stayos-backend.travbuddy.in` → the **`api`** service, port 8000 |
+| Domain | `https://api.hostos.in` → the **`api`** service, port 8000 |
 | Environment | paste `.env.stayos.coolify` |
 
 Putting the compose path into the **Dockerfile Location** field instead feeds
@@ -168,7 +168,7 @@ Two things the Dockerfile build pack cannot give this service, which is why the
 switch is worth it rather than just a preference:
 
 - **A worker.** The image's `CMD` is uvicorn, so a Dockerfile deployment runs
-  the API and nothing else. StayOS had no Celery worker at all — messaging and
+  the API and nothing else. HostOS had no Celery worker at all — messaging and
   marketing tasks would have queued forever, silently, even with Redis working.
 - **A Redis.** See below.
 
@@ -182,7 +182,7 @@ generates its own from the domain set in the UI and hand-written ones fight it.
 One URL is the Celery broker, the job store, the rate limiter's storage and the
 messaging pipeline's lock. Unset, it falls back to `redis://localhost:6379/0`,
 and nothing listens on localhost inside a container — which is how the first
-StayOS deploy came up reporting
+HostOS deploy came up reporting
 
 ```
 "redis": "error: Error 111 connecting to localhost:6379. Connection refused."
@@ -215,12 +215,12 @@ marketplace's Coolify variable still reads `redis://localhost:6379/0` and the
 service is perfectly healthy, because its compose `environment:` block sets
 `redis://redis:6379/0` and a compose value wins over the Coolify tab.
 
-So a standalone StayOS container that resolves the hostname `redis` is reaching
+So a standalone HostOS container that resolves the hostname `redis` is reaching
 **some other Redis** — which is exactly why it answered `Authentication
 required.` Borrowing a Redis nobody chose for it is not a thing to fix; it is a
 thing to stop doing.
 
-**Deploy StayOS with `docker-compose.stayos.yml`.** It is the marketplace's
+**Deploy HostOS with `docker-compose.stayos.yml`.** It is the marketplace's
 stack with the marketplace parts removed: its own `redis` service, its own
 volume, its own Traefik router name, `-Q hotelos` on the worker, and no `beat`.
 Redis then needs no password, no shared server and no coordination — and the two
@@ -230,8 +230,8 @@ products cannot collide in Redis at all, because they are not in the same one.
 stack's topology rather than a secret. Everything else still comes from
 `.env.stayos.coolify` pasted into Coolify's environment.
 
-If you would rather keep StayOS as a plain single-container app, the alternative
-is to add a **Redis resource** in Coolify to the StayOS project and use the
+If you would rather keep HostOS as a plain single-container app, the alternative
+is to add a **Redis resource** in Coolify to the HostOS project and use the
 connection string that resource's own page shows — Coolify generates the
 password there. That works, but it is a second thing to manage for no benefit
 the compose file does not already give you.
@@ -268,10 +268,10 @@ Routing is in `app/workers/celery_app.py` and is deliberately one-sided:
 So:
 
 ```sh
-# StayOS worker — this queue only
+# HostOS worker — this queue only
 celery -A app.workers.celery_app worker -l info -Q hotelos
 
-# StayOS beat — do not run one.
+# HostOS beat — do not run one.
 ```
 
 Beat belongs to the marketplace service alone. `partners.revert_intro_commission`
@@ -279,16 +279,16 @@ fires **hourly** and writes to `partners` — a table that also exists, meaning
 something entirely different, in the hotel OS — so it must run in the deployment
 that scheduled it.
 
-**One entry is a StayOS task and runs anyway**, because enqueueing is not
+**One entry is a HostOS task and runs anyway**, because enqueueing is not
 executing: `travbuddy.messaging.sweep_waiting_guests` (every five minutes) is
-routed to `hotelos`, so the marketplace beat publishes it and only the StayOS
+routed to `hotelos`, so the marketplace beat publishes it and only the HostOS
 worker can take it. The consequence to know: **if the marketplace beat stops,
-StayOS stops telling hotels about guests nobody answered.** It is a scheduled
+HostOS stops telling hotels about guests nobody answered.** It is a scheduled
 reminder rather than part of any guest's path, so that failure is silence
 towards the hotel, not towards a guest. `test_everything_beat_schedules_is_routed_to_a_deployment_that_can_run_it`
 is what stops an unrouted entry being added beside it.
 
-Give the StayOS service its own Redis database number anyway. The queue routing
+Give the HostOS service its own Redis database number anyway. The queue routing
 is what makes crossover impossible; a separate namespace means the two do not
 share result keys or locks either.
 
@@ -302,7 +302,7 @@ checks Supabase and Redis. Point Coolify's health check there. There is no
 
 ```sh
 ./venv/bin/python scripts/stayos_backend_check.py \
-    --base https://stayos-backend.travbuddy.in \
+    --base https://api.hostos.in \
     --anon-key <hotel-OS anon key>
 ```
 

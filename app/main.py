@@ -158,7 +158,7 @@ async def _correlate(request, call_next):
 
 # CORS — driven by ALLOWED_ORIGINS (comma-separated). Mobile clients don't
 # enforce CORS, but the PMS is a browser app on a different origin to this API,
-# so for StayOS this list is the difference between the front desk working and
+# so for HostOS this list is the difference between the front desk working and
 # every request failing a preflight. The marketplace needs it too: lib/search.ts
 # and lib/recommend.ts are called from Client Components on travbuddy.in, so
 # this list is load-bearing for the traveller site as well as for hotels.
@@ -186,7 +186,17 @@ async def _correlate(request, call_next):
 # Vercel preview deployments of the marketplace are deliberately not here. A
 # preview is not production and should not be able to talk to production; if one
 # needs to, name it in ALLOWED_ORIGINS for as long as that is true.
+#
+# `partner.travbuddy.in` is the PWA's old address and stays on this list after
+# the move to `app.hostos.in`. A hotel that installed the PWA on the old origin
+# serves its shell from a service worker and never sees the redirect, so it goes
+# on calling this API from a host that no longer appears anywhere else in the
+# configuration. Dropping it fails those desks on preflight, with nothing on
+# screen to say why.
 PRODUCTION_ORIGINS = [
+    "https://app.hostos.in",
+    "https://hostos.in",
+    "https://www.hostos.in",
     "https://partner.travbuddy.in",
     "https://travbuddy.in",
     "https://www.travbuddy.in",

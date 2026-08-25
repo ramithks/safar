@@ -1,7 +1,7 @@
 """
 Is this host a StayOS backend, and is it wired to the right database?
 
-    ./venv/bin/python scripts/stayos_backend_check.py --base https://stayos-backend.travbuddy.in
+    ./venv/bin/python scripts/stayos_backend_check.py --base https://api.hostos.in
 
 Run it against a new deployment before pointing the PWA at it, and against the
 marketplace host too — it is designed to give the *opposite* answer there, and a
@@ -48,7 +48,7 @@ DEFAULT_EMAIL = "deepak@casamandala.in"
 DEFAULT_PASSWORD = "hotel-os-dev"
 DEFAULT_PROPERTY = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 
-PARTNER_ORIGIN = "https://partner.travbuddy.in"
+PWA_ORIGIN = "https://app.hostos.in"
 HOSTILE_ORIGIN = "https://evil.example"
 
 passed = failed = 0
@@ -87,7 +87,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Stop at the 3xx instead of following it.
 
     The OAuth callback answers 303 to the PWA. Followed, that check would read
-    whatever partner.travbuddy.in returned and prove nothing about the backend.
+    whatever app.hostos.in returned and prove nothing about the backend.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -177,9 +177,9 @@ def main() -> int:
     # ── 4. CORS ───────────────────────────────────────────────────────────────
     print("\n── 4. only the PWA's origin may call it from a browser ──")
     st, _, headers = http(f"{api}/health", method="OPTIONS", headers={
-        "Origin": PARTNER_ORIGIN, "Access-Control-Request-Method": "GET"})
+        "Origin": PWA_ORIGIN, "Access-Control-Request-Method": "GET"})
     allow = headers.get("access-control-allow-origin", "")
-    check(f"{PARTNER_ORIGIN} is allowed", st == 200 and allow == PARTNER_ORIGIN,
+    check(f"{PWA_ORIGIN} is allowed", st == 200 and allow == PWA_ORIGIN,
           f"{st} {allow!r}")
     check("and not by a wildcard", allow != "*", f"{allow!r}")
     st, _, headers = http(f"{api}/health", method="OPTIONS", headers={

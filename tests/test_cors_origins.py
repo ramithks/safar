@@ -54,6 +54,19 @@ class TestInProduction:
         """
         origins = resolve_cors_origins("*", "production")
         assert "https://travbuddy.in" in origins
+        assert "https://app.hostos.in" in origins
+
+    def test_the_old_pms_origin_survives_the_rename(self):
+        """
+        The PMS moved from `partner.travbuddy.in` to `app.hostos.in`, and the
+        old host redirects — which is enough for a browser that makes a request
+        and nothing at all for a desk that installed the PWA on the old origin.
+        Its service worker answers navigations from cache, so it never sees the
+        redirect and goes on calling this API from a hostname that appears
+        nowhere else in the configuration. Dropping it here fails those desks
+        on preflight, silently.
+        """
+        origins = resolve_cors_origins("*", "production")
         assert "https://partner.travbuddy.in" in origins
 
     def test_a_wildcard_hidden_in_a_list_is_refused_too(self):

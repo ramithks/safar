@@ -232,8 +232,14 @@ class Settings(BaseSettings):
     # different case in the host is a rejected callback. Set explicitly in
     # production rather than derived from the request, because deriving it from
     # a proxied Host header is how an open redirect gets built by accident.
+    #
+    # ⚠ Moved with the rename to `api.hostos.in`. Meta will not accept the new
+    # string until it is added to the app's Redirect URL list in the Meta
+    # console — the default changing here does not change what Meta compares
+    # against, and a mismatch fails the callback, not the consent screen, so it
+    # looks like the hotel refused.
     instagram_redirect_uri: str = (
-        "https://stayos-backend.travbuddy.in/api/v1/messaging/instagram/oauth/callback"
+        "https://api.hostos.in/api/v1/messaging/instagram/oauth/callback"
     )
 
     # ── Meta ads ─────────────────────────────────────────────────────────────
@@ -274,7 +280,7 @@ class Settings(BaseSettings):
 
     # Where the owner lands when the connection succeeds or fails. The callback
     # appends ?instagram=connected or ?instagram=error&reason=…
-    pms_app_url: str = "https://partner.travbuddy.in"
+    pms_app_url: str = "https://app.hostos.in"
 
     # How long a signed OAuth `state` stays valid. It is a CSRF token and a
     # round trip through Meta's consent screen, so minutes, not hours.
@@ -310,8 +316,11 @@ class Settings(BaseSettings):
 
     # Byte-for-byte equal to an "Authorised redirect URI" on the OAuth client,
     # for the same reason the Instagram one is: Google compares the string.
+    # ⚠ Same as the Instagram one: add it to the OAuth client's "Authorised
+    # redirect URIs" in the Google console before this deploys, or the callback
+    # is rejected with `redirect_uri_mismatch`.
     google_oauth_redirect_uri: str = (
-        "https://stayos-backend.travbuddy.in/api/v1/google/oauth/callback"
+        "https://api.hostos.in/api/v1/google/oauth/callback"
     )
 
     # One scope, and it is the only one Business Profile publishes. There is no
