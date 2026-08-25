@@ -444,6 +444,8 @@ async def run_turn(
                     method="fallback" if i + 1 < len(candidates) else "exhausted",
                     error_class=getattr(exc, "error_class", None),
                     latency_ms=int((time.monotonic() - started) * 1000),
+                    provider_retries=getattr(exc, "provider_retries", 0),
+                    provider_status=getattr(exc, "provider_status", None),
                 ).as_dict())
                 if i + 1 < len(candidates):
                     fallback_count += 1
@@ -452,6 +454,21 @@ async def run_turn(
                         run_id, model, exc.reason, candidates[i + 1],
                     )
                 continue
+            # **A successful call that cost three region rotations is still
+            # information.** Recorded whether or not anything failed, because
+            # the question "was the provider under pressure on this turn" has
+            # to be answerable on the turns that succeeded — otherwise a report
+            # sees only the turns that broke and concludes the rest were fine.
+            if getattr(out, "provider_retries", 0):
+                model_attempts.append(recovery.Attempt(
+                    failure="provider_retry",
+                    model=model,
+                    method="succeeded",
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                    provider_retries=out.provider_retries,
+                    provider_status=getattr(out, "provider_status", None),
+                ).as_dict())
+
             if model != model_in_use:
                 # Stick with it for the rest of the turn. Flapping back to a
                 # model that just failed would spend the budget rediscovering it.

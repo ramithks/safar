@@ -180,6 +180,11 @@ class ProviderError(AgentError):
     # provider at the point it swallows the original, so the runtime can
     # record what actually failed without parsing its own message.
     error_class: str | None = None
+    # What the transport went through before giving up: how many times it
+    # retried, and the status it ended on. A 429 that exhausted every region is
+    # a quota problem, not a model problem.
+    provider_retries: int = 0
+    provider_status: str = "error"
 
     recoverable = False
     action_status = "failed"

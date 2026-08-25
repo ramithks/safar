@@ -135,6 +135,10 @@ class Attempt:
     method: str          # 'retry' · 'fallback' · 'deterministic' · 'handoff'
     error_class: str | None = None
     latency_ms: int | None = None
+    # What the transport went through underneath this attempt: how many times
+    # it retried (a 429 rotation counts), and the status it ended on.
+    provider_retries: int = 0
+    provider_status: str | None = None
 
     def as_dict(self) -> dict:
         record = {"failure": self.failure, "model": self.model,
@@ -143,6 +147,10 @@ class Attempt:
             record["error_class"] = self.error_class
         if self.latency_ms is not None:
             record["latency_ms"] = self.latency_ms
+        if self.provider_retries:
+            record["provider_retries"] = self.provider_retries
+        if self.provider_status:
+            record["provider_status"] = self.provider_status
         return record
 
 

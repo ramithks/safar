@@ -57,9 +57,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from app.db.client import get_db  # noqa: E402
-from app.services.ai import guardrails, intent, required_actions  # noqa: E402
+from app.services.ai import attempts, guardrails, intent, required_actions  # noqa: E402
 from app.services.messaging import web_chat  # noqa: E402
 
+import quota_lock  # noqa: E402
 import seed_tenant  # noqa: E402
 
 
@@ -299,8 +300,21 @@ async def converse(slug: str, property_id: str, steps: list[dict]) -> dict:
                         .eq("id", conversation_id).limit(1).execute().data or [{}])[0]
         session = conversation.get("guest_profile") or {}
 
+        # **What kind of attempt this was, before it is scored.**
+        #
+        # Two turns of a three-run repeat took 131 and 95 seconds and escalated
+        # while a 560-turn sweep was on the same Vertex quota. Scored naively
+        # those are product failures; they are somebody else's rate limit, and
+        # `attempts.classify` is what tells them apart from the transport's own
+        # account rather than from latency.
+        attempt_class = attempts.classify(run=run, actions=actions)
         problems = check(step, reply=turn.reply, run=run, actions=actions,
                          session=session, db=db, property_id=property_id)
+        if attempt_class in attempts.NOT_PROVIDER_SUCCESS:
+            # Not a pass and not a failure — the turn was never served, so it
+            # is evidence of nothing. Recorded, counted separately, and kept
+            # out of both columns.
+            problems = []
         model = (run.get("required_actions") or {}).get("model") or {}
 
         turns.append({
@@ -312,17 +326,21 @@ async def converse(slug: str, property_id: str, steps: list[dict]) -> dict:
             "served_by": model.get("served_by"),
             "fallback_count": model.get("fallback_count"),
             "latency_ms": latency,
+            "attempt_class": attempt_class,
             "tokens": (run.get("tokens_in"), run.get("tokens_out")),
             "problems": problems,
         })
-        mark = "✓" if not problems else "✗"
+        mark = ("·" if attempt_class in attempts.NOT_PROVIDER_SUCCESS
+                else "✓" if not problems else "✗")
         print(f"  {mark} {index:>2}. {step['say'][:44]:46} "
               f"{','.join(a['tool'] for a in actions)[:44]:46} {latency:>6}ms")
         for problem in problems:
             print(f"       ✗ {problem}")
 
+    classes = [t["attempt_class"] for t in turns]
     return {"conversation_id": conversation_id, "turns": turns,
-            "failures": sum(1 for t in turns if t["problems"])}
+            "failures": sum(1 for t in turns if t["problems"]),
+            "attempts": attempts.summarise(classes)}
 
 
 async def main() -> int:
@@ -333,7 +351,15 @@ async def main() -> int:
     parser.add_argument("--keep", action="store_true",
                         help="leave the tenant in place afterwards")
     parser.add_argument("--out", default=None)
+    parser.add_argument("--force-quota", action="store_true",
+                        help="start even if another evaluation holds the quota lock")
     args = parser.parse_args()
+
+    try:
+        quota_lock.acquire("first_guest_e2e", force=args.force_quota)
+    except quota_lock.Busy as busy:
+        print(f"   {busy}")
+        return 2
 
     print(f"── seeding {args.tag}{' (minimal)' if args.minimal else ''} ──")
     record = await seed_tenant.build(args.tag, minimal=args.minimal)
@@ -363,7 +389,13 @@ async def main() -> int:
     print(f"   inventory: oversold={drift['oversold']} stranded={drift['stranded']} "
           f"unledgered={len(drift['unledgered'])}")
     total = sum(r["failures"] for r in results)
-    print(f"   turns with problems: {total} of {sum(len(r['turns']) for r in results)}")
+    every = [t["attempt_class"] for r in results for t in r["turns"]]
+    found = attempts.summarise(every)
+    print(f"   turns with problems: {total} of {found['model_evaluable_attempts']} "
+          f"model-evaluable ({found['all_attempts']} attempted)")
+    print(f"   {found['counts']}")
+    if found["excluded"]:
+        print(f"   not the model's, and not counted: {found['excluded']}")
 
     payload = {"tag": args.tag, "minimal": args.minimal,
                "property_id": record["property_id"], "slug": slug,
@@ -375,6 +407,7 @@ async def main() -> int:
         pathlib.Path(args.out).write_text(json.dumps(payload, indent=1, default=str))
         print(f"   written to {args.out}")
 
+    quota_lock.release("first_guest_e2e")
     if not args.keep:
         print(f"   {seed_tenant.destroy(args.tag)}")
 

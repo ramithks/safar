@@ -64,11 +64,12 @@ from app.config import settings  # noqa: E402
 from app.db.client import get_db  # noqa: E402
 from app.services.ai import context as ai_context  # noqa: E402
 from app.services.ai import required_actions as ra  # noqa: E402
-from app.services.ai import fallback_stats, gates, model_router  # noqa: E402
+from app.services.ai import attempts, fallback_stats, gates, model_router  # noqa: E402
 from app.services.ai import runtime  # noqa: E402
 from app.services.messaging import script as script_module  # noqa: E402
 
-import e2e_sweep  # noqa: E402
+import e2e_sweep
+import quota_lock  # noqa: E402
 
 PROPERTY = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 PARTNER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -789,6 +790,15 @@ async def one_run(scenario: dict, index: int) -> dict:
         # evaluator and any dashboard compute the population split from one
         # field rather than each deciding for itself what a fallback is.
         "model_record": (requirements.get("model") or {}),
+        # **Which of the thirteen classes this attempt was**, so a rate limit
+        # can never reach a model-quality percentage. Derived from the run the
+        # runtime wrote, not from latency — see services/ai/attempts.py and the
+        # 131-second turn that was about to be recorded as a model failure.
+        "attempt_class": attempts.classify(
+            run={"status": result.status, "error": result.error,
+                 "required_actions": requirements},
+            actions=[{"tool": a.tool, "status": a.status} for a in result.actions],
+        ),
         "fell_back": any(
             a.get("action") == "fallback"
             for a in (requirements.get("recovery") or [])
@@ -1270,6 +1280,8 @@ async def main() -> int:
     parser.add_argument("--out", default="agent_eval.json")
     parser.add_argument("--keep", action="store_true",
                         help="leave the eval's own rows in the database")
+    parser.add_argument("--force-quota", action="store_true",
+                        help="start even if another evaluation holds the quota lock")
     parser.add_argument("--models", action="store_true",
                         help="run every scenario on Gemini 2.5 and 3.x and "
                              "print the matrix (§12)")
@@ -1292,6 +1304,18 @@ async def main() -> int:
     print("   legend     M model called it · A application forced it · "
           "✗ never happened · ! turn failed")
     prepared = prepare_property()
+
+    # **One evaluation at a time on one Vertex quota.**
+    #
+    # Nothing here is concurrent within itself — turns run one after another —
+    # so there was no concurrency knob to turn down when a sweep and a journey
+    # exhausted the per-region quota between them and each measured the other's
+    # rate limiting. The bound that was missing is between processes.
+    try:
+        quota_lock.acquire("agent_eval", force=args.force_quota)
+    except quota_lock.Busy as busy:
+        print(f"   {busy}")
+        return 2
 
     started = time.monotonic()
     everything: list[str] = []
@@ -1325,6 +1349,22 @@ async def main() -> int:
         # whose name was above it. The three populations are printed first, and
         # the comparison below is explicitly labelled with how clean each column
         # is — a reader who sees "PRIMARY_ONLY 32/44" knows what the row means.
+        print("\n╔══ what was actually attempted ══")
+        for name, _ in MODEL_FAMILIES:
+            found = attempts.summarise(
+                [t.get("attempt_class") or attempts.EVALUATOR_FAILURE
+                 for t in matrix[name]["turns"]])
+            print(f"║  Gemini {name}")
+            print(f"║    ALL ATTEMPTS               {found['all_attempts']:>5}")
+            print(f"║    PROVIDER-SUCCESS ATTEMPTS  {found['provider_success_attempts']:>5}")
+            print(f"║    MODEL-EVALUABLE ATTEMPTS   {found['model_evaluable_attempts']:>5}"
+                  f"   ← every model-quality % below uses this")
+            for cls, n in found["counts"].items():
+                print(f"║      {cls:<28} {n:>5}")
+            if found["excluded"]:
+                print(f"║    not the model's: {found['excluded']}")
+        print("╚" + "═" * 60)
+
         print("\n╔══ who actually answered ══")
         clean: dict[str, str] = {}
         for name, _ in MODEL_FAMILIES:
@@ -1408,6 +1448,7 @@ async def main() -> int:
         pathlib.Path(args.out).write_text(json.dumps(payload, indent=1, default=str))
         print(f"\n   every turn written to {args.out}")
 
+        quota_lock.release("agent_eval")
         handed_back = await hand_back_bookings()
         if handed_back:
             print(f"   cancelled {handed_back} bookings this evaluation made")
