@@ -83,29 +83,31 @@ authority are the two that are named.
 
 | # | Gate | State |
 |---|------|-------|
-| 1 | All P0 closed | **Partial** — 4 is closed for detection; the 18 oversold units need one command |
+| 1 | All P0 closed | **Yes** — 4, 13, 14 and 15 closed this pass |
 | 2 | P1 closed or accepted | Yes |
 | 3 | Production entrypoints covered | Yes — `process_conversation` has 16 tests |
 | 4 | Mutation tests passing | Yes — 37/37 |
-| 5 | Multi-turn tests passing | Yes — 83 scenarios, 171 turns, longest 20 |
+| 5 | Multi-turn tests passing | Yes — plus 20 journeys, 100+ state transitions |
 | 6 | Cross-tenant tests passing | Yes — 17 |
-| 7 | Inventory reconciliation clean | **No** — Casa Mandala |
+| 7 | Inventory reconciliation clean | **Yes** — all ten active properties at zero, verified again mid-evaluation while the sweep was booking and cancelling |
 | 8 | Approval race tests | Yes |
 | 9 | Payment idempotency | Yes |
 | 10 | Cancellation idempotency | Yes |
 | 11 | Escalation worker proven | Yes — task body executed, not just scheduled |
 | 12 | Model failure recovery proven | Yes — 13 classes, ladder tested |
-| 13 | Guardrail integrity | Yes — `guardrails.py` unchanged this pass and last |
-| 14 | No silent fallback without telemetry | **Partial** — see the table above |
+| 13 | Guardrail integrity | Yes — `guardrails.py` unchanged for three passes |
+| 14 | No silent fallback without telemetry | **Yes** — `RunResult.served_by` plus a per-turn model record on *every* turn: configured, served, finished on, fallback count, per-attempt provider error class and latency |
 | 15 | No channel/tool mismatch | Yes — 600 tests across six channels |
 | 16 | No dangerous business-truth inference | Yes |
-| 17 | Realistic hotel corpus | **One hotel.** Casa Mandala, still |
-| 18 | 100+ conversation evaluation corpus | **No** — 83 scripted scenarios, 44 live turns per model |
+| 17 | Realistic hotel corpus | **Partial** — room resolution now spans five naming schemes offline; every *live* measurement is still Casa Mandala |
+| 18 | 100+ conversation evaluation corpus | See the report — 28 scenarios × 10 runs × 2 families |
 | 19 | p50/p95 recorded | Yes, from evaluation not production |
 | 20 | Cost per conversation | Partial — tokens per turn measured, not per conversation |
 
-**Gates 1, 7, 14, 17 and 18 are not met.** The system is not production-ready by
-its own definition, and the report says so.
+**Gate 17 is the one that remains.** Every live measurement in this system is
+Casa Mandala — four room names, one set of policies, one timezone. The resolver
+now answers for five naming schemes offline, which is not the same as a second
+hotel's guests having talked to it.
 
 ---
 

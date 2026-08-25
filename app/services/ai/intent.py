@@ -80,7 +80,7 @@ CATEGORIES = (INFORMATIONAL, STATE_LOOKUP, TRANSACTIONAL, MUTATION,
               NEGOTIATION, ESCALATION)
 
 # Most consequential first. A message is the first category that claims it.
-_ORDER = (ESCALATION, MUTATION, NEGOTIATION, TRANSACTIONAL, STATE_LOOKUP,
+_ORDER = (ESCALATION, NEGOTIATION, MUTATION, TRANSACTIONAL, STATE_LOOKUP,
           INFORMATIONAL)
 
 
@@ -204,6 +204,22 @@ _ASKS_FOR_LESS = re.compile(
     re.IGNORECASE,
 )
 _ASKS_FOR_LESS_HI = re.compile(r"छूट|सस्ता|कम कर|मुफ़्त|मुफ्त")
+
+# **"How many rooms are free tonight?" is an availability question.**
+#
+# A real guest message, read as a haggle because `free` is in the list above.
+# The word does both jobs in English and the neighbouring noun settles it: a
+# room is free when nobody is in it, and breakfast is free when nobody pays for
+# it. Only the room sense is excluded here — "free breakfast" and "free
+# upgrade" stay negotiations.
+_FREE_MEANS_VACANT = re.compile(
+    r"(?<![a-z0-9])(?:"
+    r"(?:rooms?|kamre|kamra|suites?|villas?|beds?|dates?|nights?|slots?|tables?)"
+    r"\s+(?:\w+\s+){0,2}?free"
+    r"|free\s+(?:rooms?|kamre|kamra|suites?|villas?|beds?|dates?|nights?|slots?|tables?)"
+    r")(?![a-z0-9])",
+    re.IGNORECASE,
+)
 
 # Wants something priced, held or acquired. Note `add`, which is what separates
 # "can you add breakfast" from "what time is breakfast".
@@ -348,10 +364,23 @@ def _of_one_clause(text: str) -> str:
             return STATE_LOOKUP
         return INFORMATIONAL
 
+    # **Negotiation before mutation, when a message is both.**
+    #
+    # "free upgrade mil sakta hai?" matches `upgrade` and came back MUTATION,
+    # which routes to the modification path and away from the negotiation rules
+    # — so a request for something free was handled as a request for something
+    # different. Asking to change a booking and asking for a discount are both
+    # real, and when one sentence does both, the discount is the half with a
+    # floor and an approval attached.
+    #
+    # It only reorders messages that match *both*. "meri booking cancel karni
+    # hai" and "Can I upgrade to a suite?" contain no discount words and are
+    # unaffected.
+    if (_matches(text, _ASKS_FOR_LESS, _ASKS_FOR_LESS_HI)
+            and not _FREE_MEANS_VACANT.search(text)):
+        return NEGOTIATION
     if _matches(text, _CHANGES_A_BOOKING, _CHANGES_A_BOOKING_HI):
         return MUTATION
-    if _matches(text, _ASKS_FOR_LESS, _ASKS_FOR_LESS_HI):
-        return NEGOTIATION
 
     wants = _matches(text, _WANTS_SOMETHING, _WANTS_SOMETHING_HI)
 
@@ -366,7 +395,11 @@ def _of_one_clause(text: str) -> str:
     if _matches(text, _MINE, _MINE_HI) and asks_a_fact:
         return STATE_LOOKUP
 
-    if asks_a_fact and amenity:
+    # The same rule as the branch at the top, and it was missing here. "Can you
+    # arrange airport pickup?" reached this line with `requests` already true —
+    # `can you` and `arrange` both match — and was returned as a question about
+    # the airport rather than a request to book a car.
+    if asks_a_fact and amenity and not requests:
         return INFORMATIONAL
 
     return TRANSACTIONAL
@@ -374,7 +407,15 @@ def _of_one_clause(text: str) -> str:
 
 # Clause boundaries. A guest writes one message and asks two things in it more
 # often than any other shape in this inbox.
-_CLAUSES = re.compile(r"[,;?!।]|\baur\b|\band\b|\bbhi\b|\bplus\b", re.IGNORECASE)
+# A full stop is a clause boundary too, and leaving it out cost a real
+# message: "Courtyard Standard with breakfast. What's the total?" never
+# split, so the amenity noun and the question mark in one half outvoted the
+# price question in the other, and a guest asking what their stay costs was
+# read as asking about breakfast.
+#
+# Not a decimal point: `\d\.\d` would split "₹1234.50" into two clauses.
+_CLAUSES = re.compile(r"(?<!\d)[.](?!\d)|[,;?!।]|\baur\b|\band\b|\bbhi\b|\bplus\b",
+                      re.IGNORECASE)
 
 
 def category(message: str | None) -> str:
