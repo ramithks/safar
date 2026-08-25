@@ -60,7 +60,15 @@ services:
       # stack already registers `traefik.http.routers.api` on this same Traefik,
       # and two routers of one name is one router.
       - "traefik.enable=true"
-      - "traefik.http.routers.stayos.rule=Host(`api.hostos.in`)"
+      # Both names during the cutover. `api.hostos.in` is where the backend
+      # lives now; `stayos-backend.travbuddy.in` is still claimed because two
+      # things outside this repo still point at it — the PWA bundle currently
+      # deployed (VITE_API_BASE_URL is baked in at build time, so it changes
+      # only on a rebuild) and the Instagram webhook URL registered in the Meta
+      # console, which is Meta's configuration and not ours. Drop the second
+      # Host() once the PWA has been rebuilt and the webhook repointed;
+      # removing it earlier stops message delivery with no error on our side.
+      - "traefik.http.routers.stayos.rule=Host(`api.hostos.in`) || Host(`stayos-backend.travbuddy.in`)"
       - "traefik.http.routers.stayos.entrypoints=https"
       - "traefik.http.routers.stayos.tls=true"
       - "traefik.http.routers.stayos.tls.certresolver=letsencrypt"
