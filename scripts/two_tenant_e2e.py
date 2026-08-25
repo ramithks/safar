@@ -51,11 +51,25 @@ A_TAG, B_TAG = "isoa", "isob"
 
 
 async def _context(record: dict, conversation_id: str):
+    """
+    The context the real pipeline builds for this conversation.
+
+    **`reservation_id` comes off the conversation row**, exactly as
+    `pipeline.process_conversation` reads it. Leaving it out was a harness bug
+    that looked like a product one: `get_reservation` is scoped to the
+    conversation, so with no reservation on the context the tenant's *own*
+    booking was refused for the same reason the other tenant's was — and a
+    refusal indistinguishable from a broken fixture is what the controls exist
+    to catch. They caught it.
+    """
+    row = (get_db().table("conversations").select("reservation_id,guest_id")
+           .eq("id", conversation_id).limit(1).execute().data or [{}])[0]
     return await ai_context.load_context(
         property_id=record["property_id"],
         partner_id=record["partner_id"],
         agent_type="guest",
         conversation_id=conversation_id,
+        reservation_id=row.get("reservation_id"),
         guest_name="Isolation Guest",
         channel="whatsapp",
         actor="guest",
@@ -65,7 +79,7 @@ async def _context(record: dict, conversation_id: str):
 async def attempt(ctx, tool: str, arguments: dict) -> dict:
     """One tool call through `registry.execute`, the single door."""
     try:
-        outcome = await registry.execute(ctx, tool, arguments, seq=1)
+        outcome = await registry.execute(tool, arguments, ctx)
         return {"status": outcome.status, "output": outcome.output,
                 "refusal": outcome.refusal_reason}
     except Exception as exc:  # noqa: BLE001
@@ -172,6 +186,12 @@ async def run(force: bool) -> int:
 
         findings.append({
             "tool": tool,
+            # The whole payload, not just a verdict. A tool that "executed"
+            # against a foreign id has to be *read* — an empty result is a
+            # refusal and a populated one is a breach, and the status is the
+            # same either way.
+            "a_to_b_output": a_to_b["output"],
+            "b_to_a_output": b_to_a["output"],
             "a_to_b": a_to_b["status"], "a_to_b_leak": leak_ab,
             "b_to_a": b_to_a["status"], "b_to_a_leak": leak_ba,
             "a_own": a_own["status"], "b_own": b_own["status"],

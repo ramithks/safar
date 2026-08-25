@@ -609,9 +609,16 @@ def _seed_conversations(db, record: dict) -> None:
     _own(db, record["property_id"])
     tag = record["tag"]
     booked = record["reservations"].get("confirmed/token_paid")
+    # **The ordinary thread carries a booking.**
+    #
+    # It did not, and `get_reservation` is `scoped_to_conversation` — so the
+    # two-tenant probe's *control* failed: the tenant's own reservation was
+    # refused for the same reason the other tenant's was, and a refusal nobody
+    # can distinguish from a broken fixture proves nothing. A guest asking
+    # about their booking is talking on the thread it was made in.
     for key, handle, profile, reservation in (
         ("ordinary", f"{_MARKER.lower()}_{tag}_a",
-         {"language": "hinglish"}, None),
+         {"language": "hinglish"}, record["reservations"].get("confirmed/paid/0")),
         ("contradicted", f"{_MARKER.lower()}_{tag}_b",
          {"language": "en", "stage": "quoted"}, booked),
     ):
