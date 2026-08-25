@@ -34,6 +34,13 @@ problem. **P2** is performance, UX or maintainability.
 | 19 | P1 | A gate finer than its sample could resolve | 2% ceiling on n=43, where one failure is 2.3% | **Closed.** `services/ai/gates.py` — ZERO criteria need no sample, RATE criteria carry `min_n`, thresholds unchanged |
 | 20 | P1 | The evaluator's money reader narrower than the product's | "12,800 rupees" was not a figure; no decimals; no floor | **Closed.** Reads through `guardrails._amounts_in`; a differential test pins them together |
 | 21 | P2 | Informational turns paying a classify call | ~2.3s and its tokens, on the commonest message class after greetings | **Closed.** `intent.category` routes them deterministically to `guest_faq` |
+| 22 | **P0** | Nothing proved a *new* hotel works | Every live measurement was Casa Mandala: six rate plans, tuned agent, two years of conversations. A new hotel has none of it | **Closed.** `seed_tenant.py` builds one through the real onboarding services; `first_guest_e2e.py` runs eleven messages through `web_chat.ask` |
+| 23 | **P0** | "What rooms do you have?" ordered two rooms | `do` is two in Hindi. The first question ever asked of a brand-new hotel | **Closed.** An English auxiliary is followed by a subject pronoun; a Hindi numeral never is |
+| 24 | P1 | A rate limit read as a model failure | 131s and 95s turns while a sweep shared the quota | **Closed.** `attempts.py` — 13 classes, 3 denominators; `CallTrace` reaches the run row; `quota_lock.py` bounds it between processes |
+| 25 | P1 | The model accuracy gap was entirely the harness | 90.7% vs 84.8% decomposed to two artefacts; on everything else 99.2% vs 99.1% | **Closed.** Polite haggles read; bookings handed back between families |
+| 26 | P1 | A promise the turn did not keep | "I will share it as soon as it is ready", then a handoff | **Closed.** `recovery.promises_an_action`, consulted only on a handing-off turn |
+| 27 | P1 | A bare noun deciding a speech act, inside the module built to stop that | "the staff were rude" read as ESCALATION, which owes nothing | **Closed.** `required_actions.asks_for_a_person` is canonical |
+| 28 | P2 | The evaluation switches the tenant off | 4,711 usage events in a day exhausted Casa Mandala's credits | **Accepted.** Not topped up — that is production configuration |
 
 ---
 
@@ -99,7 +106,8 @@ authority are the two that are named.
 | 14 | No silent fallback without telemetry | **Yes** — `RunResult.served_by` plus a per-turn model record on *every* turn: configured, served, finished on, fallback count, per-attempt provider error class and latency |
 | 15 | No channel/tool mismatch | Yes — 600 tests across six channels |
 | 16 | No dangerous business-truth inference | Yes |
-| 17 | Realistic hotel corpus | **Partial** — room resolution now spans five naming schemes offline; every *live* measurement is still Casa Mandala |
+| 17 | Realistic hotel corpus | **Yes** — fresh tenants seeded through the real onboarding path, six room types with colliding and numeric names, a minimal hotel with no group pricing, and two-tenant isolation. Live journeys on all of them |
+| 21 | FRESH_ACCOUNT_E2E | **Yes** — new account, new hotel, new agent, new guest, first-ever conversation: 11/11 through `web_chat.ask` |
 | 18 | 100+ conversation evaluation corpus | See the report — 28 scenarios × 10 runs × 2 families |
 | 19 | p50/p95 recorded | Yes, from evaluation not production |
 | 20 | Cost per conversation | Partial — tokens per turn measured, not per conversation |
