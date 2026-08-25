@@ -64,7 +64,7 @@ from app.config import settings  # noqa: E402
 from app.db.client import get_db  # noqa: E402
 from app.services.ai import context as ai_context  # noqa: E402
 from app.services.ai import required_actions as ra  # noqa: E402
-from app.services.ai import fallback_stats, model_router  # noqa: E402
+from app.services.ai import fallback_stats, gates, model_router  # noqa: E402
 from app.services.ai import runtime  # noqa: E402
 from app.services.messaging import script as script_module  # noqa: E402
 
@@ -944,6 +944,11 @@ def report(rows: list[dict], label: str) -> dict:
         "by_model": totals["model"],
         "by_application": totals["forced"],
         "never": totals["never"],
+        # The count under the accuracy floor. `accuracy` is a proportion and
+        # the gate now derives its own from this and the sample — see
+        # `gate_verdict`, and the sweep where a 2% threshold was applied to 43
+        # turns.
+        "never_count": totals["never"],
         "accuracy": (completed / n) if n else None,
         "model_only_accuracy": (totals["model"] / n) if n else None,
         "handoff_rate": handoffs / len(usable) if usable else None,
@@ -1040,18 +1045,31 @@ GATE = {
 }
 
 
-def gate_verdict(summary: dict) -> list[tuple[str, bool, str]]:
-    """Each gate criterion, whether it was met, and by what."""
-    out = []
-    for key, limit in GATE.items():
-        value = summary.get(key)
-        if value is None:
-            out.append((key, False, "not measured"))
-            continue
-        met = value >= limit if key == "accuracy" else value <= limit
-        shown = f"{value * 100:.1f}%" if isinstance(value, float) else str(value)
-        out.append((key, met, shown))
-    return out
+def gate_verdict(summary: dict) -> list:
+    """
+    Each gate criterion against this sweep, with the sample it was judged on.
+
+    **Counts, not rates.** This used to read the summary's own proportions and
+    compare them to a threshold, which is how `invalid_handoff_rate ≤ 2%` came
+    to be applied to 43 turns — where the smallest non-zero value that metric
+    can take is 2.3%, so the threshold was a demand for zero wearing a
+    percentage. `services/ai/gates.py` derives the rate from the count and the
+    sample, so a criterion cannot be judged on a sample that cannot express it.
+
+    The thresholds are unchanged. What changed is when they may be applied.
+    """
+    n = summary.get("usable") or summary.get("n") or 0
+    counts = {
+        # Required actions that never ran. Accuracy is a floor, and this is the
+        # count of misses underneath it.
+        "accuracy": summary.get("never_count"),
+        "invalid_handoff_rate": summary.get("invalid_handoffs"),
+        "invented_figures": summary.get("invented_figures"),
+        "leaked_ids": summary.get("leaked_ids"),
+        "ignored_a_request_for_a_person": summary.get(
+            "ignored_a_request_for_a_person"),
+    }
+    return gates.verdicts(counts, n)
 
 
 async def main() -> int:
@@ -1169,13 +1187,15 @@ async def main() -> int:
         print("║")
         print("║  §13 promotion gate")
         for name, _ in MODEL_FAMILIES:
-            verdicts = gate_verdict(matrix.get(name, {}))
-            passed = all(met for _, met, _ in verdicts)
-            print(f"║    Gemini {name:<5} {'PASS' if passed else 'FAIL'}")
-            for key, met, shown in verdicts:
-                if not met:
-                    print(f"║      ✗ {key} = {shown} (needs "
-                          f"{'≥' if key == 'accuracy' else '≤'} {GATE[key]})")
+            found = gate_verdict(matrix.get(name, {}))
+            passed = gates.promoted(found)
+            print(f"║    Gemini {name:<5} "
+                  f"{'PROMOTABLE' if passed else 'BLOCKED'}")
+            for verdict in found:
+                mark = {gates.PASS: "✓", gates.FAIL: "✗",
+                        gates.INFORMATIONAL: "·",
+                        gates.NOT_MEASURED: "?"}[verdict.status]
+                print(f"║      {mark} {verdict.line()}")
         print("╚" + "═" * 60)
 
         payload = {
@@ -1187,7 +1207,9 @@ async def main() -> int:
             "scenarios": [s["key"] for s in chosen],
             "matrix": {n: {k: v for k, v in m.items() if k != "turns"}
                        for n, m in matrix.items()},
-            "gate": GATE,
+            "gate": {c.key: {"kind": c.kind, "threshold": c.threshold,
+                             "min_n": c.min_n, "why": c.why}
+                     for c in gates.CRITERIA},
             # Tagged with the model that produced them. They used to be one flat
             # list in the order the sweeps ran, so re-scoring the file later
             # meant inferring which half was which from its position — which is
