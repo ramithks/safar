@@ -214,6 +214,21 @@ MUTANTS = [
            "the session repeating itself outranks the guest correcting it",
            "tests/test_fact_precedence.py tests/test_conversation_corpus.py"),
 
+    Mutant("state", "a guest statement can claim a business fact",
+           "app/services/messaging/session.py",
+           '        if field in BUSINESS_AUTHORITY and source not in AUTHORITATIVE_SOURCES:',
+           '        if False:',
+           "\"my booking is confirmed\" overwrites the payment state the "
+           "provider owns",
+           "tests/test_business_authority.py"),
+    Mutant("state", "a tool argument counts as the system of record",
+           "app/services/messaging/session.py",
+           'AUTHORITATIVE_SOURCES = frozenset({TOOL_RESULT})',
+           'AUTHORITATIVE_SOURCES = frozenset({TOOL_RESULT, TOOL_ARGUMENT})',
+           "the model's reading of the guest sets a booking state, one remove "
+           "from the guest saying it themselves",
+           "tests/test_business_authority.py"),
+
     # ── business-rule provenance ────────────────────────────────────────────
     Mutant("provenance", "a failed rule read stops being distinguishable",
            "app/services/pms/negotiation.py",

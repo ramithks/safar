@@ -95,6 +95,46 @@ CARRIED = "carried"
 
 SOURCE_RANK = {GUEST_SAID: 3, TOOL_RESULT: 2, TOOL_ARGUMENT: 1, CARRIED: 0}
 
+# ── conversational precedence is not business authority ─────────────────────
+#
+# **Two different hierarchies, and confusing them is how a guest talks a hotel
+# into a booking that does not exist.**
+#
+# The ranks above answer *"whose account of the conversation wins"*, and there
+# the guest is the best evidence there is: nobody knows better than they do how
+# many rooms they want. That is why GUEST_SAID sits at the top.
+#
+# It must not be the top of the other hierarchy. A guest who writes
+#
+#     "my booking is confirmed"
+#
+# has made the highest-precedence *conversational* statement on the turn and has
+# said nothing whatever about `payment_status`. The booking system decides that,
+# and if it says `pending` then it is pending — however firmly the guest states
+# otherwise, and however plainly the model relays them.
+#
+# So the fields below are ones only the system of record may set. A source that
+# is not a verified tool result cannot claim one, whatever its rank. Today
+# nothing feeds a guest statement into these — `stated_facts` returns counts and
+# the resolvers return a room and dates — and that is exactly why the guard is
+# worth having: it is one plausible line ("payment hogyi" → payment="paid")
+# away from being real, and that line would look like a feature.
+BUSINESS_AUTHORITY = frozenset({
+    "quote_id",             # the pricing engine issued it
+    "stage",                # derived from what actually executed
+    "payment",              # the payment provider and the webhook decide
+    "negotiation",          # the negotiation engine's verdict
+    "last_business_action", # what ran, not what was discussed
+    "reservation_id",       # the booking system
+    "booking_ref",          # created when money lands, never before
+    "room_unavailable",     # an availability read, not an opinion
+})
+
+# The sources that may speak for the system of record. A tool *result* is the
+# system reporting its own state; a tool *argument* is a reading of the guest,
+# and a forced call's argument is the session repeating itself.
+AUTHORITATIVE_SOURCES = frozenset({TOOL_RESULT})
+
 
 class _Facts:
     """
@@ -118,6 +158,15 @@ class _Facts:
 
     def set(self, field: str, value, source: str, confidence: str = "stated") -> None:
         if value is None:
+            return
+        if field in BUSINESS_AUTHORITY and source not in AUTHORITATIVE_SOURCES:
+            # Conversational precedence stops at the edge of business truth.
+            # See BUSINESS_AUTHORITY — a guest saying their booking is confirmed
+            # is not the booking system saying so, and the rank table has no
+            # opinion about which is right because that is not its question.
+            logger.info(
+                "refused %s for %s: only a verified tool result may set it",
+                source, field)
             return
         held = self.sources.get(field)
         if held is not None and SOURCE_RANK[source] < SOURCE_RANK[held]:
