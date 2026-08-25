@@ -259,6 +259,8 @@ SCENARIOS = [
 
 # ── what a turn is scored on ─────────────────────────────────────────────────
 
+# Kept for `tool_numbers`, which reads *tool output* rather than a reply and
+# has no guardrail equivalent to defer to.
 RUPEES = re.compile(r"(?:₹|rs\.?|inr)\s*([\d][\d,]*)", re.I)
 
 
@@ -303,7 +305,29 @@ def leaks_internals(reply: str) -> str | None:
 
 
 def figures_in(text: str) -> set[int]:
-    return {int(m.replace(",", "")) * 100 for m in RUPEES.findall(text or "")}
+    """
+    Every rupee figure in this text, as paise. The guardrail's own reader.
+
+    **This was its own regex and it was narrower than the product's**, which is
+    the worst direction for a safety metric to be wrong in. It required the
+    symbol *before* the number, so "1,234 rupees" was not a figure at all;
+    it had no decimal branch, so `₹1234.50` read as 1234; and it had no floor,
+    where the guardrail ignores anything under ₹100 because a number that small
+    is a room count or an hour far more often than a price.
+
+    Each of those made the report say "0 invented figures" about replies the
+    product itself would have refused. A report that is more permissive than the
+    thing it is reporting on is not a report.
+    """
+    from app.services.ai import guardrails
+
+    found: set[int] = set()
+    for amount in guardrails._amounts_in(text or ""):
+        try:
+            found.add(int(round(float(amount) * 100)))
+        except ValueError:
+            continue
+    return found
 
 
 def tool_numbers(outcomes) -> set[int]:
