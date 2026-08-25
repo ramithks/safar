@@ -109,8 +109,14 @@ class _Facts:
     def __init__(self) -> None:
         self.values: dict = {}
         self.sources: dict[str, str] = {}
+        # How sure we are of each, in the vocabulary the layer that read it
+        # uses: `exact`/`fuzzy` for a room name, `explicit`/`inferred`/`derived`
+        # for a date, `stated` for everything a tool simply carried. The brief
+        # asks for source, confidence, turn, value and dependencies per fact;
+        # this is the third of the five.
+        self.confidence: dict[str, str] = {}
 
-    def set(self, field: str, value, source: str) -> None:
+    def set(self, field: str, value, source: str, confidence: str = "stated") -> None:
         if value is None:
             return
         held = self.sources.get(field)
@@ -118,10 +124,11 @@ class _Facts:
             return
         self.values[field] = value
         self.sources[field] = source
+        self.confidence[field] = confidence
 
-    def update(self, values: dict, source: str) -> None:
+    def update(self, values: dict, source: str, confidence: str = "stated") -> None:
         for field, value in (values or {}).items():
-            self.set(field, value, source)
+            self.set(field, value, source, confidence)
 
 
 def patch_from(outcomes: list, message: str | None = None,
@@ -303,8 +310,9 @@ def patch_from(outcomes: list, message: str | None = None,
 
             named = room_names.resolve(message, rooms)
             if named.resolved:
-                facts.set("room_type_id", named.room_type_id, GUEST_SAID)
-                facts.set("room_name", named.name, GUEST_SAID)
+                facts.set("room_type_id", named.room_type_id, GUEST_SAID,
+                          named.confidence)
+                facts.set("room_name", named.name, GUEST_SAID, named.confidence)
                 # A room named in prose is a *preference*, not an availability
                 # check — the same rule a date change follows. The prompt turns
                 # this into an instruction to confirm the room is free before
@@ -341,8 +349,10 @@ def patch_from(outcomes: list, message: str | None = None,
                     anchor = None
             nights = date_facts.read(message, today, check_in=anchor)
             if nights.usable:
-                facts.set("check_in", nights.check_in.isoformat(), GUEST_SAID)
-                facts.set("check_out", nights.check_out.isoformat(), GUEST_SAID)
+                facts.set("check_in", nights.check_in.isoformat(), GUEST_SAID,
+                          nights.confidence)
+                facts.set("check_out", nights.check_out.isoformat(), GUEST_SAID,
+                          nights.confidence)
                 patch["dates_from"] = nights.basis
                 # Private, consumed by `merge`: it is what tells an earlier
                 # "which month did you mean" that it has been answered.
@@ -362,7 +372,10 @@ def patch_from(outcomes: list, message: str | None = None,
     # *tried* to set would grow without bound on a long thread.
     patch.update(facts.values)
     if facts.sources:
-        patch["_sources"] = facts.sources
+        patch["_sources"] = {
+            field: {"source": source, "confidence": facts.confidence.get(field)}
+            for field, source in facts.sources.items()
+        }
     return patch
 
 
@@ -618,9 +631,9 @@ def _record_sources(merged: dict, profile: dict, patch: dict) -> dict:
 
     turn = int((profile.get("_sources_turn") or 0)) + 1
     history = dict(profile.get("_sources") or {})
-    for field, source in incoming.items():
+    for field, entry in incoming.items():
         if field in merged:
-            history[field] = {"source": source, "turn": turn}
+            history[field] = {**entry, "turn": turn}
     # Facts that have since gone — dropped by a correction, or by a date move —
     # take their provenance with them.
     history = {k: v for k, v in history.items() if k in merged}

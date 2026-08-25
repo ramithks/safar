@@ -192,3 +192,58 @@ class TestTheProvenanceRecord:
         session.merge(CONVERSATION, session.patch_from([], "3 kamre chahiye"))
         told = session.describe({"guest_profile": profile(db)})
         assert told is None or "_sources" not in told
+
+
+class TestConfidence:
+    """
+    The third of the five things §3 asks for per entity — source, confidence,
+    turn, canonical value, dependencies. The other four were already here.
+    """
+
+    def test_a_room_read_exactly_and_one_read_fuzzily_are_recorded_apart(self, db):
+        rooms = [{"id": "rt-garden", "name": "Garden Standard"}]
+
+        session.merge(CONVERSATION, session.patch_from(
+            [], "Garden Standard chahiye", rooms=rooms))
+        assert profile(db)["_sources"]["room_type_id"]["confidence"] == "exact"
+
+        session.merge(CONVERSATION, session.patch_from(
+            [], "gardern standrd chahiye", rooms=rooms))
+        assert profile(db)["_sources"]["room_type_id"]["confidence"] == "fuzzy"
+
+    def test_a_spelled_out_date_and_an_inferred_one_are_recorded_apart(self, db):
+        from datetime import date
+
+        today = date(2026, 8, 25)
+        session.merge(CONVERSATION, session.patch_from(
+            [], "25 September to 28 September", today=today))
+        assert profile(db)["_sources"]["check_in"]["confidence"] == "explicit"
+
+        session.merge(CONVERSATION, session.patch_from(
+            [], "2nd to 5th", today=today))
+        assert profile(db)["_sources"]["check_in"]["confidence"] == "inferred"
+
+    def test_anything_a_tool_merely_carried_is_stated(self, db):
+        session.merge(CONVERSATION, session.patch_from(
+            [outcome("get_stay_options", "model", check_in="2026-09-10")], None))
+        assert profile(db)["_sources"]["check_in"]["confidence"] == "stated"
+
+    def test_every_recorded_fact_has_all_five(self, db):
+        """
+        The completeness check. A record missing a field is one somebody has to
+        remember the shape of.
+        """
+        from datetime import date
+
+        rooms = [{"id": "rt-garden", "name": "Garden Standard"}]
+        session.merge(CONVERSATION, session.patch_from(
+            [], "Garden Standard, 2nd to 5th, 3 kamre",
+            rooms=rooms, today=date(2026, 8, 25)))
+        now = profile(db)
+        for field, entry in now["_sources"].items():
+            assert entry["source"] in session.SOURCE_RANK, field   # source
+            assert entry["confidence"], field                      # confidence
+            assert entry["turn"] >= 1, field                       # turn
+            assert field in now, field                             # canonical value
+        # dependencies
+        assert session.DERIVED_FROM["quote_id"]
