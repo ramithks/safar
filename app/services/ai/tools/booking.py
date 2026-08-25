@@ -650,7 +650,8 @@ _GUIDANCE = {
     "CONFIRMED": (
         "The payment has landed and this booking is real. Tell the guest it is "
         "confirmed, give them the reference, and give them bookingUrl. If "
-        "balancePaise is above zero, say that amount is due at the hotel."
+        "balance is above zero, say `balance` exactly as written is due at "
+        "the hotel — never convert a paise figure yourself."
     ),
     "CHECKED_IN": "The guest is currently staying. Answer about their stay, not about booking it.",
     "CHECKED_OUT": "This stay has ended.",

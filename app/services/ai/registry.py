@@ -39,6 +39,7 @@ from app.services.ai.errors import (
     ToolUnavailable,
 )
 from app.services.ai.schemas import ToolOutcome, ToolSpec
+from app.services.pms import money
 
 logger = logging.getLogger(__name__)
 
@@ -489,6 +490,22 @@ async def execute(
     result_id: str | None = None
     if isinstance(result, tuple) and len(result) == 2:
         result, result_id = result
+
+    # **Every paise the model can see, beside the words for it.**
+    #
+    # Thirty guardrail-blocked production runs traced back to the model
+    # formatting money itself, and the shape was always the same: a tool
+    # returned `balancePaise: 3440640` and nothing that said `₹34,406`, so the
+    # model divided by a hundred and wrote the paise out as decimals. The figure
+    # was right; it was the *rendering* it had to invent, and inventing a
+    # rendering is one keystroke from inventing a number.
+    #
+    # `get_quote` was given display strings by hand after the first of these,
+    # and the other money-returning tools were not — `frontdesk` had ten paise
+    # fields and no display calls at all. Doing it here rather than in each tool
+    # is the difference between fixing seven files and fixing the next tool
+    # somebody writes. See services/pms/money.with_display.
+    result = money.with_display(result)
 
     # **Did it actually happen?**
     #

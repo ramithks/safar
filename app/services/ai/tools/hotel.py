@@ -261,7 +261,7 @@ async def get_checkin_options(args: StayTimeArgs, ctx: AgentContext) -> dict:
         )
     else:
         out["instruction"] = (
-            "Quote chargePaise and nothing else — do not work out a different "
+            "Quote `charge` exactly as written and nothing else — do not work out a different "
             "figure. "
             + ("Say it is subject to availability."
                if verdict.subject_to_availability else "")
@@ -587,7 +587,7 @@ async def get_experiences(args: NoArgs, ctx: AgentContext) -> dict:
         ],
         "currency": "INR",
         "instruction": (
-            "Quote pricePaise with its priceUnit — per person and per group are "
+            "Quote `price` exactly as written with its priceUnit — per person and per group are "
             "very different numbers and the guest needs to know which. Mention "
             "minParticipants where there is one; a couple cannot book something "
             "that needs six."
@@ -627,7 +627,7 @@ def _sentence(decision, quote) -> str:
     """
     if decision.verdict == "allowed":
         return (
-            "This is agreed. Quote totalPaise from the quote and say the hold "
+            "This is agreed. Quote `total` from the quote exactly as written and say the hold "
             "lasts 15 minutes. Do not describe it as a special or a favour "
             "unless the guest asked for a discount."
         )
