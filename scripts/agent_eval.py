@@ -64,7 +64,7 @@ from app.config import settings  # noqa: E402
 from app.db.client import get_db  # noqa: E402
 from app.services.ai import context as ai_context  # noqa: E402
 from app.services.ai import required_actions as ra  # noqa: E402
-from app.services.ai import model_router  # noqa: E402
+from app.services.ai import fallback_stats, model_router  # noqa: E402
 from app.services.ai import runtime  # noqa: E402
 from app.services.messaging import script as script_module  # noqa: E402
 
@@ -597,6 +597,11 @@ async def one_run(scenario: dict, index: int) -> dict:
         # comparison. `usage.models` is every model the run touched, in the
         # order it touched them.
         "served_by": list(result.served_by),
+        # The runtime's own record — configured model, models served, fallback
+        # count, per-attempt error class and latency. Carried verbatim so the
+        # evaluator and any dashboard compute the population split from one
+        # field rather than each deciding for itself what a fallback is.
+        "model_record": (requirements.get("model") or {}),
         "fell_back": any(
             a.get("action") == "fallback"
             for a in (requirements.get("recovery") or [])
@@ -1107,7 +1112,38 @@ async def main() -> int:
             finally:
                 settings.hotel_models_v3 = was_v3
 
+        # **Reported by who actually answered, before anything is compared.**
+        #
+        # Eleven of forty-four turns in one 3.x sweep finished on the fallback
+        # tier and every one was counted as a 3.x turn. A quarter of the column
+        # was the other model's work, and no number in it belonged to the model
+        # whose name was above it. The three populations are printed first, and
+        # the comparison below is explicitly labelled with how clean each column
+        # is — a reader who sees "PRIMARY_ONLY 32/44" knows what the row means.
+        print("\n╔══ who actually answered ══")
+        clean: dict[str, str] = {}
+        for name, _ in MODEL_FAMILIES:
+            stats = fallback_stats.summarise(matrix[name]["turns"],
+                                             record_key="model_record")
+            counts = stats["counts"]
+            n = stats["n"] or 1
+            clean[name] = f"{counts[fallback_stats.PRIMARY_ONLY]}/{stats['n']}"
+            print(f"║  Gemini {name}  ({matrix[name]['model']})")
+            for population in (*fallback_stats.POPULATIONS, fallback_stats.UNKNOWN):
+                if not counts[population]:
+                    continue
+                print(f"║    {population:<16} {counts[population]:>4}"
+                      f"   {counts[population] / n:>6.1%}")
+            if stats["fallback_reasons"]:
+                print(f"║    why: {stats['fallback_reasons']}")
+            if stats["provider_error_classes"]:
+                print(f"║    provider errors: {stats['provider_error_classes']}")
+        print("╚" + "═" * 60)
+
         print("\n╔══ the same scenarios, two models ══")
+        print("║  every row below is the WHOLE column, fallback turns included.")
+        print("║  turns the configured model answered alone: "
+              + ", ".join(f"{n} {clean[n]}" for n, _ in MODEL_FAMILIES))
         print(f"║  {'':36} " + "".join(f"{n:>12}" for n, _ in MODEL_FAMILIES))
         for label, key, is_pct in (
             ("required-tool accuracy", "accuracy", True),

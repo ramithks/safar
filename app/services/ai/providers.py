@@ -275,7 +275,16 @@ class VertexGeminiProvider:
             # gone, hand off". Vertex raises httpx errors, RuntimeError from the
             # circuit breaker, and KeyError from a malformed body; the runtime
             # should not have to know the difference.
-            raise ProviderError(f"Vertex call failed: {type(exc).__name__}: {exc}") from exc
+            failed = ProviderError(
+                f"Vertex call failed: {type(exc).__name__}: {exc}")
+            # The provider's own exception type, kept structurally rather than
+            # only inside the message. `recovery.classify` collapses a hundred
+            # upstream errors into a handful of behaviours, which is right for
+            # deciding what to do next and lossy for deciding whether this is
+            # Google's problem or ours — the first question an operator asks
+            # about a fallback, and one a log-message substring cannot answer.
+            failed.error_class = type(exc).__name__
+            raise failed from exc
 
         return self._read(data)
 
@@ -287,7 +296,9 @@ class VertexGeminiProvider:
             # refused upstream — a safety filter, usually. Not a network
             # failure, but equally not an answer, so it routes to a human.
             reason = ((data.get("promptFeedback") or {}).get("blockReason")) or "no candidate"
-            raise ProviderError(f"Vertex returned no candidate: {reason}")
+            refused = ProviderError(f"Vertex returned no candidate: {reason}")
+            refused.error_class = f"no_candidate:{reason}"
+            raise refused
 
         candidate = candidates[0]
         content = candidate.get("content") or {}

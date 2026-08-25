@@ -408,6 +408,11 @@ async def run_turn(
     # the fallback and continues rather than starting again.
     model_in_use = choice.model
     fallback_count = 0
+    # Every provider-level attempt on this turn, successful or not. Separate
+    # from `recovery_log`, which records the *ladder's* decisions: this is the
+    # transport underneath it, where a model can be tried and fail without the
+    # ladder ever being consulted.
+    model_attempts: list[dict] = []
     tool_failures = 0
     # (tool, arguments) already executed on this turn. Two sets, because a
     # repeated read and a repeated write are different problems — see the loop.
@@ -421,12 +426,25 @@ async def run_turn(
         ]
         last: Exception | None = None
         for i, model in enumerate(candidates):
+            started = time.monotonic()
             try:
                 out = await llm.step(
                     model=model, messages=messages, tools=tools, params=params
                 )
             except ProviderError as exc:
                 last = exc
+                # **Recorded whether or not there is another rung.** The last
+                # candidate failing is the turn ending, which is the case an
+                # operator most wants to see in the row — and it was the one
+                # case that logged nothing, because the record was written
+                # inside the "there is somewhere else to go" branch.
+                model_attempts.append(recovery.Attempt(
+                    failure=exc.reason or "provider_error",
+                    model=model,
+                    method="fallback" if i + 1 < len(candidates) else "exhausted",
+                    error_class=getattr(exc, "error_class", None),
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                ).as_dict())
                 if i + 1 < len(candidates):
                     fallback_count += 1
                     logger.warning(
@@ -1169,6 +1187,33 @@ async def run_turn(
         # than it is. This is also the only way to answer "how often does the
         # arbiter fire", which is the number that decides whether it is helping.
         summary_of_requirements["handoff_judgements"] = ctx.turn.handoff_rejections[:6]
+
+    # **The turn's model record, on every turn rather than on the odd ones.**
+    #
+    # §17 asks that a turn answer, without a log search: which model was
+    # configured, which one served it, how many fallbacks fired and why, how
+    # many attempts it took, how long they cost, and what class of provider
+    # error caused each. The log line below carries most of that and only on
+    # turns that went wrong, which makes the denominator unknowable — a
+    # fallback rate needs the turns that did *not* fall back as much as the
+    # ones that did.
+    #
+    # Written unconditionally for that reason. It is six small fields on a
+    # jsonb that already exists, and it is what makes PRIMARY_ONLY /
+    # FALLBACK_USED / FALLBACK_ONLY computable from the rows rather than
+    # inferred from an absence.
+    summary_of_requirements["model"] = {
+        "configured": choice.model,
+        "served_by": list(turn_usage.models),
+        "finished_on": model_in_use,
+        "fallback_count": fallback_count,
+        # Provider-level attempts, each with its own error class and latency.
+        # Trimmed, because a pathological turn should not write an unbounded
+        # array into a row every dashboard reads.
+        "attempts": model_attempts[:8],
+        "fallback_reasons": sorted({
+            a["failure"] for a in model_attempts if a.get("failure")}),
+    }
 
     # **Which model actually answered, not which one was chosen.**
     #

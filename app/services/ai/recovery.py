@@ -113,14 +113,37 @@ def classify(step) -> str:
 
 @dataclass
 class Attempt:
-    """One rung of the ladder, for the record."""
+    """
+    One rung of the ladder, for the record.
+
+    **`error_class` and `latency_ms` were not here, and §17 needs both.** The
+    row said a fallback happened and which model it landed on; it did not say
+    what the provider had actually done or how long the failed attempt cost.
+    Those are the two questions an operator asks about a fallback — *is this
+    the provider or is this us*, and *what is this costing the guest in
+    latency* — and neither could be answered without a log search on a run id
+    nobody has.
+
+    `error_class` is the provider's own exception type, not our classification
+    of it: `classify` already collapses a hundred provider errors into a
+    handful of behaviours, which is right for deciding what to do next and
+    lossy for deciding whether to raise a ticket with Google.
+    """
 
     failure: str
     model: str
     method: str          # 'retry' · 'fallback' · 'deterministic' · 'handoff'
+    error_class: str | None = None
+    latency_ms: int | None = None
 
     def as_dict(self) -> dict:
-        return {"failure": self.failure, "model": self.model, "method": self.method}
+        record = {"failure": self.failure, "model": self.model,
+                  "method": self.method}
+        if self.error_class:
+            record["error_class"] = self.error_class
+        if self.latency_ms is not None:
+            record["latency_ms"] = self.latency_ms
+        return record
 
 
 # ── saying what the tools established ────────────────────────────────────────

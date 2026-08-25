@@ -176,6 +176,11 @@ class ProviderError(AgentError):
     the conversation goes to the human inbox.
     """
 
+    # The upstream exception type, when the provider knew it. Set by the
+    # provider at the point it swallows the original, so the runtime can
+    # record what actually failed without parsing its own message.
+    error_class: str | None = None
+
     recoverable = False
     action_status = "failed"
 
