@@ -42,6 +42,7 @@ from app.services import trace
 from app.services.messaging import language as language_module
 from app.services.messaging import obligations
 from app.services.messaging import session
+from app.services.pms import clock
 from app.services.pms import room_names
 from app.services.messaging import service as messaging
 
@@ -376,7 +377,15 @@ async def process_conversation(conversation_id: str, *, provider=None, classifie
         # resolved to an id — see services/pms/room_names. Cached for a minute;
         # a read that fails resolves nothing rather than failing the turn.
         rooms = await room_names.for_property(conversation["property_id"])
-        patch = session.patch_from(result.actions, _agent_text(message), rooms)
+        # The *hotel's* today, not the server's — every relative date the guest
+        # can say is computed from it. See services/pms/date_facts.
+        today = await clock.abusiness_date(conversation["property_id"])
+        patch = session.patch_from(
+            result.actions, _agent_text(message), rooms, today,
+            # The stay already agreed, so "make it 3 nights instead" has an
+            # arrival to measure from.
+            known=conversation.get("guest_profile") or {},
+        )
         patch["obligations"] = obligations.open_from(
             _agent_text(message),
             result.actions,

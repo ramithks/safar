@@ -67,7 +67,8 @@ _BUSINESS_TOOLS = frozenset({
 
 
 def patch_from(outcomes: list, message: str | None = None,
-               rooms: list[dict] | None = None) -> dict:
+               rooms: list[dict] | None = None, today=None,
+               known: dict | None = None) -> dict:
     """
     What one turn established. Empty when it established nothing.
 
@@ -259,6 +260,46 @@ def patch_from(outcomes: list, message: str | None = None,
                 # one thing this must not do. Carried to the prompt as a
                 # question for the model to ask, not as a state change.
                 patch["room_ambiguous"] = named.ask
+
+        # **And the nights, when the sentence settles them beyond doubt.**
+        #
+        # `today` is the *hotel's* business date and has no default here either:
+        # every relative date — "Friday", "the 25th" — is computed from it, and
+        # a caller that forgot the timezone would resolve against the server's
+        # day. A caller with no clock gets no date reading, which is the
+        # behaviour before this existed.
+        if today is not None:
+            from app.services.pms import date_facts
+
+            # The arrival already agreed, which is the only thing "make it 3
+            # nights instead" can be measured from. It comes off the *session*,
+            # not the patch: a turn where the guest says only a length has no
+            # tool call carrying a date, so the patch is empty and the anchor
+            # would be too.
+            anchor = patch.get("check_in") or (known or {}).get("check_in")
+            if isinstance(anchor, str):
+                try:
+                    from datetime import date as _date
+
+                    anchor = _date.fromisoformat(anchor)
+                except ValueError:
+                    anchor = None
+            nights = date_facts.read(message, today, check_in=anchor)
+            if nights.usable:
+                patch["check_in"] = nights.check_in.isoformat()
+                patch["check_out"] = nights.check_out.isoformat()
+                patch["dates_from"] = nights.basis
+                # Private, consumed by `merge`: it is what tells an earlier
+                # "which month did you mean" that it has been answered.
+                patch["_dates_settled"] = True
+                if nights.needs_confirming:
+                    # Read from a day of the month or a weekday with no month in
+                    # the sentence. Almost certainly right, and "almost" is why
+                    # the model is told to say them back rather than book on
+                    # them silently.
+                    patch["dates_need_confirming"] = True
+            elif nights.ask:
+                patch["dates_unclear"] = nights.ask
     return patch
 
 
@@ -273,6 +314,7 @@ _TRANSACTIONAL = _STAY_ARGS + (
     # it is waiting on a question nobody asked about this trip.
     "negotiation", "payment", "awaiting_hotel", "obligations",
     "last_business_action", "room_needs_recheck", "room_ambiguous",
+    "dates_need_confirming", "dates_unclear", "dates_from",
 )
 
 # What a *price* was true of. When the guest moves the dates, these are wrong
@@ -467,14 +509,27 @@ def clear_stay(profile: dict) -> dict:
 
 def _clear_answered_ambiguity(merged: dict) -> dict:
     """
-    A room has been settled on, so the question about which one is answered.
+    A question that has been answered stops being asked.
 
     Without this the prompt would go on asking a guest to choose between two
     rooms one turn after they chose — which reads, correctly, as not listening.
+    The same for dates: once a sentence settles them beyond doubt, the earlier
+    "which month did you mean" is answered.
     """
+    merged = dict(merged)
     if merged.get("room_ambiguous") and merged.get("room_type_id"):
-        merged = dict(merged)
         merged.pop("room_ambiguous", None)
+    if merged.get("dates_unclear") and merged.get("_dates_settled"):
+        # **Only when *this* turn settled them.** Keyed on the patch rather than
+        # on "the session has dates", because a guest asking to change dates
+        # already has dates — the old ones — and clearing the question because
+        # they exist would drop it on the very turn it was raised.
+        merged.pop("dates_unclear", None)
+    merged.pop("_dates_settled", None)
+    if merged.get("dates_need_confirming") and \
+            merged.get("dates_from", "").startswith(("two dates", "a date")):
+        # Spelled out this time. Nothing left to confirm.
+        merged.pop("dates_need_confirming", None)
     return merged
 
 
@@ -666,8 +721,24 @@ def describe(conversation: dict | None) -> str | None:
             "for them again unless they change the subject to different nights:",
             f"  {check_in} to {check_out}, {rooms} room(s), {party}",
         ]
-    elif profile.get("room_type_id") or profile.get("room_ambiguous"):
+    elif (profile.get("room_type_id") or profile.get("room_ambiguous")
+            or profile.get("dates_unclear")):
         lines.append("Earlier in this conversation:")
+
+    if profile.get("dates_need_confirming") and check_in and check_out:
+        # Read from a day of the month or a weekday, with no month in the
+        # sentence — see `date_facts`. Right almost always, and the model says
+        # them back rather than booking on them silently.
+        lines.append(
+            "  Those nights were worked out from what they said rather than "
+            "spelled out — say the two dates back to them in your reply so they "
+            "can correct you."
+        )
+    if profile.get("dates_unclear"):
+        lines.append(
+            f"  Their dates are not clear. Ask them: "
+            f"\"{profile['dates_unclear']}\" — do not guess at a month."
+        )
 
     # The room they have already settled on.
     #
