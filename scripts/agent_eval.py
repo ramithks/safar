@@ -283,20 +283,23 @@ def leaks_internals(reply: str) -> str | None:
     can never claim a leak the product would have allowed, and it can never
     miss one the product would have caught — and when the guardrail's
     vocabulary grows, this grows with it.
+
+    **And it asks the whole function, not the pattern list.** This walked
+    `_INTERNALS` itself, which is the same reimplementation one layer down: the
+    guardrail masks URLs before it scans, because every payment link this
+    product issues is `/pay/order_TTNlZOqsCGlaWH` and `[a-z]{3,}_[a-z]{2,}`
+    matches a Razorpay order id. Skipping the mask made the scorer stricter
+    than the product in exactly one place — the message that closes a sale.
+
+    It cost a model its verdict. Gemini 2.5 failed the §13 promotion gate on
+    `leaked_ids = 2`, and both of those "leaks" were payment links the
+    guardrail deliberately allows. A model does not get to be marked unsafe by
+    a rule the product does not enforce.
     """
     from app.services.ai import guardrails
 
-    for label, pattern in guardrails._INTERNALS:
-        found = pattern.search(reply or "")
-        if not found:
-            continue
-        # The one exemption the guardrail itself makes: `check_in` is a word a
-        # hotel uses, not a column name it leaked.
-        if (label == "a tool or table name"
-                and found.group(0).lower() in guardrails._SNAKE_ALLOWED):
-            continue
-        return f"{label}: {found.group(0)[:40]}"
-    return None
+    found = guardrails._internal_leak(reply or "")
+    return f"{found[0]}: {found[1][:40]}" if found else None
 
 
 def figures_in(text: str) -> set[int]:
@@ -584,6 +587,20 @@ async def one_run(scenario: dict, index: int) -> dict:
         "tokens_in": result.tokens_in,
         "tokens_out": result.tokens_out,
         "status": result.status,
+        # **Which model actually answered, not which one was configured.**
+        #
+        # The sweep stamps every turn with the family's conversation model, and
+        # eleven of forty-four turns in the 3.x sweep were served by
+        # gemini-2.5-flash after two empty completions — the §12 recovery ladder
+        # doing its job, and then being scored as though 3.x had done the work.
+        # A comparison that credits one model with another's turns is not a
+        # comparison. `usage.models` is every model the run touched, in the
+        # order it touched them.
+        "served_by": list(result.served_by),
+        "fell_back": any(
+            a.get("action") == "fallback"
+            for a in (requirements.get("recovery") or [])
+        ),
         "handoff": result.handoff,
         "run_error": result.error,
         "reply": reply[:400],

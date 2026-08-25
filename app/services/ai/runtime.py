@@ -1252,6 +1252,7 @@ async def run_turn(
         error=error,
         requirements=summary_of_requirements,
         required_action_status=required_actions.status_of(summary_of_requirements),
+        served_by=list(turn_usage.models),
     )
 
 

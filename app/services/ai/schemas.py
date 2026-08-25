@@ -329,3 +329,17 @@ class RunResult:
     requirements: dict = field(default_factory=dict)
     # 'none' · 'model' · 'forced' · 'unmet'. The single number this pass moves.
     required_action_status: str = "none"
+
+    # **Every model this turn actually touched, in the order it touched them.**
+    #
+    # A run is not served by one model. Classification is a cheap tier, the
+    # conversation another, and the §12 recovery ladder may end the turn on a
+    # third that neither the operator nor the router chose. Eleven of the
+    # forty-four turns in one 3.x sweep finished on the fallback tier after
+    # two empty completions, and every one of them was scored as a 3.x turn,
+    # because the only model on the result was the configured one.
+    #
+    # Crediting one model with another's work is not a comparison, and §11 asks
+    # that model failures never be blended with anything else. So the turn
+    # carries its own answer.
+    served_by: list[str] = field(default_factory=list)
