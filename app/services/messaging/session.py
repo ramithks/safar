@@ -440,6 +440,9 @@ _TRANSACTIONAL = _STAY_ARGS + (
     "negotiation", "payment", "awaiting_hotel", "obligations",
     "last_business_action", "room_needs_recheck", "room_ambiguous",
     "dates_need_confirming", "dates_unclear", "dates_from",
+    # The door an in-house guest is standing at. Transactional because it is
+    # about *this* stay: a guest who comes back next month is in another room.
+    "room_number",
     "_sources", "_sources_turn",
 )
 
@@ -509,7 +512,7 @@ DERIVED_FROM: dict[str, frozenset[str]] = {
 # Facts a guest can correct. Everything else on the profile is ours — a stage we
 # derived, a room we recorded — and a guest does not "correct" those.
 CORRECTABLE = frozenset({"check_in", "check_out", "units", "adults", "children",
-                         "room_type_id", "rate_plan_id"})
+                         "room_type_id", "rate_plan_id", "room_number"})
 
 
 def corrections(profile: dict, patch: dict) -> set[str]:

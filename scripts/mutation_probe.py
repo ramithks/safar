@@ -251,6 +251,14 @@ MUTANTS = [
            "_ensure_human stops reporting success, so the withdrawal never fires",
            "tests/test_promised_a_person.py"),
 
+    Mutant("entities", "a room number is counted as a room quantity",
+           "app/services/ai/required_actions.py",
+           '            if door and value == int(door):',
+           '            if False:',
+           "\"room 204 mein AC nahi chal raha\" forces group pricing for 204 "
+           "rooms on a guest reporting a fault",
+           "tests/test_room_numbers.py"),
+
     # ── business-rule provenance ────────────────────────────────────────────
     Mutant("provenance", "a failed rule read stops being distinguishable",
            "app/services/pms/negotiation.py",

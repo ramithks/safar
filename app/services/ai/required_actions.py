@@ -221,6 +221,58 @@ _ROOMS_AFTER = re.compile(
 # noun-first form: "204 rooms chahiye" is at least stated as a count, and is
 # left alone rather than second-guessed.
 _ROOM_NUMBER_FROM = 100
+
+# **A door, named as one.** The brief's own example:
+#
+#     "room 204 mein AC nahi chal raha"   → room_number 204, a complaint
+#     "204 wala room"                     → room_number 204
+#     "204 rooms chahiye"                 → room_count 204
+#
+# The first two used to read as a *count*, and the second still did after the
+# last pass widened the count pattern to allow a room name between the number
+# and the noun ("2 Deluxe rooms"). "204 wala room" fits that shape exactly.
+#
+# Refusing to count them was half the job. The other half is capturing what the
+# number actually is, because `create_task` takes a `room_number` and a guest
+# reporting a broken air conditioner has just told us which door.
+#
+# Two shapes, and both put the number beside the noun rather than in front of a
+# quantity: `room 204` and `204 wala room`. A bare number with no room noun
+# anywhere near it is not a room number either — that is a price, a year, or a
+# phone.
+_ROOM_NUMBER = re.compile(
+    rf"(?<![a-z0-9])(?:{_ROOM_NOUN}\s*(?:no\.?|number|#)?\s*(\d{{1,4}})"
+    rf"|(\d{{1,4}})\s*(?:wala|wale|wali|vala|vale)\s*{_ROOM_NOUN})"
+    r"(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def room_number(message: str) -> str | None:
+    """
+    The door the guest is talking about, or None.
+
+    Returned as a string because a room number is a label, not a quantity: a
+    hotel with rooms "04" and "4" has two different doors, and `int` would make
+    them one.
+    """
+    for match in _ROOM_NUMBER.finditer(message or ""):
+        raw = match.group(1) or match.group(2)
+        if not raw:
+            continue
+        # A leading zero settles it whatever the magnitude: "room 04" is a
+        # label and nobody has ever written "04 rooms". Without this the
+        # threshold below rejects it, and a hotel numbering its ground floor
+        # 01–09 loses every complaint from it.
+        if raw.startswith("0") and len(raw) > 1:
+            return raw
+        # Otherwise the threshold. Below it the reading is ambiguous with a
+        # count — "room 5" is as likely to be five rooms as door five — and
+        # `room_count` already claims those. Above it, no hotel is being asked
+        # for that many rooms in a chat window.
+        if int(raw) >= _ROOM_NUMBER_FROM:
+            return raw
+    return None
 _PEOPLE_BEFORE = re.compile(rf"(?<![a-z0-9])({_NUMBER})\s*{_PEOPLE_NOUN}", re.IGNORECASE)
 _PEOPLE_AFTER = re.compile(rf"{_PEOPLE_NOUN}\s*(?:hain?|hai|ke liye|for)?\s*({_NUMBER})(?![a-z0-9])",
                            re.IGNORECASE)
@@ -302,10 +354,19 @@ def room_count(message: str) -> int | None:
     rahe hain" has told us both, and the number they chose is the one to use.
     """
     text = message or ""
+    # A door is not a quantity. "204 wala room" reads as a count to the pattern
+    # below — a number, then a word, then a room noun, which is the shape of
+    # "2 Deluxe rooms" — so the room-number reading is settled first.
+    door = room_number(text)
     for pattern in (_ROOMS_BEFORE, _ROOMS_AFTER):
         for match in pattern.finditer(text):
             value = _to_int(match.group(1))
             if not value:
+                continue
+            # Compared as numbers, not as strings: the door may be written
+            # "04" and the count pattern reads it as 4, so a string comparison
+            # lets the same digits be both a label and a quantity.
+            if door and value == int(door):
                 continue
             if pattern is _ROOMS_AFTER and value >= _ROOM_NUMBER_FROM:
                 # A door, not an order. See `_ROOM_NUMBER_FROM`.
@@ -982,6 +1043,13 @@ def stated_facts(message: str) -> dict:
     people = people_count(message)
     if people is not None:
         facts["adults"] = people
+    # The door they are standing at, when they named one. `create_task` takes a
+    # `room_number`, and a guest reporting a broken air conditioner has just
+    # said which room — carrying it means the ticket goes to the right door
+    # rather than to whichever one the model remembered.
+    door = room_number(message)
+    if door is not None:
+        facts["room_number"] = door
     return facts
 
 
