@@ -523,13 +523,35 @@ def corrections(profile: dict, patch: dict) -> set[str]:
     their dates for the first time invalidates nothing. A value becoming a
     *different* value is a correction, and everything computed from it is now
     describing a stay nobody is asking about.
+
+    **Unless something has already been computed from that blank.** The rule
+    above is right while nothing derives from the field and wrong the moment
+    something does, because a quote issued while `adults` was unknown did not
+    price *nothing* — it priced whatever the tool assumed. A guest who is
+    quoted, then says "oh, and two kids are coming", was leaving a blank and is
+    now filling it, and the quote in the session is a price for a different
+    party.
+
+    Found by a twenty-journey replay: "quoted, then children arrive" and
+    "quoted, then the party size is named" both kept a quote priced before
+    either fact existed. Neither is a correction by the letter of the rule and
+    both are stale by the meaning of it.
+
+    So a blank being filled counts as a change exactly when some field that
+    derives from it is currently set. Nothing derived, nothing to invalidate,
+    and the first-mention case is untouched.
     """
     changed = set()
     for key in CORRECTABLE:
         if key not in patch:
             continue
         before, after = profile.get(key), patch.get(key)
-        if before in (None, "") or after in (None, ""):
+        if after in (None, ""):
+            continue
+        if before in (None, ""):
+            if any(profile.get(field) not in (None, "")
+                   for field, sources in DERIVED_FROM.items() if key in sources):
+                changed.add(key)
             continue
         if str(before) != str(after):
             changed.add(key)
