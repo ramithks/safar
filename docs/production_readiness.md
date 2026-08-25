@@ -49,6 +49,17 @@ that no tool returned.
 | Idempotency lookup fails | no | log only |
 | Model returns nothing | classified | `recovery` on the run row |
 
+| Redis unavailable for the conversation lock | no | log only |
+
+The Redis one is worth stating in full because it is the only fallback that
+changes what a *guest* sees. Losing the lock means two workers may answer the
+same conversation, and `_deliver` keys its idempotency on the run id — which
+differs per run — so the guest can receive the same answer twice. What cannot
+happen is a double booking or a double charge: the message-scoped idempotency
+key refuses the second mutating call, and inventory is held in Postgres. A
+duplicated sentence is embarrassing; the two failures underneath it are not
+available.
+
 The last four are **accepted P2**: each degrades to the behaviour before the
 feature existed, and none grants more authority. The two that could grant more
 authority are the two that are named.
