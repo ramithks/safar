@@ -1,0 +1,67 @@
+{
+ "tag": "alpha",
+ "minimal": false,
+ "profile_id": "05b1a6d4-5632-49a7-94df-13290833fe5b",
+ "partner_id": "6d9be2ce-d135-4547-b154-ac2fcdc951e8",
+ "property_id": "d9064c94-7789-41db-8016-962591bafdc2",
+ "name": "ZZ-SEED Alpha House",
+ "created_at": "2026-08-25T13:35:43.220890+00:00",
+ "room_types": {
+  "Garden Deluxe": "b85cb284-07f1-4802-902a-9cf99654162e",
+  "Suite 1": "8a0e525f-4cae-417b-995c-9dd4f6f493cc",
+  "Suite 2": "10aaea31-cfa6-4a66-a28b-4ef5ab05644e",
+  "Family Room": "f6a97902-3dd0-4fb6-a006-d2410f20fb7e",
+  "Attic Single": "eb4fbf8b-c87b-41a2-ac6c-5a994af701bc",
+  "Garden Standard": "f517ff48-17ff-45f6-a90b-95bce9536546"
+ },
+ "rate_plans": {
+  "GDX-EP": "e6fe04ba-addc-4c97-9597-4dd698bd2667",
+  "GDX-CP": "1df9472c-f9fa-48e2-a83f-7b6244636f3c",
+  "GDX-NR": "5bf1187e-cbf6-4e00-a2d7-377c6830a95b",
+  "FAM-EP": "b9c05810-972e-4959-9827-a7d26cc95832",
+  "FAM-CP": "4d3df414-7983-4166-bea1-d90aa9410c16",
+  "FAM-NR": "d8f0622e-eac9-4958-8196-528a0edc7a1f",
+  "GST-EP": "75e9ed4b-ce24-4ccd-bac1-f501b1e70cd2",
+  "GST-CP": "fb43bcc2-8cff-46f3-a56c-db605a57329a",
+  "GST-NR": "d0321407-cc39-472e-8406-1af3d40aab91",
+  "SU1-EP": "c54fc045-4014-41e9-9164-6360c29e8252",
+  "SU1-CP": "2c8ba1f1-a51e-451d-a5ae-4bcd5206ffb3",
+  "SU1-NR": "d99029b6-352f-41d5-a7b0-1ea9bffd0cee",
+  "SU2-EP": "4fec5cd5-fc49-4ffd-83e1-f5b5cf792535",
+  "SU2-CP": "917b2924-08f9-47f8-9118-8e3467c2d689",
+  "SU2-NR": "71abbc58-5d3c-4146-bd22-d58bceb0843d",
+  "ATT-EP": "f9fce04b-636a-4309-87cc-a26ba6355b25",
+  "ATT-CP": "c5602da1-b2bb-4bb8-9825-7ce6894435e4",
+  "ATT-NR": "8a9d36f9-a016-4e80-909a-d31a82fbaa25"
+ },
+ "reservations": {
+  "confirmed/paid/0": "997140b6-f206-5275-968e-9152107e7bf0",
+  "confirmed/token_paid/1": "a2bbd035-875f-5ef9-8fc0-d597f6506f74",
+  "pending/unpaid/2": "c575e7e2-77af-5bd6-a9ca-0122aa2736c2",
+  "cancelled/refunded/3": "aab3b57f-9c68-5162-996a-1187a25d707c",
+  "confirmed/partially_paid/4": "10443365-19fe-51b4-9fdb-e8029e9d6e50",
+  "pending/unpaid/5": "1a4b4bc6-ea95-591a-87c1-2ac0189470e5"
+ },
+ "conversations": {
+  "ordinary": "ffc8bb40-6af4-5d63-b5ef-37802517f6f1",
+  "contradicted": "41cf4fb6-f9cd-5151-88de-ba1c456d802b"
+ },
+ "escalations": [
+  "6e682e49-a06b-5964-8c85-e9d291f614e8",
+  "2783f913-338a-54e8-925a-8bd35eec6819"
+ ],
+ "status": "active",
+ "counts": {
+  "room_types": 6,
+  "rate_plans": 18,
+  "rooms": 18,
+  "room_inventory": 540,
+  "reservations": 6,
+  "conversations": 2,
+  "group_rate_tiers": 2,
+  "negotiation_rules": 2,
+  "agents": 5,
+  "agent_escalations": 2,
+  "quotes": 0
+ }
+}
