@@ -581,15 +581,52 @@ async def run_turn(
                 for call in step.tool_calls:
                     messages.append(llm.tool_result_message(call, json.dumps({
                         "refused": True,
+                        # **This used to end "…or say you are checking and call
+                        # request_human_handoff", and the step below is given no
+                        # tools at all.**
+                        #
+                        # The model did what it was told, as far as it could. On
+                        # a live eval turn it answered a ten-room enquiry with
+                        # *"I am checking the group rates with our team right
+                        # now. One of our team members will get back to you
+                        # shortly"* — and called nothing, because it had nothing
+                        # to call. `handoff` stayed false, the conversation
+                        # stayed with the AI, and the guest was left waiting for
+                        # a person nobody had asked for.
+                        #
+                        # An instruction that names an action the model cannot
+                        # take is worse than no instruction: it produces the
+                        # *words* of the action without the action. So the
+                        # sentence no longer mentions a tool, and the runtime
+                        # takes responsibility for the handoff below — which is
+                        # where it belonged, because running out of time is the
+                        # runtime's fact about the turn, not the model's.
                         "reason": (
                             "This turn has taken too long and the guest is "
-                            "waiting. Do not call any more tools. Answer with "
-                            "what you already have, or say you are checking and "
-                            "call request_human_handoff."
+                            "waiting. You have no tools left. Answer with what "
+                            "you already have. If that is not enough to answer "
+                            "them, say plainly that you are checking — do not "
+                            "promise a time, and do not say the booking or the "
+                            "price is settled."
                         ),
                     })))
                 final = await _answering_step(messages=messages, tools=[])
                 reply = (final.reply or "").strip() or None
+
+                # **Out of time with nothing to show for it goes to a person.**
+                #
+                # Deterministic, because the condition is a fact the runtime
+                # owns: did any tool on this turn actually succeed? If some did,
+                # the model has real results to summarise and its answer stands.
+                # If none did, whatever it just wrote is a holding sentence — and
+                # a holding sentence with nobody behind it is the one outcome a
+                # hotel cannot explain.
+                if not any(o.ok for o in outcomes):
+                    logger.warning(
+                        "run %s: out of time with no successful tool — handing over",
+                        run_id,
+                    )
+                    handoff = True
                 break
 
             messages.append(step.raw or {"role": "assistant", "content": None})

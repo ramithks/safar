@@ -244,3 +244,110 @@ def test_an_ordinary_fast_turn_is_untouched(wired):
     # The tools were still on the table for the second step, which is the
     # difference between a normal turn and a curtailed one.
     assert provider.tools_offered[1] != []
+
+
+# ── the promise nobody kept ─────────────────────────────────────────────────
+
+class TestOutOfTimeWithNothingToShow:
+    """
+    **Found on a live evaluation turn, not by a test.**
+
+    A guest asked for rooms for ten people. The turn spent its budget, the
+    model was handed the out-of-time note, and it replied:
+
+        I am checking the group rates for 10 people next month with our team
+        right now. One of our team members will get back to you shortly with
+        the best options.
+
+    It called nothing. `handoff` stayed false, the conversation stayed with the
+    AI, and the guest was left waiting for a person nobody had asked for. The
+    run recorded `status='succeeded'` and `required_action_status='unmet'`, and
+    it was the single turn that failed the promotion gate for Gemini 3.x.
+
+    **The cause was an instruction naming an action the step could not take.**
+    The note read *"…or say you are checking and call request_human_handoff"*,
+    and the step is called with `tools=[]`. The model did as much of that as it
+    could: it produced the words of the handoff without the handoff.
+
+    Two halves to the fix, and neither is a prompt plea. The sentence no longer
+    names a tool. And the handoff is decided by the runtime on a fact the
+    runtime owns — whether any tool on this turn actually succeeded — because
+    running out of time is the runtime's fact about the turn, not the model's.
+    """
+
+    def test_a_turn_that_ran_out_with_no_results_hands_over(self, wired):
+        fake, clock, make_ctx = wired
+        provider = SlowProvider(clock, [
+            ModelStep(reply=None,
+                      tool_calls=[ToolCall(id="1", name="get_property", arguments={})],
+                      raw={"role": "assistant", "content": None},
+                      tokens_in=1, tokens_out=1),
+            # The holding sentence, exactly as the live model wrote it.
+            ModelStep(reply="I am checking the group rates with our team right "
+                            "now. One of our team members will get back to you "
+                            "shortly.",
+                      tokens_in=1, tokens_out=1),
+        ])
+        result = run(runtime.run_turn(make_ctx(), "we need rooms for 10 people",
+                                      provider=provider, task="guest_conversation"))
+
+        assert result.handoff is True, (
+            "the guest was promised a person and nobody was asked"
+        )
+        assert fake.rows("conversations")[0]["handler"] == "human_requested"
+
+    def test_the_note_no_longer_names_a_tool_the_step_cannot_call(self):
+        import inspect
+
+        source = " ".join(inspect.getsource(runtime.run_turn).split())
+        note = source[source.index("This turn has taken too long"):][:400]
+        assert "request_human_handoff" not in note, (
+            "the out-of-time note names a tool, and the step below it is given "
+            "none — the model can only produce the words"
+        )
+        assert "no tools left" in note
+
+    def test_but_a_turn_with_real_results_still_answers_for_itself(self, wired):
+        """
+        The other half, and the reason this is not a blanket escalation. A turn
+        that ran three tools and blew its budget on the fourth has real results
+        to summarise, and the model's answer stands.
+        """
+        fake, clock, make_ctx = wired
+
+        class Paced(SlowProvider):
+            """
+            `SlowProvider` advances 45s a step against a 40s budget, so the very
+            first tool round is already over the line and nothing ever runs.
+            This one is quick until it is not — which is the shape of the turn
+            being tested: real work, then the budget.
+            """
+
+            def __init__(self, clock, steps, advances):
+                super().__init__(clock, steps)
+                self.advances = list(advances)
+
+            async def step(self, *, model, messages, tools, params):
+                self.calls += 1
+                self.tools_offered.append(list(tools or []))
+                self.clock.advance(self.advances.pop(0) if self.advances else 45.0)
+                return self.steps.pop(0)
+
+        provider = Paced(clock, [
+            ModelStep(reply=None,
+                      tool_calls=[ToolCall(id="1", name="get_property", arguments={})],
+                      raw={"role": "assistant", "content": None},
+                      tokens_in=1, tokens_out=1),
+            ModelStep(reply=None,
+                      tool_calls=[ToolCall(id="2", name="get_property", arguments={})],
+                      raw={"role": "assistant", "content": None},
+                      tokens_in=1, tokens_out=1),
+            ModelStep(reply="Casa Mandala is in Anjuna, Goa.",
+                      tokens_in=1, tokens_out=1),
+        ], advances=[5.0, 45.0, 1.0])
+        result = run(runtime.run_turn(make_ctx(), "where is the hotel?",
+                                      provider=provider, task="guest_conversation"))
+
+        assert any(o.ok for o in result.actions), "the fixture must run one tool"
+        assert result.handoff is False
+        assert result.reply == "Casa Mandala is in Anjuna, Goa."
