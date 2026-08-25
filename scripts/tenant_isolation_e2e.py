@@ -26,7 +26,7 @@ Reads only. Nothing here writes anything that succeeds — that is the point.
 import base64, json, os, subprocess, urllib.error, urllib.request
 
 # Which StayOS to test. Defaults to the uvicorn this suite's docstring tells
-# you to start; set STAYOS_API_BASE=https://stayos-backend.travbuddy.in to run
+# you to start; set STAYOS_API_BASE=https://api.hostos.in to run
 # the same assertions against the deployed one, which is the only way to find
 # out whether what is live behaves like what is on this branch.
 API = os.environ.get("STAYOS_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1"

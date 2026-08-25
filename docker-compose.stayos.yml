@@ -7,7 +7,7 @@
 # file knows about the other and they share nothing at runtime.
 #
 #   marketplace   backend.travbuddy.in          uabxtdhxbamuhthxnhid
-#   StayOS        stayos-backend.travbuddy.in   rdlozqvuywtgsodunait
+#   StayOS        api.hostos.in   rdlozqvuywtgsodunait
 #
 # ── Redis belongs to this stack ──────────────────────────────────────────────
 #
@@ -60,7 +60,7 @@ services:
       # stack already registers `traefik.http.routers.api` on this same Traefik,
       # and two routers of one name is one router.
       - "traefik.enable=true"
-      - "traefik.http.routers.stayos.rule=Host(`stayos-backend.travbuddy.in`)"
+      - "traefik.http.routers.stayos.rule=Host(`api.hostos.in`)"
       - "traefik.http.routers.stayos.entrypoints=https"
       - "traefik.http.routers.stayos.tls=true"
       - "traefik.http.routers.stayos.tls.certresolver=letsencrypt"

@@ -43,7 +43,7 @@ SB = f"https://{REF}.supabase.co"
 # Local by default, so `uvicorn --port 8010 &` and run it. Point it at the
 # deployed backend to verify a release actually serves what it was given:
 #
-#     STAYOS_API=https://stayos-backend.travbuddy.in/api/v1/pms \
+#     STAYOS_API=https://api.hostos.in/api/v1/pms \
 #       ./venv/bin/python scripts/website_roundtrip_e2e.py
 #
 # The distinction matters more here than in most suites. Every failure this

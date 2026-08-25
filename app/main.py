@@ -187,17 +187,17 @@ async def _correlate(request, call_next):
 # preview is not production and should not be able to talk to production; if one
 # needs to, name it in ALLOWED_ORIGINS for as long as that is true.
 #
-# `partner.travbuddy.in` is the PWA's old address and stays on this list after
-# the move to `app.hostos.in`. A hotel that installed the PWA on the old origin
-# serves its shell from a service worker and never sees the redirect, so it goes
-# on calling this API from a host that no longer appears anywhere else in the
-# configuration. Dropping it fails those desks on preflight, with nothing on
-# screen to say why.
+# `partner.travbuddy.in` was the PWA's address through the pilot and is **not**
+# on this list. It was kept for one commit on the theory that a desk with the
+# PWA installed on the old origin would go on calling this API from a hostname
+# nothing else mentions — true in principle, and the database says it never
+# happened: exactly one row in `conversation_messages` carried a link to that
+# host, outbound to the founder's own Instagram. Nothing to strand, so the name
+# is retired rather than carried.
 PRODUCTION_ORIGINS = [
     "https://app.hostos.in",
     "https://hostos.in",
     "https://www.hostos.in",
-    "https://partner.travbuddy.in",
     "https://travbuddy.in",
     "https://www.travbuddy.in",
 ]
