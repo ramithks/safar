@@ -501,6 +501,15 @@ async def run_turn(
 
         # Rung one: the same model, once. What failed was a sample rather than a
         # system, and asking again is the cheapest thing on this ladder.
+        #
+        # **Immediately, and that is deliberate rather than an omission.** §2
+        # asks for exponential backoff with jitter, and it belongs one layer
+        # down: `vertex.py` already spaces its retries and rotates regions when
+        # the *transport* fails, which is the case backoff is for — a service
+        # under load, where waiting is what helps. This is not that case. Vertex
+        # returned 200, a candidate and a finish reason; the service is healthy
+        # and the sample was bad. Sleeping here would add latency to a guest's
+        # turn and change nothing about the next draw.
         logger.info("run %s: %s on %s — asking again", run_id, failure, model_in_use)
         recovery_log.append(recovery.Attempt(failure, model_in_use, "retry").as_dict())
         retried = await _step(messages=messages, tools=tools)
