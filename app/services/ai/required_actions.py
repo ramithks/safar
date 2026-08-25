@@ -62,6 +62,8 @@ on a price.
 import logging
 import os
 import re
+
+from app.services.ai import intent
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -1209,7 +1211,23 @@ def detect(message: str, session: dict | None = None) -> list[Requirement]:
                               "get_group_rates", "get_room_types"},
                              "guest named a party size"))
 
-    order = {intent: i for i, intent in enumerate(_PRIORITY)}
+    # **What the guest is doing, filtering what the detectors found.**
+    #
+    # Each detector above recognises its own case and none of them knows what
+    # the sentence as a whole was *for*. That is how "Breakfast kitne baje tak
+    # milta hai?" — the matrix's own control turn, chosen to require nothing —
+    # came back owing a quote on 4 of 4 runs on both model families: `kitne` is
+    # a quantity word and `_QUOTE` is a keyword detector.
+    #
+    # The gate runs here, after detection rather than before it, for two
+    # reasons. The detectors stay exactly as they are, each still the single
+    # authority on its own case; and a detector added tomorrow is gated without
+    # its author having to remember to ask. See `services/ai/intent.py` for the
+    # six categories and what each may owe.
+    speech_act = intent.category(text)
+    found = [r for r in found if intent.permits(speech_act, r.intent)]
+
+    order = {intent_name: i for i, intent_name in enumerate(_PRIORITY)}
     found.sort(key=lambda r: order.get(r.intent, 99))
 
     # One requirement per intent — the vocabularies overlap by design and a
