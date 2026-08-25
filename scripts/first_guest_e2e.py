@@ -269,8 +269,16 @@ def check(step: dict, *, reply: str, run: dict, actions: list[dict],
             "the turn escalated, so the business action it owed never ran — "
             "the rest of this journey is a human's, not the agent's")
 
+    conversation_id = run.get("conversation_id")
+    if not conversation_id:
+        # No run row for this turn at all. Reported rather than crashed on: it
+        # is either a turn that never opened a run or a harness reading the
+        # wrong conversation, and both are worth seeing.
+        problems.append("no agent_run row was written for this turn")
+        return problems
+
     handler = (db.table("conversations").select("handler")
-               .eq("id", run.get("conversation_id") or "")
+               .eq("id", conversation_id)
                .limit(1).execute().data or [{}])[0].get("handler")
     if handler and handler != "ai":
         problems.append(f"the conversation is handled by {handler!r}, not the agent")
@@ -353,6 +361,12 @@ async def main() -> int:
     parser.add_argument("--out", default=None)
     parser.add_argument("--force-quota", action="store_true",
                         help="start even if another evaluation holds the quota lock")
+    parser.add_argument("--existing-slug", default=None,
+                        help="run the same journey against a hotel that already "
+                             "exists, instead of seeding one. §15: any difference "
+                             "between the two must be explainable by configuration, "
+                             "and anything caused by cached state, stale agent "
+                             "configuration or hidden rows is a blocker.")
     args = parser.parse_args()
 
     try:
@@ -360,6 +374,37 @@ async def main() -> int:
     except quota_lock.Busy as busy:
         print(f"   {busy}")
         return 2
+
+    if args.existing_slug:
+        db = get_db()
+        row = (db.table("properties").select("id,name,partner_id,slug")
+               .ilike("slug", args.existing_slug).limit(1).execute().data or [])
+        if not row:
+            print(f"   no property with slug {args.existing_slug!r}")
+            return 2
+        record = {"property_id": row[0]["id"], "partner_id": row[0]["partner_id"],
+                  "profile_id": None, "counts": {"existing": True}}
+        print(f"── existing hotel {row[0]['name']} ──")
+        print(f"   property {record['property_id']}  slug {row[0]['slug']}\n")
+        results = []
+        for run_number in range(1, args.runs + 1):
+            print(f"── run {run_number} of {args.runs} ──")
+            results.append(await converse(row[0]["slug"], record["property_id"],
+                                          MINIMAL_JOURNEY if args.minimal else JOURNEY))
+            print()
+        every = [t["attempt_class"] for r in results for t in r["turns"]]
+        found = attempts.summarise(every)
+        total = sum(r["failures"] for r in results)
+        print(f"   turns with problems: {total} of "
+              f"{found['model_evaluable_attempts']} model-evaluable")
+        print(f"   {found['counts']}")
+        if args.out:
+            pathlib.Path(args.out).write_text(json.dumps(
+                {"existing_slug": args.existing_slug,
+                 "property_id": record["property_id"], "runs": results,
+                 "attempts": found}, indent=1, default=str))
+        quota_lock.release("first_guest_e2e")
+        return 0 if total == 0 else 1
 
     print(f"── seeding {args.tag}{' (minimal)' if args.minimal else ''} ──")
     record = await seed_tenant.build(args.tag, minimal=args.minimal)
