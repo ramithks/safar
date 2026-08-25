@@ -543,7 +543,12 @@ async def get_reservation(args: ReservationArgs, ctx: AgentContext) -> dict:
 
 @tool(
     name="get_task",
-    description="One request the guest has already raised, and where it stands.",
+    description=(
+        "One request the guest has already raised, in full: what it was, who "
+        "has it, when it was raised and when it was resolved. Use this when the "
+        "guest asks about the request itself. For nothing more than 'is it done "
+        "yet', get_task_status is smaller — never call both."
+    ),
     input_model=TaskArgs,
     permission="tasks",
     autonomy_floor=0,

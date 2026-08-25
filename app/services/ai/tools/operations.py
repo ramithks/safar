@@ -345,7 +345,11 @@ async def assign_task(args: AssignTaskArgs, ctx: AgentContext) -> tuple[dict, st
 
 @tool(
     name="get_task_status",
-    description="Where a job has got to. Use before telling a guest anything about progress.",
+    description=(
+        "Where a job has got to, and nothing else. Use before telling a guest "
+        "anything about progress. If they want the details of the request too, "
+        "get_task returns all of this and more — never call both."
+    ),
     input_model=TaskStatusArgs,
     permission="tasks",
     autonomy_floor=0,

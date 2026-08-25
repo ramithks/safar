@@ -214,3 +214,78 @@ class TestWhatMustNotChange:
         assert "adults" not in now, "a new trip does not inherit the old party"
         assert now["room_type_id"] == "rt-deluxe"
         assert now["room_needs_recheck"] is True
+
+
+# ── the guest's own words outrank any tool argument ─────────────────────────
+
+class TestWhatTheGuestSaidBeatsWhatTheToolWasCalledWith:
+    """
+    **Found by mutation testing.** Deleting the line that applies
+    `stated_facts` broke nothing, because every test above reached the session
+    through a tool argument that happened to carry the same number.
+
+    That is exactly the failure the line exists for. Session facts were written
+    from tool *arguments* — whatever the model passed — so "Actually 4 log hain"
+    updated the party only when some tool ran carrying it. On a turn where the
+    model answered in prose, or where a *forced* call was built from the stale
+    session, the correction did not land, and the next prompt went on describing
+    the stay the guest had just changed.
+    """
+
+    def _outcome(self, tool, source, **args):
+        from app.services.ai.schemas import ToolOutcome
+
+        return ToolOutcome(tool=tool, status="executed", input=args,
+                           decision_source=source)
+
+    def test_a_correction_lands_on_a_turn_where_no_tool_ran(self, db):
+        """
+        The plainest case: the model says "theek hai" and calls nothing. The
+        guest still said four.
+        """
+        session.merge(CONVERSATION, session.patch_from([], "Sorry, 4 log hain"))
+        assert profile(db)["adults"] == 4
+
+    def test_it_beats_a_forced_call_built_from_the_stale_session(self, db):
+        """
+        The case that actually bites. A forced tool's arguments come from the
+        session — which still says two — so without this the turn would write
+        the old number back over the guest's correction, and the session would
+        go backwards on the very turn they corrected it.
+        """
+        patch = session.patch_from(
+            [self._outcome("get_group_rates", "application", units=2, adults=2)],
+            "Sorry, 4 log hain",
+        )
+        assert patch["adults"] == 4
+        session.merge(CONVERSATION, patch)
+        assert profile(db)["adults"] == 4
+
+    def test_and_beats_the_model_own_arguments_too(self, db):
+        """
+        A model that misreads the count and calls a tool with the old one does
+        not get to overrule the sentence it misread.
+        """
+        patch = session.patch_from(
+            [self._outcome("get_stay_options", "model", units=2, adults=2)],
+            "Actually 3 kamre chahiye",
+        )
+        assert patch["units"] == 3
+
+    def test_and_the_price_derived_from_the_old_count_goes_with_it(self, db):
+        """
+        The two mechanisms composed, which is the whole point: the correction
+        arrives from the guest's words, and the graph drops what depended on it.
+        """
+        session.merge(CONVERSATION, session.patch_from([], "Sorry, 4 log hain"))
+        now = profile(db)
+        assert now["adults"] == 4
+        assert "quote_id" not in now
+
+    def test_a_message_that_states_nothing_changes_nothing(self, db):
+        """
+        Most turns are a question. This must not write on every one of them.
+        """
+        assert session.patch_from([], "Breakfast included hai?") == {}
+        assert session.patch_from([], "") == {}
+        assert session.patch_from([], None) == {}

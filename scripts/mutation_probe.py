@@ -138,6 +138,39 @@ MUTANTS = [
            "'human se baat karni hai' is answered by a machine",
            "tests/test_haggle_vocabulary.py"),
 
+    # ── the catalogue ───────────────────────────────────────────────────────
+    Mutant("catalogue", "the redundant-call instruction comes back",
+           "app/services/ai/tools/read.py",
+           '"rate plans that apply and an indicative total. This already includes "\n'
+           '        "availability — do NOT call search_availability first. For a firm "',
+           '"rate plans that apply and an indicative total. Use after "\n'
+           '        "search_availability when the guest asks what the options are. For a firm "',
+           "56% of the turns that reach get_stay_options pay for a preceding "
+           "call — ~5,000 tokens and 3.5s each",
+           "tests/test_tool_catalogue_audit.py"),
+    Mutant("catalogue", "a tool stops handing the model its display strings",
+           "app/services/ai/registry.py",
+           '    result = money.with_display(result)',
+           '    pass',
+           "the model formats paise itself again — the largest class of the 30 "
+           "guardrail-blocked production replies",
+           "tests/test_money_is_never_formatted_by_the_model.py"),
+
+    # ── conversation state ──────────────────────────────────────────────────
+    Mutant("state", "a correction stops invalidating what it derived",
+           "app/services/messaging/session.py",
+           '            changed = corrections(profile, patch)',
+           '            changed = set()',
+           "a quote priced for two rooms survives the guest saying three, and "
+           "goes into the next prompt",
+           "tests/test_corrections_invalidate.py"),
+    Mutant("state", "the guest's own words stop outranking tool arguments",
+           "app/services/messaging/session.py",
+           '        patch.update(required_actions.stated_facts(message))',
+           '        pass',
+           "\"actually 4 log hain\" lands only if some tool happened to carry it",
+           "tests/test_corrections_invalidate.py tests/test_conversation_corpus.py"),
+
     # ── the negotiation floor ───────────────────────────────────────────────
     Mutant("negotiation", "the approval ceiling stops being clamped",
            "app/services/pms/negotiation.py",
