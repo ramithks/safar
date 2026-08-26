@@ -97,6 +97,70 @@ async def start_instagram_connect(
     }
 
 
+@router.post("/properties/{property_id}/instagram/disconnect")
+@limiter.limit("20/hour")
+async def disconnect_instagram(
+    request: Request,
+    property_id: str,
+    member=Depends(require_member("agents")),
+):
+    """
+    Stop answering on this hotel's Instagram.
+
+    **The button existed and there was no route behind it.** `get_channels` has
+    always returned `action: "Disconnect"` on a connected row, and the Channels
+    screen rendered it — clicking it did nothing at all, because the client had
+    nowhere to send it and no other surface offered the act either. A hotel that
+    wanted to stop had to go and remove the app on instagram.com and wait for
+    Meta to call `/deauthorize`.
+
+    The credential is revoked first and the row marked second, in that order:
+    a row that says "disconnected" while a live token is still in the store is
+    an account we can still post to, which is the direction of this pair that
+    actually matters.
+
+    `agents`, matching connect — turning the hotel's Instagram off is an
+    owner's act, not a receptionist's.
+    """
+
+    def _disconnect() -> dict:
+        db = get_db()
+        rows = (
+            db.table("instagram_connections")
+            .select("instagram_account_id,credentials_ref,status")
+            .eq("property_id", property_id).limit(1).execute().data or []
+        )
+        if not rows:
+            return {"disconnected": False, "revoked": 0}
+        row = rows[0]
+
+        revoked = 0
+        if row.get("credentials_ref"):
+            revoked = 1 if store.revoke(
+                channel=CHANNEL, credentials_ref=row["credentials_ref"],
+            ) else 0
+        elif row.get("instagram_account_id"):
+            revoked = len(store.revoke_by_account(
+                channel=CHANNEL, external_account_id=row["instagram_account_id"],
+            ))
+
+        # `last_error` is cleared, not set. This was a deliberate act by the
+        # hotel, and a red "needs reconnecting" on a channel somebody switched
+        # off on purpose is the screen telling an owner their setup is broken.
+        (
+            db.table("instagram_connections")
+            .update({"status": "disconnected", "last_error": None})
+            .eq("property_id", property_id)
+            .execute()
+        )
+        return {"disconnected": True, "revoked": revoked}
+
+    result = await run_db(_disconnect)
+    logger.info("instagram disconnected: property=%s revoked=%s",
+                property_id, result.get("revoked"))
+    return result
+
+
 # ── callback ────────────────────────────────────────────────────────────────
 
 
@@ -239,6 +303,64 @@ class ChannelsOut(BaseModel):
     liveCount: int
 
 
+def instagram_row(connection: dict | None) -> ChannelOut:
+    """
+    What every surface says about this hotel's Instagram.
+
+    **Extracted because two screens used to disagree.** The Channels page read
+    this decision from the server; the Settings page rendered an unconditional
+    "Connect Instagram" button that queried nothing at all — so a hotel with
+    Instagram connected saw "Connected" on one screen and an invitation to
+    connect on the other, and refreshing never helped because the second screen
+    held no state to be stale. Both clients now read this one row through one
+    cached query (see `useChannel`), and this function is the only thing that
+    turns a connection into words.
+
+    Pure, and takes the row rather than a property id, so the mapping can be
+    asserted without a database — which is what makes "every state has a
+    defined answer" a test rather than an intention.
+    """
+    status = (connection or {}).get("status")
+
+    if connection and status == "connected" and not connection.get("is_sandbox"):
+        handle = connection.get("username")
+        return ChannelOut(
+            id="instagram", name="Instagram", state="connected",
+            headline=f"@{handle}" if handle else "Your Instagram account",
+            detail="Your AI employee answers Instagram messages.",
+            action="Disconnect",
+        )
+
+    if connection and status not in (None, "connected", "disconnected"):
+        return ChannelOut(
+            id="instagram", name="Instagram", state="action_needed",
+            headline="Needs reconnecting",
+            detail=connection.get("last_error")
+                   or "Instagram messages aren't reaching your AI employee. Reconnect to fix it.",
+            action="Reconnect",
+        )
+
+    # `disconnected` lands here rather than in the branch above.
+    #
+    # A hotel that pressed Disconnect has a row saying so, and reading that as
+    # "needs reconnecting" put an amber "Needs you" badge on a channel somebody
+    # had deliberately switched off — the screen telling an owner their setup is
+    # broken because they used it. What is offered is Connect, the true next
+    # step. A sandbox row lands here too: it is not a connection a guest's
+    # message can reach.
+    was_connected = bool(connection and status == "disconnected")
+    return ChannelOut(
+        id="instagram", name="Instagram", state="not_connected",
+        headline="Not connected",
+        detail=(
+            "Your AI employee has stopped answering here. Connect again whenever you like."
+            if was_connected
+            else "Connect the account guests already message you on."
+        ),
+        action="Connect Instagram",
+    )
+
+
 @router.get("/properties/{property_id}/channels", response_model=ChannelsOut)
 @limiter.limit("120/minute")
 async def get_channels(
@@ -328,30 +450,7 @@ async def get_channels(
         ))
 
     # ── Instagram ──
-    instagram = found["instagram"]
-    if instagram and instagram.get("status") == "connected" and not instagram.get("is_sandbox"):
-        handle = instagram.get("username")
-        channels.append(ChannelOut(
-            id="instagram", name="Instagram", state="connected",
-            headline=f"@{handle}" if handle else "Your Instagram account",
-            detail="Your AI employee answers Instagram messages.",
-            action="Disconnect",
-        ))
-    elif instagram and instagram.get("status") not in (None, "connected"):
-        channels.append(ChannelOut(
-            id="instagram", name="Instagram", state="action_needed",
-            headline="Needs reconnecting",
-            detail=instagram.get("last_error")
-                   or "Instagram messages aren't reaching your AI employee. Reconnect to fix it.",
-            action="Reconnect",
-        ))
-    else:
-        channels.append(ChannelOut(
-            id="instagram", name="Instagram", state="not_connected",
-            headline="Not connected",
-            detail="Connect the account guests already message you on.",
-            action="Connect Instagram",
-        ))
+    channels.append(instagram_row(found["instagram"]))
 
     # ── Google Business Profile ──
     #

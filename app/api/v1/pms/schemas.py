@@ -1977,6 +1977,22 @@ class WebsiteConfigOut(BaseModel):
     contactPhone: str | None = None
     contactEmail: str | None = None
     sections: list[dict] = []
+    # ── the bands a website has that a form did not ─────────────────────────
+    #
+    # Each of these was already derivable from rows this hotel had filled in —
+    # a check-in time, a cancellation ladder, a meal option — and none of them
+    # had anywhere to live, so the builder asked a hotelier to retype facts the
+    # PMS already held. They are stored in the same `draft` jsonb as the rest;
+    # no column was added for any of them.
+    highlights: list[dict] = []
+    faq: list[dict] = []
+    offers: list[dict] = []
+    seo: dict = {}
+    design: dict = {}
+    # When the site was last composed from the hotel's own records. Null for a
+    # site nobody has generated, which is what the builder reads to decide
+    # between "Build my website" and "Rebuild from your latest data".
+    generatedAt: datetime | None = None
     # Names the server did not recognise on the request that produced this
     # response. Empty on every read and on every correct save, so a client can
     # surface it without checking what kind of call it made. See
@@ -2052,6 +2068,66 @@ class WebsiteUpdateRequest(BaseModel):
     contactPhone: str | None = Field(default=None, max_length=32)
     contactEmail: str | None = Field(default=None, max_length=200)
     sections: list[dict] | None = None
+    # Lists of small objects, shaped and truncated by `website._normalise`
+    # rather than here: this model decides what may be *sent*, that function
+    # decides what may be *stored*, and the second is the one the public page
+    # reads. Typed loosely on purpose so a builder one version ahead does not
+    # get a 422 for a key the storage layer would have dropped anyway.
+    highlights: list[dict] | None = None
+    faq: list[dict] | None = None
+    offers: list[dict] | None = None
+    seo: dict | None = None
+    design: dict | None = None
+
+
+class WebsiteInventoryOut(BaseModel):
+    """
+    What a generate would be built from, before it runs.
+
+    Counts of rows rather than a completeness score: a hotelier about to press
+    a button that rewrites their home page is asking "built from what?", and
+    "8 room types, 42 photographs" answers that where "83% ready" answers a
+    different question. `thin` names the two or three absences that visibly
+    thin the result, so the screen can say so before rather than after.
+    """
+    hotelName: str = ""
+    city: str | None = None
+    roomTypes: int = 0
+    rooms: int = 0
+    photos: int = 0
+    roomPhotos: int = 0
+    galleryPhotos: int = 0
+    amenities: int = 0
+    rates: int = 0
+    fromPricePaise: int | None = None
+    services: int = 0
+    experiences: int = 0
+    meals: int = 0
+    hasAddress: bool = False
+    hasMap: bool = False
+    hasContact: bool = False
+    hasStory: bool = False
+    thin: list[str] = []
+
+
+class WebsiteGenerateRequest(BaseModel):
+    """
+    `force` throws away edits. It is the "start again" behind a confirmation,
+    never the default: a generate that silently replaced the sentence somebody
+    wrote about their own hotel is a feature nobody presses twice.
+    """
+    force: bool = False
+
+
+class WebsiteRewriteRequest(BaseModel):
+    """One field, one style. The text is sent back rather than saved."""
+    field: str = Field(max_length=40)
+    text: str = Field(max_length=2000)
+    tone: str = Field(max_length=32)
+
+
+class WebsiteRewriteOut(BaseModel):
+    text: str
 
 
 class CreditOrderRequest(BaseModel):
