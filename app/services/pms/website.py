@@ -31,17 +31,76 @@ from app.services.pms import seo_ping
 
 logger = logging.getLogger(__name__)
 
+# The looks a hotel can choose between.
+#
+# `minimal` and `heritage` were added with the visual template picker: the eight
+# original names are property *types* as much as designs, and an owner choosing
+# between "Homestay" and "Hostel" is being asked what their hotel is rather than
+# what they want their page to look like. The database CHECK constraint carries
+# the same list — see the migration named for this.
 TEMPLATES = (
-    "boutique", "resort", "luxury", "homestay",
-    "hostel", "business", "beach", "mountain",
+    "boutique", "resort", "luxury", "homestay", "hostel",
+    "business", "beach", "mountain", "minimal", "heritage",
 )
 
 # The sections a template can switch on. Closed, because a section nobody has
 # drawn renders as an empty band down the middle of a hotel's home page.
+#
+# Six were added when the builder became a website builder rather than a form:
+# a trust strip under the hero, the hotel's own story, what there is to do, the
+# questions guests actually ask, and the reviews — each of which existed as
+# data this service already had and as a band the page did not draw.
 SECTIONS = (
-    "hero", "rooms", "amenities", "gallery",
-    "location", "policies", "offers", "contact",
+    "hero", "highlights", "rooms", "about", "amenities", "gallery",
+    "experiences", "offers", "location", "reviews", "faq", "policies", "contact",
 )
+
+# Whether a section a draft has never heard of arrives switched on.
+#
+# **On, every one of them.** A section only draws when it has something in it —
+# that rule lives in the renderer and in `compose`, which never fills a band it
+# has no facts for — so "enabled" means "show this if there is something to
+# show" rather than "reserve a stripe of white space". The alternative, adding
+# them switched off, means a hotel that generates a site gets a page missing
+# the sections that were the reason to regenerate it, and no way to discover
+# they exist short of reading a toggle list.
+SECTION_DEFAULTS: dict[str, bool] = {s: True for s in SECTIONS}
+
+
+def sections_for(draft: dict) -> list[dict]:
+    """
+    The closed section list, whatever the stored row happens to hold.
+
+    Rows written before a section existed simply do not mention it, and a
+    builder rendering `draft["sections"]` verbatim would offer eight toggles on
+    an old row and thirteen on a new one. Projected through the defaults here
+    so every reader — builder, preview, public page — sees one list in one
+    order.
+    """
+    stored = {
+        s.get("id"): bool(s.get("enabled"))
+        for s in (draft.get("sections") or [])
+        if isinstance(s, dict)
+    }
+    return [
+        {"id": s, "enabled": stored.get(s, SECTION_DEFAULTS[s])} for s in SECTIONS
+    ]
+
+
+# What a highlight strip may say. Closed, because each key is an icon the page
+# draws, and an unknown one is a blank square beside a promise.
+HIGHLIGHT_ICONS = (
+    "rate", "wifi", "breakfast", "parking", "reception", "pool", "ac",
+    "restaurant", "pets", "cancellation", "family", "view",
+)
+
+# How the type is set and how a button is shaped. Three small closed
+# vocabularies rather than a stylesheet: an owner picking "Editorial" is making
+# a choice a designer already made, and a free-text font name is a page that
+# renders in Times New Roman on somebody else's laptop.
+FONTS = ("modern", "editorial", "grotesk", "classic")
+BUTTON_STYLES = ("rounded", "pill", "square")
+LAYOUTS = ("standard", "wide", "compact")
 
 
 # What a photograph can be of.
@@ -144,10 +203,14 @@ def default_draft(property_name: str, city: str | None) -> dict:
         "heroImageUrl": None,
         "gallery": [],
         "amenities": [],
+        "highlights": [],
+        "faq": [],
+        "offers": [],
+        "seo": {},
+        "design": {"font": "modern", "buttons": "rounded", "layout": "standard"},
         "contactPhone": None,
         "contactEmail": None,
-        "sections": [{"id": s, "enabled": s in ("hero", "rooms", "contact")}
-                     for s in SECTIONS],
+        "sections": [{"id": s, "enabled": SECTION_DEFAULTS[s]} for s in SECTIONS],
     }
 
 
@@ -186,9 +249,86 @@ def _normalise(draft: dict, existing: dict) -> dict:
             s.get("id"): bool(s.get("enabled"))
             for s in draft["sections"] if isinstance(s, dict)
         }
+        # A section the *client* did not mention keeps what it had, and only
+        # falls back to the default when the row has never held it either.
+        #
+        # It used to fall to `False`, which meant an older builder — one that
+        # knows eight section ids — saving a headline would silently switch off
+        # the five it has never heard of, and the hotel's FAQ would vanish from
+        # a live page because somebody edited a sentence in an old tab.
+        current = {s["id"]: s["enabled"] for s in sections_for(existing or {})}
         out["sections"] = [
-            {"id": s, "enabled": wanted.get(s, False)} for s in SECTIONS
+            {"id": s, "enabled": wanted.get(s, current.get(s, SECTION_DEFAULTS[s]))}
+            for s in SECTIONS
         ]
+
+    # ── the bands the builder fills in ───────────────────────────────────────
+    #
+    # Each of these is a list of small objects rather than prose, for the same
+    # reason the rest of this file is an allow-list: they are rendered onto a
+    # page a guest reads, so what may appear in them is decided here and not by
+    # whatever arrived.
+    if "highlights" in draft and isinstance(draft["highlights"], list):
+        out["highlights"] = [
+            {
+                "icon": item.get("icon") if item.get("icon") in HIGHLIGHT_ICONS else "rate",
+                "label": str(item.get("label") or "")[:60],
+            }
+            for item in draft["highlights"][:6]
+            if isinstance(item, dict) and str(item.get("label") or "").strip()
+        ]
+    if "faq" in draft and isinstance(draft["faq"], list):
+        out["faq"] = [
+            {"q": str(item.get("q") or "")[:200], "a": str(item.get("a") or "")[:1000]}
+            for item in draft["faq"][:12]
+            if isinstance(item, dict)
+            and str(item.get("q") or "").strip()
+            and str(item.get("a") or "").strip()
+        ]
+    if "offers" in draft and isinstance(draft["offers"], list):
+        out["offers"] = [
+            {
+                "title": str(item.get("title") or "")[:80],
+                "detail": str(item.get("detail") or "")[:300],
+                "terms": str(item["terms"])[:300] if item.get("terms") else None,
+            }
+            for item in draft["offers"][:6]
+            if isinstance(item, dict) and str(item.get("title") or "").strip()
+        ]
+    if "seo" in draft and isinstance(draft["seo"], dict):
+        # Cut to what a search result actually shows. A 300-character meta
+        # description is not a longer snippet, it is the same snippet with an
+        # ellipsis and a hotelier who thinks they wrote the second half.
+        out["seo"] = {
+            "title": str(draft["seo"].get("title") or "")[:70],
+            "description": str(draft["seo"].get("description") or "")[:180],
+        }
+    if "design" in draft and isinstance(draft["design"], dict):
+        design = draft["design"]
+        out["design"] = {
+            "font": design.get("font") if design.get("font") in FONTS else "modern",
+            "buttons": (
+                design.get("buttons") if design.get("buttons") in BUTTON_STYLES else "rounded"
+            ),
+            "layout": design.get("layout") if design.get("layout") in LAYOUTS else "standard",
+        }
+
+    # **Editing a field takes it away from the generator.**
+    #
+    # `generatedFields` is the list of things `website_compose` wrote itself,
+    # and the only thing it is allowed to write over next time. The moment a
+    # hotelier saves their own headline, the name leaves the list here — so
+    # pressing Generate again after uploading six photographs rebuilds the
+    # gallery and the highlights and leaves the sentence they wrote alone.
+    #
+    # Done in `_normalise` rather than in the endpoint because this is the one
+    # function every draft write passes through, and a second path that forgot
+    # would silently reclaim a hotelier's words.
+    claimed = set(out.get("generatedFields") or [])
+    if claimed:
+        edited = {k for k in draft if k in claimed}
+        if edited:
+            out["generatedFields"] = sorted(claimed - edited)
     return out
 
 
@@ -294,6 +434,70 @@ def _save(property_id: str, template: str | None, draft: dict) -> dict:
             "property_slug": row.get("property_slug")}
 
 
+def _save_composed(property_id: str, template: str | None, draft: dict) -> dict:
+    """
+    Write a draft this server composed.
+
+    Deliberately not routed through `_normalise`: that function is the door a
+    *client* comes through, and the two keys it does not accept —
+    `generatedAt` and `generatedFields` — are precisely the ones a client must
+    never set, because they decide what the next generate is allowed to
+    overwrite. What is written here was built by `website_compose` from rows in
+    this database, on top of a draft that had already been normalised.
+    """
+    row = _ensure(property_id)
+    patch: dict = {"draft": draft}
+    if template:
+        patch["template"] = template
+    updated = (
+        get_db().table("hotel_websites").update(patch)
+        .eq("property_id", property_id).execute().data or []
+    )
+    return {**(updated[0] if updated else row),
+            "property_slug": row.get("property_slug")}
+
+
+async def generate(property_id: str, *, force: bool = False) -> dict:
+    """
+    Build this hotel's site from this hotel's records, and save it as the draft.
+
+    **A draft, never a publish.** The generate button is not a publish button:
+    an owner presses it to see what their page would look like, and a page that
+    went live because they were curious is the single worst thing this feature
+    could do.
+    """
+    # Imported here rather than at module scope: the composer imports this
+    # module for its section list and its gallery normaliser, and a top-level
+    # import in both directions is a cycle.
+    from app.services.pms import website_compose
+
+    found = await website_compose.facts(property_id)
+    if not found:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
+
+    row = _read(property_id) or {}
+    template = website_compose.template_for(found, row.get("template"))
+    draft = website_compose.compose(found, force=force)
+
+    # An accent colour only when the hotel has never had one — a template
+    # suggestion should not repaint a page somebody has already coloured.
+    if template and not (draft.get("accentColor") or "").strip():
+        draft["accentColor"] = website_compose.accent_for(template)
+
+    saved = await run_db(_save_composed, property_id, template, draft)
+    return saved
+
+
+async def inventory(property_id: str) -> dict:
+    """What a generate would be built from, counted, before it runs."""
+    from app.services.pms import website_compose
+
+    found = await website_compose.facts(property_id)
+    if not found:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
+    return website_compose.inventory(found)
+
+
 async def save_draft(property_id: str, *, template: str | None, draft: dict) -> dict:
     if template and template not in TEMPLATES:
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
@@ -397,7 +601,22 @@ def project(row: dict, *, slug: str | None = None) -> dict:
         "amenities": draft.get("amenities") or [],
         "contactPhone": draft.get("contactPhone"),
         "contactEmail": draft.get("contactEmail"),
-        "sections": draft.get("sections") or [],
+        # Projected through the closed list rather than returned verbatim, so a
+        # row written before a section existed does not hand the builder a
+        # shorter list of toggles than the one it draws. See `sections_for`.
+        "sections": sections_for(draft),
+        "highlights": draft.get("highlights") or [],
+        "faq": draft.get("faq") or [],
+        "offers": draft.get("offers") or [],
+        "seo": draft.get("seo") or {},
+        "design": draft.get("design") or {
+            "font": "modern", "buttons": "rounded", "layout": "standard",
+        },
+        # When this site was last composed from the hotel's own records. What
+        # it drives is one sentence in the builder — "built from your rooms and
+        # photos on 26 August" — which is the difference between a page an
+        # owner trusts and one they assume is a demo.
+        "generatedAt": draft.get("generatedAt"),
         "publishedAt": row.get("published_at"),
         # The claim and its state, so the builder can render the setup steps
         # without a second round trip. The DNS lookup is not done here — that

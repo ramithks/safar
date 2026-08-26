@@ -110,6 +110,10 @@ from app.api.v1.pms.schemas import (
     WebChatOpenerOut,
     WebChatOut,
     WebsiteConfigOut,
+    WebsiteGenerateRequest,
+    WebsiteInventoryOut,
+    WebsiteRewriteOut,
+    WebsiteRewriteRequest,
     PlanStateOut,
     CreditsSummaryOut,
     CouponPreviewOut,
@@ -198,6 +202,7 @@ from app.services.pms import webhook_log
 from app.services.messaging import web_chat
 from app.services.pms import sync as sync_service
 from app.services.pms import website as website_service
+from app.services.pms import website_rewrite
 from app.services.pms import domains as domains_service
 from app.services import razorpay
 from app.config import settings
@@ -4911,6 +4916,79 @@ async def update_website(
         ),
     )
     return {**website_service.project(row), "ignoredFields": ignored}
+
+
+@router.get("/properties/{property_id}/website/inventory", response_model=WebsiteInventoryOut)
+@limiter.limit("60/minute")
+async def get_website_inventory(
+    request: Request, property_id: str, member=Depends(require_member("rates")),
+):
+    """
+    What HostOS already knows about this hotel.
+
+    Read before generating, and shown as the counts themselves — "8 room types,
+    42 photographs, current rates" — because the argument this product is
+    making is that the website is already there in the operational data. A
+    percentage would make the same screen into a chore list.
+    """
+    return await website_service.inventory(property_id)
+
+
+@router.post("/properties/{property_id}/website/generate", response_model=WebsiteConfigOut)
+@limiter.limit("20/minute")
+async def generate_website(
+    request: Request,
+    property_id: str,
+    body: WebsiteGenerateRequest | None = None,
+    member=Depends(require_member("rates")),
+):
+    """
+    Build the site from this hotel's own records, and save it as the **draft**.
+
+    **Not a publish.** An owner presses this to see what their page would look
+    like; a page that went live because somebody was curious is the worst thing
+    this button could do. `/publish` stays a separate, deliberate act.
+
+    **Composed, not written by a model.** See `services/pms/website_compose` —
+    every sentence is a template filled from a column somebody typed into their
+    own dashboard, because an invented amenity on a hotel's own website is a
+    promise the hotel then has to keep. The model is allowed at
+    `/website/rewrite`, and only over words that already exist.
+
+    Pressing it twice is safe: a field the hotelier has since edited is no
+    longer the generator's to overwrite. `force` is the "start again" behind a
+    confirmation.
+    """
+    row = await website_service.generate(property_id, force=bool(body and body.force))
+    return {
+        **website_service.project(row),
+        **await website_service.direct_30d(property_id),
+    }
+
+
+@router.post("/properties/{property_id}/website/rewrite", response_model=WebsiteRewriteOut)
+@limiter.limit("30/minute")
+async def rewrite_website_text(
+    request: Request,
+    property_id: str,
+    body: WebsiteRewriteRequest,
+    member=Depends(require_member("rates")),
+):
+    """
+    Rephrase one piece of the hotel's own copy.
+
+    Returns the candidate; it is saved only when the owner presses Save, the
+    same as text they typed. A rewrite that would state a fact the original did
+    not — a price, a pool, a rating — is refused with a 422 and the owner keeps
+    what they had. See `services/pms/website_rewrite` for the gates.
+    """
+    prop = (await run_db(website_service._property, property_id)) or {}
+    return WebsiteRewriteOut(
+        text=await website_rewrite.rewrite(
+            text=body.text, tone=body.tone, field=body.field,
+            hotel=prop.get("name") or "this hotel",
+        ),
+    )
 
 
 @router.post("/properties/{property_id}/website/publish", response_model=WebsiteConfigOut)
