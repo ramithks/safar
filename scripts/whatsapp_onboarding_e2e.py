@@ -448,10 +448,25 @@ check("an errored row asks for a reconnect",
 check("a claimed-but-unfinished row is its own state",
       whatsapp_row({"status": "pending", "is_sandbox": False},
                    onboarding_enabled=True).action == "Finish connecting")
-check("with the flag off, nothing is offered that cannot be done",
+check("with onboarding unconfigured, nothing is offered that cannot be done",
       whatsapp_row(None, onboarding_enabled=False).state == "coming_soon")
-check("with the flag on, it can be connected",
+check("once it is configured, it can be connected",
       whatsapp_row(None, onboarding_enabled=True).action == "Connect WhatsApp")
+
+# **The half-configured case, which is the one a deploy actually produces.**
+# `is_configured()` is the flag AND the app id AND the app secret AND the
+# configuration id. Setting the flag first — the natural order, because it is
+# the line that reads like the switch — must not put a Connect button in front
+# of a hotel while `/whatsapp/start` still 503s.
+from app.config import settings as _settings  # noqa: E402
+
+_before = (_settings.whatsapp_onboarding_enabled, _settings.whatsapp_config_id)
+_settings.whatsapp_onboarding_enabled, _settings.whatsapp_config_id = True, None
+check("**the flag alone does not offer a Connect button that would 503**",
+      onboarding.is_configured() is False
+      and whatsapp_row(None, onboarding_enabled=onboarding.is_configured()).state
+          == "coming_soon")
+_settings.whatsapp_onboarding_enabled, _settings.whatsapp_config_id = _before
 
 print("\n── nothing reached Meta ──────────────────────────────────────────────")
 

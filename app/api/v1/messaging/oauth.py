@@ -40,6 +40,7 @@ from app.deps.property import require_member
 from app.services.messaging import store
 from app.services.messaging.crypto import CredentialCryptoError
 from app.services.messaging.instagram import oauth as ig_oauth
+from app.services.messaging.whatsapp import onboarding as wa_onboarding
 
 logger = logging.getLogger(__name__)
 
@@ -424,6 +425,11 @@ def whatsapp_row(connection: dict | None, *, onboarding_enabled: bool) -> Channe
     # absent: WhatsApp is the first thing an Indian hotelier asks about, and a
     # missing row reads as "never" while a Connect button that 503s reads as
     # "broken".
+    #
+    # The caller passes `onboarding.is_configured()`, which is all four of the
+    # flag, the app id, the app secret and the configuration id — not the flag
+    # on its own. A half-configured deployment lands here and says "soon",
+    # which is true.
     if not onboarding_enabled:
         return ChannelOut(
             id="whatsapp", name="WhatsApp", state="coming_soon",
@@ -551,9 +557,15 @@ async def get_channels(
     #
     # Above Google and above the "not yet" rows, because it is the channel an
     # Indian hotelier asks about first.
+    # `is_configured()`, not the bare flag. The flag alone is not enough to
+    # connect a hotel — Embedded Signup also needs the app id, the app secret
+    # and the configuration id — and a screen that reads only the flag offers a
+    # Connect button that 503s the moment somebody switches onboarding on before
+    # pasting the configuration id. Which is exactly the order a deploy happens
+    # in. The endpoint has always checked all four; this makes the screen agree.
     channels.append(whatsapp_row(
         found["whatsapp"],
-        onboarding_enabled=settings.whatsapp_onboarding_enabled,
+        onboarding_enabled=wa_onboarding.is_configured(),
     ))
 
     # ── Google Business Profile ──

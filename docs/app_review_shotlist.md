@@ -60,11 +60,28 @@ just connected presses it to check its number works. It sends one WhatsApp
 message from the hotel's own number and prints the API call and Meta's reply on
 screen — which is exactly what Meta means by embedding the cURL into your site.
 
-**⚠ Route A needs a deploy first.** The card is new. `api.hostos.in` and
-`app.hostos.in` are still running the code from before this work, so the button
-is not on the live Settings page yet. Either deploy both, or record against a
-local backend — a hotelier pressing a button in your app is what the reviewer is
-grading, not which host served it.
+**⚠ The card is new, so the live site does not have it yet.** `api.hostos.in`
+and `app.hostos.in` are still running the code from before this work. Two ways
+round it, and the quick one is fine:
+
+*Record locally* (no deploy, ~2 minutes to set up). The reviewer is grading a
+person pressing a button in your app and the message arriving — not which host
+served the page.
+
+```
+# terminal 1 — the backend
+cd travbuddy_backend
+set -a; . ./.env.hotelos; set +a
+./venv/bin/uvicorn app.main:app --port 8000
+
+# terminal 2 — the app
+cd Travbuddy_supply_os
+npm run dev            # http://localhost:5173, already points at :8000
+```
+
+*Or deploy* both repos first, and record against `app.hostos.in`. Unambiguous,
+and you need the deploy for real hotels anyway — but it is not required for the
+video.
 
 Log in as **`owner@anandihouse.demo`**. That is the hotel that owns the real
 verified number (+91 93184 79690, "Travbuddy"); Casa Mandala and the other seed
@@ -185,6 +202,36 @@ videos while it propagates.
       it locks its name for 30 days, and you may need to record again.
 - [ ] Check the API test calls have landed in the submission form before
       submitting. Meta says up to 24 hours.
+
+---
+
+## Submitting
+
+App Dashboard → **App Review → Permissions and Features**.
+
+1. Find **`whatsapp_business_messaging`** and **`whatsapp_business_management`**
+   and request **Advanced Access** on each. That builds one submission
+   containing both.
+2. For each permission you are asked how your app uses it and for step-by-step
+   instructions a reviewer could follow. Keep it plain and concrete:
+   - *messaging* — "Hotels connect their own WhatsApp number. Guest messages
+     reach our AI front desk, which answers with the hotel's own rooms, rates
+     and policies, and hands anything unusual to staff. We send booking
+     confirmations, check-in links and pre-arrival details."
+   - *management* — "We create and manage message templates on each hotel's own
+     WhatsApp Business Account on their behalf, and track approval status, so a
+     hotel does not have to author WhatsApp templates itself."
+3. Attach the video to the matching permission. **Do not attach the same file
+   twice** — Meta asks for a separate, unique video per permission and rejects
+   duplicates.
+4. Check the API test calls have registered before you submit. Meta says up to
+   24 hours.
+5. Submit, and expect a few working days. If something is refused, the reply
+   names the permission — re-record only that one.
+
+**Before you press submit**, confirm all of: business verification complete;
+app icon, Privacy Policy URL and category set; both videos attached to the right
+permissions; test calls showing.
 
 ---
 
