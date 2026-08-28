@@ -390,6 +390,63 @@ twice = (db.table("whatsapp_onboardings").select("id").eq("waba_id", WABA)
 check("a hotel that completes the link twice produces one claimable row",
       len(twice) == 1, len(twice))
 
+print("\n── claiming an unattributed arrival ──────────────────────────────────")
+
+# The Meta-hosted arrival above is still unclaimed and carries no partner. This
+# is the path the claim screen drives, and what matters is what it refuses.
+# Casa Mandala's partner — genuinely a different one from this suite's, which
+# runs on "Somewhere Else". Writing the suite's own partner id here made
+# "another partner" the same partner and the assertion passed for no reason;
+# the check below caught it, which is the whole argument for having it.
+OTHER_PARTNER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+assert OTHER_PARTNER != PARTNER, "the negative case needs a genuinely different partner"
+
+unclaimed = (db.table("whatsapp_onboardings").select("id,waba_id,partner_id,status")
+               .eq("waba_id", WABA).limit(1).execute().data or [{}])[0]
+check("the arrival is unclaimed and belongs to nobody",
+      unclaimed.get("status") == "unclaimed" and not unclaimed.get("partner_id"),
+      unclaimed)
+
+# **The hole this design exists to close.** A uuid is guessable in a way a WABA
+# id read off somebody's own WhatsApp Manager is not, so an arrival nobody has
+# proved they own must not be claimable by id alone.
+refused = routes.claim_arrival(
+    routes.ClaimIn(onboardingId=str(unclaimed["id"])), PARTNER, PROPERTY)
+check("**an unattributed arrival is refused when named only by its uuid**",
+      refused.get("claimed") is False and refused.get("reason") == "not_yours", refused)
+
+wrong = routes.claim_arrival(routes.ClaimIn(wabaId="999999999999999"), PARTNER, PROPERTY)
+check("a WABA id we have never heard of is refused",
+      wrong.get("claimed") is False and wrong.get("reason") == "not_found", wrong)
+
+# Typing the WABA id is the proof, and it survives being read off a screen.
+ok = routes.claim_arrival(routes.ClaimIn(wabaId=f" {WABA[:4]} {WABA[4:]} "), PARTNER, PROPERTY)
+check("typing the WABA id attaches it, spaces and all",
+      ok.get("claimed") is True and ok.get("wabaId") == WABA, ok)
+
+attached = (db.table("whatsapp_connections")
+              .select("property_id,partner_id,status,credentials_ref,is_sandbox,last_error")
+              .eq("waba_id", WABA).limit(1).execute().data or [{}])[0]
+check("it lands on the hotel that claimed it",
+      str(attached.get("property_id")) == PROPERTY, attached.get("property_id"))
+check("**as `pending`, not `connected` — there is no token yet**",
+      attached.get("status") == "pending", attached.get("status"))
+check("and it says what is still needed", bool(attached.get("last_error")))
+check("it is not a sandbox row", attached.get("is_sandbox") is False)
+
+again = routes.claim_arrival(routes.ClaimIn(wabaId=WABA), PARTNER, PROPERTY)
+check("claiming the same arrival twice is refused",
+      again.get("claimed") is False and again.get("reason") == "not_found", again)
+
+# Put it back to unclaimed and prove another partner cannot take it.
+db.table("whatsapp_onboardings").update({"status": "unclaimed", "property_id": None}) \
+  .eq("waba_id", WABA).execute()
+db.table("whatsapp_connections").delete().eq("waba_id", WABA).execute()
+db.table("whatsapp_onboardings").update({"partner_id": PARTNER}).eq("waba_id", WABA).execute()
+stolen = routes.claim_arrival(routes.ClaimIn(wabaId=WABA), OTHER_PARTNER, PROPERTY)
+check("**a partner cannot claim an arrival that belongs to another**",
+      stolen.get("claimed") is False and stolen.get("reason") == "not_yours", stolen)
+
 print("\n── disconnect, and the order it happens in ───────────────────────────")
 
 db.table("whatsapp_onboardings").delete().eq("waba_id", WABA).execute()

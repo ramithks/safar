@@ -63,6 +63,9 @@ class StartOut(BaseModel):
     configId: str
     state: str
     graphVersion: str
+    # Which Embedded Signup variant to run. Must match the configuration —
+    # see `settings.whatsapp_signup_feature_type`.
+    featureType: str = ""
     # Null unless a Meta-hosted landing page is configured. The PWA offers it as
     # "send this hotel a link instead" — the sales-led path.
     metaHostedUrl: str | None = None
@@ -81,7 +84,23 @@ class FinishIn(BaseModel):
 
 
 class ClaimIn(BaseModel):
-    onboardingId: str
+    """
+    Which arrival to attach, named one of two ways.
+
+    `onboardingId` is for a row this partner *started* — we issued the link, so
+    the row already carries their partner id and `/claimable` can list it.
+
+    `wabaId` is for the harder case, and the one the Meta-hosted link actually
+    produces: a completion that arrives with nothing but Meta's ids on it. There
+    is no list to pick from, deliberately — enumerating unattributed arrivals
+    would show every hotel that had just onboarded, and claiming one is claiming
+    their guests. Instead the owner types the WhatsApp Business Account ID from
+    their own WhatsApp Manager, which is a thing only somebody with access to
+    that account can read off a screen.
+    """
+
+    onboardingId: str | None = None
+    wabaId: str | None = None
 
 
 class TestMessageIn(BaseModel):
@@ -171,6 +190,7 @@ async def start_whatsapp_connect(
         configId=str(settings.whatsapp_config_id),
         state=signed,
         graphVersion=settings.whatsapp_api_base.rstrip("/").rsplit("/", 1)[-1],
+        featureType=settings.whatsapp_signup_feature_type,
         metaHostedUrl=onboarding.meta_hosted_url(nonce),
         onboardingId=str(row.get("id") or ""),
     )
@@ -483,6 +503,80 @@ async def disconnect_whatsapp(
 # ── the Meta-hosted path ────────────────────────────────────────────────────
 
 
+def claim_arrival(body: "ClaimIn", partner_id: str, property_id: str) -> dict:
+    """
+    Attach one unclaimed arrival to a hotel.
+
+    **Module level rather than a closure so the refusals can be tested.** The
+    interesting behaviour here is entirely what it says no to — an arrival that
+    belongs to another partner, one already attached, one named only by a uuid
+    somebody could walk — and a rule that only exists inside a request handler
+    is a rule with no test.
+    """
+    db = get_db()
+    query = (
+        db.table("whatsapp_onboardings")
+        .select("id,waba_id,owner_business_id,phone_number_id,status,partner_id")
+        .eq("status", "unclaimed")
+    )
+    if body.onboardingId:
+        query = query.eq("id", body.onboardingId)
+    else:
+        # Digits only. A WABA id read off a screen arrives with spaces in it
+        # about half the time.
+        query = query.eq("waba_id", "".join(c for c in body.wabaId if c.isdigit()))
+
+    rows = query.limit(1).execute().data or []
+    if not rows:
+        return {"claimed": False, "reason": "not_found"}
+    row = rows[0]
+
+    # A row that names a partner belongs to that partner and nobody else.
+    # A row that names none is an unattributed Meta-hosted arrival, and the
+    # WABA id the caller typed is what stands in for proof — which is why
+    # that path is not reachable by `onboardingId`, a value they could
+    # otherwise guess by walking uuids.
+    owner = str(row.get("partner_id") or "")
+    if owner and owner != partner_id:
+        return {"claimed": False, "reason": "not_yours"}
+    if not owner and not body.wabaId:
+        return {"claimed": False, "reason": "not_yours"}
+
+    taken = (
+        db.table("whatsapp_connections").select("property_id")
+        .eq("waba_id", row["waba_id"]).limit(1).execute().data or []
+    )
+    if taken and str(taken[0]["property_id"]) != property_id:
+        return {"claimed": False, "reason": "waba_taken"}
+
+    db.table("whatsapp_connections").upsert({
+        "property_id": property_id,
+        "partner_id": partner_id,
+        "phone_number_id": row.get("phone_number_id") or f"pending:{row['waba_id']}",
+        "waba_id": row["waba_id"],
+        "business_id": row.get("owner_business_id"),
+        "solution_id": settings.whatsapp_solution_id,
+        "credentials_ref": store.ref_for_property(property_id),
+        # `pending`, not `connected`. There is no token yet, and a row that
+        # claims otherwise is a hotel told it is live while every send
+        # raises CHANNEL_NOT_CONFIGURED.
+        "status": "pending",
+        "is_sandbox": False,
+        "onboarding_id": row["id"],
+        "last_error": "Almost there — finish connecting from this screen to "
+                      "start answering guests.",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }, on_conflict="property_id").execute()
+
+    db.table("whatsapp_onboardings").update({
+        "status": "completed", "property_id": property_id,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", row["id"]).execute()
+
+    return {"claimed": True, "wabaId": row["waba_id"]}
+
+
 @router.get("/properties/{property_id}/whatsapp/claimable")
 @limiter.limit("60/minute")
 async def claimable_accounts(
@@ -551,56 +645,10 @@ async def claim_account(
     one WABA is an ambiguity that must be impossible rather than resolved at
     read time.
     """
-    def _claim() -> dict:
-        db = get_db()
-        rows = (
-            db.table("whatsapp_onboardings")
-            .select("id,waba_id,owner_business_id,phone_number_id,status,partner_id")
-            .eq("id", body.onboardingId).limit(1).execute().data or []
-        )
-        if not rows:
-            return {"claimed": False, "reason": "not_found"}
-        row = rows[0]
-        if row.get("status") != "unclaimed":
-            return {"claimed": False, "reason": "already_claimed"}
-        if str(row.get("partner_id") or "") != str(member.partner_id):
-            return {"claimed": False, "reason": "not_yours"}
+    if not body.onboardingId and not body.wabaId:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "nothing_named")
 
-        taken = (
-            db.table("whatsapp_connections").select("property_id")
-            .eq("waba_id", row["waba_id"]).limit(1).execute().data or []
-        )
-        if taken and str(taken[0]["property_id"]) != property_id:
-            return {"claimed": False, "reason": "waba_taken"}
-
-        db.table("whatsapp_connections").upsert({
-            "property_id": property_id,
-            "partner_id": str(member.partner_id),
-            "phone_number_id": row.get("phone_number_id") or f"pending:{row['waba_id']}",
-            "waba_id": row["waba_id"],
-            "business_id": row.get("owner_business_id"),
-            "solution_id": settings.whatsapp_solution_id,
-            "credentials_ref": store.ref_for_property(property_id),
-            # `pending`, not `connected`. There is no token yet, and a row that
-            # claims otherwise is a hotel told it is live while every send
-            # raises CHANNEL_NOT_CONFIGURED.
-            "status": "pending",
-            "is_sandbox": False,
-            "onboarding_id": row["id"],
-            "last_error": "Almost there — finish connecting from this screen to "
-                          "start answering guests.",
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="property_id").execute()
-
-        db.table("whatsapp_onboardings").update({
-            "status": "completed", "property_id": property_id,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }).eq("id", row["id"]).execute()
-
-        return {"claimed": True, "wabaId": row["waba_id"]}
-
-    result = await run_db(_claim)
+    result = await run_db(claim_arrival, body, str(member.partner_id), property_id)
     if not result.get("claimed"):
         raise HTTPException(status.HTTP_409_CONFLICT, result.get("reason", "could_not_claim"))
     logger.info("whatsapp account claimed: property=%s waba=%s",

@@ -217,6 +217,20 @@ class Settings(BaseSettings):
     # need and never creates a WABA.
     whatsapp_config_id: Optional[str] = None
 
+    # Which Embedded Signup variant the popup should run, and it must match the
+    # configuration named above.
+    #
+    #   ""                              a business getting a new number
+    #   "whatsapp_business_app_onboarding"
+    #                                   a business already using the WhatsApp
+    #                                   Business App, migrating that number
+    #
+    # Server-driven rather than hardcoded in the PWA: the answer is a property
+    # of the Meta configuration, and a popup asking for one flow against a
+    # config built for the other fails inside Meta's own UI, where we cannot see
+    # it. Read it out of the Meta-hosted link's `extras.featureType`.
+    whatsapp_signup_feature_type: str = ""
+
     # Ours, from the App Dashboard. Rides along on the signup so Meta attributes
     # the WABA to us as its Tech Provider, and comes back on the PARTNER_ADDED
     # webhook.
