@@ -361,6 +361,95 @@ def instagram_row(connection: dict | None) -> ChannelOut:
     )
 
 
+def whatsapp_row(connection: dict | None, *, onboarding_enabled: bool) -> ChannelOut:
+    """
+    What every surface says about this hotel's WhatsApp.
+
+    **This row used to be a hardcoded "coming soon".** The pipeline behind it
+    has been real since migration 11 — signed webhook, property resolution,
+    24-hour window, templates, delivery receipts — but there was exactly one
+    connection in the table and it was ours, so the honest answer to a hotelier
+    was "soon". Embedded Signup is what makes it theirs, and this function is
+    what turns a connection into words.
+
+    Pure, and takes the row rather than a property id, so the mapping can be
+    asserted without a database — same as `instagram_row`, and for the same
+    reason: "every state has a defined answer" should be a test.
+    """
+    status = (connection or {}).get("status")
+
+    if connection and status == "connected" and not connection.get("is_sandbox"):
+        number = connection.get("display_number")
+        quality = (connection.get("quality_rating") or "").upper()
+        detail = "Your AI employee answers WhatsApp messages."
+        # Only ever mentioned when it is bad news a hotel can act on. A GREEN
+        # rating is the normal state and saying so on every page load teaches an
+        # owner to read a health metric they cannot influence.
+        if quality == "RED":
+            detail = ("Your AI employee answers WhatsApp messages. Meta has "
+                      "marked this number's quality as low — too many guests "
+                      "have blocked or reported it.")
+        elif quality == "YELLOW":
+            detail = ("Your AI employee answers WhatsApp messages. Meta has "
+                      "flagged this number's quality; keep an eye on it.")
+        return ChannelOut(
+            id="whatsapp", name="WhatsApp", state="connected",
+            headline=number or connection.get("verified_name") or "Your WhatsApp number",
+            detail=detail,
+            action="Disconnect",
+        )
+
+    # Claimed from a Meta-hosted signup and waiting for the one popup that mints
+    # a token. Not an error and not connected — a real half-finished state that
+    # would otherwise read as either.
+    if connection and status == "pending" and not connection.get("is_sandbox"):
+        return ChannelOut(
+            id="whatsapp", name="WhatsApp", state="action_needed",
+            headline="Almost there",
+            detail=connection.get("last_error")
+                   or "Finish connecting and your AI employee starts answering on WhatsApp.",
+            action="Finish connecting",
+        )
+
+    if connection and status not in (None, "connected", "disconnected", "pending"):
+        return ChannelOut(
+            id="whatsapp", name="WhatsApp", state="action_needed",
+            headline="Needs reconnecting",
+            detail=connection.get("last_error")
+                   or "WhatsApp messages aren't reaching your AI employee. Reconnect to fix it.",
+            action="Reconnect",
+        )
+
+    # Nothing a hotel can connect yet on this deployment. Honest rather than
+    # absent: WhatsApp is the first thing an Indian hotelier asks about, and a
+    # missing row reads as "never" while a Connect button that 503s reads as
+    # "broken".
+    if not onboarding_enabled:
+        return ChannelOut(
+            id="whatsapp", name="WhatsApp", state="coming_soon",
+            headline="Launching soon",
+            detail="Your AI employee will answer WhatsApp messages too.",
+        )
+
+    # `disconnected` lands here rather than in the branch above, exactly as it
+    # does for Instagram: a hotel that pressed Disconnect has a row saying so,
+    # and reading that as "needs reconnecting" puts an amber badge on something
+    # somebody switched off deliberately. A sandbox row lands here too — it is
+    # not a connection a guest's message can reach.
+    was_connected = bool(connection and status == "disconnected")
+    return ChannelOut(
+        id="whatsapp", name="WhatsApp", state="not_connected",
+        headline="Not connected",
+        detail=(
+            "Your AI employee has stopped answering here. Connect again whenever you like."
+            if was_connected
+            else "Connect your hotel's WhatsApp number. Guests message the number "
+                 "they already have, and your AI employee answers."
+        ),
+        action="Connect WhatsApp",
+    )
+
+
 @router.get("/properties/{property_id}/channels", response_model=ChannelsOut)
 @limiter.limit("120/minute")
 async def get_channels(
@@ -393,6 +482,11 @@ async def get_channels(
             .select("username,status,is_sandbox,last_error")
             .eq("property_id", property_id).limit(1).execute().data or []
         )
+        whatsapp = (
+            db.table("whatsapp_connections")
+            .select("display_number,verified_name,status,is_sandbox,last_error,quality_rating")
+            .eq("property_id", property_id).limit(1).execute().data or []
+        )
         prop = (
             db.table("properties").select("slug")
             .eq("id", property_id).limit(1).execute().data or [{}]
@@ -414,6 +508,7 @@ async def get_channels(
         return {
             "site": site[0] if site else None,
             "instagram": instagram[0] if instagram else None,
+            "whatsapp": whatsapp[0] if whatsapp else None,
             "google": google[0] if google else None,
             "slug": prop.get("slug") or "",
         }
@@ -451,6 +546,15 @@ async def get_channels(
 
     # ── Instagram ──
     channels.append(instagram_row(found["instagram"]))
+
+    # ── WhatsApp ──
+    #
+    # Above Google and above the "not yet" rows, because it is the channel an
+    # Indian hotelier asks about first.
+    channels.append(whatsapp_row(
+        found["whatsapp"],
+        onboarding_enabled=settings.whatsapp_onboarding_enabled,
+    ))
 
     # ── Google Business Profile ──
     #
@@ -501,14 +605,13 @@ async def get_channels(
 
     # ── not yet ──
     #
-    # Listed rather than hidden. A hotelier deciding whether to move their
-    # enquiries here is asking "will this cover WhatsApp?", and the honest
-    # answer is "soon" — an absent row reads as "never".
-    channels.append(ChannelOut(
-        id="whatsapp", name="WhatsApp", state="coming_soon",
-        headline="Launching soon",
-        detail="Your AI employee will answer WhatsApp messages too.",
-    ))
+    # Listed rather than hidden, on the same argument that used to apply to
+    # WhatsApp: a hotelier deciding whether to move their enquiries here wants
+    # to know where this goes next, and an absent row reads as "never".
+    #
+    # WhatsApp has moved out of this section. It is a real row now — see
+    # `whatsapp_row`, which still returns `coming_soon` on a deployment where
+    # Embedded Signup is not switched on.
     channels.append(ChannelOut(
         id="messenger", name="Facebook Messenger", state="coming_soon",
         headline="Coming soon",

@@ -41,6 +41,7 @@ from app.services.ai import usage as usage_mod
 from app.services.messaging import policy
 from app.services.messaging.instagram import webhook as ig
 from app.services.messaging.whatsapp import webhook as wa
+from app.services.messaging.whatsapp import account_events as wa_accounts
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,22 @@ async def handle_payload(payload: dict, *, provider=None, channel: str = "whatsa
     accepted = duplicates = 0
     touched: set[str] = set()
 
+    # Everything that is not a message or a receipt: a hotel removed us, Meta
+    # restricted an account, a template we submitted was decided on.
+    #
+    # **First, and never dispatched.** These are the events that say a
+    # credential is dead or a template may now be sent, so applying them before
+    # the messages in the same body means a batch that carries both a
+    # PARTNER_REMOVED and a guest message does not answer the guest as a hotel
+    # that has just removed us. Nothing here needs a model, and putting an
+    # account event on the agent's queue would leave a hotel's suspension
+    # waiting behind a guest's question.
+    accounts: dict[str, int] = {}
+    if channel == "whatsapp":
+        events = wa.parse_account_events(payload)
+        if events:
+            accounts = await wa_accounts.apply_all(events)
+
     for inbound in messages:
         try:
             connection = await messaging.resolve_connection(inbound.account_id, channel)
@@ -191,6 +208,7 @@ async def handle_payload(payload: dict, *, provider=None, channel: str = "whatsa
         "accepted": accepted,
         "duplicates": duplicates,
         "statuses": len(statuses),
+        "accounts": accounts,
     }
 
 

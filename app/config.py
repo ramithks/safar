@@ -198,6 +198,41 @@ class Settings(BaseSettings):
     # test can shorten it rather than sleep through it.
     whatsapp_service_window_hours: int = 24
 
+    # ── Embedded Signup (Tech Provider) ─────────────────────────────────────
+    #
+    # What turns "we have a WhatsApp number" into "a hotel can connect its own".
+    # A hotel completes Meta's Embedded Signup, we exchange the code it returns
+    # for a business token scoped to that customer, and from then on the hotel
+    # has its own WABA, its own number and its own templates.
+    #
+    # `whatsapp_app_id` is the **Facebook** app id from Basic settings — the
+    # same app the webhook signature already uses, and NOT the Instagram app id
+    # a few lines below. They are both ~16 digits and only one of them works
+    # here; `scripts/meta_config_check.py` exists because of that trap.
+    whatsapp_app_id: Optional[str] = None
+
+    # The Embedded Signup configuration created under Facebook Login for
+    # Business. Required, not optional: without it the popup falls back to a
+    # generic login dialogue that asks a hotelier for permissions we do not
+    # need and never creates a WABA.
+    whatsapp_config_id: Optional[str] = None
+
+    # Ours, from the App Dashboard. Rides along on the signup so Meta attributes
+    # the WABA to us as its Tech Provider, and comes back on the PARTNER_ADDED
+    # webhook.
+    whatsapp_solution_id: Optional[str] = None
+
+    # The Meta-hosted landing page, for onboarding a hotel by sending them a
+    # link rather than sitting them in front of the PWA. Optional — the in-app
+    # popup is the primary path and the only one that returns a code.
+    whatsapp_meta_hosted_url: Optional[str] = None
+
+    # Off by default, like `enable_hotel_os`. A deployment with the flag unset
+    # shows WhatsApp as not-yet-available rather than offering a Connect button
+    # that leads to a 503 — which is what a half-configured Embedded Signup
+    # looks like to a hotelier.
+    whatsapp_onboarding_enabled: bool = False
+
     # ── Instagram ────────────────────────────────────────────────────────────
     #
     # Two windows, because Meta gives two. An automated reply gets 24 hours from
@@ -342,6 +377,17 @@ class Settings(BaseSettings):
     # `.env` is genuinely the one place any of this lives.
     whatsapp_test_recipient: Optional[str] = None
     whatsapp_test_phone_number_id: Optional[str] = None
+
+    # The hotel-facing number this deployment actually sends from, and the WABA
+    # that owns it. Distinct from `whatsapp_test_phone_number_id` above, which
+    # is Meta's throwaway test sender.
+    #
+    # **The WABA id cannot be discovered from the token** — a system-user token
+    # returns nothing from `me/businesses` or
+    # `assigned_whatsapp_business_accounts`. It is on the App Dashboard under
+    # WhatsApp → API Setup, and it has to be set by hand or passed with --waba.
+    whatsapp_phone_number_id: Optional[str] = None
+    whatsapp_waba_id: Optional[str] = None
 
     # Run the agent inline in the webhook request instead of handing it to
     # Celery. Development and the E2E suite only: a real deployment must
