@@ -40,7 +40,9 @@ from app.config import settings
 from app.core.limiter import limiter
 from app.db.client import get_db, run_db
 from app.deps.property import require_member
+from app.services.messaging import credentials as creds_module
 from app.services.messaging import crypto, store
+from app.services.messaging.channels import MessagingError
 from app.services.messaging.crypto import CredentialCryptoError
 from app.services.messaging.whatsapp import onboarding, provisioning
 
@@ -80,6 +82,18 @@ class FinishIn(BaseModel):
 
 class ClaimIn(BaseModel):
     onboardingId: str
+
+
+class TestMessageIn(BaseModel):
+    """
+    One number, given deliberately.
+
+    No list, no default, no "send to everyone on the account". A diagnostic that
+    could quietly widen into outbound traffic would be the worst possible way to
+    discover a mistake — the same rule `scripts/meta_smoke.py` follows.
+    """
+
+    to: str = Field(min_length=8, max_length=20)
 
 
 class TemplateOut(BaseModel):
@@ -592,6 +606,132 @@ async def claim_account(
     logger.info("whatsapp account claimed: property=%s waba=%s",
                 property_id, result.get("wabaId"))
     return result
+
+
+# ── proving it works ────────────────────────────────────────────────────────
+
+def _mask_contacts(raw: dict | None, recipient: str) -> dict:
+    """Meta's reply, with the phone number reduced to its last four digits."""
+    if not isinstance(raw, dict):
+        return {}
+    masked = dict(raw)
+    if isinstance(masked.get("contacts"), list):
+        tail = f"…{recipient[-4:]}"
+        masked["contacts"] = [
+            {**c, **{k: tail for k in ("input", "wa_id") if k in c}}
+            for c in masked["contacts"]
+            if isinstance(c, dict)
+        ]
+    return masked
+
+
+
+
+@router.post("/properties/{property_id}/whatsapp/test-message")
+@limiter.limit("5/hour")
+async def send_test_message(
+    request: Request,
+    property_id: str,
+    body: TestMessageIn,
+    member=Depends(require_member("agents")),
+):
+    """
+    Send one WhatsApp message from this hotel's own number, and show the call.
+
+    **A hotel that has just connected has no way to know it worked.** The badge
+    says "Connected", and the first proof otherwise is a guest who never got an
+    answer. Every WhatsApp provider has this button for that reason.
+
+    It also happens to be what Meta's App Review asks to watch: their own
+    instruction is to *"embed the cURL command into your website and record how
+    you send a message"*. So the response carries the request we sent and Meta's
+    reply verbatim, for the screen to render — a reviewer who cannot see the API
+    call cannot grant the permission.
+
+    ── why a template, and not "hi there" ───────────────────────────────────
+
+    Meta allows free text only inside the 24-hour window a guest's own message
+    opens. A hotel testing its connection has no such window — nobody has
+    written to it yet — so free text is refused with `131047` and the test
+    looks like a broken integration. An approved template has no such
+    restriction, which is exactly why Meta's own "Try it out" tool sends
+    `hello_world`.
+
+    ── why the adapter directly, and not `messaging.send` ───────────────────
+
+    This is a diagnostic, not a conversation. Going through `messaging.send`
+    would open a conversation row, a guest record and a billable window for
+    somebody testing their own setup, and the hotel's inbox would fill with
+    threads it never had. Nothing here is metered and nothing is recorded as a
+    guest interaction — the point is the wire, not the thread.
+    """
+    def _read() -> dict | None:
+        rows = (
+            get_db().table("whatsapp_connections")
+            .select("*").eq("property_id", property_id).limit(1).execute().data or []
+        )
+        return rows[0] if rows else None
+
+    connection = await run_db(_read)
+    if not connection:
+        raise HTTPException(status.HTTP_409_CONFLICT, "not_connected")
+    if connection.get("status") != "connected":
+        raise HTTPException(status.HTTP_409_CONFLICT, "not_connected")
+
+    # Digits only. Meta wants an E.164 number without the plus, and a hotelier
+    # will type spaces, dashes and brackets.
+    recipient = "".join(c for c in body.to if c.isdigit())
+    if len(recipient) < 8:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "bad_number")
+
+    template = settings.whatsapp_test_template
+    language = settings.whatsapp_test_template_language
+
+    try:
+        adapter = await creds_module.adapter_for_async(connection)
+        sent = await adapter.send_template(
+            to=recipient,
+            template_name=template,
+            language=language,
+            parameters=[],
+            client_reference=f"test:{property_id}",
+        )
+    except MessagingError as exc:
+        logger.warning("whatsapp test message failed for %s: %s", property_id, exc.detail)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            {"code": exc.code, "detail": exc.detail},
+        ) from exc
+
+    logger.info("whatsapp test message sent: property=%s template=%s id=%s",
+                property_id, template, sent.external_id)
+
+    # The request is reconstructed rather than captured, because the adapter
+    # builds it. It is the same shape byte for byte — `send_template` above —
+    # and it is here so the screen can show what went over the wire.
+    return {
+        "sent": True,
+        "messageId": sent.external_id,
+        "sandbox": bool(connection.get("is_sandbox")),
+        "request": {
+            "method": "POST",
+            "url": f"{settings.whatsapp_api_base.rstrip('/')}/"
+                   f"{connection['phone_number_id']}/messages",
+            "body": {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                # Masked. This response is rendered on a screen that is about to
+                # be screen-recorded and sent to Meta.
+                "to": f"…{recipient[-4:]}",
+                "type": "template",
+                "template": {"name": template, "language": {"code": language}},
+            },
+        },
+        # Meta echoes the recipient back in `contacts`. Masked for the same
+        # reason `to` is above: this panel is rendered on a screen that is about
+        # to be recorded and attached to an App Review submission.
+        "response": _mask_contacts(sent.raw, recipient),
+    }
 
 
 # ── templates ───────────────────────────────────────────────────────────────

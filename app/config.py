@@ -389,6 +389,16 @@ class Settings(BaseSettings):
     whatsapp_phone_number_id: Optional[str] = None
     whatsapp_waba_id: Optional[str] = None
 
+    # The template the in-app "send a test message" button uses.
+    #
+    # `hello_world` is Meta's own, present on every WABA from the day it is
+    # created, and is what their "Try it out" tool sends. A *template* rather
+    # than free text because a hotel testing a new connection has no 24-hour
+    # window open — nobody has written to it — and free text there is refused
+    # with 131047, which reads as a broken integration.
+    whatsapp_test_template: str = "hello_world"
+    whatsapp_test_template_language: str = "en_US"
+
     # Run the agent inline in the webhook request instead of handing it to
     # Celery. Development and the E2E suite only: a real deployment must
     # acknowledge Meta quickly and do the model call elsewhere.

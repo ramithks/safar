@@ -27,8 +27,12 @@ Do a dry run of each with `--fast` first. The real recording runs without it.
       token — a system user's `me/businesses` comes back empty.
 - [ ] `./venv/bin/python scripts/meta_config_check.py` reports the WhatsApp
       token valid and the app secret matching.
-- [ ] Screen recording is at a resolution where the terminal text is legible
-      when Meta scales the video down. Increase the font size first.
+- [ ] For Route A: the backend and PWA are running the current code. The demo
+      hotel is already `connected`, so `WHATSAPP_ONBOARDING_ENABLED` does **not**
+      need to be true for the card to appear — that flag only gates the *Connect*
+      button for hotels that have no number yet.
+- [ ] Screen recording is at a resolution where the text is legible when Meta
+      scales the video down. Increase the font or browser zoom first.
 - [ ] Nothing secret is on screen: no `.env` open in another window, no token in
       shell history you might scroll to. The script never prints one.
 
@@ -39,28 +43,72 @@ Do a dry run of each with `--fast` first. The real recording runs without it.
 > *"Record a video showing a message sending from your app to a WhatsApp number.
 > The video should show your app sending the message, as well as the WhatsApp
 > interface (either web or mobile app) receiving the same message."*
+>
+> *"You can use the Try it out tool… Embed the cURL command from step 2 into
+> your website and record how you send a message."*
 
-Both halves have to be in **one continuous take**. A cut between the send and
-the receipt is the most common reason this video is rejected — the reviewer
-cannot tell the two are related.
+Read that last line carefully: Meta wants to see **your app** sending, not a
+terminal. A terminal recording often passes, but it is the weaker submission and
+it is the most common reason this video is sent back.
 
-**Set up before pressing record:** terminal on one side, WhatsApp Web logged in
-as the recipient handset on the other, both visible at once.
+So there are two ways to record it, and the first is much stronger.
+
+### Route A — from the product (recommended)
+
+**Settings → Send a test message.** This is a real feature: a hotel that has
+just connected presses it to check its number works. It sends one WhatsApp
+message from the hotel's own number and prints the API call and Meta's reply on
+screen — which is exactly what Meta means by embedding the cURL into your site.
+
+**⚠ Route A needs a deploy first.** The card is new. `api.hostos.in` and
+`app.hostos.in` are still running the code from before this work, so the button
+is not on the live Settings page yet. Either deploy both, or record against a
+local backend — a hotelier pressing a button in your app is what the reviewer is
+grading, not which host served it.
+
+Log in as **`owner@anandihouse.demo`**. That is the hotel that owns the real
+verified number (+91 93184 79690, "Travbuddy"); Casa Mandala and the other seed
+hotels are on sandbox connections and will not send anything.
+
+Set up before pressing record: the Settings page on one side, WhatsApp Web
+logged in as the recipient handset on the other, **both visible at once**.
+
+| # | On screen | Why it matters |
+| --- | --- | --- |
+| 1 | The Settings page, with WhatsApp showing **Connected** and the real number | Establishes this is a product, not a script |
+| 2 | Typing the recipient number into "Send a test message" | A deliberate user action |
+| 3 | Pressing **Send** | The moment the app sends |
+| 4 | The dark panel that appears: `POST …/messages`, the JSON body, and Meta's reply with the `wamid.…` id | **This is the API call Meta needs to see** |
+| 5 | **Move to the WhatsApp window.** The message arriving | The other half of the requirement |
+| 6 | Hold on it for ~3 seconds | Time to match the two |
+
+One continuous take. A cut between step 4 and step 5 is the single most common
+rejection — the reviewer cannot tell the two halves are related.
+
+**It sends the `hello_world` template, not free text, and that is correct.**
+Meta only allows free text inside the 24-hour window a guest's own message
+opens. A hotel testing a fresh connection has no such window, so free text comes
+back `131047` and the test would report a broken integration on a connection
+that is fine. `hello_world` is on every WABA from the day it is created, which
+is why Meta's own "Try it out" tool sends exactly that.
+
+### Route B — from the terminal (fallback)
+
+Use this if you would rather not deploy first, or would rather not show the
+product. **It works right now, with no deploy.** It sends a free-text message
+and therefore needs the recipient to have messaged the number within the last 24
+hours — if it comes back `131047`, message the hotel's number from the handset
+first and run it again.
 
 ```
 ./venv/bin/python scripts/app_review_evidence.py --messaging --wait 0
 ```
 
-| # | On screen | Why it matters |
-| --- | --- | --- |
-| 1 | The command being typed and run | Establishes that an application is doing this, not a console |
-| 2 | Step 1 — the `POST .../messages` URL and the JSON body | The reviewer must see the API call itself |
-| 3 | Step 2 — Meta's reply with the `wamid.…` message id | Proof Meta accepted it |
-| 4 | **Move to the WhatsApp window.** The message arriving, with its timestamp | The other half of the requirement |
-| 5 | Hold on the message for ~3 seconds | Gives the reviewer time to match the text |
+Same shot list: command → request → Meta's reply with the message id → switch to
+WhatsApp → the message arriving. Same rule about one continuous take.
 
-The message body carries a timestamp — read it aloud or make sure it is legible
-in both windows. That is what makes "the same message" verifiable.
+The message body carries a timestamp in both routes. Make sure it is legible in
+both windows — that is what makes "the same message" verifiable.
 
 ---
 
