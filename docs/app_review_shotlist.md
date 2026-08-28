@@ -116,28 +116,62 @@ both windows — that is what makes "the same message" verifiable.
 
 > *"Make API test calls and record a separate unique video of creating a message
 > template."*
+>
+> *"You can use **WhatsApp Manager** to create a message template for your use
+> case. Record a video of creating and saving the template."*
 
-**Separate and unique** — do not reuse any footage from video 1.
+**This is two separate requirements, and only one of them is the video.**
 
-```
-./venv/bin/python scripts/app_review_evidence.py --management --waba <WABA_ID>
-```
+### 2a. The video — record it in WhatsApp Manager, not in code
+
+Meta's own instruction is to use the WhatsApp Manager UI. That is simpler than
+driving the API on camera and it needs no WABA id, no deploy and no terminal.
+
+Go to **business.facebook.com → WhatsApp Manager → Message templates → Create
+template**, and record the whole thing in one take.
 
 | # | On screen | Why it matters |
 | --- | --- | --- |
-| 1 | The command being typed and run | Same as above |
-| 2 | Step 1 — the existing templates listed | Establishes the "before" |
-| 3 | Step 2 — the `POST .../message_templates` body, with `name`, `category`, `components` | This is the call being reviewed |
-| 4 | Step 3 — Meta's reply with the new template `id` | Proof it was created |
-| 5 | Step 4 — the template read back, now on the account | The "after" |
+| 1 | WhatsApp Manager, Message templates list | Establishes the "before" |
+| 2 | Pressing **Create template**, choosing a category and name | The act being reviewed |
+| 3 | Typing the body, including at least one `{{1}}` and its sample value | A template with no parameters looks trivial |
+| 4 | Pressing **Submit** | The moment it is created |
+| 5 | The template appearing in the list as **In review** | The "after" |
 
-The status will be `PENDING`. That is correct and does not weaken the evidence:
-the permission is for *creating* a template, and Meta's own review of the
-template's content is a separate process.
+`In review` is the correct end state. Meta reviews the template's *content*
+separately; the permission is for creating one.
 
-**Optional, and stronger:** after step 5, switch to WhatsApp Manager in a
-browser and show the same template listed there. It costs twenty seconds and
-removes any doubt that the API call had a real effect.
+Use a genuine hotel template — a booking confirmation reads as a real use case.
+The six in `whatsapp/provisioning.py` are good sources of wording.
+
+### 2b. The API test calls — separate, and they need the WABA id
+
+> *"Go to our published Postman collection to complete the requirements. Keep in
+> mind, testing data can take 24 hours to show in the App Review submission
+> form."*
+
+Meta wants to see that the app has actually **called** the API for this
+permission. Two ways, and either counts:
+
+- **Meta's Postman collection** — the link in their instructions. It will ask for
+  your WABA id and a token.
+- **Our own script**, which makes the same call against our own account:
+
+  ```
+  ./venv/bin/python scripts/app_review_evidence.py --management --waba <WABA_ID>
+  ```
+
+  It lists the templates, creates one, and reads it back — a real
+  `POST /{waba_id}/message_templates`.
+
+Either way you need `WHATSAPP_WABA_ID`. It is **not discoverable from the
+token** — `me/businesses`, `assigned_whatsapp_business_accounts` and the phone
+number node all come back empty or reject the field. Read it off **WhatsApp →
+API Setup → "WhatsApp Business Account ID"**, under the phone number id.
+
+**Do this first.** Meta says test data takes up to 24 hours to appear in the
+submission form, so it is the long pole — make the calls today, record the
+videos while it propagates.
 
 ---
 
@@ -149,6 +183,8 @@ removes any doubt that the API call had a real effect.
       timestamp the call happens.
 - [ ] The template created for video 2 stays on the account. Leave it — deleting
       it locks its name for 30 days, and you may need to record again.
+- [ ] Check the API test calls have landed in the submission form before
+      submitting. Meta says up to 24 hours.
 
 ---
 
