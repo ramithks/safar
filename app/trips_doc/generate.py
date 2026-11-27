@@ -119,6 +119,16 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
                     prior_doc: dict | None) -> None:
     from app.services.weather import get_trip_weather
 
+    # A recovered run must keep its recovery counter through every milestone
+    # rewrite, or a repeatedly-orphaned trip would loop forever instead of
+    # reaching MAX_RECOVERY_ATTEMPTS and a terminal error.
+    recovery_marker = dict((prior_doc or {}).get("recovery") or {})
+
+    def _keep_recovery(doc: dict) -> dict:
+        if recovery_marker:
+            doc["recovery"] = dict(recovery_marker)
+        return doc
+
     started_at = _now()
     travelers = max(int(spec.get("travelers") or 1), 1)
     budget = spec.get("budget_tier") or spec.get("budget") or "mid"
@@ -146,8 +156,8 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
         "comments": spec.get("comments") or "",
         "start_time": spec.get("start_time"), "end_time": spec.get("end_time"),
     }}
-    await store.put_doc(trip_id, doc_from_graph(
-        trip_id, spec, graph, status="planning", progress=10))
+    await store.put_doc(trip_id, _keep_recovery(doc_from_graph(
+        trip_id, spec, graph, status="planning", progress=10)))
 
     notes = await B._sync_legs_after_change(work_state, graph, user_id)
 
@@ -173,16 +183,16 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
     if not any(e.routes for e in graph.edges):
         raise RuntimeError(f"no leg of {graph.journey_summary()} could be routed")
 
-    await store.put_doc(trip_id, doc_from_graph(
-        trip_id, spec, graph, status="planning", progress=45, notes=notes))
+    await store.put_doc(trip_id, _keep_recovery(doc_from_graph(
+        trip_id, spec, graph, status="planning", progress=45, notes=notes)))
 
     # ── itineraries + stays for every city the traveller sleeps in ──────────
     stayed = [n for n in graph.nodes if n.role != "origin" and (n.nights or 0) > 0]
     terminal_trip = await _fill_itineraries_and_stays(
         graph, stayed, spec, travelers, budget, user_id)
 
-    await store.put_doc(trip_id, doc_from_graph(
-        trip_id, spec, graph, status="planning", progress=80, notes=notes))
+    await store.put_doc(trip_id, _keep_recovery(doc_from_graph(
+        trip_id, spec, graph, status="planning", progress=80, notes=notes)))
 
     await B._geocode_nodes(graph)
     weather = await _wait_weather(weather_task)
@@ -190,7 +200,7 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
     # ── final doc ────────────────────────────────────────────────────────────
     title = (terminal_trip.get("trip_name")
              or f"{spec.get('origin')} → {spec.get('destination')}")
-    doc = doc_from_graph(
+    doc = _keep_recovery(doc_from_graph(
         trip_id, spec, graph,
         title=title, status="ready", progress=100,
         destination={
@@ -203,7 +213,7 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
                     "spec_version": int(spec.get("version") or 1),
                     "started_at": started_at, "finished_at": _now(),
                     "status": "complete"},
-    )
+    ))
     if terminal_trip.get("trip_intelligence"):
         doc["intelligence"] = terminal_trip["trip_intelligence"]
     dropped = carry_forward_selections(prior_doc, doc)
@@ -376,9 +386,28 @@ MAX_RECOVERY_ATTEMPTS = 2           # then a terminal honest error
 
 def _stale_planning_rows_sync(cutoff_iso: str) -> list[dict]:
     from app.db.client import get_db
-    res = (get_db().table("trip_states").select("id, user_id, doc")
+    res = (get_db().table("trip_states").select("id, user_id, doc, updated_at")
            .eq("status", "planning").lt("updated_at", cutoff_iso).execute())
     return res.data or []
+
+
+def _claim_row_sync(trip_id: str, stale_updated_at: str, doc: dict,
+                    recovery: dict) -> bool:
+    """Atomic adoption claim: ONE conditional UPDATE carrying the attempt
+    increment and a fresh updated_at, gated on the row still being exactly
+    the stale planning row we read. During a rolling deploy two instances can
+    read the same stale row; the loser's WHERE clause no longer matches once
+    the winner's write lands, so it updates nothing and spawns nothing.
+    Returns True only for the winner."""
+    from app.db.client import get_db
+    new_doc = dict(doc)
+    new_doc["recovery"] = recovery
+    new_doc["updated_at"] = _now()
+    res = (get_db().table("trip_states")
+           .update({"doc": new_doc, "updated_at": _now()})
+           .eq("id", trip_id).eq("status", "planning")
+           .eq("updated_at", stale_updated_at).execute())
+    return bool(res.data)
 
 
 async def reconcile_orphaned_trips() -> dict:
@@ -414,9 +443,14 @@ async def reconcile_orphaned_trips() -> dict:
         recovery["count"] = attempts + 1
         recovery["last_at"] = _now()
         try:
-            doc["recovery"] = recovery
-            await store.put_doc(trip_id, doc)   # claim: bumps updated_at before spawn
-            spawn_background(run_generation(trip_id, spec, str(row.get("user_id") or ""), doc),
+            won = await run_db(_claim_row_sync, trip_id, row.get("updated_at"),
+                               doc, recovery)
+            if not won:
+                logger.info("[trip-doc] %s adoption claim lost to a concurrent "
+                            "reconciler - leaving it to the winner", trip_id)
+                continue
+            claimed_doc = {**doc, "recovery": recovery}
+            spawn_background(run_generation(trip_id, spec, str(row.get("user_id") or ""), claimed_doc),
                              name=f"trip_doc_gen:{trip_id}:recovery{recovery['count']}")
             restarted += 1
             logger.info("[trip-doc] %s adopted for recovery attempt %d", trip_id, recovery["count"])
