@@ -229,6 +229,13 @@ async def run_pipeline(
         ]
 
         if not confident_results:
+            if vision_results and all(vr.detection_source == "freellm_failed" for vr in vision_results):
+                return _no_results(
+                    job_id, reel_url, duration_seconds, len(unique_frames),
+                    "ANALYSIS_UNAVAILABLE",
+                    "The free analysis models are rate-limited right now, so this Reel could not be analysed. Try again in a few minutes.",
+                    metadata,
+                )
             return _no_results(
                 job_id, reel_url, duration_seconds, len(unique_frames),
                 "INDOOR_UNIDENTIFIABLE",

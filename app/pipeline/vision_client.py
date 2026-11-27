@@ -553,7 +553,7 @@ def _call_freellm_batch(
         )
     except Exception as exc:
         logger.error(f"Free-LLM batch call failed: {type(exc).__name__}: {exc}")
-        return [VisionResult(frame=f) for f in frames]
+        return [VisionResult(frame=f, detection_source="freellm_failed") for f in frames]
     return _parse_batch_text(text, frames)
 
 
