@@ -103,8 +103,8 @@
         <div><label>To</label><input id="destination" placeholder="Gokarna"></div>
       </div>
       <div class="row">
-        <div><label>Departure date</label><input type="date" id="departure_date"></div>
-        <div><label>Days</label><input type="number" id="days" value="3" min="1" max="14"></div>
+        <div><label>Start date</label><input type="date" id="departure_date"></div>
+        <div><label>End date</label><input type="date" id="end_date"></div>
       </div>
       <div class="row">
         <div><label>Travellers</label><input type="number" id="travelers" value="1" min="1" max="12"></div>
@@ -116,10 +116,8 @@
           </select>
         </div>
       </div>
-      <label>Interests (comma separated, optional)</label>
-      <input id="interests" placeholder="beaches, cafes, trekking">
-      <label>Stops along the way (comma separated cities, optional)</label>
-      <input id="stops" placeholder="Hubballi">
+      <label>Comments (optional - preferences, must-see places, stops along the way)</label>
+      <textarea id="comments" rows="3" placeholder="e.g. beaches and cafes, avoid long treks, stop at Hubballi on the way"></textarea>
       <button id="plan-btn">Plan my trip</button>
       <div class="msg" id="plan-msg"></div>
     </div>
@@ -127,6 +125,7 @@
     <div class="card hidden" id="trip-card">
       <div class="trip-title" id="trip-title"></div>
       <div class="route" id="trip-route"></div>
+      <div class="unavail hidden" id="trip-error" style="margin-top:10px"></div>
       <div class="progress-track"><div class="progress-fill" id="trip-progress"></div></div>
       <div class="msg" id="trip-status"></div>
       <div id="trip-transport"></div>
@@ -147,6 +146,22 @@ import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js
 const $ = (id) => document.getElementById(id);
 let supabase = null;
 let pollTimer = null;
+
+async function resumeActiveTrip() {
+  let tripId = null;
+  try { tripId = localStorage.getItem("safar_active_trip"); } catch (_) {}
+  if (!tripId) return;
+  try {
+    const res = await fetch("/api/v3/trips/" + tripId, {
+      headers: { "Authorization": "Bearer " + await token() },
+    });
+    if (!res.ok) { if (res.status === 404 || res.status === 403) { try { localStorage.removeItem("safar_active_trip"); } catch (_) {} } return; }
+    const env = await res.json();
+    $("trip-card").classList.remove("hidden");
+    renderTrip(env);
+    if (env.status === "planning") pollTrip(tripId);
+  } catch (_) { /* offline or transient - leave the form as-is */ }
+}
 
 async function boot() {
   const cfg = await (await fetch("/api/v1/public-config")).json();
@@ -195,20 +210,28 @@ async function token() {
 }
 
 function showPlanner() {
+  setTimeout(resumeActiveTrip, 0);
   $("auth-card").classList.add("hidden");
   $("planner").classList.remove("hidden");
 }
 
 $("plan-btn").onclick = async () => {
+  const startD = $("departure_date").value || null;
+  const endD = $("end_date").value || null;
+  let days = 3;
+  if (startD && endD) {
+    const span = Math.round((new Date(endD) - new Date(startD)) / 86400000) + 1;
+    if (span < 1) { $("plan-msg").textContent = "End date must be on or after the start date."; $("plan-msg").classList.add("err"); return; }
+    days = Math.min(span, 30);
+  }
   const body = {
     origin: $("origin").value.trim(),
     destination: $("destination").value.trim(),
-    departure_date: $("departure_date").value || null,
-    days: parseInt($("days").value || "3", 10),
+    departure_date: startD,
+    days: days,
     travelers: parseInt($("travelers").value || "1", 10),
     budget: $("budget").value,
-    interests: $("interests").value.split(",").map(s => s.trim()).filter(Boolean),
-    stops: $("stops").value.split(",").map(s => s.trim()).filter(Boolean),
+    comments: $("comments").value.trim() || null,
   };
   if (!body.origin || !body.destination) {
     $("plan-msg").textContent = "From and To are required.";
@@ -226,6 +249,7 @@ $("plan-btn").onclick = async () => {
     });
     if (!res.ok) throw new Error((await res.json()).detail || ("HTTP " + res.status));
     const { trip_id } = await res.json();
+    try { localStorage.setItem("safar_active_trip", trip_id); } catch (_) {}
     $("plan-msg").textContent = "";
     $("trip-card").classList.remove("hidden");
     pollTrip(trip_id);
@@ -265,7 +289,15 @@ function renderTrip(env) {
   $("trip-progress").style.width = (env.progress || 0) + "%";
   $("trip-status").textContent =
     env.status === "planning" ? "Planning... " + (env.progress || 0) + "%" :
-    env.status === "ready" ? "Trip plan ready." : ("Status: " + env.status);
+    env.status === "ready" ? "Trip plan ready." : "";
+  const errBox = $("trip-error");
+  if (env.status !== "planning" && env.status !== "ready") {
+    errBox.textContent = doc.error || "Trip planning failed. Please try again.";
+    errBox.classList.remove("hidden");
+    $("trip-progress").style.width = "100%";
+  } else {
+    errBox.classList.add("hidden");
+  }
 
   // Transport
   const legs = doc.transport || [];

@@ -62,6 +62,21 @@ def initial_doc(spec: dict, title: str | None = None) -> dict:
     }
 
 
+GENERATION_TIMEOUT_SECONDS = 600  # observed healthy runs finish in ~5.5 min
+
+
+def _honest_failure(exc: Exception) -> str:
+    """The user-facing reason for a failed generation. No invented causes."""
+    msg = str(exc).lower()
+    if "free-models" in msg or "429" in msg or "quota" in msg or "rate limit" in msg:
+        return ("Free AI plan generation is temporarily unavailable - the daily "
+                "free-model quota is exhausted. Please try again later.")
+    if "no leg" in msg and "routed" in msg:
+        return ("Live transport for this route could not be found right now. "
+                "Try different dates or a nearby city.")
+    return "Trip planning failed. Please try again."
+
+
 async def run_generation(trip_id: str, spec: dict, user_id: str,
                          prior_doc: dict | None = None) -> None:
     """Entry point: admit through the global generation queue, then build."""
@@ -74,12 +89,28 @@ async def run_generation(trip_id: str, spec: dict, user_id: str,
             pass
     async with generation_slot(trip_id):
         try:
-            await _generate(trip_id, spec, user_id, prior_doc)
+            # Hard cap: a hung provider await must never leave the doc spinning
+            # at "planning" forever (the stuck-at-10% bug). Normal successful
+            # runs finish well under this.
+            await asyncio.wait_for(
+                _generate(trip_id, spec, user_id, prior_doc),
+                timeout=GENERATION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[trip-doc] generation timed out for %s", trip_id)
+            sentry_sdk.capture_message(f"trip-doc generation timeout {trip_id}")
+            try:
+                await store.set_status(
+                    trip_id, "error", progress=100,
+                    error="Plan generation took too long on the free deployment and was stopped. Please try again.")
+            except Exception:  # noqa: BLE001
+                logger.error("[trip-doc] could not mark %s as error", trip_id)
         except Exception as exc:  # noqa: BLE001 — the doc must reach a terminal status
             logger.error("[trip-doc] generation failed for %s: %s", trip_id, exc, exc_info=True)
             sentry_sdk.capture_exception(exc)
             try:
-                await store.set_status(trip_id, "error", progress=100)
+                await store.set_status(trip_id, "error", progress=100,
+                                       error=_honest_failure(exc))
             except Exception:  # noqa: BLE001
                 logger.error("[trip-doc] could not mark %s as error", trip_id)
 
@@ -112,6 +143,7 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
         "departure_date": spec.get("departure_date"), "days": spec.get("days") or 3,
         "travelers": travelers, "budget_tier": budget,
         "interests": spec.get("interests") or [], "stops": spec.get("stops") or [],
+        "comments": spec.get("comments") or "",
     }}
     await store.put_doc(trip_id, doc_from_graph(
         trip_id, spec, graph, status="planning", progress=10))
@@ -203,6 +235,7 @@ async def _fill_itineraries_and_stays(graph: G.TripGraph, stayed: list[G.TripSto
                 PlanTripRequest(
                     destination=node.city, days=min(days, 7), budget=budget,
                     travelers=travelers, interests=spec.get("interests") or [],
+                    notes=spec.get("comments") or None,
                     start_date=node.arrival_date, end_date=node.departure_date,
                     skip_user_trips=True,
                 ),

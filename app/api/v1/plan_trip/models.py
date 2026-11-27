@@ -20,6 +20,7 @@ class PlanTripRequest(BaseModel):
     days: int = 3
     budget: str = "mid"
     travelers: int = 2
+    notes: str | None = None        # free-text traveller preferences/stops
     interests: list[str] = []
     start_date: str | None = None
     end_date: str | None = None
@@ -122,6 +123,7 @@ class PlanRequest(BaseModel):
     budget: str = "mid"                 # "low" | "mid" | "high"
     interests: list[str] = []
     stops: list[StopSpec] = []
+    comments: str | None = None     # free-text preferences; stops may be named here
 
     @field_validator("departure_date")
     @classmethod

@@ -79,14 +79,21 @@ async def put_doc(trip_id: str, doc: dict) -> dict:
     return doc
 
 
-async def set_status(trip_id: str, status: str, progress: int | None = None) -> None:
-    """Cheap status/progress-only transition (row columns + doc fields)."""
+async def set_status(trip_id: str, status: str, progress: int | None = None,
+                     error: str | None = None) -> None:
+    """Cheap status/progress-only transition (row columns + doc fields).
+    A terminal error also records a user-honest reason on the doc so the
+    client can say WHY instead of spinning forever."""
     def _sync() -> None:
         row = get_row_sync(trip_id)
         if row is None:
             return
         doc = row.get("doc") or {}
         doc["status"] = status
+        if error is not None:
+            doc["error"] = error
+        elif status == "ready":
+            doc.pop("error", None)
         if progress is not None:
             doc["progress"] = progress
         doc["updated_at"] = _now()

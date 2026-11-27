@@ -53,7 +53,7 @@ Days: {days}
 Budget: {budget} ({symbol}{low}–{symbol}{high}/day)
 Travelers: {travelers}
 Interests: {interests}
-
+{notes_block}
 TASK: Create a rich {days}-day itinerary for {destination}.
 
 RULES:
@@ -189,6 +189,9 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
         high=brange[1],
         travelers=body.travelers,
         interests=", ".join(body.interests) or "general sightseeing",
+        notes_block=(("Traveller notes (respect these preferences; places named "
+                      "here should appear in the plan): " + body.notes + "\n")
+                     if getattr(body, "notes", None) else ""),
     )
 
     # Deterministic sampling: identical filters → identical itinerary.
