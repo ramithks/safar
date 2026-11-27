@@ -71,10 +71,9 @@ class TransportOption(BaseModel):
     # falls back to computing it from `raw`.
     available: Optional[bool] = None
     # Waitlist honesty (trains): the provider's cheapest class is often a
-    # waitlist, not a confirmed seat. fare_per_person is the cheapest
-    # CONFIRMED-available class fare when class data exists; a cheaper
-    # waitlisted fare is carried separately and must never be presented as
-    # a confirmed price.
+    # waitlist. fare_per_person is the cheapest fare that was AVAILABLE at
+    # check time when class data exists; a cheaper waitlisted fare is carried
+    # separately and must never be presented as an available price.
     fare_waitlist: Optional[float] = None
     availability_note: Optional[str] = None
     # Permanent search-store reference (search_results.id) — the v4 typed link.
@@ -221,8 +220,9 @@ def _train_fare_fields(item: dict) -> tuple[float | None, float | None, str | No
         note = (
             f"Cheapest fare Rs {waitlist_fare} ({waitlist_cls}) is a waitlist"
             + (f" ({wl_display}, {wl_pred} prediction)" if wl_pred else (f" ({wl_display})" if wl_display else ""))
-            + (f"; a confirmed seat starts at Rs {confirmed_fare} ({confirmed_cls})" if confirmed_fare else "; no confirmed seat on this train")
-            + ". A waitlist prediction is not a confirmed seat."
+            + (f"; Rs {confirmed_fare} ({confirmed_cls}) was available at the time of checking"
+               if confirmed_fare else "; no class showed seats available at the time of checking")
+            + ". Availability and waitlist predictions can change until a ticket is issued."
         )
     return confirmed_fare, waitlist_fare, note
 

@@ -81,6 +81,12 @@ async def _photon(query: str) -> Optional[dict]:
                 params={"q": query, "limit": 3, "lang": "en"},
                 headers={"User-Agent": _UA},
             )
+            if r.status_code in (403, 429):
+                # Photon terms: extensive usage is throttled. On throttling we
+                # STOP grounding, never retry - activities stay honestly
+                # labelled unverified.
+                logger.warning("[osm] photon throttled (%s); grounding skipped", r.status_code)
+                return None
             r.raise_for_status()
             data = r.json()
     except Exception as exc:  # noqa: BLE001
