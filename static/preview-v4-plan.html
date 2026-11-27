@@ -114,7 +114,8 @@
   .day-panel { display: none; }
   .day-panel.on { display: block; }
   .results { display: none; }
-  .plan-status { flex: 1; align-self: center; color: var(--muted); font-size: 12.5px; min-width: 0; }
+  .plan-status:empty { display: none; }
+  .plan-status { grid-column: 1 / -1; color: var(--muted); font-size: 12.5px; min-width: 0; }
   .plan-status.err { color: #ff9d7e; }
   .mode-banner { display: none; margin: 14px 0 0; background: rgba(255,255,255,0.05); border: 1px solid var(--line); color: var(--muted); font-size: 12px; border-radius: 10px; padding: 8px 12px; }
   .mode-banner.on { display: block; }
@@ -178,7 +179,8 @@
           <div class="f"><label>Days</label><input type="number" value="3" min="1" max="14"></div>
           <div class="f"><label>Travellers</label><input type="number" value="2" min="1" max="12"></div>
           <div class="f"><label>Budget</label><select><option>Low</option><option selected>Mid</option><option>High</option></select></div>
-          <div class="build-row"><div id="planStatus" class="plan-status" role="status"></div><button id="build">Build my plan</button></div>
+          <div id="planStatus" class="plan-status" role="status"></div>
+          <div class="build-row"><button id="build">Build my plan</button></div>
         </div>
       </div>
     </div>
@@ -236,6 +238,7 @@
           <div class="ih-meta" id="itinMeta">Bengaluru &#8594; Gokarna &#183; 5 - 7 Dec &#183; 2 travellers</div>
         </div>
       </div>
+      <div class="mode-banner" id="mockBannerResults" style="margin: 14px 22px 0;"></div>
       <div class="sample-banner">Sample plan - your generated plan appears here after you build a trip.</div>
       <div class="day-tabs">
         <span class="dt on" data-day="1">Day 1</span><span class="dt" data-day="2">Day 2</span><span class="dt" data-day="3">Day 3</span>
@@ -261,7 +264,8 @@
   /* ---- real integration layer (same contract as the deployed app) ---- */
   const API_BASE = location.protocol === 'data:' || location.hostname === '' ? null : '';
   const qs = new URLSearchParams(location.search || location.hash.slice(1));
-  const MOCK = qs.get('mock'); // preview-only test hook: planning | ready | error
+  const LOCAL = location.protocol === 'data:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1' || location.hostname === '';
+  const MOCK = LOCAL ? qs.get('mock') : null; // preview-only test hook, inert on the deployed origin
   const modeBanner = document.getElementById('modeBanner');
   const planStatus = document.getElementById('planStatus');
   let sb = null, session = null;
@@ -278,7 +282,7 @@
     const j = (code, obj) => ({ ok: code < 300, status: code, json: async () => obj });
     if (path === '/api/v1/public-config') return j(200, { supabase_url: '', supabase_anon_key: '' });
     if (path === '/api/v3/trips' && (!opts || opts.method !== 'GET')) {
-      if (MOCK === 'error') return j(429, { detail: 'Free AI plan generation is temporarily unavailable: the daily free-model quota is exhausted. It resets within 24 hours; please try again tomorrow.' });
+      if (MOCK === 'error') return j(429, { detail: 'Free AI plan generation is temporarily unavailable - the daily free-model quota is exhausted. Please try again later.' });
       return j(200, { trip_id: 'mock-trip-1' });
     }
     if (path.startsWith('/api/v3/trips/')) {
@@ -298,7 +302,7 @@
         session = data.session;
       }
     } catch (_) { /* unreachable API: stay in design mode */ }
-    if (MOCK) { banner('Preview mock mode (' + MOCK + ') - API responses are simulated for design verification.'); return; }
+    if (MOCK) { banner('Preview mock mode (' + MOCK + ') - API responses are simulated for design verification.'); document.getElementById('mockBannerResults').textContent = 'Simulated sample data (mock mode: ' + MOCK + ') - not a real generated trip.'; document.getElementById('mockBannerResults').classList.add('on'); return; }
     if (!session) banner('Design preview - sign in on the deployed app to build real trips. Sample content is labelled.');
   }
 
