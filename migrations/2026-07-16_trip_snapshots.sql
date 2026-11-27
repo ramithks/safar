@@ -29,6 +29,7 @@ ALTER TABLE public.trip_snapshots ENABLE ROW LEVEL SECURITY;
 -- are never read directly by clients).
 DROP POLICY IF EXISTS trip_snapshots_service ON public.trip_snapshots;
 drop policy if exists trip_snapshots_service on public.trip_snapshots;
+drop policy if exists trip_snapshots_service on public.trip_snapshots;
 create policy trip_snapshots_service on public.trip_snapshots
   FOR ALL USING (auth.role() = 'service_role')
   WITH CHECK (auth.role() = 'service_role');

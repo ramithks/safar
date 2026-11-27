@@ -106,12 +106,14 @@ ALTER TABLE public.trip_memory          ENABLE ROW LEVEL SECURITY;
 -- Shared visibility predicate mirrors schema.sql:472-475 (trip_state_events_own).
 DROP POLICY IF EXISTS search_batches_read ON public.search_batches;
 drop policy if exists search_batches_read on public.search_batches;
+drop policy if exists search_batches_read on public.search_batches;
 create policy search_batches_read on public.search_batches FOR SELECT
   USING (EXISTS (SELECT 1 FROM public.trip_states t
                  WHERE t.id = search_batches.trip_id
                    AND (t.user_id = auth.uid() OR t.visibility IN ('link','public'))));
 
 DROP POLICY IF EXISTS search_results_read ON public.search_results;
+drop policy if exists search_results_read on public.search_results;
 drop policy if exists search_results_read on public.search_results;
 create policy search_results_read on public.search_results FOR SELECT
   USING (EXISTS (SELECT 1 FROM public.trip_states t
@@ -120,6 +122,7 @@ create policy search_results_read on public.search_results FOR SELECT
 
 DROP POLICY IF EXISTS trip_result_views_read ON public.trip_result_views;
 drop policy if exists trip_result_views_read on public.trip_result_views;
+drop policy if exists trip_result_views_read on public.trip_result_views;
 create policy trip_result_views_read on public.trip_result_views FOR SELECT
   USING (EXISTS (SELECT 1 FROM public.trip_states t
                  WHERE t.id = trip_result_views.trip_id
@@ -127,12 +130,14 @@ create policy trip_result_views_read on public.trip_result_views FOR SELECT
 
 DROP POLICY IF EXISTS trip_recommendations_read ON public.trip_recommendations;
 drop policy if exists trip_recommendations_read on public.trip_recommendations;
+drop policy if exists trip_recommendations_read on public.trip_recommendations;
 create policy trip_recommendations_read on public.trip_recommendations FOR SELECT
   USING (EXISTS (SELECT 1 FROM public.trip_states t
                  WHERE t.id = trip_recommendations.trip_id
                    AND (t.user_id = auth.uid() OR t.visibility IN ('link','public'))));
 
 DROP POLICY IF EXISTS trip_memory_read ON public.trip_memory;
+drop policy if exists trip_memory_read on public.trip_memory;
 drop policy if exists trip_memory_read on public.trip_memory;
 create policy trip_memory_read on public.trip_memory FOR SELECT
   USING (EXISTS (SELECT 1 FROM public.trip_states t

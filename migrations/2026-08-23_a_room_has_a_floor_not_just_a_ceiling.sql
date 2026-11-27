@@ -105,12 +105,14 @@ alter table public.negotiation_rules enable row level security;
 -- The agent reads through the service role and shows nobody.
 do $$ begin
   drop policy if exists negotiation_rules_read on public.negotiation_rules;
+drop policy if exists negotiation_rules_read on public.negotiation_rules;
 create policy negotiation_rules_read on public.negotiation_rules
     for select using (has_partner_perm(partner_id, 'rates'));
 exception when duplicate_object then null; end $$;
 
 do $$ begin
   drop policy if exists negotiation_rules_write on public.negotiation_rules;
+drop policy if exists negotiation_rules_write on public.negotiation_rules;
 create policy negotiation_rules_write on public.negotiation_rules
     for all using (has_partner_perm(partner_id, 'rates'))
     with check (has_partner_perm(partner_id, 'rates'));

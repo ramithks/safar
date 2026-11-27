@@ -366,68 +366,96 @@ ALTER TABLE public.folder_items       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.user_home_feed    ENABLE ROW LEVEL SECURITY;
 
 -- profiles
-CREATE POLICY "profiles_read_all"   ON public.profiles FOR SELECT USING (true);
-CREATE POLICY "profiles_insert_own" ON public.profiles FOR INSERT WITH CHECK (auth.uid() = id);
-CREATE POLICY "profiles_update_own" ON public.profiles FOR UPDATE USING (auth.uid() = id);
-CREATE POLICY "profiles_admin_all"  ON public.profiles FOR ALL USING (is_admin());
+drop policy if exists "profiles_read_all" on public.profiles;
+create policy "profiles_read_all" on public.profiles FOR SELECT USING (true);
+drop policy if exists "profiles_insert_own" on public.profiles;
+create policy "profiles_insert_own" on public.profiles FOR INSERT WITH CHECK (auth.uid() = id);
+drop policy if exists "profiles_update_own" on public.profiles;
+create policy "profiles_update_own" on public.profiles FOR UPDATE USING (auth.uid() = id);
+drop policy if exists "profiles_admin_all" on public.profiles;
+create policy "profiles_admin_all" on public.profiles FOR ALL USING (is_admin());
 
 -- trips
-CREATE POLICY "trips_crud_own"    ON public.trips FOR ALL    USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
-CREATE POLICY "trips_public_read" ON public.trips FOR SELECT USING (is_public = true);
+drop policy if exists "trips_crud_own" on public.trips;
+create policy "trips_crud_own" on public.trips FOR ALL    USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+drop policy if exists "trips_public_read" on public.trips;
+create policy "trips_public_read" on public.trips FOR SELECT USING (is_public = true);
 
 -- internal_trip_logs
-CREATE POLICY "logs_system_insert" ON public.internal_trip_logs FOR INSERT WITH CHECK (true);
-CREATE POLICY "logs_public_read"   ON public.internal_trip_logs FOR SELECT USING (is_public = true);
-CREATE POLICY "logs_admin_read"    ON public.internal_trip_logs FOR SELECT USING (is_admin());
+drop policy if exists "logs_system_insert" on public.internal_trip_logs;
+create policy "logs_system_insert" on public.internal_trip_logs FOR INSERT WITH CHECK (true);
+drop policy if exists "logs_public_read" on public.internal_trip_logs;
+create policy "logs_public_read" on public.internal_trip_logs FOR SELECT USING (is_public = true);
+drop policy if exists "logs_admin_read" on public.internal_trip_logs;
+create policy "logs_admin_read" on public.internal_trip_logs FOR SELECT USING (is_admin());
 
 -- trip_groups
-CREATE POLICY "trip_groups_owner_all"    ON public.trip_groups FOR ALL    USING (auth.uid() = created_by) WITH CHECK (auth.uid() = created_by);
-CREATE POLICY "trip_groups_member_read"  ON public.trip_groups FOR SELECT USING (is_group_member(id));
+drop policy if exists "trip_groups_owner_all" on public.trip_groups;
+create policy "trip_groups_owner_all" on public.trip_groups FOR ALL    USING (auth.uid() = created_by) WITH CHECK (auth.uid() = created_by);
+drop policy if exists "trip_groups_member_read" on public.trip_groups;
+create policy "trip_groups_member_read" on public.trip_groups FOR SELECT USING (is_group_member(id));
 
 -- group_members
-CREATE POLICY "group_members_read"   ON public.group_members FOR SELECT USING (user_id = auth.uid() OR is_group_member(group_id));
-CREATE POLICY "group_members_insert" ON public.group_members FOR INSERT WITH CHECK (auth.uid() = user_id OR is_group_admin(group_id));
-CREATE POLICY "group_members_delete" ON public.group_members FOR DELETE USING (user_id = auth.uid() OR is_group_admin(group_id));
+drop policy if exists "group_members_read" on public.group_members;
+create policy "group_members_read" on public.group_members FOR SELECT USING (user_id = auth.uid() OR is_group_member(group_id));
+drop policy if exists "group_members_insert" on public.group_members;
+create policy "group_members_insert" on public.group_members FOR INSERT WITH CHECK (auth.uid() = user_id OR is_group_admin(group_id));
+drop policy if exists "group_members_delete" on public.group_members;
+create policy "group_members_delete" on public.group_members FOR DELETE USING (user_id = auth.uid() OR is_group_admin(group_id));
 
 -- group_messages
-CREATE POLICY "group_messages_member_all" ON public.group_messages FOR ALL USING (is_group_member(group_id)) WITH CHECK (is_group_member(group_id));
+drop policy if exists "group_messages_member_all" on public.group_messages;
+create policy "group_messages_member_all" on public.group_messages FOR ALL USING (is_group_member(group_id)) WITH CHECK (is_group_member(group_id));
 
 -- group_expenses
-CREATE POLICY "group_expenses_member_all" ON public.group_expenses FOR ALL USING (is_group_member(group_id)) WITH CHECK (is_group_member(group_id));
+drop policy if exists "group_expenses_member_all" on public.group_expenses;
+create policy "group_expenses_member_all" on public.group_expenses FOR ALL USING (is_group_member(group_id)) WITH CHECK (is_group_member(group_id));
 
 -- trip_bookings
-CREATE POLICY "trip_bookings_own" ON public.trip_bookings FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+drop policy if exists "trip_bookings_own" on public.trip_bookings;
+create policy "trip_bookings_own" on public.trip_bookings FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
 -- trip_documents
-CREATE POLICY "trip_documents_own" ON public.trip_documents FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+drop policy if exists "trip_documents_own" on public.trip_documents;
+create policy "trip_documents_own" on public.trip_documents FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
 -- trip_reels
-CREATE POLICY "trip_reels_own" ON public.trip_reels FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+drop policy if exists "trip_reels_own" on public.trip_reels;
+create policy "trip_reels_own" on public.trip_reels FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
 -- reel_scans
-CREATE POLICY "reel_scans_own" ON public.reel_scans FOR ALL USING (auth.uid() = user_id);
+drop policy if exists "reel_scans_own" on public.reel_scans;
+create policy "reel_scans_own" on public.reel_scans FOR ALL USING (auth.uid() = user_id);
 
 -- reel_jobs
-CREATE POLICY "reel_jobs_own" ON public.reel_jobs FOR ALL USING (auth.uid() = user_id);
+drop policy if exists "reel_jobs_own" on public.reel_jobs;
+create policy "reel_jobs_own" on public.reel_jobs FOR ALL USING (auth.uid() = user_id);
 
 -- saved_reels
-CREATE POLICY "saved_reels_own" ON public.saved_reels FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+drop policy if exists "saved_reels_own" on public.saved_reels;
+create policy "saved_reels_own" on public.saved_reels FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
 -- trip_saved_reels
-CREATE POLICY "trip_saved_reels_own" ON public.trip_saved_reels FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+drop policy if exists "trip_saved_reels_own" on public.trip_saved_reels;
+create policy "trip_saved_reels_own" on public.trip_saved_reels FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
 -- trip_journey
-CREATE POLICY "trip_journey_crud_own" ON public.trip_journey FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+drop policy if exists "trip_journey_crud_own" on public.trip_journey;
+create policy "trip_journey_crud_own" on public.trip_journey FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
 -- saved_folders
-CREATE POLICY "saved_folders_own" ON public.saved_folders FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+drop policy if exists "saved_folders_own" on public.saved_folders;
+create policy "saved_folders_own" on public.saved_folders FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
 -- folder_items
-CREATE POLICY "folder_items_own" ON public.folder_items FOR ALL USING (EXISTS (SELECT 1 FROM public.saved_folders WHERE id = folder_items.folder_id AND user_id = auth.uid()));
+drop policy if exists "folder_items_own" on public.folder_items;
+create policy "folder_items_own" on public.folder_items FOR ALL USING (EXISTS (SELECT 1 FROM public.saved_folders WHERE id = folder_items.folder_id AND user_id = auth.uid()));
 
 -- user_home_feed
-CREATE POLICY "feed_user_read"  ON public.user_home_feed FOR SELECT USING (auth.uid() = user_id);
-CREATE POLICY "feed_service_all" ON public.user_home_feed FOR ALL USING (auth.role() = 'service_role');
+drop policy if exists "feed_user_read" on public.user_home_feed;
+create policy "feed_user_read" on public.user_home_feed FOR SELECT USING (auth.uid() = user_id);
+drop policy if exists "feed_service_all" on public.user_home_feed;
+create policy "feed_service_all" on public.user_home_feed FOR ALL USING (auth.role() = 'service_role');
 
 -- ══════════════════════════════════════════════════════════════════════════════
 -- Trip State V2 — persistent TripState object + append-only patch log
@@ -468,12 +496,15 @@ ALTER TABLE public.trip_states       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.trip_state_events ENABLE ROW LEVEL SECURITY;
 
 -- Owner CRUD; public/link trips readable by anyone (share/clone flows)
-CREATE POLICY "trip_states_own"    ON public.trip_states FOR ALL
+drop policy if exists "trip_states_own" on public.trip_states;
+create policy "trip_states_own" on public.trip_states FOR ALL
   USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
-CREATE POLICY "trip_states_shared" ON public.trip_states FOR SELECT
+drop policy if exists "trip_states_shared" on public.trip_states;
+create policy "trip_states_shared" on public.trip_states FOR SELECT
   USING (visibility IN ('link', 'public'));
 
-CREATE POLICY "trip_state_events_own" ON public.trip_state_events FOR SELECT
+drop policy if exists "trip_state_events_own" on public.trip_state_events;
+create policy "trip_state_events_own" on public.trip_state_events FOR SELECT
   USING (EXISTS (SELECT 1 FROM public.trip_states t
                  WHERE t.id = trip_state_events.trip_id
                    AND (t.user_id = auth.uid() OR t.visibility IN ('link', 'public'))));
@@ -501,7 +532,8 @@ CREATE INDEX IF NOT EXISTS idx_copilot_messages_trip ON public.copilot_messages(
 ALTER TABLE public.copilot_messages ENABLE ROW LEVEL SECURITY;
 
 -- Readable by the trip owner + anyone the trip is shared with (mirrors events)
-CREATE POLICY "copilot_messages_own" ON public.copilot_messages FOR SELECT
+drop policy if exists "copilot_messages_own" on public.copilot_messages;
+create policy "copilot_messages_own" on public.copilot_messages FOR SELECT
   USING (EXISTS (SELECT 1 FROM public.trip_states t
                  WHERE t.id = copilot_messages.trip_id
                    AND (t.user_id = auth.uid() OR t.visibility IN ('link', 'public'))));
@@ -521,6 +553,7 @@ CREATE TABLE IF NOT EXISTS public.user_travel_memory (
 
 ALTER TABLE public.user_travel_memory ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "user_travel_memory_own" ON public.user_travel_memory FOR SELECT
+drop policy if exists "user_travel_memory_own" on public.user_travel_memory;
+create policy "user_travel_memory_own" on public.user_travel_memory FOR SELECT
   USING (auth.uid() = user_id);
 -- Writes go through the service role only (backend distiller)

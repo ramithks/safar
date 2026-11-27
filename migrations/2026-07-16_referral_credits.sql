@@ -51,10 +51,12 @@ ALTER TABLE public.credit_ledger  ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS referral_codes_service ON public.referral_codes;
 drop policy if exists referral_codes_service on public.referral_codes;
+drop policy if exists referral_codes_service on public.referral_codes;
 create policy referral_codes_service on public.referral_codes
   FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
 DROP POLICY IF EXISTS credit_ledger_service ON public.credit_ledger;
+drop policy if exists credit_ledger_service on public.credit_ledger;
 drop policy if exists credit_ledger_service on public.credit_ledger;
 create policy credit_ledger_service on public.credit_ledger
   FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');

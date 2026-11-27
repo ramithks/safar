@@ -59,12 +59,14 @@ alter table public.stay_time_rules enable row level security;
 
 do $$ begin
   drop policy if exists stay_time_rules_read on public.stay_time_rules;
+drop policy if exists stay_time_rules_read on public.stay_time_rules;
 create policy stay_time_rules_read on public.stay_time_rules
     for select using (owns_partner(partner_id));
 exception when duplicate_object then null; end $$;
 
 do $$ begin
   drop policy if exists stay_time_rules_write on public.stay_time_rules;
+drop policy if exists stay_time_rules_write on public.stay_time_rules;
 create policy stay_time_rules_write on public.stay_time_rules
     for all using (has_partner_perm(partner_id, 'rates'))
     with check (has_partner_perm(partner_id, 'rates'));

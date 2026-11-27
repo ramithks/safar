@@ -51,6 +51,7 @@ alter table public.hotel_config_audit enable row level security;
 -- happened, which is worse than having no history.
 do $$ begin
   drop policy if exists hotel_config_audit_read on public.hotel_config_audit;
+drop policy if exists hotel_config_audit_read on public.hotel_config_audit;
 create policy hotel_config_audit_read on public.hotel_config_audit
     for select using (has_partner_perm(partner_id, 'rates'));
 exception when duplicate_object then null; end $$;

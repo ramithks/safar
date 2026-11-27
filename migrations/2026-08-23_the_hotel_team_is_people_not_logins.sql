@@ -157,11 +157,13 @@ alter table public.agent_escalations enable row level security;
 -- adding somebody to the hotel's staff in every sense that matters.
 do $$ begin
   drop policy if exists hotel_team_members_read on public.hotel_team_members;
+drop policy if exists hotel_team_members_read on public.hotel_team_members;
 create policy hotel_team_members_read on public.hotel_team_members
     for select using (owns_partner(partner_id));
 exception when duplicate_object then null; end $$;
 do $$ begin
   drop policy if exists hotel_team_members_write on public.hotel_team_members;
+drop policy if exists hotel_team_members_write on public.hotel_team_members;
 create policy hotel_team_members_write on public.hotel_team_members
     for all using (has_partner_perm(partner_id, 'members'))
     with check (has_partner_perm(partner_id, 'members'));
@@ -169,11 +171,13 @@ exception when duplicate_object then null; end $$;
 
 do $$ begin
   drop policy if exists team_notification_rules_read on public.team_notification_rules;
+drop policy if exists team_notification_rules_read on public.team_notification_rules;
 create policy team_notification_rules_read on public.team_notification_rules
     for select using (owns_partner(partner_id));
 exception when duplicate_object then null; end $$;
 do $$ begin
   drop policy if exists team_notification_rules_write on public.team_notification_rules;
+drop policy if exists team_notification_rules_write on public.team_notification_rules;
 create policy team_notification_rules_write on public.team_notification_rules
     for all using (has_partner_perm(partner_id, 'members'))
     with check (has_partner_perm(partner_id, 'members'));
@@ -181,11 +185,13 @@ exception when duplicate_object then null; end $$;
 
 do $$ begin
   drop policy if exists agent_escalations_read on public.agent_escalations;
+drop policy if exists agent_escalations_read on public.agent_escalations;
 create policy agent_escalations_read on public.agent_escalations
     for select using (owns_partner(partner_id));
 exception when duplicate_object then null; end $$;
 do $$ begin
   drop policy if exists agent_escalations_write on public.agent_escalations;
+drop policy if exists agent_escalations_write on public.agent_escalations;
 create policy agent_escalations_write on public.agent_escalations
     for all using (has_partner_perm(partner_id, 'messaging'))
     with check (has_partner_perm(partner_id, 'messaging'));
