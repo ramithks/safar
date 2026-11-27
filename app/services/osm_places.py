@@ -111,6 +111,7 @@ async def city_pois(city: str) -> list[dict]:
         return cached
 
     coords = await _geocode_city(city)
+    max_km = 50.0  # 'nearby' means the requested town/region, not the state
     if not coords:
         return []
     lat, lng = coords
@@ -118,7 +119,8 @@ async def city_pois(city: str) -> list[dict]:
     query = (
         "[out:json][timeout:35]"
         f"[bbox:{bbox}];"
-        'nwr["tourism"~"^(attraction|viewpoint|museum|zoo|theme_park|gallery|artwork)$"]["name"];'
+        '(nwr["tourism"~"^(attraction|viewpoint|museum|zoo|theme_park|gallery|artwork)$"]["name"];'
+        'nwr["amenity"~"^(cafe|restaurant)$"]["name"];);'
         "out center tags 120;"
     )
     data = None
@@ -153,7 +155,8 @@ async def city_pois(city: str) -> list[dict]:
             "lng": float(elng),
             "osm_type": el.get("type"),
             "osm_id": el.get("id"),
-            "category": tags.get("tourism"),
+            "category": tags.get("tourism") or tags.get("amenity"),
+            "locality": tags.get("addr:city") or tags.get("addr:town") or tags.get("addr:village"),
             "source": "openstreetmap",
         })
     if not pois:  # Overpass unreachable or mapped nothing: try Wikidata
@@ -171,6 +174,8 @@ _WIKIDATA_TYPES = {
     "Q44539": "temple",        # Hindu temple
     "Q33506": "museum",
     "Q839954": "viewpoint",
+    "Q30022": "cafe",          # cafe
+    "Q11707": "restaurant",
 }
 
 
@@ -320,22 +325,31 @@ async def _photon(title: str, city: str) -> Optional[dict]:
                     logger.warning("[osm] photon throttled (%s); grounding skipped", r.status_code)
                     return None
                 r.raise_for_status()
+                near = []
                 for f in (r.json().get("features") or []):
                     props = f.get("properties") or {}
                     name = props.get("name")
                     lon, lat = (f.get("geometry") or {}).get("coordinates") or [None, None]
-                    if name and lat is not None and _matches(title, name):
-                        if coords and _km(coords[0], coords[1], float(lat), float(lon)) > 150:
-                            continue  # same-named place in another region
-                        hit = {
-                            "name": name,
-                            "lat": float(lat),
-                            "lng": float(lon),
-                            "osm_type": (props.get("osm_type") or "").lower() or None,
-                            "osm_id": props.get("osm_id"),
-                            "category": props.get("osm_value"),
-                        }
-                        break
+                    if not (name and lat is not None and _matches(title, name)):
+                        continue
+                    if coords and _km(coords[0], coords[1], float(lat), float(lon)) > max_km:
+                        continue  # same-named place outside the requested town/region
+                    near.append({
+                        "name": name,
+                        "lat": float(lat),
+                        "lng": float(lon),
+                        "osm_type": (props.get("osm_type") or "").lower() or None,
+                        "osm_id": props.get("osm_id"),
+                        "category": props.get("osm_value"),
+                        "locality": props.get("city") or props.get("town") or props.get("village") or props.get("locality"),
+                    })
+                # two same-named matches in clearly different spots: ambiguous,
+                # not verification
+                if len(near) >= 2 and _km(near[0]["lat"], near[0]["lng"],
+                                          near[1]["lat"], near[1]["lng"]) > 10:
+                    near = []
+                if near:
+                    hit = near[0]
                 if hit:
                     break
     except Exception as exc:  # noqa: BLE001

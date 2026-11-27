@@ -98,7 +98,9 @@ def _apply_osm(act: dict, hit: dict, city: str = "") -> None:
         "waterfall": "Waterfall", "peak": "Peak", "temple": "Temple",
     }.get((hit.get("category") or "").lower(), "Place")
     via = "Wikidata" if hit.get("source") == "wikidata" else "OpenStreetMap"
-    where = f" in {city}" if city else ""
+    # Only a locality the provider itself returned counts as venue geography;
+    # the trip's stop city is not evidence of where the place sits.
+    where = f" near {hit['locality']}" if hit.get("locality") else ""
     act["description"] = (
         f"{kind}{where} — name and location verified via {via}. "
         "Opening hours, entry fees and other details are not independently verified."

@@ -112,6 +112,9 @@
   .slot .what b { font-size: 14.5px; display: block; }
   .slot .what span { color: var(--muted); font-size: 12.5px; line-height: 1.45; display: block; margin-top: 2px; }
   .slot .tagchip { flex: none; align-self: flex-start; font-size: 10.5px; font-weight: 700; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 4px 9px; }
+  .sugg { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 8px; }
+  .sugg-h { font-size: 11.5px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 2px; }
+  .sugg-i .what b { font-weight: 600; color: var(--muted); }
   .day-panel { display: none; }
   .day-panel.on { display: block; }
   .results { display: none; }
@@ -533,7 +536,12 @@
       box.innerHTML = days.map((dd, i) => {
         const items = (dd.activities || dd.items || []).map(it =>
           '<div class="slot"><div class="time">' + esc(it.time || it.start_time || '') + '</div><div class="what"><b>' + esc(it.title || it.name || it) + '</b>' + (it.description ? '<span>' + esc(it.description) + '</span>' : '') + '</div></div>').join('');
-        return '<div class="day day-panel' + (i === 0 ? ' on' : '') + '" data-day="' + (i + 1) + '">' + items + '</div>';
+        const sugg = (dd.suggestions || []).length
+          ? '<div class="sugg"><div class="sugg-h">More verified places nearby &mdash; optional ideas, not in your schedule</div>' +
+            (dd.suggestions || []).map(it =>
+              '<div class="slot sugg-i"><div class="time">&nbsp;</div><div class="what"><b>' + esc(it.title || '') + '</b>' + (it.description ? '<span>' + esc(it.description) + '</span>' : '') + '</div></div>').join('') + '</div>'
+          : '';
+        return '<div class="day day-panel' + (i === 0 ? ' on' : '') + '" data-day="' + (i + 1) + '">' + items + sugg + '</div>';
       }).join('');
       document.querySelector('.day-tabs').innerHTML = days.map((dd, i) =>
         '<span class="dt' + (i === 0 ? ' on' : '') + '" data-day="' + (i + 1) + '">Day ' + (dd.day ?? i + 1) + '</span>').join('');
