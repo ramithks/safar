@@ -323,8 +323,10 @@
       const res = await api('/api/v3/trips', { method: 'POST', headers, body: JSON.stringify(body) });
       if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || ('Request failed (HTTP ' + res.status + ')')); }
       const { trip_id } = await res.json();
-      const ids = JSON.parse(localStorage.getItem('safar_trip_ids') || '[]');
-      if (!ids.includes(trip_id)) { ids.unshift(trip_id); localStorage.setItem('safar_trip_ids', JSON.stringify(ids.slice(0, 12))); }
+      try {
+        const ids = JSON.parse(localStorage.getItem('safar_trip_ids') || '[]');
+        if (!ids.includes(trip_id)) { ids.unshift(trip_id); localStorage.setItem('safar_trip_ids', JSON.stringify(ids.slice(0, 12))); }
+      } catch (_) { /* storage unavailable (e.g. data: preview) - trip still renders */ }
       clearInterval(pollTimer);
       const tick = async () => {
         try {
