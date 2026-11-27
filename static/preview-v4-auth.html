@@ -92,12 +92,13 @@
   .dest-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
   .dest {
     border-radius: 16px; overflow: hidden; border: 1px solid var(--line);
-    min-height: 200px; display: flex; flex-direction: column; justify-content: flex-end;
+    min-height: 168px; display: flex; flex-direction: column; justify-content: flex-end;
     padding: 16px; cursor: pointer;
     transition: transform 0.18s ease, border-color 0.18s ease;
   }
   .dest:hover { transform: translateY(-3px); border-color: #3a3a3a; }
-  .dest h4 { font-size: 18px; }
+  .dest .d-motif { font-size: 26px; margin-bottom: auto; padding-top: 2px; opacity: 0.9; }
+  .dest h4 { font-size: 18px; margin-top: 10px; }
   .dest .d-meta { color: rgba(255,255,255,0.75); font-size: 12.5px; margin-top: 3px; }
   .d1 { background: linear-gradient(165deg, #14384a, #081620 70%); }
   .d2 { background: linear-gradient(200deg, #2e2e2e, #101010 70%); }
@@ -169,10 +170,10 @@
   <div class="sec-head"><h3>Route ideas</h3></div>
   <p class="sec-note">Inspiration only - Safar plans any route you enter; it does not carry a pre-loaded destination inventory.</p>
   <div class="dest-grid">
-    <div class="dest d1"><h4>Gokarna</h4><div class="d-meta">Beaches &#183; Karnataka</div></div>
-    <div class="dest d2"><h4>Coorg</h4><div class="d-meta">Coffee estates &#183; Karnataka</div></div>
-    <div class="dest d3"><h4>Wayanad</h4><div class="d-meta">Forests &#183; Kerala</div></div>
-    <div class="dest d4"><h4>Hampi</h4><div class="d-meta">Heritage ruins &#183; Karnataka</div></div>
+    <div class="dest d1"><span class="d-motif">&#9582;&#65039;</span><h4>Gokarna</h4><div class="d-meta">Beaches &#183; Karnataka &#183; ~485 km from Bengaluru</div></div>
+    <div class="dest d2"><span class="d-motif">&#9748;</span><h4>Coorg</h4><div class="d-meta">Coffee estates &#183; Karnataka &#183; ~265 km from Bengaluru</div></div>
+    <div class="dest d3"><span class="d-motif">&#127794;</span><h4>Wayanad</h4><div class="d-meta">Forests &#183; Kerala &#183; ~280 km from Bengaluru</div></div>
+    <div class="dest d4"><span class="d-motif">&#127983;</span><h4>Hampi</h4><div class="d-meta">Heritage ruins &#183; Karnataka &#183; ~340 km from Bengaluru</div></div>
   </div>
 </section>
 
