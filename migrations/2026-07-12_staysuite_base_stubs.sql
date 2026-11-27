@@ -276,7 +276,7 @@ CREATE TABLE IF NOT EXISTS public.room_types (
   accessible boolean,
   bathroom text,
   bed_count integer,
-  children_allowed boolean,
+  children_allowed text,
   connecting boolean,
   created_at timestamptz NOT NULL DEFAULT now(),
   crib text,
@@ -297,7 +297,7 @@ ALTER TABLE public.room_types ADD COLUMN bathroom text;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS bed_count CASCADE;
 ALTER TABLE public.room_types ADD COLUMN bed_count integer;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS children_allowed CASCADE;
-ALTER TABLE public.room_types ADD COLUMN children_allowed boolean;
+ALTER TABLE public.room_types ADD COLUMN children_allowed text;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS connecting CASCADE;
 ALTER TABLE public.room_types ADD COLUMN connecting boolean;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS crib CASCADE;
@@ -385,3 +385,61 @@ BEGIN
   RETURN coalesce((m.permissions ->> perm)::boolean, false);
 END;
 $$;
+
+-- Ordering fix: 2026-08-23_marketing_that_can_be_reused.sql references
+-- public.experiences but sorts before 2026-08-23_what_a_hotel_sells_besides_a_bed.sql,
+-- which creates it. Definition copied verbatim from the latter (its
+-- CREATE TABLE IF NOT EXISTS becomes a no-op).
+
+create table if not exists public.experiences (
+  id             uuid primary key default gen_random_uuid(),
+  property_id    uuid not null references public.properties(id) on delete cascade,
+  partner_id     uuid not null references public.partners(id) on delete cascade,
+
+  title          text not null,
+  description    text,
+  category       text not null default 'other',
+
+  duration_minutes integer check (duration_minutes is null or duration_minutes > 0),
+  price_paise    integer not null default 0 check (price_paise >= 0),
+  price_unit     text not null default 'per_person'
+                 check (price_unit in ('per_person','per_group','per_vehicle','fixed')),
+
+  meeting_point  text,
+  starts_at      time,
+
+  min_participants integer not null default 1 check (min_participants >= 1),
+  max_participants integer check (max_participants is null or max_participants >= 1),
+
+  min_age        integer check (min_age is null or min_age between 0 and 120),
+  max_age        integer check (max_age is null or max_age between 0 and 120),
+  requirements   text,
+
+  -- Same three-value vocabulary as services and room amenities.
+  availability   text not null default 'available'
+                 check (availability in ('available','on_request','seasonal','not_available')),
+  available_from date,
+  available_to   date,
+  days_of_week   smallint[] not null default '{}',
+
+  -- Same shape as rate_plans.cancellation_policy; one resolver reads all three.
+  cancellation   jsonb not null default '{}'::jsonb,
+
+  photos         text[] not null default '{}',
+  photo_meta     jsonb not null default '{}'::jsonb,
+
+  lead_time_hours integer not null default 0 check (lead_time_hours >= 0),
+  daily_capacity integer check (daily_capacity is null or daily_capacity >= 0),
+
+  is_active      boolean not null default true,
+  sort_order     integer not null default 0,
+  created_at     timestamptz not null default now(),
+  updated_at     timestamptz not null default now(),
+
+  constraint experiences_participants check (
+    max_participants is null or max_participants >= min_participants
+  ),
+  constraint experiences_ages check (
+    min_age is null or max_age is null or max_age >= min_age
+  )
+);
