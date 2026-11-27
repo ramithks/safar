@@ -163,6 +163,8 @@
   .signout:hover { color: var(--text); }
   .details .f textarea { width: 100%; min-width: 0; background: rgba(0,0,0,0.6); border: 1px solid var(--line); color: var(--text); border-radius: 10px; padding: 11px 12px; font-size: 14px; outline: none; font-family: inherit; resize: vertical; }
   .details .f input, .details .f select { min-width: 0; }
+  .details .f, .details .build-row { min-width: 0; grid-column: auto; }
+  .details .build-row { grid-column: 1 / -1; }
   .empty-note { color: var(--muted); font-size: 13px; border: 1px dashed var(--line); border-radius: 12px; padding: 16px; }
   @media (max-width: 900px) {
     .auth-hero { grid-template-columns: 1fr; padding-top: 32px; gap: 30px; }
