@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS public.partners (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   owner_id uuid,
   platform_fee_bps numeric,
-  subscription_id uuid,
+  subscription_id text,
   subscription_status text
 );
 
@@ -160,7 +160,7 @@ ALTER TABLE public.partners ADD COLUMN owner_id uuid;
 ALTER TABLE public.partners DROP COLUMN IF EXISTS platform_fee_bps CASCADE;
 ALTER TABLE public.partners ADD COLUMN platform_fee_bps numeric;
 ALTER TABLE public.partners DROP COLUMN IF EXISTS subscription_id CASCADE;
-ALTER TABLE public.partners ADD COLUMN subscription_id uuid;
+ALTER TABLE public.partners ADD COLUMN subscription_id text;
 ALTER TABLE public.partners DROP COLUMN IF EXISTS subscription_status CASCADE;
 ALTER TABLE public.partners ADD COLUMN subscription_status text;
 
@@ -279,9 +279,9 @@ CREATE TABLE IF NOT EXISTS public.room_types (
   children_allowed boolean,
   connecting boolean,
   created_at timestamptz NOT NULL DEFAULT now(),
-  crib boolean,
+  crib text,
   crib_paise integer,
-  extra_bed boolean,
+  extra_bed text,
   extra_bed_paise integer,
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   max_adults integer,
@@ -301,11 +301,11 @@ ALTER TABLE public.room_types ADD COLUMN children_allowed boolean;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS connecting CASCADE;
 ALTER TABLE public.room_types ADD COLUMN connecting boolean;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS crib CASCADE;
-ALTER TABLE public.room_types ADD COLUMN crib boolean;
+ALTER TABLE public.room_types ADD COLUMN crib text;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS crib_paise CASCADE;
 ALTER TABLE public.room_types ADD COLUMN crib_paise integer;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS extra_bed CASCADE;
-ALTER TABLE public.room_types ADD COLUMN extra_bed boolean;
+ALTER TABLE public.room_types ADD COLUMN extra_bed text;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS extra_bed_paise CASCADE;
 ALTER TABLE public.room_types ADD COLUMN extra_bed_paise integer;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS max_adults CASCADE;
