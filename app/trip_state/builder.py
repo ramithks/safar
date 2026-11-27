@@ -256,6 +256,8 @@ async def _shaped_journey(from_city: str, to_city: str, date: str | None,
         block = _shape_journey(result, include_hotels=include_hotels)
         return block
     except Exception as exc:  # noqa: BLE001 — a routing miss is not fatal
+        if "quota exhausted" in str(exc).lower():
+            raise  # daily free quota must reach the trip's error state as itself
         logger.warning("[builder] journey %s→%s failed: %s", from_city, to_city, exc)
         return None
 

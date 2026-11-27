@@ -157,6 +157,8 @@ async def with_retry(coro_fn, *args, max_retries: int = 2, base_delay: float = 1
         try:
             return await coro_fn(*args, **kwargs)
         except Exception as e:
+            if "quota exhausted" in str(e).lower():
+                raise  # daily free quota: surface the real cause, never silently degrade
             if attempt == max_retries:
                 logger.warning("[retry] %s failed after %dx: %s", getattr(coro_fn, "__name__", "?"), max_retries + 1, e)
                 return fallback
