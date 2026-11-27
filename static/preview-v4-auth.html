@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Safar - AI trip planner</title>
+<style>
+  :root {
+    --bg: #0b1020;
+    --bg2: #0e1530;
+    --surface: rgba(255,255,255,0.045);
+    --surface2: rgba(255,255,255,0.08);
+    --line: rgba(255,255,255,0.09);
+    --text: #eef1fa;
+    --muted: #9aa3c0;
+    --accent: #ff7a59;
+    --accent2: #ffb35c;
+    --teal: #3ddad7;
+    --violet: #8b7bff;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background:
+      radial-gradient(1100px 500px at 85% -10%, rgba(139,123,255,0.16), transparent 60%),
+      radial-gradient(900px 480px at -10% 8%, rgba(61,218,215,0.10), transparent 55%),
+      radial-gradient(700px 700px at 50% 110%, rgba(255,122,89,0.12), transparent 60%),
+      linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%);
+    background-attachment: fixed;
+    color: var(--text);
+    min-height: 100vh;
+  }
+  /* ---------- nav ---------- */
+  nav {
+    position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; gap: 28px;
+    padding: 14px 28px;
+    background: rgba(11,16,32,0.72); backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--line);
+  }
+  .logo { font-size: 22px; font-weight: 800; letter-spacing: 0.4px; }
+  .logo em { font-style: normal; background: linear-gradient(90deg, var(--accent), var(--accent2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .logo .dot { color: var(--teal); }
+  nav .links { display: flex; gap: 20px; margin-left: 8px; }
+  nav .links a { color: var(--muted); text-decoration: none; font-size: 14px; font-weight: 500; }
+  nav .links a.active, nav .links a:hover { color: var(--text); }
+  nav .spacer { flex: 1; }
+  .avatar {
+    width: 34px; height: 34px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--violet), var(--accent));
+    display: grid; place-items: center; font-size: 13px; font-weight: 700; color: #fff;
+    border: 2px solid rgba(255,255,255,0.18);
+  }
+  /* ---------- hero ---------- */
+  .hero { max-width: 1180px; margin: 0 auto; padding: 54px 28px 30px; display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 40px; align-items: center; }
+  .kicker { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--line); color: var(--teal); font-size: 12px; font-weight: 600; letter-spacing: 0.6px; text-transform: uppercase; }
+  .hero h1 { font-size: 46px; line-height: 1.08; margin: 18px 0 14px; letter-spacing: -0.8px; }
+  .hero h1 .grad { background: linear-gradient(90deg, var(--accent), var(--accent2) 55%, var(--teal)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero p.sub { color: var(--muted); font-size: 16px; line-height: 1.55; max-width: 480px; }
+  .hero .cta-row { display: flex; gap: 12px; margin-top: 26px; flex-wrap: wrap; }
+  .btn-primary {
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    color: #1a0e08; font-weight: 700; font-size: 15px;
+    border: none; border-radius: 12px; padding: 14px 26px; cursor: pointer;
+    box-shadow: 0 8px 28px rgba(255,122,89,0.35);
+  }
+  .btn-ghost { background: var(--surface2); color: var(--text); border: 1px solid var(--line); border-radius: 12px; padding: 14px 22px; font-weight: 600; font-size: 15px; cursor: pointer; }
+  .hero .proof { display: flex; gap: 26px; margin-top: 30px; color: var(--muted); font-size: 13px; }
+  .hero .proof b { display: block; color: var(--text); font-size: 19px; }
+  /* ---------- hero art ---------- */
+  .hero-art { position: relative; height: 420px; }
+  .postcard {
+    position: absolute; border-radius: 20px; overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.14);
+    box-shadow: 0 24px 60px rgba(0,0,0,0.5);
+    display: flex; flex-direction: column; justify-content: flex-end;
+    padding: 16px;
+  }
+  .postcard .pc-tag { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; opacity: 0.9; }
+  .postcard .pc-name { font-size: 20px; font-weight: 800; }
+  .postcard .pc-meta { font-size: 12px; opacity: 0.85; margin-top: 2px; }
+  .pc1 { width: 240px; height: 300px; left: 8%; top: 6%; rotate: -4deg; background: linear-gradient(160deg, #153e5e, #0e2237 55%, #ff7a59 140%); }
+  .pc2 { width: 210px; height: 260px; right: 6%; top: 24%; rotate: 5deg; background: linear-gradient(200deg, #2d1b4e, #171033 55%, #3ddad7 150%); }
+  .pc3 { width: 180px; height: 150px; left: 30%; bottom: 2%; rotate: -1deg; background: linear-gradient(120deg, #4e2d1b, #33210f 55%, #ffb35c 150%); }
+  /* ---------- trip builder ---------- */
+  .builder-wrap { max-width: 1180px; margin: 10px auto 0; padding: 0 28px; }
+  .builder {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 22px; padding: 22px; backdrop-filter: blur(8px);
+    box-shadow: 0 18px 50px rgba(0,0,0,0.35);
+  }
+  .builder h2 { font-size: 17px; margin-bottom: 14px; display: flex; align-items: center; gap: 10px; }
+  .builder h2 .spark { color: var(--accent2); }
+  .b-grid { display: grid; grid-template-columns: repeat(5, 1fr) auto; gap: 12px; align-items: end; }
+  .field label { display: block; font-size: 11px; font-weight: 700; letter-spacing: 0.7px; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+  .field input, .field select {
+    width: 100%; background: rgba(0,0,0,0.35); border: 1px solid var(--line);
+    color: var(--text); border-radius: 11px; padding: 12px 13px; font-size: 14px; outline: none;
+  }
+  .field input:focus, .field select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(61,218,215,0.15); }
+  .go { background: linear-gradient(90deg, var(--teal), #5eead4); color: #052e2b; border: none; border-radius: 11px; padding: 13px 22px; font-weight: 800; font-size: 14px; cursor: pointer; white-space: nowrap; }
+  .chips { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+  .chip { font-size: 12.5px; color: var(--muted); background: var(--surface2); border: 1px solid var(--line); border-radius: 999px; padding: 7px 13px; cursor: pointer; }
+  .chip:hover { color: var(--text); border-color: var(--accent); }
+  /* ---------- sections ---------- */
+  section.block { max-width: 1180px; margin: 46px auto 0; padding: 0 28px; }
+  .sec-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 18px; }
+  .sec-head h3 { font-size: 22px; letter-spacing: -0.3px; }
+  .sec-head a { color: var(--teal); font-size: 13px; text-decoration: none; font-weight: 600; }
+  .dest-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+  .dest {
+    border-radius: 18px; overflow: hidden; border: 1px solid var(--line);
+    min-height: 210px; display: flex; flex-direction: column; justify-content: flex-end;
+    padding: 16px; position: relative; cursor: pointer;
+    transition: transform 0.18s ease, box-shadow 0.18s ease;
+  }
+  .dest:hover { transform: translateY(-4px); box-shadow: 0 20px 44px rgba(0,0,0,0.45); }
+  .dest .d-badge { position: absolute; top: 12px; left: 12px; background: rgba(0,0,0,0.55); backdrop-filter: blur(6px); border: 1px solid var(--line); padding: 5px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+  .dest h4 { font-size: 19px; }
+  .dest .d-meta { color: rgba(255,255,255,0.82); font-size: 12.5px; margin-top: 3px; }
+  .d1 { background: linear-gradient(165deg, #0f3a4d, #0a2231 50%, #ff7a59 160%); }
+  .d2 { background: linear-gradient(200deg, #3b2a63, #1d1436 50%, #8b7bff 160%); }
+  .d3 { background: linear-gradient(150deg, #173d2a, #0d2418 55%, #3ddad7 170%); }
+  .d4 { background: linear-gradient(180deg, #4d2f16, #2a1a0c 55%, #ffb35c 170%); }
+  /* ---------- feature trio ---------- */
+  .feat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .feat { background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 20px; }
+  .feat .f-ico { width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center; font-size: 19px; margin-bottom: 12px; }
+  .fi1 { background: rgba(255,122,89,0.16); } .fi2 { background: rgba(61,218,215,0.14); } .fi3 { background: rgba(139,123,255,0.16); }
+  .feat h5 { font-size: 15.5px; margin-bottom: 6px; }
+  .feat p { color: var(--muted); font-size: 13.5px; line-height: 1.5; }
+  footer { max-width: 1180px; margin: 56px auto 0; padding: 26px 28px 34px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12.5px; display: flex; justify-content: space-between; }
+  @media (max-width: 900px) {
+    .hero { grid-template-columns: 1fr; padding-top: 34px; }
+    .hero h1 { font-size: 34px; }
+    .hero-art { display: none; }
+    .b-grid { grid-template-columns: 1fr 1fr; }
+    .dest-grid { grid-template-columns: repeat(2, 1fr); }
+    .feat-grid { grid-template-columns: 1fr; }
+    nav .links { display: none; }
+  }
+</style>
+</head>
+<body>
+<nav>
+  <div class="logo"><em>Safar</em><span class="dot">.</span></div>
+  <div class="links">
+    <a href="#" class="active">Discover</a>
+    <a href="#">My trips</a>
+    <a href="#">Hostels</a>
+    <a href="#">Reels import</a>
+  </div>
+  <div class="spacer"></div>
+  <div class="avatar">R</div>
+</nav>
+
+<div class="hero">
+  <div>
+    <span class="kicker">&#10022; AI trip studio for India-first travel</span>
+    <h1>Your next trip,<br><span class="grad">planned in minutes.</span></h1>
+    <p class="sub">Tell Safar where you're headed. Get a day-by-day itinerary with real transport options, stays, weather and budgets - plus one-tap imports from travel reels you saved.</p>
+    <div class="cta-row">
+      <button class="btn-primary">Plan a trip &#8594;</button>
+      <button class="btn-ghost">Import from a reel</button>
+    </div>
+    <div class="proof">
+      <div><b>40+</b>routes covered</div>
+      <div><b>3 min</b>avg. plan time</div>
+      <div><b>&#8377;0</b>to use</div>
+    </div>
+  </div>
+  <div class="hero-art">
+    <div class="postcard pc1">
+      <div class="pc-tag">Beach &#183; Karnataka</div>
+      <div class="pc-name">Gokarna</div>
+      <div class="pc-meta">3 days &#183; from &#8377;4,200</div>
+    </div>
+    <div class="postcard pc2">
+      <div class="pc-tag">Mountains &#183; Himachal</div>
+      <div class="pc-name">Manali</div>
+      <div class="pc-meta">5 days &#183; from &#8377;8,900</div>
+    </div>
+    <div class="postcard pc3">
+      <div class="pc-tag">Heritage &#183; Rajasthan</div>
+      <div class="pc-name">Jaisalmer</div>
+      <div class="pc-meta">4 days</div>
+    </div>
+  </div>
+</div>
+
+<div class="builder-wrap">
+  <div class="builder">
+    <h2><span class="spark">&#10022;</span> Trip builder</h2>
+    <div class="b-grid">
+      <div class="field"><label>From</label><input value="Bengaluru"></div>
+      <div class="field"><label>To</label><input placeholder="Gokarna"></div>
+      <div class="field"><label>Departure</label><input type="date" value="2026-12-05"></div>
+      <div class="field"><label>Days</label><input type="number" value="3" min="1" max="14"></div>
+      <div class="field"><label>Budget</label><select><option>Low</option><option selected>Mid</option><option>High</option></select></div>
+      <button class="go">Build my plan</button>
+    </div>
+    <div class="chips">
+      <span class="chip">Bengaluru &#8594; Gokarna</span>
+      <span class="chip">Bengaluru &#8594; Coorg</span>
+      <span class="chip">Mysuru weekend</span>
+      <span class="chip">Hampi 2 days</span>
+      <span class="chip">Pondicherry</span>
+    </div>
+  </div>
+</div>
+
+<section class="block">
+  <div class="sec-head"><h3>Trending from Bengaluru</h3><a href="#">See all &#8594;</a></div>
+  <div class="dest-grid">
+    <div class="dest d1"><span class="d-badge">&#9728; 29&#176;C</span><h4>Gokarna</h4><div class="d-meta">Beaches &#183; 485 km &#183; sleeper bus from &#8377;699</div></div>
+    <div class="dest d2"><span class="d-badge">&#9728; 24&#176;C</span><h4>Coorg</h4><div class="d-meta">Coffee estates &#183; 265 km &#183; cab from &#8377;3,200</div></div>
+    <div class="dest d3"><span class="d-badge">&#9728; 27&#176;C</span><h4>Wayanad</h4><div class="d-meta">Forests &#183; 280 km &#183; bus from &#8377;450</div></div>
+    <div class="dest d4"><span class="d-badge">&#9728; 31&#176;C</span><h4>Hampi</h4><div class="d-meta">Ruins &#183; 340 km &#183; train from &#8377;310</div></div>
+  </div>
+</section>
+
+<section class="block">
+  <div class="sec-head"><h3>Why Safar</h3></div>
+  <div class="feat-grid">
+    <div class="feat"><div class="f-ico fi1">&#128506;</div><h5>Real routes, real prices</h5><p>Transport options with timings and fares pulled per trip - not canned suggestions.</p></div>
+    <div class="feat"><div class="f-ico fi2">&#127909;</div><h5>Reels to itinerary</h5><p>Drop a saved travel reel link. Safar spots the places and slots them into your days.</p></div>
+    <div class="feat"><div class="f-ico fi3">&#127967;</div><h5>Stays that fit</h5><p>Hostels and budget stays matched to your budget tier, with nightly rates.</p></div>
+  </div>
+</section>
+
+<footer>
+  <span>Safar - AI trip planner. Source-available build; attribution to the original TravBuddy project.</span>
+  <span>Made for India-first travel</span>
+</footer>
+</body>
+</html>
