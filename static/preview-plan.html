@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Safar - AI Trip Planner</title>
+<style>
+  :root {
+    --bg: #faf7f1;
+    --card: #ffffff;
+    --line: #e7ddcd;
+    --text: #1d3a4a;
+    --muted: #6b7f8a;
+    --ocean: #0b6e8c;
+    --ocean-dark: #085268;
+    --ocean-soft: #e3f0f4;
+    --sand: #f3ead9;
+    --shadow: 0 2px 14px rgba(29, 58, 74, 0.08);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+  }
+
+  /* ── hero ─────────────────────────────────────────────── */
+  .hero {
+    position: relative;
+    background: url("https://raw.githubusercontent.com/ramithks/safar/ui-preview/static/img/coorg.jpg") center 38% / cover no-repeat;
+    min-height: 300px;
+    display: flex; align-items: flex-end;
+  }
+  .hero::before {
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(180deg, rgba(9, 45, 60, 0.28) 0%, rgba(9, 45, 60, 0.78) 100%);
+  }
+  .hero-inner {
+    position: relative; width: 100%; max-width: 1020px;
+    margin: 0 auto; padding: 96px 16px 64px;
+  }
+  .hero h1 {
+    color: #ffffff; font-size: 40px; letter-spacing: -1px;
+    line-height: 1.1; margin: 0 0 8px; text-shadow: 0 1px 10px rgba(0,0,0,0.35);
+  }
+  .hero p {
+    display: inline-block; color: #ffffff; font-size: 15px; margin: 0;
+    text-shadow: 0 1px 4px rgba(0,0,0,0.65), 0 2px 14px rgba(0,0,0,0.5);
+    background: rgba(9, 45, 60, 0.38); padding: 5px 12px; border-radius: 8px;
+  }
+
+  .wrap { max-width: 1020px; margin: 0 auto; padding: 0 16px 80px; }
+
+  /* ── cards & forms ────────────────────────────────────── */
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 16px; padding: 22px; margin-top: 18px;
+    box-shadow: var(--shadow);
+  }
+  .card.lift { margin-top: -34px; position: relative; }
+  label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 5px; text-transform: uppercase; letter-spacing: 0.4px; }
+  input, select {
+    width: 100%; padding: 11px 12px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text);
+    font-size: 15px; outline: none;
+  }
+  input:focus, select:focus { border-color: var(--ocean); box-shadow: 0 0 0 3px var(--ocean-soft); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (min-width: 860px) {
+    .row.cols4 { grid-template-columns: repeat(4, 1fr); }
+  }
+  button {
+    margin-top: 16px; width: 100%; padding: 13px; border: none; border-radius: 11px;
+    background: var(--ocean); color: #ffffff; font-size: 15px; font-weight: 700;
+    cursor: pointer;
+  }
+  button:hover { background: var(--ocean-dark); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.ghost { background: transparent; color: var(--ocean); border: 1.5px solid var(--ocean); font-weight: 600; }
+  button.ghost:hover { background: var(--ocean-soft); }
+  .msg { font-size: 13px; color: var(--muted); margin-top: 12px; min-height: 18px; }
+  .msg.err { color: #c0472b; }
+
+  /* ── destination strip ────────────────────────────────── */
+  .strip-title { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; margin: 26px 0 10px; }
+  .strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .dest {
+    position: relative; border-radius: 14px; overflow: hidden; cursor: pointer;
+    height: 132px; aspect-ratio: 4 / 3; border: 1px solid var(--line); box-shadow: var(--shadow);
+    background-size: cover; background-position: center;
+  }
+  .dest::after {
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(180deg, transparent 45%, rgba(9, 45, 60, 0.66) 100%);
+  }
+  .dest span {
+    position: absolute; left: 10px; bottom: 8px; z-index: 1;
+    color: #fff; font-size: 14px; font-weight: 700; text-shadow: 0 1px 6px rgba(0,0,0,0.4);
+  }
+  .dest small {
+    position: absolute; left: 8px; top: 8px; z-index: 1;
+    background: rgba(255,255,255,0.94); color: var(--ocean-dark);
+    font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 99px;
+  }
+
+  /* ── trip plan ────────────────────────────────────────── */
+  .progress-track { background: var(--sand); border-radius: 99px; height: 8px; margin: 14px 0 6px; overflow: hidden; }
+  .progress-fill { background: var(--ocean); height: 100%; width: 0%; transition: width 0.6s ease; }
+  .trip-title { font-size: 20px; font-weight: 700; }
+  .route { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .day { border-top: 1px solid var(--line); padding: 14px 0; }
+  .day h3 { font-size: 15px; margin-bottom: 6px; }
+  .day h3 span { color: var(--ocean); }
+  .item { font-size: 14px; color: var(--text); padding: 4px 0 4px 14px; position: relative; }
+  .item::before { content: ""; position: absolute; left: 0; top: 11px; width: 6px; height: 6px; border-radius: 50%; background: var(--ocean); }
+  .item small { color: var(--muted); display: block; }
+  .pill { display: inline-block; background: var(--sand); border: 1px solid var(--line); border-radius: 99px; padding: 4px 12px; font-size: 12px; color: var(--text); margin: 4px 6px 0 0; }
+  .transport-opt { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 10px; background: var(--bg); }
+  .transport-opt b { font-size: 14px; }
+  .transport-opt .meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
+  .hidden { display: none; }
+  footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 40px; line-height: 1.7; }
+  a { color: var(--ocean); text-decoration: none; }
+  .signout { float: right; background: none; border: none; color: var(--muted); font-size: 12px; cursor: pointer; width: auto; margin: 0; padding: 4px; }
+  .signout:hover { color: var(--ocean); background: none; }
+
+  @media (max-width: 560px) {
+    .hero { min-height: 220px; }
+    .hero-inner { padding: 72px 16px 78px; }
+    .hero h1 { font-size: 32px; }
+    .strip { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="hero">
+  <div class="hero-inner">
+    <h1>Safar</h1>
+    <p>Tell it where. It plans the whole trip: route, stays and days.</p>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <!-- Auth -->
+  <div class="card lift hidden" id="auth-card">
+    <div id="auth-form">
+      <label>Email</label>
+      <input type="email" id="email" placeholder="you@example.com" autocomplete="email">
+      <label>Password</label>
+      <input type="password" id="password" placeholder="6+ characters" autocomplete="current-password">
+      <button id="signin-btn">Sign in</button>
+      <button class="ghost" id="signup-btn" disabled style="opacity:0.55;cursor:not-allowed">Sign-ups closed for now</button>
+      <div class="msg" style="margin-top:6px;min-height:0">New accounts are paused while Safar is in early testing.</div>
+      <div class="msg" id="auth-msg"></div>
+    </div>
+  </div>
+
+  <!-- Planner -->
+  <div id="planner">
+    <button class="signout" id="signout-btn">sign out</button>
+    <div class="card lift">
+      <div class="row cols4">
+        <div><label>From</label><input id="origin" placeholder="Bengaluru" value="Bengaluru"></div>
+        <div><label>To</label><input id="destination" placeholder="Gokarna" value="Coorg"></div>
+        <div><label>Departure date</label><input type="date" id="departure_date"></div>
+        <div><label>Days</label><input type="number" id="days" value="2" min="1" max="14"></div>
+      </div>
+      <div class="row">
+        <div><label>Travellers</label><input type="number" id="travelers" value="2" min="1" max="12"></div>
+        <div><label>Budget</label>
+          <select id="budget">
+            <option value="low">Low</option>
+            <option value="mid" selected>Mid</option>
+            <option value="high">High</option>
+          </select>
+        </div>
+      </div>
+      <label>Interests (comma separated, optional)</label>
+      <input id="interests" placeholder="beaches, cafes, trekking">
+      <label>Stops along the way (comma separated cities, optional)</label>
+      <input id="stops" placeholder="Hubballi">
+      <button id="plan-btn">Plan my trip</button>
+      <div class="msg" id="plan-msg"></div>
+    </div>
+
+    <div class="strip-title">Popular from Bengaluru</div>
+    <div class="strip">
+      <div class="dest" data-dest="Coorg" style="background-image:url('https://raw.githubusercontent.com/ramithks/safar/ui-preview/static/img/coorg.jpg')"><small>2-3 days</small><span>Coorg</span></div>
+      <div class="dest" data-dest="Hampi" style="background-image:url('https://raw.githubusercontent.com/ramithks/safar/ui-preview/static/img/hampi.jpg')"><small>2-3 days</small><span>Hampi</span></div>
+      <div class="dest" data-dest="Gokarna" style="background-image:url('https://raw.githubusercontent.com/ramithks/safar/ui-preview/static/img/gokarna.jpg')"><small>2-4 days</small><span>Gokarna</span></div>
+    </div>
+
+    <div class="card" id="trip-card">
+      <div style="background:#fdf3e0;border:1px solid #e8c96a;color:#7a5b12;border-radius:10px;padding:10px 14px;font-size:13px;font-weight:600;margin-bottom:12px">SAMPLE PREVIEW - an example of what a finished plan looks like, not a real generated trip.</div>
+      <div class="trip-title" id="trip-title">Bengaluru → Coorg</div>
+      <div class="route" id="trip-route">Bengaluru → Coorg → Bengaluru · 2 days · 2 travellers · mid budget</div>
+      <div class="progress-track"><div class="progress-fill" id="trip-progress" style="width:100%"></div></div>
+      <div class="msg" id="trip-status">Sample plan shown for preview.</div>
+      <div id="trip-transport"><h3 style="margin-top:14px;font-size:15px">Getting there</h3>
+<div style="margin-top:10px"><span class="pill">Bengaluru → Coorg</span></div>
+<div class="transport-opt"><b>Bus</b><div class="meta">Overnight or day coach to Madikeri, roughly 6 hours</div></div>
+<div class="transport-opt"><b>Self-drive</b><div class="meta">Highway route via Hassan, roughly 5.5 hours</div></div></div>
+      <div id="trip-days">
+<div class="day"><h3><span>Day 1</span> Madikeri</h3>
+<div class="item">Raja's Seat viewpoint<small>Garden viewpoint over the valley, best early in the morning</small></div>
+<div class="item">Coffee estate walk<small>Guided walk through a working estate with tasting</small></div>
+<div class="item">Madikeri Fort and Omkareshwara Temple<small>Town centre heritage loop</small></div></div>
+<div class="day"><h3><span>Day 2</span> Abbey Falls and Dubare</h3>
+<div class="item">Abbey Falls<small>Short walk from the parking area</small></div>
+<div class="item">Dubare Elephant Camp<small>River crossing and morning activities</small></div>
+<div class="item">Drive back to Bengaluru<small>Afternoon start to miss evening traffic</small></div></div></div>
+      <div id="trip-notes" style="margin-top:10px"><span class="pill">Pack for cool mornings</span><span class="pill">Closed shoes for estate walks</span></div>
+    </div>
+  </div>
+
+  <footer>
+    Safar plans trips with free AI models. Built on the source-available TravBuddy backend
+    (<a href="https://github.com/sahil28123/travbuddy_backend">upstream</a>, see NOTICE).
+    Photos: Wikimedia Commons contributors, CC licences.
+  </footer>
+</div>
+
+<script type="module">
+import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
+
+const $ = (id) => document.getElementById(id);
+let supabase = null;
+let pollTimer = null;
+
+async function boot() {
+  const cfg = await (await fetch("/api/v1/public-config")).json();
+  document.title = cfg.brand + " - AI Trip Planner";
+  if (!cfg.supabase_url || !cfg.supabase_anon_key) {
+    $("auth-msg").textContent = "Supabase is not configured on this deployment.";
+    $("auth-msg").classList.add("err");
+    return;
+  }
+  supabase = createClient(cfg.supabase_url, cfg.supabase_anon_key);
+  const { data: { session } } = await supabase.auth.getSession();
+  if (session) showPlanner();
+  supabase.auth.onAuthStateChange((_e, s) => { if (s) showPlanner(); });
+}
+
+function authMsg(t, isErr) {
+  $("auth-msg").textContent = t || "";
+  $("auth-msg").classList.toggle("err", !!isErr);
+}
+
+$("signin-btn").onclick = async () => {
+  authMsg("Signing in...");
+  const { error } = await supabase.auth.signInWithPassword({
+    email: $("email").value.trim(), password: $("password").value,
+  });
+  if (error) authMsg(error.message, true);
+};
+
+$("signup-btn").onclick = async () => {
+  authMsg("Creating account...");
+  const { data, error } = await supabase.auth.signUp({
+    email: $("email").value.trim(), password: $("password").value,
+  });
+  if (error) return authMsg(error.message, true);
+  if (data.session) return showPlanner();
+  authMsg("Account created. Confirm the email if asked, then sign in.");
+};
+
+$("signout-btn").onclick = async () => {
+  await supabase.auth.signOut();
+  location.reload();
+};
+
+async function token() {
+  const { data: { session } } = await supabase.auth.getSession();
+  return session ? session.access_token : null;
+}
+
+function showPlanner() {
+  $("auth-card").classList.add("hidden");
+  $("planner").classList.remove("hidden");
+}
+
+document.querySelectorAll(".dest").forEach(el => {
+  el.addEventListener("click", () => {
+    $("destination").value = el.dataset.dest;
+    $("destination").focus();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  });
+});
+
+$("plan-btn").onclick = async () => {
+  const body = {
+    origin: $("origin").value.trim(),
+    destination: $("destination").value.trim(),
+    departure_date: $("departure_date").value || null,
+    days: parseInt($("days").value || "3", 10),
+    travelers: parseInt($("travelers").value || "1", 10),
+    budget: $("budget").value,
+    interests: $("interests").value.split(",").map(s => s.trim()).filter(Boolean),
+    stops: $("stops").value.split(",").map(s => s.trim()).filter(Boolean),
+  };
+  if (!body.origin || !body.destination) {
+    $("plan-msg").textContent = "From and To are required.";
+    $("plan-msg").classList.add("err");
+    return;
+  }
+  $("plan-msg").classList.remove("err");
+  $("plan-msg").textContent = "Starting the planner...";
+  $("plan-btn").disabled = true;
+  try {
+    const res = await fetch("/api/v3/trips", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + await token() },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error((await res.json()).detail || ("HTTP " + res.status));
+    const { trip_id } = await res.json();
+    $("plan-msg").textContent = "";
+    $("trip-card").classList.remove("hidden");
+    pollTrip(trip_id);
+  } catch (e) {
+    $("plan-msg").textContent = e.message;
+    $("plan-msg").classList.add("err");
+  } finally {
+    $("plan-btn").disabled = false;
+  }
+};
+
+async function pollTrip(tripId) {
+  clearInterval(pollTimer);
+  const tick = async () => {
+    try {
+      const res = await fetch("/api/v3/trips/" + tripId, {
+        headers: { "Authorization": "Bearer " + await token() },
+      });
+      if (!res.ok) return;
+      const env = await res.json();
+      renderTrip(env);
+      if (env.status !== "planning") clearInterval(pollTimer);
+    } catch (_) { /* keep polling */ }
+  };
+  await tick();
+  pollTimer = setInterval(tick, 5000);
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function renderTrip(env) {
+  const doc = env.doc || {};
+  $("trip-title").textContent = doc.title || "Your trip";
+  $("trip-route").textContent = (doc.route || []).join(" → ");
+  $("trip-progress").style.width = (env.progress || 0) + "%";
+  $("trip-status").textContent =
+    env.status === "planning" ? "Planning... " + (env.progress || 0) + "%" :
+    env.status === "ready" ? "Trip plan ready." : ("Status: " + env.status);
+
+  // Transport
+  const legs = doc.transport || [];
+  $("trip-transport").innerHTML = legs.length
+    ? "<h3 style='margin-top:14px;font-size:15px'>Getting there</h3>" + legs.map(leg => {
+        const opts = (leg.options || []).slice(0, 3).map(o =>
+          `<div class="transport-opt"><b>${esc(o.mode || o.provider || "Option")}</b>` +
+          `<div class="meta">${esc(o.summary || o.name || "")} ${o.price ? " - ₹" + esc(o.price) : ""}</div></div>`
+        ).join("");
+        return `<div style="margin-top:10px"><span class="pill">${esc(leg.from || "")} → ${esc(leg.to || "")}</span></div>` + opts;
+      }).join("")
+    : "";
+
+  // Itinerary
+  const days = doc.itinerary || [];
+  $("trip-days").innerHTML = days.map((d, i) => {
+    const items = (d.items || d.activities || []).map(it =>
+      `<div class="item">${esc(it.title || it.name || it)}` +
+      (it.description ? `<small>${esc(it.description)}</small>` : "") + `</div>`
+    ).join("");
+    return `<div class="day"><h3><span>Day ${esc(d.day ?? i + 1)}</span> ${esc(d.city || d.title || "")}</h3>${items}</div>`;
+  }).join("");
+
+  // Notes
+  const notes = doc.notes || [];
+  $("trip-notes").innerHTML = notes.map(n => `<span class="pill">${esc(n.text || n)}</span>`).join("");
+}
+
+boot();
+</script>
+</body>
+</html>
