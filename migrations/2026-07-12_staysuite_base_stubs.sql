@@ -262,3 +262,25 @@ END $$;
 ALTER TABLE public.provider_cost_rates ADD COLUMN IF NOT EXISTS cost_per_unit_micros bigint;
 ALTER TABLE public.provider_cost_rates ADD COLUMN IF NOT EXISTS currency text;
 ALTER TABLE public.provider_cost_rates ADD COLUMN IF NOT EXISTS source text;
+
+-- Bare columns from later CHECK constraints and INSERT column lists.
+ALTER TABLE public.platform_coupons ADD COLUMN IF NOT EXISTS plan_period text;
+ALTER TABLE public.rate_plans ADD COLUMN IF NOT EXISTS allocation_units text;
+ALTER TABLE public.rate_plans ADD COLUMN IF NOT EXISTS derive_discount_pct text;
+ALTER TABLE public.agent_actions ADD COLUMN IF NOT EXISTS result_type text;
+ALTER TABLE public.room_types ADD COLUMN IF NOT EXISTS accessible text;
+ALTER TABLE public.room_types ADD COLUMN IF NOT EXISTS bathroom text;
+ALTER TABLE public.room_types ADD COLUMN IF NOT EXISTS bed_count text;
+ALTER TABLE public.room_types ADD COLUMN IF NOT EXISTS children_allowed text;
+ALTER TABLE public.room_types ADD COLUMN IF NOT EXISTS connecting text;
+ALTER TABLE public.room_types ADD COLUMN IF NOT EXISTS crib text;
+ALTER TABLE public.room_types ADD COLUMN IF NOT EXISTS crib_paise text;
+ALTER TABLE public.room_types ADD COLUMN IF NOT EXISTS extra_bed text;
+ALTER TABLE public.room_types ADD COLUMN IF NOT EXISTS extra_bed_paise text;
+ALTER TABLE public.room_types ADD COLUMN IF NOT EXISTS max_children text;
+ALTER TABLE public.room_types ADD COLUMN IF NOT EXISTS smoking text;
+ALTER TABLE public.reservations ADD COLUMN IF NOT EXISTS payout_paise text;
+ALTER TABLE public.services ADD COLUMN IF NOT EXISTS availability text;
+ALTER TABLE public.services ADD COLUMN IF NOT EXISTS max_quantity text;
+ALTER TABLE public.agent_runs ADD COLUMN IF NOT EXISTS model_tier text;
+ALTER TABLE public.agent_runs ADD COLUMN IF NOT EXISTS required_action_status text;
