@@ -455,3 +455,28 @@ ALTER TABLE public.agent_actions ADD COLUMN status text;
 
 ALTER TABLE public.hotel_websites DROP COLUMN IF EXISTS template CASCADE;
 ALTER TABLE public.hotel_websites ADD COLUMN template text;
+
+-- DEFAULT DENY: enable RLS on every reconstructed stub. No policies are defined
+-- here, so PostgREST/anon access is denied; the server uses the service role,
+-- which bypasses RLS. Later real migrations add their own policies where needed.
+ALTER TABLE public.agent_actions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.agent_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.agent_tools ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.agents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.bookings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.conversations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.hotel_websites ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.meal_plan ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.partner_listings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.partner_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.partner_payments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.partners ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.platform_coupons ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.properties ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.provider_cost_rates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.quotes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.rate_plans ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.reservations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.room_types ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.services ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tasks ENABLE ROW LEVEL SECURITY;
