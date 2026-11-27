@@ -1193,6 +1193,21 @@ async def run_plan_journey(
     _ungrounded = [l for l in legs if l.get("needs_live_search") and not l.get("has_live_data")]
     for _l in _ungrounded:
         _l["unverified"] = True
+        # Strip any specific service assertions the planner wrote for a leg we
+        # could not ground — an honest summary is undermined if the leg itself
+        # still names a train, operator, time or fare that was never confirmed.
+        _l["title"] = (
+            f"Suggested (unverified): {(_l.get('from') or '?')} → {(_l.get('to') or '?')} "
+            f"by {(_l.get('mode') or '').lower() or 'surface travel'}"
+        )
+        _l["description"] = (
+            "No live service was confirmed for this leg. The mode, timing and cost "
+            "are planning estimates only — confirm the operator and schedule before booking."
+        )
+        for _k in ("service_no", "operator", "train_name", "train_number",
+                   "departs", "arrives", "duration_approx", "cost_approx"):
+            _l.pop(_k, None)
+        _l["estimates_unverified"] = True
     if _ungrounded:
         _segs = "; ".join(
             f"{(_l.get('from') or '?')} → {(_l.get('to') or '?')} by {(_l.get('mode') or '').lower() or 'unspecified mode'}"

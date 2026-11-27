@@ -242,7 +242,7 @@ async def run_plan(body: PlanRequest, user_id: str) -> dict:
     if trip_result and not isinstance(trip_result, Exception):
         for key in ("trip_name", "destination", "destination_description",
                     "destination_photo_ref", "image", "days",
-                    "trip_intelligence", "currency"):
+                    "trip_intelligence", "trip_quality", "currency"):
             if key in trip_result:
                 merged[key] = trip_result[key]
     else:

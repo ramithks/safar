@@ -368,22 +368,42 @@ def enforce_must_stops(days: list[dict], notes: str | None) -> list[dict]:
             for d in days for a in (d.get("activities") or [])
         )
         if found:
-            report.append({"place": place, "fulfilled": True, "injected": False})
+            # Present in the plan, but presence by name match is not route
+            # verification — feasibility stays explicitly unverified.
+            report.append({
+                "place": place, "status": "already_included",
+                "fulfilled": True, "injected": False,
+                "feasibility": "unverified",
+                "note": "named in the itinerary; routing/duration not verified against the journey plan",
+            })
             continue
         if days:
             acts = days[0].setdefault("activities", [])
             acts.insert(1 if acts else 0, {
-                "time": "10:30",
-                "title": f"{place} (requested stop)",
+                "time": "",
+                "timing": "en route — not scheduled",
+                "title": f"{place} (requested stop — routing unverified)",
                 "category": "En-route stop",
-                "description": f"Stop at {place} on the way, as asked for in your trip notes.",
-                "estimated_cost": "Free",
+                "description": (
+                    f"You asked to stop at {place} on the way. It is placed here as a "
+                    "requested waypoint; the route, detour time and opening hours are "
+                    "not verified, so treat this as a plan to confirm, not a scheduled stop."
+                ),
+                "estimated_cost": "Unknown",
                 "requested_stop": True,
+                "feasibility": "unverified",
             })
-            report.append({"place": place, "fulfilled": True, "injected": True})
+            report.append({
+                "place": place, "status": "included_as_requested",
+                "fulfilled": True, "injected": True,
+                "feasibility": "unverified",
+                "note": "placed on day 1 as an en-route waypoint; routing, detour time and opening hours not verified",
+            })
         else:
             report.append({
-                "place": place, "fulfilled": False, "injected": False,
+                "place": place, "status": "unfulfilled",
+                "fulfilled": False, "injected": False,
+                "feasibility": "unknown",
                 "note": "no itinerary days available to place the stop",
             })
     return report

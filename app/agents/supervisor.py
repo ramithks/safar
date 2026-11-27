@@ -410,7 +410,7 @@ async def supervisor_run(
     if trip_result and not isinstance(trip_result, Exception):
         for key in ("trip_name", "destination", "destination_description",
                     "cover_photo_ref", "days",
-                    "trip_intelligence", "currency"):
+                    "trip_intelligence", "trip_quality", "currency"):
             if key in trip_result:
                 merged[key] = trip_result[key]
     else:
@@ -459,12 +459,27 @@ async def supervisor_run(
             for _a in (_last.get("activities") or []):
                 _t = _to_minutes(_a.get("time") or "")
                 (_kept if _t is None or _t <= _cutoff else _dropped).append(_a)
+            _return_live = bool(
+                (merged.get("return") or {}).get("summary", {}).get("has_real_data")
+            )
+            merged["return_buffer"] = {
+                "end_time": body.end_time,
+                "return_travel_estimate_min": _ret_min,
+                "estimate_basis": (
+                    "live return services found; duration from the journey plan"
+                    if _return_live else
+                    "journey-plan estimate only — no live return services confirmed, actual travel time may differ"
+                ),
+                "arrival_time_uncertain": not _return_live,
+                "moved_out_of_last_day": [_a.get("title") or "?" for _a in _dropped],
+            }
             if _dropped:
                 _last["activities"] = _kept
                 _names = ", ".join(_a.get("title") or "?" for _a in _dropped)
                 merged["return_buffer_note"] = (
                     f"Moved out of the last day so you can be back by {body.end_time}: {_names}. "
-                    "Return travel time is an estimate."
+                    + ("Return travel time is from the journey plan." if _return_live else
+                       "Return travel time is an unverified estimate; your actual arrival may be later.")
                 )
                 logger.info("[supervisor] return-buffer: dropped %d last-day activities to meet %s", len(_dropped), body.end_time)
 
