@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     openrouter_model_vision: str = "nvidia/nemotron-3.5-super-vl:free"
     openrouter_fallback_models: str = (
         "nvidia/nemotron-3.5-super-vl:free,inclusionai/ling-3.2-flash:free,"
-        "nvidia/nemotron-3.5-lightning:free,openrouter/free"
+        "google/gemma-4-26b-a4b-it:free,google/gemma-4-31b-it:free"
     )
 
     # Branding — surfaced in the API title, UI and outbound request headers.
