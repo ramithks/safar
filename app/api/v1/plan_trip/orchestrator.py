@@ -27,7 +27,6 @@ from .helpers import (
     fetch_memory_context,
     fill_deterministic_fields,
     assign_activity_times,
-    enforce_must_stops,
     nearest_neighbor_sort,
     compute_trip_intelligence,
     with_retry,
@@ -37,6 +36,7 @@ from .hydration import batch_hydrate_days
 from .validation import (
     annotate_confidence, filter_low_confidence,
     trip_health_check, auto_fix_trip,
+    enforce_must_stops,
 )
 
 # ── Gemini prompt ─────────────────────────────────────────────────────────────
