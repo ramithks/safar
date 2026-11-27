@@ -165,16 +165,33 @@ def _retime_day1_for_arrival(graph: G.TripGraph, spec: dict, flags: list[str]) -
     if not early:
         return
     cur = arr_m
+    kept, dropped = [], []
     for a in acts:
         dur = int(a.get("duration_min") or 90)
+        if cur + dur > 21 * 60:
+            # Don't portray late-night slots as a plan: the day is full.
+            dropped.append(a)
+            continue
         a["start_time"] = f"{cur // 60:02d}:{cur % 60:02d}"
         a["retimed_for_arrival"] = True
+        kept.append(a)
         cur += dur + 30
-    flags.append(
-        f"Day 1 in {dst.city} was re-timed around your {arr_clock} arrival — the "
-        "original morning slots weren't reachable with the grounded transport. "
-        "Times from arrival onward are approximate."
-    )
+    dst.days[0]["activities"] = kept
+    if dropped:
+        # Activities that no longer fit are removed from the day, not pushed
+        # past a realistic evening — and the loss is said out loud.
+        names = ", ".join(a.get("title") or "?" for a in dropped)
+        flags.append(
+            f"Day 1 in {dst.city} was re-timed around your {arr_clock} arrival; "
+            f"not everything fit before evening, so it no longer includes: {names}. "
+            "Times from arrival onward are approximate."
+        )
+    else:
+        flags.append(
+            f"Day 1 in {dst.city} was re-timed around your {arr_clock} arrival — the "
+            "original morning slots weren't reachable with the grounded transport. "
+            "Times from arrival onward are approximate."
+        )
 
 
 async def run_generation(trip_id: str, spec: dict, user_id: str,
@@ -302,7 +319,9 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
         if _ms.get("injected") or _ms.get("feasibility") == "unverified":
             window_flags.append(
                 f"Requested stop at {_ms.get('place')}: included in the plan as a "
-                "requested waypoint — routing and detour time are not verified."
+                "requested waypoint. Its placement and timing are tentative — the "
+                "detour, opening hours and how long it adds are not verified, so "
+                "treat that part of the schedule as a plan to confirm, not a timetable."
             )
 
     # ── final doc ────────────────────────────────────────────────────────────
