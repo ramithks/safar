@@ -15,14 +15,60 @@ logger = logging.getLogger(__name__)
 
 JOB_TTL_SECONDS = 86400  # 24 hours
 
-_redis: Optional[redis_lib.Redis] = None
+_redis = None
 
 
-def _get_redis() -> redis_lib.Redis:
+class _MemoryRedis:
+    """In-memory stand-in for the Redis ops this module uses. Lets the reel
+    pipeline run on a single free instance with no Redis: job state lives and
+    dies with the web process (acceptable for one dyno, no persistence)."""
+
+    def __init__(self):
+        self._hashes: dict = {}
+        self._values: dict = {}
+
+    def hset(self, name, key=None, value=None, mapping=None):
+        h = self._hashes.setdefault(name, {})
+        if mapping:
+            h.update(mapping)
+        elif key is not None:
+            h[key] = value
+
+    def hgetall(self, name):
+        return dict(self._hashes.get(name, {}))
+
+    def expire(self, name, seconds):
+        return True
+
+    def set(self, name, value, nx=False, ex=None):
+        if nx and name in self._values:
+            return None
+        self._values[name] = value
+        return True
+
+    def get(self, name):
+        return self._values.get(name)
+
+    def ping(self):
+        return True
+
+
+def _get_redis():
     global _redis
     if _redis is None:
-        _redis = redis_lib.from_url(settings.redis_url, decode_responses=True)
+        try:
+            client = redis_lib.from_url(settings.redis_url, decode_responses=True)
+            client.ping()
+            _redis = client
+        except Exception:
+            logger.warning("Redis unreachable - using in-memory job store (single process, no persistence)")
+            _redis = _MemoryRedis()
     return _redis
+
+
+def redis_available() -> bool:
+    """True when a real Redis broker answered; False when running on memory."""
+    return not isinstance(_get_redis(), _MemoryRedis)
 
 
 def create_job(job_id: str, reel_url: str, metadata: Optional[dict] = None) -> dict:
