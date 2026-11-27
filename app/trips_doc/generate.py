@@ -154,10 +154,11 @@ async def _backfill_sparse_days(stayed: list, flags: list[str],
             if not extra:
                 continue
             for poi in extra:
+                via = "Wikidata" if poi.get("source") == "wikidata" else "OpenStreetMap"
                 acts.append({
                     "title": poi["name"],
                     "description": (
-                        "Verified nearby place (OpenStreetMap name and location), added "
+                        f"Verified nearby place (name and location via {via}), added "
                         "because this day was light. No time slot assigned — slot it as "
                         "you like; opening hours and details are not independently verified."
                     ),
@@ -165,7 +166,7 @@ async def _backfill_sparse_days(stayed: list, flags: list[str],
                     "start_time": None,
                     "lat": poi["lat"],
                     "lng": poi["lng"],
-                    "source": "openstreetmap",
+                    "source": poi.get("source") or "openstreetmap",
                     "grounded": "server",
                     "backfilled": True,
                     "maps_url": (

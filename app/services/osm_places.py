@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 from difflib import SequenceMatcher
@@ -116,6 +117,7 @@ async def city_pois(city: str) -> list[dict]:
         'nwr["tourism"~"^(attraction|viewpoint|museum|zoo|theme_park|gallery|artwork)$"]["name"];'
         "out center tags 120;"
     )
+    data = None
     try:
         async with httpx.AsyncClient(timeout=45.0) as client:
             r = await client.post(_OVERPASS, data={"data": query},
@@ -124,7 +126,12 @@ async def city_pois(city: str) -> list[dict]:
             data = r.json()
     except Exception as exc:  # noqa: BLE001
         logger.warning("[osm] overpass failed for %r: %s", city, type(exc).__name__)
-        return []
+    if data is None:
+        pois = await _wikidata_pois(lat, lng)
+        if pois:
+            logger.info("[osm] %r POI list from wikidata fallback (%d)", city, len(pois))
+        _cache_set(cache_key, pois)
+        return pois
 
     pois = []
     for el in data.get("elements") or []:
@@ -143,8 +150,75 @@ async def city_pois(city: str) -> list[dict]:
             "osm_type": el.get("type"),
             "osm_id": el.get("id"),
             "category": tags.get("tourism"),
+            "source": "openstreetmap",
         })
+    if not pois:  # Overpass unreachable or mapped nothing: try Wikidata
+        pois = await _wikidata_pois(lat, lng)
+        if pois:
+            logger.info("[osm] %r POI list from wikidata fallback (%d)", city, len(pois))
     _cache_set(cache_key, pois)
+    return pois
+
+
+_WIKIDATA_TYPES = {
+    "Q570116": "attraction",   # tourist attraction
+    "Q8502": "peak",           # mountain
+    "Q34038": "waterfall",
+    "Q44539": "temple",        # Hindu temple
+    "Q33506": "museum",
+    "Q839954": "viewpoint",
+}
+
+
+async def _wikidata_pois(lat: float, lng: float) -> list[dict]:
+    """Fallback POI list when Overpass is unreachable: real named places
+    near the city from Wikidata (Wikimedia API, one cached query per city).
+    Only items with an English label are kept; admin/junk entries excluded."""
+    types = " ".join(f"wd:{q}" for q in _WIKIDATA_TYPES)
+    query = (
+        "SELECT ?item ?itemLabel ?coord ?type WHERE { "
+        "?item wdt:P31/wdt:P279* ?type . "
+        f"VALUES ?type {{ {types} }} . "
+        "SERVICE wikibase:around { ?item wdt:P625 ?coord . "
+        f'bd:serviceParam wikibase:center "Point({lng} {lat})"^^geo:wktLiteral . '
+        'bd:serviceParam wikibase:radius "40" . } '
+        'SERVICE wikibase:label { bd:serviceParam wikibase:language "en" . } } LIMIT 60'
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(
+                "https://query.wikidata.org/sparql",
+                params={"query": query, "format": "json"},
+                headers={"User-Agent": _UA, "Accept": "application/sparql-results+json"},
+            )
+            r.raise_for_status()
+            rows = (r.json().get("results") or {}).get("bindings") or []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[osm] wikidata pois failed: %s", type(exc).__name__)
+        return []
+    seen: set[str] = set()
+    pois = []
+    for row in rows:
+        name = (row.get("itemLabel") or {}).get("value") or ""
+        item = (row.get("item") or {}).get("value") or ""
+        if not name or name.startswith("Q") or item in seen:
+            continue
+        seen.add(item)
+        coord = (row.get("coord") or {}).get("value") or ""
+        m = re.match(r"Point\(([-0-9.]+) ([-0-9.]+)\)", coord)
+        if not m:
+            continue
+        qtype = ((row.get("type") or {}).get("value") or "").rsplit("/", 1)[-1]
+        pois.append({
+            "name": name,
+            "lat": float(m.group(2)),
+            "lng": float(m.group(1)),
+            "osm_type": None,
+            "osm_id": None,
+            "category": _WIKIDATA_TYPES.get(qtype, "attraction"),
+            "source": "wikidata",
+            "wikidata_id": item.rsplit("/", 1)[-1],
+        })
     return pois
 
 
