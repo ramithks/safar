@@ -111,6 +111,10 @@
   .slot .what b { font-size: 14.5px; display: block; }
   .slot .what span { color: var(--muted); font-size: 12.5px; line-height: 1.45; display: block; margin-top: 2px; }
   .slot .tagchip { flex: none; align-self: flex-start; font-size: 10.5px; font-weight: 700; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 4px 9px; }
+  .day-panel { display: none; }
+  .day-panel.on { display: block; }
+  .results { display: none; }
+  .results.on { display: block; }
   .sample-banner { margin: 14px 22px 0; background: rgba(255,179,92,0.07); border: 1px dashed #6b4a1f; color: #ffb35c; font-size: 12px; border-radius: 10px; padding: 9px 13px; }
 
   footer { max-width: 1120px; margin: 48px auto 0; padding: 22px 26px 30px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
@@ -169,7 +173,7 @@
           <div class="f"><label>Days</label><input type="number" value="3" min="1" max="14"></div>
           <div class="f"><label>Travellers</label><input type="number" value="2" min="1" max="12"></div>
           <div class="f"><label>Budget</label><select><option>Low</option><option selected>Mid</option><option>High</option></select></div>
-          <div class="build-row"><button>Build my plan</button></div>
+          <div class="build-row"><button id="build">Build my plan</button></div>
         </div>
       </div>
     </div>
@@ -205,7 +209,7 @@
     </div>
   </div>
 
-  <div class="sec" id="mytrips">
+  <div class="sec results" id="mytrips">
     <div class="sec-head"><h2>My trips</h2></div>
     <div class="trip-card">
       <img src="https://thumb.wikimedia.org/wikipedia/commons/thumb/f/f0/PXL_20260103_101009613_People_and_Beach_Om_Beach_Gokarna%2C_Karnataka_19.jpg/1280px-PXL_20260103_101009613_People_and_Beach_Om_Beach_Gokarna%2C_Karnataka_19.jpg" alt="Gokarna trip">
@@ -229,11 +233,20 @@
       <div class="day-tabs">
         <span class="dt on">Day 1</span><span class="dt">Day 2</span><span class="dt">Day 3</span>
       </div>
-      <div class="day">
+      <div class="day day-panel on" data-day="1">
         <div class="slot"><div class="time">06:00</div><div class="what"><b>Overnight bus arrives, Gokarna town</b><span>Check in, drop bags, breakfast near the bus stand.</span></div><span class="tagchip">Travel</span></div>
         <div class="slot"><div class="time">10:30</div><div class="what"><b>Kudle Beach</b><span>Slow morning on the sand; shacks open for lunch by noon.</span></div><span class="tagchip">Beach</span></div>
         <div class="slot"><div class="time">16:30</div><div class="what"><b>Om Beach sunset</b><span>Walk the shore from Namaste Cafe side; best light around 5:40.</span></div><span class="tagchip">Beach</span></div>
         <div class="slot"><div class="time">20:00</div><div class="what"><b>Dinner in town</b><span>Local thali places along Car Street.</span></div><span class="tagchip">Food</span></div>
+      </div>
+      <div class="day day-panel" data-day="2">
+        <div class="slot"><div class="time">09:00</div><div class="what"><b>Half Moon Beach hike</b><span>Trail over the headland from Om Beach; carry water.</span></div><span class="tagchip">Trek</span></div>
+        <div class="slot"><div class="time">13:00</div><div class="what"><b>Paradise Beach</b><span>Boat or hike; quietest of the four beaches.</span></div><span class="tagchip">Beach</span></div>
+        <div class="slot"><div class="time">18:30</div><div class="what"><b>Mahabaleshwar Temple</b><span>Evening aarti in the old town.</span></div><span class="tagchip">Town</span></div>
+      </div>
+      <div class="day day-panel" data-day="3">
+        <div class="slot"><div class="time">08:00</div><div class="what"><b>Mirjan Fort</b><span>16th-century laterite fort, 11 km from town.</span></div><span class="tagchip">Heritage</span></div>
+        <div class="slot"><div class="time">14:00</div><div class="what"><b>Return bus to Bengaluru</b><span>Overnight or late-afternoon departure.</span></div><span class="tagchip">Travel</span></div>
       </div>
     </div>
   </div>
@@ -248,9 +261,39 @@
   const details = document.getElementById('details');
   const dest = document.getElementById('dest');
   const planit = document.getElementById('planit');
+  const results = document.getElementById('mytrips');
   function open() { details.classList.add('open'); }
   planit.addEventListener('click', () => { if (dest.value.trim()) open(); else dest.focus(); });
   document.querySelectorAll('.chip[data-d]').forEach(c => c.addEventListener('click', () => { dest.value = c.dataset.d; open(); }));
+  document.getElementById('build').addEventListener('click', () => {
+    if (!dest.value.trim()) { dest.focus(); return; }
+    results.classList.add('on');
+    results.scrollIntoView({ behavior: 'smooth' });
+  });
+  const tabs = document.querySelectorAll('.dt');
+  tabs.forEach(t => t.addEventListener('click', () => {
+    tabs.forEach(x => x.classList.toggle('on', x === t));
+    document.querySelectorAll('.day-panel').forEach(p => p.classList.toggle('on', p.dataset.day === t.dataset.day));
+  }));
+  const PHOTOS = {
+    'Gokarna': ['https://thumb.wikimedia.org/wikipedia/commons/thumb/f/f0/PXL_20260103_101009613_People_and_Beach_Om_Beach_Gokarna%2C_Karnataka_19.jpg/1280px-PXL_20260103_101009613_People_and_Beach_Om_Beach_Gokarna%2C_Karnataka_19.jpg','Om Beach, Gokarna'],
+    'Coorg': ['https://thumb.wikimedia.org/wikipedia/commons/thumb/9/94/Coffee_Coconuts_Pepper_Estate_Coorg_Feb24_A7C_09365.jpg/1280px-Coffee_Coconuts_Pepper_Estate_Coorg_Feb24_A7C_09365.jpg','Coffee estate, Coorg'],
+    'Wayanad': ['https://thumb.wikimedia.org/wikipedia/commons/thumb/d/d6/Banasura_hills_from_View_Point_Wayanad_Resort%2C_Pulinjal_%2819%29.jpg/1280px-Banasura_hills_from_View_Point_Wayanad_Resort%2C_Pulinjal_%2819%29.jpg','Banasura hills, Wayanad'],
+    'Hampi': ['https://thumb.wikimedia.org/wikipedia/commons/thumb/b/b9/Complex_of_Virupaksha_Temple%2C_Hampi_%2804%29.jpg/1280px-Complex_of_Virupaksha_Temple%2C_Hampi_%2804%29.jpg','Virupaksha Temple, Hampi']
+  };
+  function applyDest(name) {
+    const p = PHOTOS[name] || PHOTOS['Gokarna'];
+    document.getElementById('tripPhoto').src = p[0];
+    document.getElementById('itinPhoto').src = p[0];
+    document.getElementById('tripTitle').textContent = 'Bengaluru \u2192 ' + name;
+    document.getElementById('itinTitle').textContent = name + ', 3 days';
+    document.getElementById('itinMeta').textContent = 'Bengaluru \u2192 ' + name + ' \u00b7 5 - 7 Dec \u00b7 2 travellers';
+  }
+  document.querySelectorAll('.pcard').forEach(c => c.addEventListener('click', () => {
+    const name = c.querySelector('.info h3').textContent;
+    dest.value = name; applyDest(name); open(); window.scrollTo({ top: 0, behavior: 'smooth' });
+  }));
+  document.getElementById('build').addEventListener('click', () => applyDest(dest.value.trim()));
 </script>
 </body>
 </html>
