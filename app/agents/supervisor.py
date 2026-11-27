@@ -423,7 +423,8 @@ async def supervisor_run(
         for key in ("journey_summary", "total_distance_km", "total_duration_approx",
                     "cost_breakdown", "best_time_to_depart", "packing_tips",
                     "is_international", "visa_required", "visa_info",
-                    "documents_needed", "health_requirements", "currency_info"):
+                    "documents_needed", "health_requirements", "currency_info",
+                    "transport_verified"):
             if key in journey_result:
                 merged[key] = journey_result[key]
     else:
@@ -457,7 +458,7 @@ async def supervisor_run(
             _last = merged["days"][-1]
             _kept, _dropped = [], []
             for _a in (_last.get("activities") or []):
-                _t = _to_minutes(_a.get("time") or "")
+                _t = _to_minutes(_a.get("start_time") or _a.get("time") or "")
                 (_kept if _t is None or _t <= _cutoff else _dropped).append(_a)
             _return_live = bool(
                 (merged.get("return") or {}).get("summary", {}).get("has_real_data")

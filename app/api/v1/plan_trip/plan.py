@@ -256,7 +256,8 @@ async def run_plan(body: PlanRequest, user_id: str) -> dict:
         for key in ("journey_summary", "total_distance_km", "total_duration_approx",
                     "cost_breakdown", "best_time_to_depart", "packing_tips",
                     "is_international", "visa_required", "visa_info",
-                    "documents_needed", "health_requirements", "currency_info"):
+                    "documents_needed", "health_requirements", "currency_info",
+                    "transport_verified"):
             if key in journey_result:
                 merged[key] = journey_result[key]
     else:
