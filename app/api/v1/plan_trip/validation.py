@@ -375,27 +375,28 @@ def scrub_unverified_activities(days: list[dict], threshold: float = FILTER_THRE
             if a.get("confidence_score", 1.0) >= threshold:
                 continue
             old = a.get("title") or ""
+            # Keep the suggestion's name (renaming to a bare category hid the
+            # planner's idea AND kept town-prefixed invented venues looking
+            # official); attach the honest label instead.
+            if "suggested, not verified" not in old:
+                a["title"] = (old + " (suggested, not verified)") if old else "Suggested stop (not verified)"
             if a.get("requested_place"):
-                # The traveller named this place: keep the name, qualify
-                # everything else the model claimed about it.
+                # The traveller named this area: qualify everything the model
+                # claimed about the specific venue.
                 a["description"] = (
-                    "You asked to stop here. We could not verify its opening "
-                    "hours, access or current details - treat anything beyond "
-                    "the stop itself as unconfirmed."
+                    "You asked to stop in this area. We could not verify this "
+                    "specific place - its listing, opening hours or details - "
+                    "so treat it as an unconfirmed suggestion."
                 )
-                a["estimated_cost"] = "Unknown"
-                a["unverified"] = True
-                continue
-            cat = (a.get("category") or "Stop").strip() or "Stop"
-            a["title"] = f"{cat} - suggested, not verified"
-            a["description"] = (
-                "The planner suggested this, but no live listing, reviews or "
-                "opening hours were found for it - treat it as an idea to check "
-                "locally, not a confirmed place."
-            )
+            else:
+                a["description"] = (
+                    "The planner suggested this, but no live listing, reviews or "
+                    "opening hours were found for it - treat it as an idea to check "
+                    "locally, not a confirmed place."
+                )
             a["estimated_cost"] = "Unknown"
             a["unverified"] = True
-            if old and old != a["title"]:
+            if old:
                 scrubbed.append(old)
     return scrubbed
 

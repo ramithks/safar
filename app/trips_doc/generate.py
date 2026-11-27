@@ -97,7 +97,8 @@ def _window_flags(graph: G.TripGraph, spec: dict) -> list[str]:
     ret = graph.edges[-1] if graph.edges else None
     if ret is None or not ret.date:
         return flags
-    arrive_by = _return_deadline(spec)
+    window = _return_deadline(spec)
+    arrive_by, not_before = window if window else (None, None)
     end_iso = trip_end.isoformat()
     if ret.date > end_iso:
         flags.append(
@@ -109,10 +110,12 @@ def _window_flags(graph: G.TripGraph, spec: dict) -> list[str]:
         return flags  # outside the window entirely; the clock check no longer applies
     if end_time:
         arr = None
-        route = G.active_route(ret, None, spec.get("budget_tier"), arrive_by=arrive_by)
+        route = G.active_route(ret, None, spec.get("budget_tier"), arrive_by=arrive_by,
+                               not_before=not_before)
         if route and route.hops:
             opt = G.selected_option_for_hop(ret, route, len(route.hops) - 1, None,
-                                            spec.get("budget_tier"), arrive_by=arrive_by)
+                                            spec.get("budget_tier"), arrive_by=arrive_by,
+                                            not_before=not_before)
             if opt and opt.arrival:
                 arr = str(opt.arrival)
         if arr and len(arr) >= 16:
@@ -334,7 +337,8 @@ def _retime_final_day_for_departure(graph: G.TripGraph, spec: dict, flags: list[
         return
     if inbound is None:
         return
-    arrive_by = _return_deadline(spec)
+    window = _return_deadline(spec)
+    arrive_by, not_before = window if window else (None, None)
     route = G.active_route(inbound, None, spec.get("budget_tier"), arrive_by=arrive_by)
     if not route or not route.hops:
         return

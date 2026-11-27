@@ -162,7 +162,10 @@ def trim_hotel(h: dict) -> dict:
 # ── graph → doc sections ────────────────────────────────────────────────
 
 def _return_deadline(spec: dict):
-    """The trip's end clock on its last day, as a datetime, when both are set."""
+    """(arrive_by, not_before) on the trip's last day: the end clock binds the
+    arrival home; the traveller's own start clock (default 06:00) is the
+    earliest a same-day return can leave and still be day travel. None when
+    no end_time was requested."""
     dep, end_time = spec.get("departure_date"), spec.get("end_time")
     if not dep or not end_time:
         return None
@@ -172,7 +175,10 @@ def _return_deadline(spec: dict):
         days = max(int(spec.get("days") or 1), 1)
         last = _date(y, m, d) + timedelta(days=days - 1)
         hh, mm = int(end_time[:2]), int(end_time[3:5])
-        return datetime(last.year, last.month, last.day, hh, mm)
+        st = spec.get("start_time") or "06:00"
+        sh, sm = int(st[:2]), int(st[3:5])
+        base = datetime(last.year, last.month, last.day)
+        return (base.replace(hour=hh, minute=mm), base.replace(hour=sh, minute=sm))
     except Exception:  # noqa: BLE001
         return None
 
@@ -180,15 +186,17 @@ def _return_deadline(spec: dict):
 # ─────
 
 def _leg_entry(leg: G.TripLeg, budget: str | None, searched_at: str,
-               arrive_by=None) -> dict:
-    route = G.active_route(leg, None, budget, arrive_by=arrive_by)
+               arrive_by=None, not_before=None) -> dict:
+    route = G.active_route(leg, None, budget, arrive_by=arrive_by, not_before=not_before)
     hops: list[dict] = []
     if route:
         sel = leg.selection if (leg.selection and leg.selection.route_id == route.id) else None
         for i, hop in enumerate(route.hops):
             # The end-clock window binds the hop that lands home.
-            hop_deadline = arrive_by if i == len(route.hops) - 1 else None
-            ranked = G.rank_options(hop.options, None, budget, arrive_by=hop_deadline,
+            final = i == len(route.hops) - 1
+            ranked = G.rank_options(hop.options, None, budget,
+                                    arrive_by=arrive_by if final else None,
+                                    not_before=not_before if final else None,
                                     hop_date=hop.date or leg.date)[:MAX_OPTIONS_PER_HOP]
             options = [trim_transport_option(o) for o in ranked]
             selected_id = None
@@ -263,7 +271,8 @@ def doc_from_graph(
     searched_at = _now()
     ordered_nodes, outbound, inbound = G.ordered_path(graph)
     legs = outbound + ([inbound] if inbound else [])
-    arrive_by = _return_deadline(spec)
+    window = _return_deadline(spec)
+    arrive_by, not_before = window if window else (None, None)
 
     doc = {
         "id": trip_id,
@@ -275,7 +284,8 @@ def doc_from_graph(
         "destination": destination or {"name": spec.get("destination")},
         "itinerary": [_stop_entry(n, searched_at) for n in ordered_nodes if n.role != "origin"],
         "transport": [_leg_entry(leg, budget_tier, searched_at,
-                                 arrive_by=(arrive_by if inbound is not None and leg is inbound else None))
+                                 arrive_by=(arrive_by if inbound is not None and leg is inbound else None),
+                                 not_before=(not_before if inbound is not None and leg is inbound else None))
                       for leg in legs],
         "weather": weather or {},
         "documents": documents or {},
