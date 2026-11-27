@@ -77,21 +77,25 @@ alter table public.group_rate_tiers enable row level security;
 alter table public.group_policies enable row level security;
 
 do $$ begin
-  create policy group_rate_tiers_read on public.group_rate_tiers
+  drop policy if exists group_rate_tiers_read on public.group_rate_tiers;
+create policy group_rate_tiers_read on public.group_rate_tiers
     for select using (owns_partner(partner_id));
 exception when duplicate_object then null; end $$;
 do $$ begin
-  create policy group_rate_tiers_write on public.group_rate_tiers
+  drop policy if exists group_rate_tiers_write on public.group_rate_tiers;
+create policy group_rate_tiers_write on public.group_rate_tiers
     for all using (has_partner_perm(partner_id, 'rates'))
     with check (has_partner_perm(partner_id, 'rates'));
 exception when duplicate_object then null; end $$;
 
 do $$ begin
-  create policy group_policies_read on public.group_policies
+  drop policy if exists group_policies_read on public.group_policies;
+create policy group_policies_read on public.group_policies
     for select using (owns_partner(partner_id));
 exception when duplicate_object then null; end $$;
 do $$ begin
-  create policy group_policies_write on public.group_policies
+  drop policy if exists group_policies_write on public.group_policies;
+create policy group_policies_write on public.group_policies
     for all using (has_partner_perm(partner_id, 'rates'))
     with check (has_partner_perm(partner_id, 'rates'));
 exception when duplicate_object then null; end $$;

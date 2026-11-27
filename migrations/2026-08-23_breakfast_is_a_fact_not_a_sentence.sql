@@ -52,12 +52,14 @@ create index if not exists meal_options_property_idx on public.meal_options (pro
 alter table public.meal_options enable row level security;
 
 do $$ begin
-  create policy meal_options_read on public.meal_options
+  drop policy if exists meal_options_read on public.meal_options;
+create policy meal_options_read on public.meal_options
     for select using (owns_partner(partner_id));
 exception when duplicate_object then null; end $$;
 
 do $$ begin
-  create policy meal_options_write on public.meal_options
+  drop policy if exists meal_options_write on public.meal_options;
+create policy meal_options_write on public.meal_options
     for all using (has_partner_perm(partner_id, 'rates'))
     with check (has_partner_perm(partner_id, 'rates'));
 exception when duplicate_object then null; end $$;

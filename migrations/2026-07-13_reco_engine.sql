@@ -158,8 +158,10 @@ ALTER TABLE public.expected_price     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.destination_priors ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS hotel_profiles_public_read ON public.hotel_profiles;
-CREATE POLICY hotel_profiles_public_read ON public.hotel_profiles FOR SELECT USING (true);
+drop policy if exists hotel_profiles_public_read on public.hotel_profiles;
+create policy hotel_profiles_public_read on public.hotel_profiles FOR SELECT USING (true);
 
 DROP POLICY IF EXISTS traveller_profiles_own ON public.traveller_profiles;
-CREATE POLICY traveller_profiles_own ON public.traveller_profiles FOR SELECT USING (auth.uid() = user_id);
+drop policy if exists traveller_profiles_own on public.traveller_profiles;
+create policy traveller_profiles_own on public.traveller_profiles FOR SELECT USING (auth.uid() = user_id);
 -- All writes + all other tables: service role only (bypasses RLS); no anon policy = denied.

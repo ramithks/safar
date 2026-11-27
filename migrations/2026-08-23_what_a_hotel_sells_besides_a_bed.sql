@@ -99,11 +99,13 @@ create index if not exists experiences_property_idx
 alter table public.experiences enable row level security;
 
 do $$ begin
-  create policy experiences_read on public.experiences
+  drop policy if exists experiences_read on public.experiences;
+create policy experiences_read on public.experiences
     for select using (owns_partner(partner_id));
 exception when duplicate_object then null; end $$;
 do $$ begin
-  create policy experiences_write on public.experiences
+  drop policy if exists experiences_write on public.experiences;
+create policy experiences_write on public.experiences
     for all using (has_partner_perm(partner_id, 'rates'))
     with check (has_partner_perm(partner_id, 'rates'));
 exception when duplicate_object then null; end $$;

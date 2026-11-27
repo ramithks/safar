@@ -41,9 +41,11 @@ ALTER TABLE public.group_trips ENABLE ROW LEVEL SECURITY;
 -- Public marketing content: anyone can read ACTIVE trips (the website reads
 -- with the anon key); writes are dashboard/service-role only.
 DROP POLICY IF EXISTS group_trips_public_read ON public.group_trips;
-CREATE POLICY group_trips_public_read ON public.group_trips
+drop policy if exists group_trips_public_read on public.group_trips;
+create policy group_trips_public_read on public.group_trips
   FOR SELECT USING (is_active = true);
 
 DROP POLICY IF EXISTS group_trips_service ON public.group_trips;
-CREATE POLICY group_trips_service ON public.group_trips
+drop policy if exists group_trips_service on public.group_trips;
+create policy group_trips_service on public.group_trips
   FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');

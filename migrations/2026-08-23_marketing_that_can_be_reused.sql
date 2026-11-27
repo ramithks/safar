@@ -151,41 +151,49 @@ alter table public.ad_campaigns enable row level security;
 alter table public.ad_creatives enable row level security;
 
 do $$ begin
-  create policy marketing_profiles_read on public.marketing_profiles
+  drop policy if exists marketing_profiles_read on public.marketing_profiles;
+create policy marketing_profiles_read on public.marketing_profiles
     for select using (owns_partner(partner_id));
 exception when duplicate_object then null; end $$;
 do $$ begin
-  create policy marketing_profiles_write on public.marketing_profiles
+  drop policy if exists marketing_profiles_write on public.marketing_profiles;
+create policy marketing_profiles_write on public.marketing_profiles
     for all using (has_partner_perm(partner_id, 'marketing'))
     with check (has_partner_perm(partner_id, 'marketing'));
 exception when duplicate_object then null; end $$;
 
 do $$ begin
-  create policy ad_audiences_read on public.ad_audiences
+  drop policy if exists ad_audiences_read on public.ad_audiences;
+create policy ad_audiences_read on public.ad_audiences
     for select using (owns_partner(partner_id));
 exception when duplicate_object then null; end $$;
 do $$ begin
-  create policy ad_audiences_write on public.ad_audiences
+  drop policy if exists ad_audiences_write on public.ad_audiences;
+create policy ad_audiences_write on public.ad_audiences
     for all using (has_partner_perm(partner_id, 'marketing'))
     with check (has_partner_perm(partner_id, 'marketing'));
 exception when duplicate_object then null; end $$;
 
 do $$ begin
-  create policy ad_campaigns_read on public.ad_campaigns
+  drop policy if exists ad_campaigns_read on public.ad_campaigns;
+create policy ad_campaigns_read on public.ad_campaigns
     for select using (owns_partner(partner_id));
 exception when duplicate_object then null; end $$;
 do $$ begin
-  create policy ad_campaigns_write on public.ad_campaigns
+  drop policy if exists ad_campaigns_write on public.ad_campaigns;
+create policy ad_campaigns_write on public.ad_campaigns
     for all using (has_partner_perm(partner_id, 'marketing'))
     with check (has_partner_perm(partner_id, 'marketing'));
 exception when duplicate_object then null; end $$;
 
 do $$ begin
-  create policy ad_creatives_read on public.ad_creatives
+  drop policy if exists ad_creatives_read on public.ad_creatives;
+create policy ad_creatives_read on public.ad_creatives
     for select using (owns_partner(partner_id));
 exception when duplicate_object then null; end $$;
 do $$ begin
-  create policy ad_creatives_write on public.ad_creatives
+  drop policy if exists ad_creatives_write on public.ad_creatives;
+create policy ad_creatives_write on public.ad_creatives
     for all using (has_partner_perm(partner_id, 'marketing'))
     with check (has_partner_perm(partner_id, 'marketing'));
 exception when duplicate_object then null; end $$;
