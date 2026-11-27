@@ -95,15 +95,16 @@ def _apply_osm(act: dict, hit: dict, city: str = "") -> None:
         "attraction": "Attraction", "viewpoint": "Viewpoint", "museum": "Museum",
         "zoo": "Zoo", "theme_park": "Theme park", "gallery": "Gallery",
         "artwork": "Artwork", "place_of_worship": "Place of worship",
-        "waterfall": "Waterfall", "peak": "Peak",
+        "waterfall": "Waterfall", "peak": "Peak", "temple": "Temple",
     }.get((hit.get("category") or "").lower(), "Place")
+    via = "Wikidata" if hit.get("source") == "wikidata" else "OpenStreetMap"
     where = f" in {city}" if city else ""
     act["description"] = (
-        f"{kind}{where} — name and location verified via OpenStreetMap. "
+        f"{kind}{where} — name and location verified via {via}. "
         "Opening hours, entry fees and other details are not independently verified."
     )
     act["place_id"] = None  # never a Google place_id; keeps Google-only UI paths off
-    act["source"] = "openstreetmap"
+    act["source"] = hit.get("source") or "openstreetmap"
     act["grounded"] = "server"
     act["maps_url"] = (
         f"https://www.openstreetmap.org/{hit['osm_type']}/{hit['osm_id']}"

@@ -26,6 +26,7 @@ import logging
 import re
 import threading
 import time
+import unicodedata
 from difflib import SequenceMatcher
 from typing import Optional
 
@@ -63,9 +64,9 @@ def _cache_get(key: str):
         return None
 
 
-def _cache_set(key: str, value) -> None:
+def _cache_set(key: str, value, ttl: Optional[int] = None) -> None:
     try:
-        _get_cache().set(key, value, expire=settings.places_cache_ttl_seconds)
+        _get_cache().set(key, value, expire=ttl or settings.places_cache_ttl_seconds)
     except Exception:  # noqa: BLE001
         pass
 
@@ -91,9 +92,12 @@ async def _geocode_city(city: str) -> Optional[tuple[float, float]]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("[osm] city geocode failed for %r: %s", city, type(exc).__name__)
         return None
-    if not results:
+    if not isinstance(results, list) or not results:
         return None
-    coords = (float(results[0]["lat"]), float(results[0]["lon"]))
+    try:
+        coords = (float(results[0]["lat"]), float(results[0]["lon"]))
+    except (KeyError, TypeError, ValueError):
+        return None
     _cache_set(key, coords)
     return coords
 
@@ -130,7 +134,7 @@ async def city_pois(city: str) -> list[dict]:
         pois = await _wikidata_pois(lat, lng)
         if pois:
             logger.info("[osm] %r POI list from wikidata fallback (%d)", city, len(pois))
-        _cache_set(cache_key, pois)
+        _cache_set(cache_key, pois, ttl=600 if not pois else None)
         return pois
 
     pois = []
@@ -156,7 +160,7 @@ async def city_pois(city: str) -> list[dict]:
         pois = await _wikidata_pois(lat, lng)
         if pois:
             logger.info("[osm] %r POI list from wikidata fallback (%d)", city, len(pois))
-    _cache_set(cache_key, pois)
+    _cache_set(cache_key, pois, ttl=600 if not pois else None)
     return pois
 
 
@@ -222,14 +226,31 @@ async def _wikidata_pois(lat: float, lng: float) -> list[dict]:
     return pois
 
 
+def _normtext(v: str) -> str:
+    v = unicodedata.normalize("NFKD", (v or "").lower())
+    v = "".join(c for c in v if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9 ]+", " ", v).strip()
+
+
 def _matches(title: str, name: str) -> bool:
-    """The POI name must resemble the requested title, and a much shorter
-    generic name (a town, a region) cannot verify a longer specific venue."""
-    name = (name or "").lower().strip()
+    """Verify a name match two ways only: near-identical spelling
+    (Chennakesava/Chennakeshava), or every token of the shorter string
+    contained in the longer with a length floor — so a town or a
+    different-venue lookalike ('Madhur Caf\xe9' vs the Madhugiri peak)
+    cannot verify the place."""
+    name = _normtext(name)
     if not name:
         return False
-    for cand in {title.lower().strip(), title.split(",")[0].strip().lower()}:
-        if _sim(cand, name) > 0.45 and min(len(cand), len(name)) / max(len(cand), len(name), 1) >= 0.6:
+    for cand in {_normtext(title), _normtext(title.split(",")[0])}:
+        if not cand:
+            continue
+        if _sim(cand, name) >= 0.8:
+            return True
+        short, long = (cand, name) if len(cand) <= len(name) else (name, cand)
+        if len(short) / max(len(long), 1) < 0.5:
+            continue
+        stoks, ltoks = set(short.split()), set(long.split())
+        if stoks and stoks <= ltoks:
             return True
     return False
 
@@ -246,9 +267,19 @@ def match_poi(title: str, pois: list[dict]) -> Optional[dict]:
     return None
 
 
+def _km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    from math import radians, sin, cos, asin, sqrt
+    p = 6371.0
+    dlat, dlng = radians(lat2 - lat1), radians(lng2 - lng1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
+    return 2 * p * asin(sqrt(a))
+
+
 async def _photon(title: str, city: str) -> Optional[dict]:
     """Per-activity fallback when Overpass is unreachable. Paced; throttling
-    stops grounding with no retry (Photon terms)."""
+    stops grounding with no retry (Photon terms). A name match far from the
+    city (a same-named place in another state) is NOT verification."""
+    coords = await _geocode_city(city)
     key = "ph:" + " ".join(f"{title}|{city}".lower().split())
     cached = _cache_get(key)
     if cached is not None:
@@ -278,6 +309,8 @@ async def _photon(title: str, city: str) -> Optional[dict]:
                     name = props.get("name")
                     lon, lat = (f.get("geometry") or {}).get("coordinates") or [None, None]
                     if name and lat is not None and _matches(title, name):
+                        if coords and _km(coords[0], coords[1], float(lat), float(lon)) > 150:
+                            continue  # same-named place in another region
                         hit = {
                             "name": name,
                             "lat": float(lat),
