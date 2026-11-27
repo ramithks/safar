@@ -38,6 +38,7 @@
   }
   input:focus, select:focus { border-color: var(--lime-dim); }
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 480px) { .row { grid-template-columns: 1fr; gap: 0; } }
   button {
     margin-top: 16px; width: 100%; padding: 13px; border: none; border-radius: 10px;
     background: var(--lime); color: #10160a; font-size: 15px; font-weight: 700;
