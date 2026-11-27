@@ -114,6 +114,10 @@
   .day-panel { display: none; }
   .day-panel.on { display: block; }
   .results { display: none; }
+  .plan-status { flex: 1; align-self: center; color: var(--muted); font-size: 12.5px; min-width: 0; }
+  .plan-status.err { color: #ff9d7e; }
+  .mode-banner { display: none; margin: 14px 0 0; background: rgba(255,255,255,0.05); border: 1px solid var(--line); color: var(--muted); font-size: 12px; border-radius: 10px; padding: 8px 12px; }
+  .mode-banner.on { display: block; }
   .results.on { display: block; }
   .sample-banner { margin: 14px 22px 0; background: rgba(255,179,92,0.07); border: 1px dashed #6b4a1f; color: #ffb35c; font-size: 12px; border-radius: 10px; padding: 9px 13px; }
 
@@ -167,17 +171,20 @@
           <span class="chip" data-d="Coorg">Coorg</span>
           <span class="chip" data-d="Wayanad">Wayanad</span>
           <span class="chip" data-d="Hampi">Hampi</span>
+          <span class="chip" id="sampleToggle">See a sample plan</span>
         </div>
         <div class="details" id="details">
           <div class="f"><label>Departure</label><input type="date" value="2026-12-05"></div>
           <div class="f"><label>Days</label><input type="number" value="3" min="1" max="14"></div>
           <div class="f"><label>Travellers</label><input type="number" value="2" min="1" max="12"></div>
           <div class="f"><label>Budget</label><select><option>Low</option><option selected>Mid</option><option>High</option></select></div>
-          <div class="build-row"><button id="build">Build my plan</button></div>
+          <div class="build-row"><div id="planStatus" class="plan-status" role="status"></div><button id="build">Build my plan</button></div>
         </div>
       </div>
     </div>
   </div>
+
+  <div class="mode-banner" id="modeBanner"></div>
 
   <div class="sec" id="discover">
     <div class="sec-head"><h2>Discover</h2><span class="hint">Inspiration - tap a place to start a plan</span></div>
@@ -251,16 +258,128 @@
   function open() { details.classList.add('open'); }
   planit.addEventListener('click', () => { if (dest.value.trim()) open(); else dest.focus(); });
   document.querySelectorAll('.chip[data-d]').forEach(c => c.addEventListener('click', () => { dest.value = c.dataset.d; open(); }));
-  document.getElementById('build').addEventListener('click', () => {
-    if (!dest.value.trim()) { dest.focus(); return; }
+  /* ---- real integration layer (same contract as the deployed app) ---- */
+  const API_BASE = location.protocol === 'data:' || location.hostname === '' ? null : '';
+  const qs = new URLSearchParams(location.search || location.hash.slice(1));
+  const MOCK = qs.get('mock'); // preview-only test hook: planning | ready | error
+  const modeBanner = document.getElementById('modeBanner');
+  const planStatus = document.getElementById('planStatus');
+  let sb = null, session = null;
+
+  function banner(text) { modeBanner.textContent = text; modeBanner.classList.add('on'); }
+  function status(text, isErr) { planStatus.textContent = text || ''; planStatus.classList.toggle('err', !!isErr); }
+
+  async function api(path, opts) {
+    if (MOCK) return mockApi(path, opts);
+    const res = await fetch(API_BASE + path, opts);
+    return res;
+  }
+  async function mockApi(path, opts) {
+    const j = (code, obj) => ({ ok: code < 300, status: code, json: async () => obj });
+    if (path === '/api/v1/public-config') return j(200, { supabase_url: '', supabase_anon_key: '' });
+    if (path === '/api/v3/trips' && (!opts || opts.method !== 'GET')) {
+      if (MOCK === 'error') return j(429, { detail: 'Free AI plan generation is temporarily unavailable: the daily free-model quota is exhausted. It resets within 24 hours; please try again tomorrow.' });
+      return j(200, { trip_id: 'mock-trip-1' });
+    }
+    if (path.startsWith('/api/v3/trips/')) {
+      if (MOCK === 'planning') return j(200, { status: 'planning', progress: 40, doc: { title: dest.value || 'Trip', route: ['Bengaluru', dest.value || 'Destination'] } });
+      return j(200, { status: 'ready', progress: 100, doc: { title: (dest.value || 'Trip') + ', 3 days', route: ['Bengaluru', dest.value || 'Destination'], itinerary: (DAYS[dest.value] || DAYS['Gokarna']).map((sl, i) => ({ day: i+1, theme: '', items: sl.map(x => ({ title: x[1], description: x[2] })) })), transport: [], notes: [] } });
+    }
+    return j(404, { detail: 'mock: unknown path' });
+  }
+
+  async function boot() {
+    try {
+      const cfg = await (await api('/api/v1/public-config')).json();
+      if (!MOCK && cfg.supabase_url && cfg.supabase_anon_key) {
+        const { createClient } = await import('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm');
+        sb = createClient(cfg.supabase_url, cfg.supabase_anon_key);
+        const { data } = await sb.auth.getSession();
+        session = data.session;
+      }
+    } catch (_) { /* unreachable API: stay in design mode */ }
+    if (MOCK) { banner('Preview mock mode (' + MOCK + ') - API responses are simulated for design verification.'); return; }
+    if (!session) banner('Design preview - sign in on the deployed app to build real trips. Sample content is labelled.');
+  }
+
+  function showSample() {
+    applyDest(dest.value.trim() || 'Gokarna');
     results.classList.add('on');
     results.scrollIntoView({ behavior: 'smooth' });
+  }
+  document.getElementById('sampleToggle').addEventListener('click', showSample);
+
+  let pollTimer = null;
+  document.getElementById('build').addEventListener('click', async () => {
+    const d = dest.value.trim();
+    if (!d) { dest.focus(); return; }
+    if (!MOCK && !session) { status('Sign in on the deployed app to build a real trip. You can view the labelled sample below.', true); showSample(); return; }
+    status('Starting the planner...');
+    document.getElementById('build').disabled = true;
+    try {
+      const body = { origin: 'Bengaluru', destination: d, departure_date: document.querySelector('.details input[type=date]').value || null, days: parseInt(document.querySelector('.details input[type=number]').value || '3', 10), travelers: parseInt(document.querySelectorAll('.details input[type=number]')[1].value || '2', 10), budget: document.querySelector('.details select').value.toLowerCase(), interests: [], stops: [] };
+      const headers = { 'Content-Type': 'application/json' };
+      if (session) headers['Authorization'] = 'Bearer ' + session.access_token;
+      const res = await api('/api/v3/trips', { method: 'POST', headers, body: JSON.stringify(body) });
+      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || ('Request failed (HTTP ' + res.status + ')')); }
+      const { trip_id } = await res.json();
+      const ids = JSON.parse(localStorage.getItem('safar_trip_ids') || '[]');
+      if (!ids.includes(trip_id)) { ids.unshift(trip_id); localStorage.setItem('safar_trip_ids', JSON.stringify(ids.slice(0, 12))); }
+      clearInterval(pollTimer);
+      const tick = async () => {
+        try {
+          const r2 = await api('/api/v3/trips/' + trip_id, { headers });
+          if (!r2.ok) return;
+          const env = await r2.json();
+          renderRealTrip(env);
+          if (env.status !== 'planning') { clearInterval(pollTimer); status(''); }
+          else status('Planning... ' + (env.progress || 0) + '%');
+        } catch (_) { /* keep polling */ }
+      };
+      await tick();
+      pollTimer = setInterval(tick, 5000);
+    } catch (e) {
+      status(e.message, true);   // honest failure: no sample reveal, nothing saved
+    } finally {
+      document.getElementById('build').disabled = false;
+    }
   });
-  const tabs = document.querySelectorAll('.dt');
-  tabs.forEach(t => t.addEventListener('click', () => {
-    tabs.forEach(x => x.classList.toggle('on', x === t));
-    document.querySelectorAll('.day-panel').forEach(p => p.classList.toggle('on', p.dataset.day === t.dataset.day));
-  }));
+
+  function esc(s2) { return String(s2 ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+  function renderRealTrip(env) {
+    const doc = env.doc || {};
+    results.classList.add('on');
+    document.getElementById('tripTitle').textContent = doc.title || 'Your trip';
+    document.getElementById('itinTitle').textContent = doc.title || 'Your trip';
+    document.getElementById('itinMeta').textContent = (doc.route || []).join(' \u2192 ');
+    document.querySelector('.badge-sample').style.display = 'none';
+    document.querySelector('.sample-banner').style.display = 'none';
+    const days = (doc.itinerary || []).flatMap(dd => dd.days ? dd.days.map(x => ({ ...x, city: x.city || dd.city })) : [dd]);
+    const box = document.getElementById('dayPanels');
+    if (days.length) {
+      box.innerHTML = days.map((dd, i) => {
+        const items = (dd.activities || dd.items || []).map(it =>
+          '<div class="slot"><div class="time">' + esc(it.time || '') + '</div><div class="what"><b>' + esc(it.title || it.name || it) + '</b>' + (it.description ? '<span>' + esc(it.description) + '</span>' : '') + '</div></div>').join('');
+        return '<div class="day day-panel' + (i === 0 ? ' on' : '') + '" data-day="' + (i+1) + '">' + items + '</div>';
+      }).join('');
+      const tabsBox = document.querySelector('.day-tabs');
+      tabsBox.innerHTML = days.map((dd, i) => '<span class="dt' + (i === 0 ? ' on' : '') + '" data-day="' + (i+1) + '">Day ' + (dd.day ?? i+1) + '</span>').join('');
+      wireTabs();
+    }
+    if (env.status !== 'planning' && !(doc.transport || []).some(l => (l.options || []).length)) {
+      box.insertAdjacentHTML('beforeend', '<div class="sample-banner" style="display:block">Live fares and bookable transport are not available on this free deployment yet. The route above is AI-planned; check operators directly for tickets.</div>');
+    }
+    results.scrollIntoView({ behavior: 'smooth' });
+  }
+  function wireTabs() {
+    const tt = document.querySelectorAll('.dt');
+    tt.forEach(t => t.addEventListener('click', () => {
+      tt.forEach(x => x.classList.toggle('on', x === t));
+      document.querySelectorAll('.day-panel').forEach(pp => pp.classList.toggle('on', pp.dataset.day === t.dataset.day));
+    }));
+  }
+  wireTabs();
+  boot();
   const DAYS = {
     'Gokarna': [
       [['06:00','Overnight bus arrives, Gokarna town','Check in, drop bags, breakfast near the bus stand.','Travel'],['10:30','Kudle Beach','Slow morning on the sand; shacks open for lunch by noon.','Beach'],['16:30','Om Beach sunset','Walk the shore from Namaste Cafe side; best light around 5:40.','Beach'],['20:00','Dinner in town','Local thali places along Car Street.','Food']],
@@ -313,7 +432,6 @@
     const name = c.querySelector('.info h3').textContent;
     dest.value = name; applyDest(name); open(); window.scrollTo({ top: 0, behavior: 'smooth' });
   }));
-  document.getElementById('build').addEventListener('click', () => applyDest(dest.value.trim()));
 </script>
 </body>
 </html>
