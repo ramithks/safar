@@ -347,7 +347,20 @@ def leg_travel_days(leg: TripLeg, prefer: str | None = None, budget: str | None 
     for i in range(len(route.hops)):
         opt = selected_option_for_hop(leg, route, i, prefer, budget)
         if opt:
-            total += option_day_span(opt)
+            span = option_day_span(opt)
+            sel = leg.selection
+            user_picked = bool(
+                sel and sel.route_id == route.id and i < len(sel.per_hop_option_ids)
+            )
+            if span > 0 and not user_picked:
+                # An overnight *default* silently stretches the whole trip past
+                # the requested day count. When the hop has any same-day
+                # arrival, anchor the date cascade on it; picking the overnight
+                # ride explicitly re-sequences from the traveller's own choice.
+                hop = route.hops[i]
+                if any(option_day_span(o) == 0 for o in (hop.options or [])):
+                    span = 0
+            total += span
     return total
 
 

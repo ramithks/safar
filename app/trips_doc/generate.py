@@ -77,6 +77,54 @@ def _honest_failure(exc: Exception) -> str:
     return "Trip planning failed. Please try again."
 
 
+def _window_flags(graph: G.TripGraph, spec: dict) -> list[str]:
+    """Visible constraint check: the requested dates and clock times bind the
+    WHOLE trip, return travel included. Surface a plain flag wherever the
+    grounded plan cannot meet them — never silently extend the trip or claim
+    the window is met."""
+    flags: list[str] = []
+    dep = spec.get("departure_date")
+    if not dep:
+        return flags
+    try:
+        from datetime import date as _date, timedelta
+        y, m, d = (int(x) for x in str(dep).split("-"))
+        days = max(int(spec.get("days") or 1), 1)
+        trip_end = _date(y, m, d) + timedelta(days=days - 1)
+    except Exception:  # noqa: BLE001 — unparseable spec dates skip the check
+        return flags
+    end_time = spec.get("end_time")
+    ret = graph.edges[-1] if graph.edges else None
+    if ret is None or not ret.date:
+        return flags
+    end_iso = trip_end.isoformat()
+    if ret.date > end_iso:
+        flags.append(
+            f"Your {days}-day window isn't fully met: no live "
+            f"{ret.from_city} → {ret.to_city} services were found inside it, so the "
+            f"return shown leaves {ret.date}, outside your plan. Adjust the dates or "
+            "check operators directly for that day."
+        )
+        return flags  # outside the window entirely; the clock check no longer applies
+    if end_time:
+        arr = None
+        route = G.active_route(ret, None, spec.get("budget_tier"))
+        if route and route.hops:
+            opt = G.selected_option_for_hop(ret, route, len(route.hops) - 1, None,
+                                            spec.get("budget_tier"))
+            if opt and opt.arrival:
+                arr = str(opt.arrival)
+        if arr and len(arr) >= 16:
+            arr_date, arr_clock = arr[:10], arr[11:16]
+            if arr_date > end_iso or (arr_date == end_iso and arr_clock > end_time):
+                flags.append(
+                    f"The recommended return reaches {ret.to_city} at {arr_clock} on "
+                    f"{arr_date} — after your {end_time} target. Earlier options may be "
+                    f"listed; otherwise the {end_time} target isn't met."
+                )
+    return flags
+
+
 async def run_generation(trip_id: str, spec: dict, user_id: str,
                          prior_doc: dict | None = None) -> None:
     """Entry point: admit through the global generation queue, then build."""
@@ -196,6 +244,7 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
 
     await B._geocode_nodes(graph)
     weather = await _wait_weather(weather_task)
+    window_flags = _window_flags(graph, spec)
 
     # ── final doc ────────────────────────────────────────────────────────────
     title = (terminal_trip.get("trip_name")
@@ -216,6 +265,10 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
     ))
     if terminal_trip.get("trip_intelligence"):
         doc["intelligence"] = terminal_trip["trip_intelligence"]
+    if window_flags:
+        # User-facing constraint flags: rendered as visible banners in the UI.
+        doc["flags"] = window_flags
+        doc["notes"] = list(doc.get("notes") or []) + window_flags
     dropped = carry_forward_selections(prior_doc, doc)
     if dropped:
         doc["notes"] = list(doc.get("notes") or []) + \
