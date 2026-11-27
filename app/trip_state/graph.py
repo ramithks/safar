@@ -377,8 +377,25 @@ def _mode_rank(mode: str) -> int:
     return {"flight": 0, "train": 1, "bus": 2}.get(mode, 3)
 
 
+def _dt_with_date(s: str | None, fallback_date: str | None) -> Optional[datetime]:
+    """Full datetime, or clock time on the fallback date (transport searches
+    return '12:00' clock-only strings on dated hops)."""
+    dt = _parse_dt(s)
+    if dt is not None:
+        return dt
+    if fallback_date and len(fallback_date) >= 10:
+        clock = _parse_clock(s)
+        if clock is not None:
+            try:
+                return datetime.fromisoformat(fallback_date[:10]) + timedelta(minutes=clock)
+            except ValueError:
+                return None
+    return None
+
+
 def rank_options(options: list[TransportOption], prefer: str | None = None,
-                 budget: str | None = None) -> list[TransportOption]:
+                 budget: str | None = None, arrive_by: Optional[datetime] = None,
+                 hop_date: str | None = None) -> list[TransportOption]:
     """Order the options on a hop by the chosen axis. Pure — computes the
     suggestion, stores nothing. Options with no bookable seats left sort after
     every available one regardless of axis — a sold-out ride is never the
@@ -395,11 +412,26 @@ def rank_options(options: list[TransportOption], prefer: str | None = None,
             return 0
         return 0 if option_day_span(o) == 0 else 1
 
+    def _window(o: TransportOption) -> tuple:
+        # With arrive_by (the trip's end clock on its last day, for the return
+        # leg): anything landing after the deadline sorts last, and among the
+        # in-window options the LATEST departure wins, so the last day stays
+        # usable instead of being sacrificed to a dawn train that's merely
+        # cheapest. Options with unverifiable times are never preferred.
+        if arrive_by is None:
+            return (0, 0)
+        on_date = hop_date or arrive_by.date().isoformat()
+        arr = _dt_with_date(o.arrival, on_date)
+        after = 1 if (arr is None or arr > arrive_by) else 0
+        dep = _dt_with_date(o.departure, on_date)
+        dep_min = (dep.timestamp() / 60) if dep else 0
+        return (after, -dep_min)
+
     def cost_key(o: TransportOption) -> tuple:
-        return (_sold_out(o), _overnight(o), o.fare_per_person or 1e12, o.duration_min or 1e12, _mode_rank(o.mode))
+        return (_sold_out(o), _overnight(o), *_window(o), o.fare_per_person or 1e12, o.duration_min or 1e12, _mode_rank(o.mode))
 
     def time_key(o: TransportOption) -> tuple:
-        return (_sold_out(o), _overnight(o), o.duration_min or 1e12, o.fare_per_person or 1e12, _mode_rank(o.mode))
+        return (_sold_out(o), _overnight(o), *_window(o), o.duration_min or 1e12, o.fare_per_person or 1e12, _mode_rank(o.mode))
 
     def bal_key(o: TransportOption) -> tuple:
         # Balanced: normalise fare & duration into a blended score.
@@ -407,25 +439,28 @@ def rank_options(options: list[TransportOption], prefer: str | None = None,
         durs = [x.duration_min for x in options if x.duration_min] or [1]
         f = (o.fare_per_person or max(fares)) / max(fares)
         d = (o.duration_min or max(durs)) / max(durs)
-        return (_sold_out(o), _overnight(o), 0.6 * f + 0.4 * d, _mode_rank(o.mode))
+        return (_sold_out(o), _overnight(o), *_window(o), 0.6 * f + 0.4 * d, _mode_rank(o.mode))
 
     key = {"cheapest": cost_key, "fastest": time_key, "earliest": time_key}.get(axis, bal_key)
     return sorted(options, key=key)
 
 
 def recommended_option(hop: RouteHop, prefer: str | None = None,
-                       budget: str | None = None) -> Optional[TransportOption]:
-    ranked = rank_options(hop.options, prefer, budget)
+                       budget: str | None = None,
+                       arrive_by: Optional[datetime] = None) -> Optional[TransportOption]:
+    ranked = rank_options(hop.options, prefer, budget, arrive_by=arrive_by,
+                          hop_date=hop.date)
     return ranked[0] if ranked else None
 
 
-def _route_metrics(route: RouteCandidate, prefer: str | None, budget: str | None) -> tuple[float, int]:
+def _route_metrics(route: RouteCandidate, prefer: str | None, budget: str | None,
+                   arrive_by: Optional[datetime] = None) -> tuple[float, int]:
     """(total_fare_per_person, total_duration_min) using the recommended option on
     each hop — the cost of taking this candidate at the chosen preference."""
     total_fare = 0.0
     total_dur = 0
     for hop in route.hops:
-        best = recommended_option(hop, prefer, budget)
+        best = recommended_option(hop, prefer, budget, arrive_by=arrive_by)
         if not best:
             return (1e12, 1_000_000)             # a hop with no option → infeasible
         total_fare += best.fare_per_person or 0
@@ -434,13 +469,14 @@ def _route_metrics(route: RouteCandidate, prefer: str | None, budget: str | None
 
 
 def rank_routes(leg: TripLeg, prefer: str | None = None,
-                budget: str | None = None) -> list[RouteCandidate]:
+                budget: str | None = None,
+                arrive_by: Optional[datetime] = None) -> list[RouteCandidate]:
     """Order a leg's candidate routes (direct + gateway) by the chosen axis, so a
     cheaper/faster multi-leg route can be surfaced even when a direct one exists."""
     axis = _prefer_for(prefer, budget)
 
     def key(route: RouteCandidate) -> tuple:
-        fare, dur = _route_metrics(route, prefer, budget)
+        fare, dur = _route_metrics(route, prefer, budget, arrive_by)
         direct_first = 0 if route.kind == "direct" else 1
         if axis == "cheapest":
             return (fare, dur, direct_first)
@@ -454,7 +490,8 @@ def rank_routes(leg: TripLeg, prefer: str | None = None,
 
 
 def selected_option_for_hop(leg: TripLeg, route: RouteCandidate, hop_index: int,
-                            prefer: str | None, budget: str | None) -> Optional[TransportOption]:
+                            prefer: str | None, budget: str | None,
+                            arrive_by: Optional[datetime] = None) -> Optional[TransportOption]:
     """The user's picked option for this hop if they chose one on this route,
     else the derived recommendation."""
     hop = route.hops[hop_index] if hop_index < len(route.hops) else None
@@ -466,16 +503,17 @@ def selected_option_for_hop(leg: TripLeg, route: RouteCandidate, hop_index: int,
         picked = next((o for o in hop.options if o.id == oid), None)
         if picked:
             return picked
-    return recommended_option(hop, prefer, budget)
+    return recommended_option(hop, prefer, budget, arrive_by=arrive_by)
 
 
-def active_route(leg: TripLeg, prefer: str | None, budget: str | None) -> Optional[RouteCandidate]:
+def active_route(leg: TripLeg, prefer: str | None, budget: str | None,
+                 arrive_by: Optional[datetime] = None) -> Optional[RouteCandidate]:
     """The route in force: the selected one, else the top-ranked derived pick."""
     if leg.selection:
         chosen = next((r for r in leg.routes if r.id == leg.selection.route_id), None)
         if chosen:
             return chosen
-    ranked = rank_routes(leg, prefer, budget)
+    ranked = rank_routes(leg, prefer, budget, arrive_by)
     return ranked[0] if ranked else None
 
 

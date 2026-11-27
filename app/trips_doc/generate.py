@@ -29,7 +29,7 @@ from app.trip_state import compose as C
 from app.trip_state import graph as G
 
 from . import mytrips, store
-from .serialize import carry_forward_selections, chosen_hotel, doc_from_graph
+from .serialize import _return_deadline, carry_forward_selections, chosen_hotel, doc_from_graph
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,7 @@ def _window_flags(graph: G.TripGraph, spec: dict) -> list[str]:
     ret = graph.edges[-1] if graph.edges else None
     if ret is None or not ret.date:
         return flags
+    arrive_by = _return_deadline(spec)
     end_iso = trip_end.isoformat()
     if ret.date > end_iso:
         flags.append(
@@ -108,10 +109,10 @@ def _window_flags(graph: G.TripGraph, spec: dict) -> list[str]:
         return flags  # outside the window entirely; the clock check no longer applies
     if end_time:
         arr = None
-        route = G.active_route(ret, None, spec.get("budget_tier"))
+        route = G.active_route(ret, None, spec.get("budget_tier"), arrive_by=arrive_by)
         if route and route.hops:
             opt = G.selected_option_for_hop(ret, route, len(route.hops) - 1, None,
-                                            spec.get("budget_tier"))
+                                            spec.get("budget_tier"), arrive_by=arrive_by)
             if opt and opt.arrival:
                 arr = str(opt.arrival)
         if arr and len(arr) >= 16:
@@ -322,6 +323,67 @@ def _enforce_transfer_gaps(stayed: list, flags: list[str]) -> None:
                 )
 
 
+def _retime_final_day_for_departure(graph: G.TripGraph, spec: dict, flags: list[str]) -> None:
+    """The last day cannot schedule past the grounded ride home. Activities
+    ending after the return departure (minus an ESTIMATED transfer to the
+    boarding point when it isn't the stay city) are removed and named —
+    never left as a plan the traveller can't both do and catch.""" 
+    try:
+        _, _, inbound = G.ordered_path(graph)
+    except Exception:  # noqa: BLE001
+        return
+    if inbound is None:
+        return
+    arrive_by = _return_deadline(spec)
+    route = G.active_route(inbound, None, spec.get("budget_tier"), arrive_by=arrive_by)
+    if not route or not route.hops:
+        return
+    hop = route.hops[-1]
+    opt = G.selected_option_for_hop(inbound, route, len(route.hops) - 1, None,
+                                    spec.get("budget_tier"), arrive_by=arrive_by)
+    if not opt or not opt.departure:
+        return
+    dst = graph.node(inbound.from_node_id)
+    if dst is None or not dst.days:
+        return
+    dep_dt = G._dt_with_date(str(opt.departure), hop.date or inbound.date)
+    if dep_dt is None:
+        return
+    transfer = 60 if (hop.from_city or "") != (dst.city or "") else 30
+    cutoff = dep_dt.timestamp() / 60 - transfer
+    dep_clock = f"{dep_dt.hour:02d}:{dep_dt.minute:02d}"
+
+    def _mins(t: str) -> int | None:
+        try:
+            return int(t[:2]) * 60 + int(t[3:5])
+        except Exception:  # noqa: BLE001
+            return None
+
+    dep_base = dep_dt.replace(hour=0, minute=0).timestamp() / 60
+    day = dst.days[-1]
+    acts = day.get("activities") or []
+    if not acts:
+        return
+    kept, dropped = [], []
+    for a in acts:
+        start = _mins(str(a.get("start_time") or a.get("time") or ""))
+        if start is None:
+            kept.append(a)
+            continue
+        end = dep_base + start + int(a.get("duration_min") or 90)
+        (dropped if end > cutoff else kept).append(a)
+    if not dropped:
+        return
+    day["activities"] = kept
+    names = ", ".join(a.get("title") or "?" for a in dropped)
+    flags.append(
+        f"Your grounded return leaves {hop.from_city} at {dep_clock}; the last day in "
+        f"{dst.city} no longer includes: {names} — they ended after the departure minus "
+        f"an ESTIMATED {transfer}-minute transfer to the boarding point (not a measured "
+        "road time). Earlier slots are unchanged."
+    )
+
+
 async def run_generation(trip_id: str, spec: dict, user_id: str,
                          prior_doc: dict | None = None) -> None:
     """Entry point: admit through the global generation queue, then build."""
@@ -443,6 +505,7 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
     weather = await _wait_weather(weather_task)
     window_flags = _window_flags(graph, spec)
     _retime_day1_for_arrival(graph, spec, window_flags)
+    _retime_final_day_for_departure(graph, spec, window_flags)
     _enforce_transfer_gaps(stayed, window_flags)
     for _ms in ((terminal_trip.get("trip_quality") or {}).get("must_stops") or []):
         if _ms.get("injected") or _ms.get("feasibility") == "unverified":
