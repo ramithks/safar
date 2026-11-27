@@ -194,7 +194,8 @@ def _retime_day1_for_arrival(graph: G.TripGraph, spec: dict, flags: list[str]) -
             f"after day 1 — so day 1 at the destination is travel time. Its activities "
             f"were moved to after arrival"
             + (f"; not everything fit before evening and was left out: {names}. " if dropped else ". ")
-            + "Times from arrival onward are approximate."
+            + "Times from arrival onward are approximate and start with an estimated "
+            "45-minute buffer from the drop point - not a verified transfer."
         )
         return
 
@@ -222,13 +223,15 @@ def _retime_day1_for_arrival(graph: G.TripGraph, spec: dict, flags: list[str]) -
         flags.append(
             f"Day 1 in {dst.city} was re-timed around your {arr_clock} arrival; "
             f"not everything fit before evening, so it no longer includes: {names}. "
-            "Times from arrival onward are approximate."
+            "Times from arrival onward are approximate and start with an estimated "
+            "45-minute buffer from the drop point - not a verified transfer."
         )
     else:
         flags.append(
             f"Day 1 in {dst.city} was re-timed around your {arr_clock} arrival — the "
             "original morning slots weren't reachable with the grounded transport. "
-            "Times from arrival onward are approximate."
+            "Times from arrival onward are approximate and start with an estimated "
+            "45-minute buffer from the drop point - not a verified transfer."
         )
 
 
@@ -278,6 +281,7 @@ def _enforce_transfer_gaps(stayed: list, flags: list[str]) -> None:
             if len(acts) < 2:
                 continue
             kept, dropped = [], []
+            adjusted = False
             prev_end, prev_coords = None, None
             for a in acts:
                 start = _mins(str(a.get("start_time") or a.get("time") or ""))
@@ -292,6 +296,7 @@ def _enforce_transfer_gaps(stayed: list, flags: list[str]) -> None:
                         start = prev_end + gap
                         a["start_time"] = f"{start // 60:02d}:{start % 60:02d}"
                         a["transfer_adjusted"] = True
+                        adjusted = True
                 if start is not None and start + dur > 21 * 60:
                     dropped.append(a)
                     continue
@@ -303,9 +308,17 @@ def _enforce_transfer_gaps(stayed: list, flags: list[str]) -> None:
                 day["activities"] = kept
                 names = ", ".join(x.get("title") or "?" for x in dropped)
                 flags.append(
-                    f"Day {day.get('day')}: realistic travel time between stops didn't "
+                    f"Day {day.get('day')}: estimated travel time between stops didn't "
                     f"leave room for everything before evening, so it no longer "
                     f"includes: {names}."
+                )
+            if adjusted:
+                # The gaps are straight-line estimates, not road evidence.
+                flags.append(
+                    f"Day {day.get('day')} times include ESTIMATED transfer gaps "
+                    "(straight-line distance at ~30 km/h, not measured road time) - "
+                    "real travel, especially on hill roads, can take longer. Treat "
+                    "the clock times as rough estimates, not a feasible-route promise."
                 )
 
 

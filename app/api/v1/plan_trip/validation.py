@@ -375,6 +375,17 @@ def scrub_unverified_activities(days: list[dict], threshold: float = FILTER_THRE
             if a.get("confidence_score", 1.0) >= threshold:
                 continue
             old = a.get("title") or ""
+            if a.get("requested_place"):
+                # The traveller named this place: keep the name, qualify
+                # everything else the model claimed about it.
+                a["description"] = (
+                    "You asked to stop here. We could not verify its opening "
+                    "hours, access or current details - treat anything beyond "
+                    "the stop itself as unconfirmed."
+                )
+                a["estimated_cost"] = "Unknown"
+                a["unverified"] = True
+                continue
             cat = (a.get("category") or "Stop").strip() or "Stop"
             a["title"] = f"{cat} - suggested, not verified"
             a["description"] = (
@@ -407,10 +418,13 @@ def enforce_must_stops(days: list[dict], notes: str | None) -> list[dict]:
     places = [m.group(1).strip() for m in _STOP_RE.finditer(notes)]
     report: list[dict] = []
     for place in dict.fromkeys(places):
-        found = any(
-            place.lower() in (a.get("title") or "").lower()
-            for d in days for a in (d.get("activities") or [])
-        )
+        matched = [a for d in days for a in (d.get("activities") or [])
+                   if place.lower() in (a.get("title") or "").lower()]
+        found = bool(matched)
+        for a in matched:
+            # The traveller asked for this place by name: its name stays, but
+            # anything beyond that still has to earn its confidence.
+            a["requested_place"] = True
         if found:
             # Present in the plan, but presence by name match is not route
             # verification — feasibility stays explicitly unverified.

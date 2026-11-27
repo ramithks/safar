@@ -233,9 +233,6 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
     dropped = filter_low_confidence(days)
     if dropped:
         logger.debug("[plan_trip] Dropped %d low-confidence activities: %s", len(dropped), dropped)
-    scrubbed = scrub_unverified_activities(days)
-    if scrubbed:
-        logger.info("[plan_trip] Scrubbed invented specifics from ungrounded activities: %s", scrubbed)
 
     # ── Trip health check + auto-fix ─────────────────────────────────────────
     health = trip_health_check(days)
@@ -260,6 +257,13 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
     if must_stop_report:
         ai_json.setdefault("trip_quality", {})["must_stops"] = must_stop_report
         logger.info("[orchestrator] must-stops: %s", must_stop_report)
+
+    # After must-stop marking so user-named places keep their name but lose
+    # unverified specifics (requested_place), while fully invented venues are
+    # rewritten as unverified suggestions.
+    scrubbed = scrub_unverified_activities(days)
+    if scrubbed:
+        logger.info("[plan_trip] Scrubbed invented specifics from ungrounded activities: %s", scrubbed)
 
     ai_json["currency"] = symbol
     ai_json["trip_intelligence"] = compute_trip_intelligence(ai_json, safe_budget, body.days, ci["ceiling"])
