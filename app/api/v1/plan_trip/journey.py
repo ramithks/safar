@@ -1128,6 +1128,86 @@ async def run_plan_journey(
         legs[leg_idx]["has_live_data"] = has
         legs[leg_idx]["booking_url"] = _leg_booking_url(legs[leg_idx], result, departure_date)
 
+    # ── Grounding rescue + transparency ─────────────────────────────────────
+    # A leg whose planned mode has no resolvable live services gets one retry
+    # on the other surface mode (train↔bus). A leg that still has no live
+    # service after that is marked unverified, and the journey narrative stops
+    # asserting concrete services — otherwise the summary can claim things
+    # like a direct train to a town that has no station.
+    for leg in legs:
+        if not leg.get("needs_live_search") or leg.get("has_live_data"):
+            continue
+        _m = (leg.get("mode") or "").lower()
+        _sp = leg.get("search_params") or {}
+        _o = clean_city(_sp.get("origin") or leg.get("from") or "")
+        _d = clean_city(_sp.get("destination") or leg.get("to") or "")
+        if not (_o and _d and departure_date):
+            continue
+        try:
+            if _m in ("train", "railway"):
+                _fid = resolved.get(f"bus|{_o.lower()}") or await _transport.resolve_bus_city_id(_o)
+                _tid = resolved.get(f"bus|{_d.lower()}") or await _transport.resolve_bus_city_id(_d)
+                if _fid and _tid:
+                    _res = await with_retry(
+                        _transport.search_buses_direct,
+                        _fid, _tid, _o, _d, departure_date, body.travelers,
+                        budget=safe_budget,
+                        fallback={"buses": [], "resolved": False},
+                    )
+                    _buses = _enrich_buses_with_maps(_res.get("buses") or [])
+                    if _buses:
+                        _res["buses"] = _buses
+                        _rec = _pick_recommended_bus(_buses, safe_budget)
+                        if _rec:
+                            _rec["is_recommended"] = True
+                        logger.info("[journey] grounding rescue: %s → %s %s leg replaced by %d live bus options",
+                                    _o, _d, _m, len(_buses))
+                        leg["mode"] = "bus"
+                        leg["live_data"] = _res
+                        leg["has_live_data"] = True
+                        leg["grounding_rescue"] = f"{_m}→bus"
+                        leg.pop("live_search_note", None)
+                        leg["booking_url"] = _leg_booking_url(leg, _res, departure_date)
+            elif _m == "bus":
+                _fc = resolved.get(f"train|{_o.lower()}") or city_to_station_code(_o)
+                _tc = resolved.get(f"train|{_d.lower()}") or city_to_station_code(_d)
+                if _fc and _tc:
+                    _res = await with_retry(
+                        _railway.search, _o, _d, departure_date,
+                        from_code=_fc, to_code=_tc,
+                        fallback={"trains": [], "resolved": False},
+                    )
+                    _trains = _res.get("trains") or []
+                    if _trains:
+                        logger.info("[journey] grounding rescue: %s → %s bus leg replaced by %d live train options",
+                                    _o, _d, len(_trains))
+                        leg["mode"] = "train"
+                        leg["live_data"] = _res
+                        leg["has_live_data"] = True
+                        leg["grounding_rescue"] = "bus→train"
+                        leg.pop("live_search_note", None)
+                        leg["booking_url"] = _leg_booking_url(leg, _res, departure_date)
+        except Exception as _e:  # noqa: BLE001 — rescue is best-effort, never fatal
+            logger.info("[journey] grounding rescue failed for %s → %s: %s", _o, _d, type(_e).__name__)
+
+    _ungrounded = [l for l in legs if l.get("needs_live_search") and not l.get("has_live_data")]
+    for _l in _ungrounded:
+        _l["unverified"] = True
+    if _ungrounded:
+        _segs = "; ".join(
+            f"{(_l.get('from') or '?')} → {(_l.get('to') or '?')} by {(_l.get('mode') or '').lower() or 'unspecified mode'}"
+            for _l in _ungrounded
+        )
+        route_plan["transport_verified"] = False
+        route_plan["journey_summary"] = (
+            "Planning suggestion, not verified against live services: "
+            + " → ".join((str(_l.get("mode") or "")).lower() or "leg" for _l in legs)
+            + f". No live fares or services were confirmed for: {_segs}. "
+            "Treat times and costs here as estimates and confirm with the operator before booking."
+        )
+    else:
+        route_plan["transport_verified"] = True
+
     # ── Chain the legs: each must depart after the previous one arrives ───────
     # Overrides the per-leg picks above so a connecting leg never departs before
     # the prior leg lands (+ buffer), and stamps each live leg with its date.

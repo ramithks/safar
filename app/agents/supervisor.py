@@ -26,13 +26,14 @@ and adjusts cost figures rather than silently returning an unaffordable plan.
 """
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta
 from uuid import uuid4
 
 from .budget_agent import budget_agent_check
 from app.api.v1.plan_trip.constraints import validate_trip
 from app.api.v1.plan_trip.models import PlanRequest, PlanJourneyRequest, PlanTripRequest
-from app.api.v1.plan_trip.journey import run_plan_journey, reverse_route_plan
+from app.api.v1.plan_trip.journey import run_plan_journey, reverse_route_plan, _parse_duration_approx
 from app.api.v1.plan_trip.orchestrator import run_plan_trip
 from app.api.v1.plan_trip.budget import compute_detailed_budget
 from app.api.v1.plan_trip.helpers import CURRENCY_CONFIG, fetch_user_profile
@@ -64,6 +65,11 @@ def _shape_journey(j: dict, include_hotels: bool = False) -> dict:
 
 
 # ── Budget intervention: swap transport recommendation + update costs ──────────
+
+def _to_minutes(t: str) -> int | None:
+    m = re.match(r"^(\d{1,2}):(\d{2})", (t or "").strip())
+    return int(m.group(1)) * 60 + int(m.group(2)) if m else None
+
 
 def _apply_intervention(merged: dict, intervention: dict, currency_code: str) -> dict:
     """
@@ -319,6 +325,9 @@ async def supervisor_run(
         interests=body.interests,
         start_date=body.departure_date,
         end_date=end_date,
+        notes=body.comments,
+        start_time=body.start_time,
+        end_time=body.end_time,
     )
     return_journey_req = PlanJourneyRequest(
         origin=body.destination,
@@ -435,6 +444,29 @@ async def supervisor_run(
         merged["return"] = _shape_journey(return_journey_result, include_hotels=False)
     elif isinstance(return_journey_result, Exception):
         merged["return_error"] = str(return_journey_result)
+
+    # ── Return-buffer: end_time is "home by", so the last day must leave room
+    # for the return journey, not just fit activities until end_time. ─────────
+    if body.end_time and merged.get("days"):
+        _ret_min = (
+            _parse_duration_approx(((merged.get("return") or {}).get("summary") or {}).get("duration") or "")
+            or _parse_duration_approx(merged.get("total_duration_approx") or "")
+        )
+        if _ret_min:
+            _cutoff = _to_minutes(body.end_time) - _ret_min
+            _last = merged["days"][-1]
+            _kept, _dropped = [], []
+            for _a in (_last.get("activities") or []):
+                _t = _to_minutes(_a.get("time") or "")
+                (_kept if _t is None or _t <= _cutoff else _dropped).append(_a)
+            if _dropped:
+                _last["activities"] = _kept
+                _names = ", ".join(_a.get("title") or "?" for _a in _dropped)
+                merged["return_buffer_note"] = (
+                    f"Moved out of the last day so you can be back by {body.end_time}: {_names}. "
+                    "Return travel time is an estimate."
+                )
+                logger.info("[supervisor] return-buffer: dropped %d last-day activities to meet %s", len(_dropped), body.end_time)
 
     if "trip_intelligence" in merged and isinstance(merged["trip_intelligence"], dict):
         merged["trip_intelligence"].pop("total_estimated_cost", None)

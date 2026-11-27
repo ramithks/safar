@@ -198,6 +198,9 @@ async def run_plan(body: PlanRequest, user_id: str) -> dict:
         interests=body.interests,
         start_date=body.departure_date,
         end_date=end_date,
+        notes=body.comments,
+        start_time=body.start_time,
+        end_time=body.end_time,
     )
 
     # Return journey: origin/destination swapped, no hotel needed

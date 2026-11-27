@@ -343,3 +343,47 @@ def filter_low_confidence(days: list[dict], threshold: float = FILTER_THRESHOLD)
         day["activities"] = kept
 
     return removed
+
+
+# ── Must-stop enforcement ────────────────────────────────────────────────────
+
+_STOP_RE = re.compile(
+    r"(?i:\bstop\s+(?:at|by|in)\s+)([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})"
+)
+
+
+def enforce_must_stops(days: list[dict], notes: str | None) -> list[dict]:
+    """Ensure places the traveller explicitly asked to stop at appear in the
+    itinerary. Returns a transparent report per requested place
+    (fulfilled / injected / unfulfilled). An explicit request is never
+    silently dropped: if the model omitted it, we inject a clearly-labelled
+    en-route stop on day 1."""
+    if not notes:
+        return []
+    places = [m.group(1).strip() for m in _STOP_RE.finditer(notes)]
+    report: list[dict] = []
+    for place in dict.fromkeys(places):
+        found = any(
+            place.lower() in (a.get("title") or "").lower()
+            for d in days for a in (d.get("activities") or [])
+        )
+        if found:
+            report.append({"place": place, "fulfilled": True, "injected": False})
+            continue
+        if days:
+            acts = days[0].setdefault("activities", [])
+            acts.insert(1 if acts else 0, {
+                "time": "10:30",
+                "title": f"{place} (requested stop)",
+                "category": "En-route stop",
+                "description": f"Stop at {place} on the way, as asked for in your trip notes.",
+                "estimated_cost": "Free",
+                "requested_stop": True,
+            })
+            report.append({"place": place, "fulfilled": True, "injected": True})
+        else:
+            report.append({
+                "place": place, "fulfilled": False, "injected": False,
+                "note": "no itinerary days available to place the stop",
+            })
+    return report

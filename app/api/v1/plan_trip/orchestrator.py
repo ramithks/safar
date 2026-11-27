@@ -27,6 +27,7 @@ from .helpers import (
     fetch_memory_context,
     fill_deterministic_fields,
     assign_activity_times,
+    enforce_must_stops,
     nearest_neighbor_sort,
     compute_trip_intelligence,
     with_retry,
@@ -249,6 +250,13 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
     # Sorts activities by category+best_time window: viewpoints at dawn/dusk,
     # cafes at lunch, treks at early morning. Time-correctness > route order.
     assign_activity_times(days)
+
+    # Explicit "stop at X" requests in the traveller's notes must appear in the
+    # plan or be transparently flagged — never silently dropped.
+    must_stop_report = enforce_must_stops(days, getattr(body, "notes", None))
+    if must_stop_report:
+        ai_json.setdefault("trip_quality", {})["must_stops"] = must_stop_report
+        logger.info("[orchestrator] must-stops: %s", must_stop_report)
 
     ai_json["currency"] = symbol
     ai_json["trip_intelligence"] = compute_trip_intelligence(ai_json, safe_budget, body.days, ci["ceiling"])
