@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     openrouter_model_brain: str = "google/gemma-4-31b-it:free"
     openrouter_model_muscle: str = "google/gemma-4-26b-a4b-it:free"
     openrouter_model_vision: str = "nvidia/nemotron-3.5-super-vl:free"
+    groq_api_key: Optional[str] = None
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+    groq_model: str = "openai/gpt-oss-120b"
+    groq_model_vision: str = "qwen/qwen3.8-27b"
     openrouter_fallback_models: str = (
         "nvidia/nemotron-3.5-super-vl:free,inclusionai/ling-3.2-flash:free,"
         "google/gemma-4-26b-a4b-it:free,google/gemma-4-31b-it:free"
