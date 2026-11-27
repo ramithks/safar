@@ -443,3 +443,9 @@ create table if not exists public.experiences (
     min_age is null or max_age is null or max_age >= min_age
   )
 );
+
+-- Index-referenced columns.
+ALTER TABLE public.agent_runs DROP COLUMN IF EXISTS started_at CASCADE;
+ALTER TABLE public.agent_runs ADD COLUMN started_at timestamptz;
+ALTER TABLE public.agent_actions DROP COLUMN IF EXISTS property_id CASCADE;
+ALTER TABLE public.agent_actions ADD COLUMN property_id uuid;
