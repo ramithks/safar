@@ -130,6 +130,42 @@ def _window_flags(graph: G.TripGraph, spec: dict) -> list[str]:
     return flags
 
 
+async def _requested_stop_flag(ms: dict, stayed: list) -> str:
+    """The waypoint flag must describe the FINAL schedule, never restate the
+    request: a stop represented only by a verified place at its location is
+    stated as exactly that; a stop nothing represents is marked unmet."""
+    from app.services.osm_places import _geocode_city, _km
+    place = (ms.get("place") or "").strip()
+    acts = [a for n in stayed for d in (n.days or [])
+            for a in (d.get("activities") or [])]
+    if place and any(place.lower() in (a.get("title") or "").lower() for a in acts):
+        return (
+            f"Requested stop at {place}: included in the plan as a "
+            "requested waypoint. Its placement and timing are tentative — the "
+            "detour, opening hours and how long it adds are not verified, so "
+            "treat that part of the schedule as a plan to confirm, not a timetable."
+        )
+    try:
+        coords = await _geocode_city(place) if place else None
+    except Exception:  # noqa: BLE001
+        coords = None
+    if coords:
+        for a in acts:
+            if (a.get("grounded") == "server" and a.get("lat") and a.get("lng")
+                    and _km(coords[0], coords[1], float(a["lat"]), float(a["lng"])) <= 15):
+                return (
+                    f"Requested stop at {place}: no separate waypoint is scheduled. "
+                    f"The plan does include {a.get('title')} — a place verified by name "
+                    f"and location within 15 km of {place} — but the drive there and "
+                    "back and its timing are ESTIMATED, not verified transfers."
+                )
+    return (
+        f"Requested stop at {place}: NOT in the final schedule. It survived "
+        "neither the feasibility trims nor grounding as a verified stop, so it "
+        "is marked unmet here rather than claimed — nothing was silently dropped."
+    )
+
+
 _INTEREST_POI = {
     "cafe": {"cafe", "restaurant"}, "coffee": {"cafe", "restaurant"},
     "food": {"cafe", "restaurant"}, "restaurant": {"cafe", "restaurant"},
@@ -642,13 +678,9 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
     _waitlist_flags(graph, spec, window_flags)
     await _backfill_sparse_days(stayed, window_flags, spec)
     for _ms in ((terminal_trip.get("trip_quality") or {}).get("must_stops") or []):
-        if _ms.get("injected") or _ms.get("feasibility") == "unverified":
-            window_flags.append(
-                f"Requested stop at {_ms.get('place')}: included in the plan as a "
-                "requested waypoint. Its placement and timing are tentative — the "
-                "detour, opening hours and how long it adds are not verified, so "
-                "treat that part of the schedule as a plan to confirm, not a timetable."
-            )
+        if not (_ms.get("injected") or _ms.get("feasibility") == "unverified"):
+            continue
+        window_flags.append(await _requested_stop_flag(_ms, stayed))
 
     # ── final doc ────────────────────────────────────────────────────────────
     title = (terminal_trip.get("trip_name")
