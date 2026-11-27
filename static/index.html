@@ -126,6 +126,7 @@
       <div class="trip-title" id="trip-title"></div>
       <div class="route" id="trip-route"></div>
       <div class="unavail hidden" id="trip-error" style="margin-top:10px"></div>
+      <button id="trip-retry" class="hidden" style="margin-top:10px">Try again with the same details</button>
       <div class="progress-track"><div class="progress-fill" id="trip-progress"></div></div>
       <div class="msg" id="trip-status"></div>
       <div id="trip-transport"></div>
@@ -267,6 +268,35 @@ $("plan-btn").onclick = async () => {
   }
 };
 
+let lastFailedSpec = null;
+$("trip-retry").onclick = async () => {
+  if (!lastFailedSpec) return;
+  const s = lastFailedSpec;
+  $("trip-retry").disabled = true;
+  try {
+    const res = await fetch("/api/v3/trips", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + await token() },
+      body: JSON.stringify({
+        origin: s.origin, destination: s.destination,
+        departure_date: s.departure_date || null, days: s.days || 3,
+        travelers: s.travelers || 1, budget: s.budget || s.budget_tier || "mid",
+        interests: s.interests || [], start_time: s.start_time || null,
+        end_time: s.end_time || null, comments: s.comments || null,
+      }),
+    });
+    if (!res.ok) throw new Error((await res.json()).detail || ("HTTP " + res.status));
+    const { trip_id } = await res.json();
+    try { localStorage.setItem("safar_active_trip", trip_id); } catch (_) {}
+    $("trip-retry").classList.add("hidden");
+    pollTrip(trip_id);
+  } catch (e) {
+    $("trip-error").textContent = e.message;
+  } finally {
+    $("trip-retry").disabled = false;
+  }
+};
+
 async function pollTrip(tripId) {
   clearInterval(pollTimer);
   const tick = async () => {
@@ -296,13 +326,20 @@ function renderTrip(env) {
   $("trip-status").textContent =
     env.status === "planning" ? "Planning... " + (env.progress || 0) + "%" :
     env.status === "ready" ? "Trip plan ready." : "";
-  const errBox = $("trip-error");
+  const errBox = $("trip-error"), retryBtn = $("trip-retry");
   if (env.status !== "planning" && env.status !== "ready") {
     errBox.textContent = doc.error || "Trip planning failed. Please try again.";
     errBox.classList.remove("hidden");
     $("trip-progress").style.width = "100%";
+    // The spec persisted in the doc is the traveller's original input - the
+    // retry button re-submits it verbatim instead of making them retype.
+    if (doc.spec && doc.spec.origin && doc.spec.destination) {
+      lastFailedSpec = doc.spec;
+      retryBtn.classList.remove("hidden");
+    }
   } else {
     errBox.classList.add("hidden");
+    retryBtn.classList.add("hidden");
   }
 
   // Transport

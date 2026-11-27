@@ -104,24 +104,18 @@ async def lifespan(app: FastAPI):
         logger.info("Redis: %s (REDIS_URL unset, using the default)",
                     redis_target())
 
-    # Orphaned-trip sweep: in-process generation dies with the process, so any
-    # trip left "planning" by a previous life is terminal in truth. Runs after
-    # boot so the service is live first; the 3-minute age guard avoids racing a
-    # briefly-overlapping old instance's fresh writes.
+    # Durable-trip reconciler: generation is in-process, so restarts, deploys
+    # and free-tier sleep orphan "planning" trips. One pass now plus a periodic
+    # loop adopts provably-dead ones (stale > 13 min > the 600s cap, so no live
+    # job here or on a dying old instance can be touched) and restarts them
+    # from the spec persisted in their doc.
     try:
         import asyncio as _asyncio
-        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-        from app.trips_doc import store as _trip_store
+        from app.trips_doc import generate as _trip_gen
 
-        async def _orphan_sweep() -> None:
-            cutoff = (_dt.now(_tz.utc) - _td(minutes=3)).isoformat()
-            await _trip_store.fail_orphaned_planning(
-                "This plan was interrupted when the server restarted (the free "
-                "host sleeps and redeploys). Please start a new trip.", cutoff)
-
-        _asyncio.get_event_loop().create_task(_orphan_sweep())
-    except Exception as _exc:  # noqa: BLE001 - never block startup on the sweep
-        logger.warning("[trip-doc] orphan sweep scheduling failed: %s", _exc)
+        _asyncio.get_event_loop().create_task(_trip_gen.reconciler_loop())
+    except Exception as _exc:  # noqa: BLE001 - never block startup on recovery
+        logger.warning("[trip-doc] reconciler scheduling failed: %s", _exc)
 
     logger.info(f"Safar backend started (env={settings.app_env})")
     yield

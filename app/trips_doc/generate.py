@@ -354,3 +354,86 @@ async def _distill(user_id: str, doc: dict) -> None:
         await distill_from_trip(user_id, adapter)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[trip-doc] memory distill failed: %s", exc)
+
+
+# ── durable recovery (zero-spend, DB-backed) ─────────────────────────────────
+# Generation checkpoints are persisted as whole-doc milestones in trip_states
+# (spec + route at 10%, transport at 45%, itineraries+stays at 80%), so the DB
+# always holds everything a restart needs. The reconciler adopts trips whose
+# generation died with a previous process (restart, deploy, free-tier sleep)
+# and restarts them from the persisted spec.
+#
+# Duplicate-safety: the 600s cap above means a LIVE generation always reaches
+# a terminal write within 10 minutes of starting, and its first doc write
+# happens at start. A planning row with no write for STALE_ORPHAN_SECONDS
+# (> cap + margin) is therefore provably not owned by any live process,
+# including a briefly-overlapping old instance mid-deploy. Only such rows are
+# adopted. Queue-wait pathological depth (>2 full-cap jobs ahead) is the one
+# theoretical false-positive and is bounded by the per-user create rate limit.
+STALE_ORPHAN_SECONDS = 780          # 13 min > 600s cap + milestone-write margin
+MAX_RECOVERY_ATTEMPTS = 2           # then a terminal honest error
+
+
+def _stale_planning_rows_sync(cutoff_iso: str) -> list[dict]:
+    from app.db.client import get_db
+    res = (get_db().table("trip_states").select("id, user_id, doc")
+           .eq("status", "planning").lt("updated_at", cutoff_iso).execute())
+    return res.data or []
+
+
+async def reconcile_orphaned_trips() -> dict:
+    """Adopt provably-dead planning trips: restart from the persisted spec, or
+    after MAX_RECOVERY_ATTEMPTS mark a terminal error. Never touches a row a
+    live process could still own (see STALE_ORPHAN_SECONDS)."""
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(seconds=STALE_ORPHAN_SECONDS)).isoformat()
+    try:
+        rows = await run_db(_stale_planning_rows_sync, cutoff)
+    except Exception:  # noqa: BLE001 - a reconciler pass must never crash the app
+        logger.error("[trip-doc] reconciler query failed", exc_info=True)
+        return {"error": "query failed"}
+    restarted, failed = 0, 0
+    for row in rows:
+        trip_id, doc = row["id"], (row.get("doc") or {})
+        spec = doc.get("spec") or {}
+        recovery = dict(doc.get("recovery") or {})
+        attempts = int(recovery.get("count") or 0)
+        if not spec.get("origin") or not spec.get("destination") or attempts >= MAX_RECOVERY_ATTEMPTS:
+            try:
+                await store.set_status(
+                    trip_id, "error", progress=100,
+                    error=("This plan was interrupted when the server restarted "
+                           "(the free host sleeps and redeploys) and could not "
+                           "be recovered. Your details are kept - start a new "
+                           "trip with the same details to try again."))
+                failed += 1
+            except Exception:  # noqa: BLE001
+                logger.error("[trip-doc] reconciler could not fail %s", trip_id)
+            continue
+        recovery["count"] = attempts + 1
+        recovery["last_at"] = _now()
+        try:
+            doc["recovery"] = recovery
+            await store.put_doc(trip_id, doc)   # claim: bumps updated_at before spawn
+            spawn_background(run_generation(trip_id, spec, str(row.get("user_id") or ""), doc),
+                             name=f"trip_doc_gen:{trip_id}:recovery{recovery['count']}")
+            restarted += 1
+            logger.info("[trip-doc] %s adopted for recovery attempt %d", trip_id, recovery["count"])
+        except Exception:  # noqa: BLE001
+            logger.error("[trip-doc] reconciler could not adopt %s", trip_id, exc_info=True)
+    if restarted or failed:
+        logger.info("[trip-doc] reconciler: %d restarted, %d terminally failed", restarted, failed)
+    return {"restarted": restarted, "failed": failed}
+
+
+async def reconciler_loop(interval_seconds: int = 300) -> None:
+    """Periodic pass so orphans younger than the boot-time staleness threshold
+    are still recovered later, and orphans created by sleep-while-idle are
+    recovered as soon as any traffic wakes the instance."""
+    while True:
+        try:
+            await reconcile_orphaned_trips()
+        except Exception:  # noqa: BLE001
+            logger.error("[trip-doc] reconciler pass failed", exc_info=True)
+        await asyncio.sleep(interval_seconds)
