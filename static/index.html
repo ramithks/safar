@@ -177,6 +177,7 @@
     .hero .h-body { padding: 18px; background: linear-gradient(180deg, #0c0c0c, #121212); }
     .hero h1 { font-size: 25px; }
     .details { grid-template-columns: 1fr 1fr; }
+    .details .f:first-child, .details .f:nth-child(2) { grid-column: 1 / -1; }
     .photo-grid { grid-template-columns: repeat(2, 1fr); }
     nav .links a { padding: 7px 9px; font-size: 13px; }
     .trip-card img { width: 116px; height: 130px; }
@@ -266,25 +267,25 @@
         <img src="https://thumb.wikimedia.org/wikipedia/commons/thumb/f/f0/PXL_20260103_101009613_People_and_Beach_Om_Beach_Gokarna%2C_Karnataka_19.jpg/1280px-PXL_20260103_101009613_People_and_Beach_Om_Beach_Gokarna%2C_Karnataka_19.jpg" alt="Om Beach, Gokarna" loading="lazy">
         <div class="shade"></div>
         <span class="plan">Plan this &#8594;</span>
-        <div class="info"><h3>Gokarna</h3><div class="m">Beaches &#183; Karnataka &#183; 485 km from Bengaluru</div></div>
+        <div class="info"><h3>Gokarna</h3><div class="m">Beaches &#183; Karnataka &#183; 485 km by road from Bengaluru</div></div>
       </div>
       <div class="pcard">
         <img src="https://thumb.wikimedia.org/wikipedia/commons/thumb/9/94/Coffee_Coconuts_Pepper_Estate_Coorg_Feb24_A7C_09365.jpg/1280px-Coffee_Coconuts_Pepper_Estate_Coorg_Feb24_A7C_09365.jpg" alt="Coffee estate, Coorg" loading="lazy">
         <div class="shade"></div>
         <span class="plan">Plan this &#8594;</span>
-        <div class="info"><h3>Coorg</h3><div class="m">Coffee estates &#183; Karnataka &#183; 265 km from Bengaluru</div></div>
+        <div class="info"><h3>Coorg</h3><div class="m">Coffee estates &#183; Karnataka &#183; 260 km by road from Bengaluru</div></div>
       </div>
       <div class="pcard">
         <img src="https://thumb.wikimedia.org/wikipedia/commons/thumb/d/d6/Banasura_hills_from_View_Point_Wayanad_Resort%2C_Pulinjal_%2819%29.jpg/1280px-Banasura_hills_from_View_Point_Wayanad_Resort%2C_Pulinjal_%2819%29.jpg" alt="Banasura hills, Wayanad" loading="lazy">
         <div class="shade"></div>
         <span class="plan">Plan this &#8594;</span>
-        <div class="info"><h3>Wayanad</h3><div class="m">Hills &amp; forests &#183; Kerala &#183; 280 km from Bengaluru</div></div>
+        <div class="info"><h3>Wayanad</h3><div class="m">Hills &amp; forests &#183; Kerala &#183; 280 km by road from Bengaluru</div></div>
       </div>
       <div class="pcard">
         <img src="https://thumb.wikimedia.org/wikipedia/commons/thumb/b/b9/Complex_of_Virupaksha_Temple%2C_Hampi_%2804%29.jpg/1280px-Complex_of_Virupaksha_Temple%2C_Hampi_%2804%29.jpg" alt="Virupaksha Temple, Hampi" loading="lazy">
         <div class="shade"></div>
         <span class="plan">Plan this &#8594;</span>
-        <div class="info"><h3>Hampi</h3><div class="m">Heritage ruins &#183; Karnataka &#183; 340 km from Bengaluru</div></div>
+        <div class="info"><h3>Hampi</h3><div class="m">Heritage ruins &#183; Karnataka &#183; 340 km by road from Bengaluru</div></div>
       </div>
     </div>
   </div>
@@ -569,24 +570,24 @@
 
   const DAYS = {
     'Gokarna': [
-      [['06:00','Overnight bus arrives, Gokarna town','Check in, drop bags, breakfast near the bus stand.','Travel'],['10:30','Kudle Beach','Slow morning on the sand; shacks open for lunch by noon.','Beach'],['16:30','Om Beach sunset','Walk the shore from Namaste Cafe side; best light around 5:40.','Beach'],['20:00','Dinner in town','Local thali places along Car Street.','Food']],
+      [['06:00','Overnight bus arrives, Gokarna town','Check in, drop bags, breakfast near the bus stand.','Travel'],['10:30','Kudle Beach','Slow morning on the sand; lunch at the beach shacks.','Beach'],['16:30','Om Beach sunset','Walk the shore from the Namaste Cafe side at sunset.','Beach'],['20:00','Dinner in town','Local thali places along Car Street.','Food']],
       [['09:00','Half Moon Beach hike','Trail over the headland from Om Beach; carry water.','Trek'],['13:00','Paradise Beach','Boat or hike; quietest of the four beaches.','Beach'],['18:30','Mahabaleshwar Temple','Evening aarti in the old town.','Town']],
-      [['08:00','Mirjan Fort','16th-century laterite fort, 11 km from town.','Heritage'],['14:00','Return bus to Bengaluru','Overnight or late-afternoon departure.','Travel']]
+      [['08:00','Mirjan Fort','16th-century laterite fort, a short drive from town.','Heritage'],['14:00','Return bus to Bengaluru','Afternoon or overnight departure.','Travel']]
     ],
     'Coorg': [
       [['06:30','Arrive Madikeri','Check in, breakfast at a local mess.','Travel'],['10:00','Abbey Falls','Short walk through coffee estates to the falls.','Nature'],['16:00',"Raja's Seat sunset",'Garden viewpoint over the valley.','View'],['19:30','Kodava dinner','Pandi curry and akki rotti at a local home-style place.','Food']],
-      [['08:00','Dubare Elephant Camp','Morning river crossing; go early for the bathing session.','Nature'],['13:30','Coffee estate walk','Guided walk through a working plantation near Kushalnagar.','Estate'],['17:00','Namdroling Monastery','Golden Temple at Bylakuppe; prayer hall closes by 6.','Culture']],
-      [['07:00','Mandalpatti viewpoint','Jeep up for the early mist over the hills.','View'],['13:00','Return to Bengaluru','~5.5 hrs via Kushalnagar.','Travel']]
+      [['08:00','Dubare Elephant Camp','Morning river crossing at the camp.','Nature'],['13:30','Coffee estate walk','Guided walk through a working plantation near Kushalnagar.','Estate'],['17:00','Namdroling Monastery','Golden Temple at Bylakuppe.','Culture']],
+      [['07:00','Mandalpatti viewpoint','Jeep up for the early mist over the hills.','View'],['13:00','Return to Bengaluru','Drive back via Kushalnagar.','Travel']]
     ],
     'Wayanad': [
       [['07:00','Arrive Kalpetta','Check in, breakfast in town.','Travel'],['10:30','Banasura Sagar Dam','Earth dam with speedboat rides; hills behind.','Nature'],['16:00','Pookode Lake','Forested freshwater lake, paddle boats.','Nature'],['19:30','Dinner in Kalpetta','Kerala meals; try the local biryani.','Food']],
       [['07:30','Edakkal Caves','Morning climb to the petroglyph caves; steps involved.','Heritage'],['13:00','Bamboo Craft Village','Wayanad heritage museum stop on the way back.','Culture'],['16:30','Lakkidi viewpoint','Thamarassery churam hairpins, best at dusk.','View']],
-      [['08:00','Tea estate walk, Vythiri','Morning walk through the estates.','Estate'],['13:00','Return to Bengaluru','~6 hrs via Mysuru.','Travel']]
+      [['08:00','Tea estate walk, Vythiri','Morning walk through the estates.','Estate'],['13:00','Return to Bengaluru','Drive back via Mysuru.','Travel']]
     ],
     'Hampi': [
       [['07:00','Arrive Hosapete','Check in, breakfast; auto to Hampi Bazaar.','Travel'],['10:00','Virupaksha Temple','The living temple at the heart of Hampi.','Heritage'],['15:00','Vittala Temple','Stone chariot and musical pillars.','Heritage'],['18:00','Matanga Hill sunset','Climb for the classic Hampi sunset.','View']],
       [['08:00','Coracle ride on the Tungabhadra','Round boat ride near the bathing ghats.','River'],['11:00','Anegundi village','Older than Hampi; quiet lanes and fort remains.','Village'],['16:00','Hemakuta Hill','Cluster of small temples, golden hour light.','Heritage']],
-      [['08:00','Lotus Mahal + Elephant Stables','Zenana enclosure before the heat.','Heritage'],['13:00','Return to Bengaluru','~6 hrs via Hosapete.','Travel']]
+      [['08:00','Lotus Mahal + Elephant Stables','Zenana enclosure before the heat.','Heritage'],['13:00','Return to Bengaluru','Drive back via Hosapete.','Travel']]
     ]
   };
   function renderDays(name) {
