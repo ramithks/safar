@@ -6,141 +6,325 @@
 <title>Safar - AI Trip Planner</title>
 <style>
   :root {
-    --bg: #0b0e11;
-    --card: #141a20;
-    --card2: #1a222b;
-    --line: #26313c;
-    --text: #e8eef2;
-    --muted: #8ba0ae;
-    --lime: #b8f33d;
-    --lime-dim: #8fbf2e;
+    --bg: #000000;
+    --surface: #0d0d0d;
+    --surface2: #1a1a1a;
+    --line: #262626;
+    --text: #f5f5f5;
+    --muted: #a8a8a8;
+    --blue: #0095f6;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     background: var(--bg); color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    min-height: 100vh; overflow-x: hidden;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 760px; margin: 0 auto; padding: 24px 16px 80px; }
-  header { padding: 20px 0 8px; }
-  header h1 { font-size: 28px; letter-spacing: -0.5px; margin: 0 0 4px; line-height: 1.2; }
-  header h1 span { color: var(--lime); }
-  header p { color: var(--muted); font-size: 13px; margin: 0; }
-  .card {
-    background: var(--card); border: 1px solid var(--line);
-    border-radius: 14px; padding: 20px; margin-top: 18px;
+
+  /* ── top bar ──────────────────────────────────────────── */
+  .topbar {
+    position: sticky; top: 0; z-index: 20;
+    background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
   }
-  label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 5px; }
-  input, select, textarea {
-    width: 100%; min-width: 0; padding: 11px 12px; border-radius: 9px;
-    border: 1px solid var(--line); background: var(--card2); color: var(--text);
-    font-size: 15px; outline: none;
+  .topbar-in {
+    max-width: 935px; margin: 0 auto; height: 54px;
+    display: flex; align-items: center; justify-content: space-between; padding: 0 16px;
   }
-  input:focus, select:focus { border-color: var(--lime-dim); }
-  .row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
-  @media (max-width: 480px) { .row { grid-template-columns: minmax(0, 1fr); gap: 0; } }
-  button {
-    margin-top: 16px; width: 100%; padding: 13px; border: none; border-radius: 10px;
-    background: var(--lime); color: #10160a; font-size: 15px; font-weight: 700;
-    cursor: pointer;
+  .logo { font-size: 24px; font-weight: 800; letter-spacing: -1px; }
+  .logo em { font-style: normal; color: var(--blue); }
+  .signout { background: none; border: none; color: var(--muted); font-size: 13px; cursor: pointer; padding: 4px; }
+  .signout:hover { color: var(--text); }
+
+  /* ── discovery ────────────────────────────────────────── */
+  .discover { max-width: 935px; margin: 0 auto; padding: 28px 16px 60px; }
+  .discover h1 { font-size: 28px; font-weight: 800; letter-spacing: -0.8px; }
+  .discover .sub { color: var(--muted); font-size: 14px; margin-top: 4px; }
+  .grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-top: 22px;
   }
-  button:disabled { opacity: 0.45; cursor: default; }
-  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); font-weight: 500; }
-  .google-btn { width: 100%; padding: 12px; border-radius: 10px; border: 1px solid #2a2a2a; background: #fff; color: #111; font-weight: 600; cursor: pointer; margin-bottom: 14px; }
-.google-btn:hover { background: #f0f0f0; }
-.divider { display: flex; align-items: center; gap: 10px; color: #666; font-size: 12px; margin: 4px 0 14px; }
-.divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: #2a2a2a; }
-.closed-note { color: #777; font-size: 12px; text-align: center; margin-top: 10px; }
-.msg { font-size: 13px; color: var(--muted); margin-top: 12px; min-height: 18px; }
-  .msg.err { color: #ff7b72; }
-  .progress-track { background: var(--card2); border-radius: 99px; height: 8px; margin: 14px 0 6px; overflow: hidden; }
-  .progress-fill { background: var(--lime); height: 100%; width: 0%; transition: width 0.6s ease; }
-  .trip-title { font-size: 20px; font-weight: 700; }
-  .route { color: var(--muted); font-size: 13px; margin-top: 4px; }
-  .day { border-top: 1px solid var(--line); padding: 14px 0; }
-  .day h3 { font-size: 15px; margin-bottom: 6px; }
-  .day h3 span { color: var(--lime); }
-  .item { font-size: 14px; color: var(--text); padding: 4px 0 4px 14px; position: relative; }
-  .item::before { content: ""; position: absolute; left: 0; top: 11px; width: 6px; height: 6px; border-radius: 50%; background: var(--lime-dim); }
-  .item small { color: var(--muted); display: block; }
-  .pill { display: inline-block; background: var(--card2); border: 1px solid var(--line); border-radius: 99px; padding: 4px 12px; font-size: 12px; color: var(--muted); margin: 4px 6px 0 0; }
-  .transport-opt { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 10px; background: var(--card2); }
+  .dest {
+    position: relative; border-radius: 14px; overflow: hidden; cursor: pointer;
+    aspect-ratio: 4 / 5; border: 1px solid var(--line);
+    background-size: cover; background-position: center;
+    transition: transform .15s ease, border-color .15s ease;
+  }
+  .dest:hover { transform: translateY(-3px); border-color: #3d3d3d; }
+  .dest::after {
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(180deg, rgba(0,0,0,0.02) 45%, rgba(0,0,0,0.78) 100%);
+  }
+  .dest-meta { position: absolute; left: 16px; bottom: 16px; z-index: 1; }
+  .dest-name { display: block; color: #fff; font-size: 22px; font-weight: 800; letter-spacing: -0.4px; }
+  .dest-sub { display: block; color: rgba(255,255,255,0.75); font-size: 12.5px; margin-top: 2px; }
+  .plan-chip {
+    position: absolute; right: 14px; bottom: 16px; z-index: 1;
+    background: #ffffff; color: #000; font-size: 12.5px; font-weight: 700;
+    padding: 7px 14px; border-radius: 99px;
+  }
+  .scratch {
+    display: block; margin: 26px auto 0; background: none;
+    border: 1px solid var(--line); border-radius: 99px; color: var(--text);
+    font-size: 14px; font-weight: 600; padding: 12px 26px; cursor: pointer;
+  }
+  .scratch:hover { border-color: #4d4d4d; }
+
+  /* ── planner sheet ────────────────────────────────────── */
+  #sheet { position: fixed; inset: 0; z-index: 40; }
+  .sheet-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.72); }
+  .sheet-panel {
+    position: relative; max-width: 460px; margin: 8vh auto 0;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 16px;
+    padding: 20px 22px 24px; max-height: 84vh; overflow-y: auto;
+  }
+  .sheet-head { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+  #sheet-close { background: none; border: none; color: var(--muted); font-size: 17px; cursor: pointer; padding: 2px 6px; }
+  #step-label { color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: 0.4px; text-transform: uppercase; }
+  .ticks { display: flex; gap: 5px; margin-left: auto; }
+  .ticks i { width: 22px; height: 3px; border-radius: 2px; background: var(--surface2); }
+  .ticks i.on { background: #ffffff; }
+  .step h2 { font-size: 19px; font-weight: 800; letter-spacing: -0.3px; margin: 10px 0 2px; }
+  .step .sub { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+
+  label { display: block; font-size: 11px; font-weight: 700; color: var(--muted); margin: 14px 0 6px; text-transform: uppercase; letter-spacing: 0.8px; }
+  .step input {
+    width: 100%; background: var(--surface2); border: 1px solid var(--line);
+    border-radius: 9px; padding: 13px 14px; font-size: 15px; color: var(--text); outline: none;
+   min-width: 0;
+  }
+  .step input:focus { border-color: var(--blue); }
+  .step input::placeholder { color: #6a6a6a; }
+
+  .chips { display: flex; gap: 8px; }
+  .chips button {
+    flex: 1; padding: 9px 0; border-radius: 99px; cursor: pointer;
+    background: transparent; border: 1px solid var(--line);
+    color: var(--muted); font-size: 13px; font-weight: 600;
+  }
+  .chips button.on { background: #ffffff; border-color: #ffffff; color: #000000; }
+
+  .meta-row { display: grid; grid-template-columns: 1fr 1fr 1.3fr; gap: 8px; }
+  .meta-row label { margin-top: 0; }
+
+  details { margin-top: 14px; border-top: 1px solid var(--line); }
+  summary { cursor: pointer; color: var(--muted); font-size: 13px; font-weight: 600; padding: 12px 0; list-style: none; }
+  summary::before { content: "+ "; color: var(--blue); font-weight: 700; }
+  details[open] summary::before { content: "- "; }
+
+  button.cta {
+    margin-top: 18px; width: 100%; padding: 13px; border: none; border-radius: 10px;
+    background: #ffffff; color: #000000; font-size: 15px; font-weight: 700; cursor: pointer;
+  }
+  button.cta:disabled { opacity: 0.35; cursor: default; }
+  button.ghost {
+    margin-top: 10px; width: 100%; padding: 11px; border-radius: 10px;
+    background: transparent; color: var(--muted); border: 1px solid var(--line);
+    font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .msg { font-size: 12px; color: var(--muted); margin-top: 10px; min-height: 16px; }
+  .msg.err { color: #ed4956; }
+
+  /* ── auth ─────────────────────────────────────────────── */
+  #auth-card {
+    max-width: 380px; margin: 70px auto; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 14px; padding: 38px 30px; text-align: center;
+  }
+  #auth-card .logo { font-size: 38px; display: block; margin-bottom: 6px; }
+  #auth-card .tag { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
+  #auth-form { text-align: left; }
+  #auth-form input {
+    width: 100%; background: var(--surface2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 12px; font-size: 14px; color: var(--text);
+    outline: none; margin-bottom: 8px;
+  }
+  #auth-form input:focus { border-color: #4d4d4d; }
+  #auth-form input::placeholder { color: #6a6a6a; }
+  #auth-form label { position: absolute; left: -9999px; }
+  #signin-btn { background: var(--blue); color: #fff; border: none; border-radius: 8px; width: 100%; padding: 12px; font-size: 14px; font-weight: 700; margin-top: 6px; cursor: pointer; }
+  .signup-note { color: var(--muted); font-size: 12px; margin-top: 16px; text-align: center; line-height: 1.5; }
+
+  /* ── trip plan (feed post) ────────────────────────────── */
+  .post {
+    max-width: 614px; margin: 26px auto; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 14px; padding: 20px 18px;
+  }
+  .post-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .avatar {
+    width: 38px; height: 38px; border-radius: 50%; flex: none;
+    background: var(--surface2); border: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text); font-weight: 800; font-size: 17px;
+  }
+  .trip-title { font-size: 15px; font-weight: 700; }
+  .route { color: var(--muted); font-size: 12px; margin-top: 1px; }
+  .progress-track { background: var(--surface2); border-radius: 99px; height: 3px; margin: 12px 0 8px; overflow: hidden; }
+  .progress-fill { background: #ffffff; height: 100%; width: 0%; transition: width 0.6s ease; }
+
+  .day { border-left: 2px solid var(--line); margin: 14px 0 0 6px; padding: 2px 0 8px 16px; position: relative; }
+  .day::before { content: ""; position: absolute; left: -6px; top: 6px; width: 10px; height: 10px; border-radius: 50%; background: var(--blue); }
+  .day h3 { font-size: 14px; margin-bottom: 8px; font-weight: 700; }
+  .day h3 span { color: var(--blue); margin-right: 6px; }
+  .item { font-size: 14px; color: var(--text); padding: 5px 0; }
+  .item small { color: var(--muted); display: block; margin-top: 1px; font-size: 12.5px; line-height: 1.45; }
+
+  .pill { display: inline-block; background: var(--surface2); border: 1px solid var(--line); border-radius: 99px; padding: 4px 12px; font-size: 12px; color: var(--muted); margin: 5px 6px 0 0; }
+  .transport-opt { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 8px; background: var(--surface2); }
   .transport-opt b { font-size: 14px; }
   .transport-opt .meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
+  .unavail { border: 1px dashed #383838; color: var(--muted); border-radius: 10px; padding: 12px; font-size: 12.5px; margin-top: 8px; line-height: 1.55; }
+  .sample-banner {
+    max-width: 614px; margin: 18px auto -8px; border: 1px solid #3d3d3d; background: var(--surface);
+    color: var(--muted); border-radius: 10px; padding: 10px 14px; font-size: 12px; font-weight: 600;
+  }
+  .google-btn { width: 100%; padding: 12px; border-radius: 10px; border: 1px solid #3d3d3d; background: #ffffff; color: #111111; font-weight: 600; cursor: pointer; margin-bottom: 12px; font-size: 14px; }
+  .google-btn:hover { background: #f0f0f0; }
+  .or-sep { text-align: center; color: #555555; font-size: 11px; margin: 2px 0 10px; }
+  .meta-row2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+  .step textarea { width: 100%; min-width: 0; padding: 11px 12px; border-radius: 9px; border: 1px solid #333333; background: #1c1c1c; color: #f2f2f2; font-size: 14px; outline: none; font-family: inherit; resize: vertical; }
   .hidden { display: none; }
-  footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 40px; line-height: 1.7; }
-  a { color: var(--lime-dim); text-decoration: none; }
-  .signout { float: right; background: none; border: none; color: var(--muted); font-size: 12px; cursor: pointer; width: auto; margin: 0; padding: 4px; }
+  h3.sec { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-top: 18px; }
+  footer { text-align: center; color: #555555; font-size: 11px; margin: 34px 16px; line-height: 1.7; }
+  a { color: var(--blue); text-decoration: none; }
+
+  @media (max-width: 700px) {
+    .grid { grid-template-columns: 1fr; gap: 14px; }
+    .meta-row { grid-template-columns: minmax(0, 1fr); }
+    .meta-row2 { grid-template-columns: minmax(0, 1fr); }
+    .dest { aspect-ratio: 16 / 10; }
+    .sheet-panel { margin: 0; border-radius: 16px 16px 0 0; position: absolute; left: 0; right: 0; bottom: 0; max-height: 92vh; max-width: none; }
+    .discover h1 { font-size: 24px; }
+  }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <h1><span>Safar</span></h1>
-    <p>AI trip planner. Plan a full trip in minutes.</p>
-  </header>
+<div class="topbar"><div class="topbar-in"><div class="logo">safar<em>.</em></div><button class="signout hidden" id="signout-btn">Sign out</button></div></div>
 
-  <!-- Auth -->
-  <div class="card" id="auth-card">
-    <div id="auth-form">
-      <button id="google-btn" class="google-btn">Continue with Google</button>
-      <div class="divider"><span>or sign in with email</span></div>
-      <label>Email</label>
-      <input type="email" id="email" placeholder="you@example.com" autocomplete="email">
-      <label>Password</label>
-      <input type="password" id="password" placeholder="6+ characters" autocomplete="current-password">
-      <button id="signin-btn">Sign in</button>
-      <div class="msg" id="auth-msg"></div>
-      <p class="closed-note">New account registration is currently closed.</p>
-    </div>
+<!-- Auth -->
+<div id="auth-card">
+  <span class="logo">safar<em>.</em></span>
+  <div class="tag">Tell it where. It plans your route and day-by-day itinerary.</div>
+  <div id="auth-form">
+    <button id="google-btn" class="google-btn">Continue with Google</button>
+    <div class="or-sep"><span>or with email</span></div>
+    <label>Email</label>
+    <input type="email" id="email" placeholder="Email" autocomplete="email">
+    <label>Password</label>
+    <input type="password" id="password" placeholder="Password" autocomplete="current-password">
+    <button id="signin-btn">Sign in</button>
+    <div class="signup-note">New accounts are paused while Safar is in early testing.</div>
+    <div class="msg" id="auth-msg"></div>
   </div>
-
-  <!-- Planner -->
-  <div id="planner" class="hidden">
-    <button class="signout" id="signout-btn">sign out</button>
-    <div class="card">
-      <div class="row">
-        <div><label>From</label><input id="origin" placeholder="Bengaluru"></div>
-        <div><label>To</label><input id="destination" placeholder="Gokarna"></div>
-      </div>
-      <div class="row">
-        <div><label>Start (date &amp; time)</label><input type="datetime-local" id="departure_date"></div>
-        <div><label>End (date &amp; time)</label><input type="datetime-local" id="end_date"></div>
-      </div>
-      <div class="row">
-        <div><label>Travellers</label><input type="number" id="travelers" value="1" min="1" max="12"></div>
-        <div><label>Budget</label>
-          <select id="budget">
-            <option value="low">Low</option>
-            <option value="mid" selected>Mid</option>
-            <option value="high">High</option>
-          </select>
-        </div>
-      </div>
-      <label>Comments (optional - preferences, must-see places, stops along the way)</label>
-      <textarea id="comments" rows="3" placeholder="e.g. beaches and cafes, avoid long treks, stop at Hubballi on the way"></textarea>
-      <button id="plan-btn">Plan my trip</button>
-      <div class="msg" id="plan-msg"></div>
-    </div>
-
-    <div class="card hidden" id="trip-card">
-      <div class="trip-title" id="trip-title"></div>
-      <div class="route" id="trip-route"></div>
-      <div class="unavail hidden" id="trip-error" style="margin-top:10px"></div>
-      <button id="trip-retry" class="hidden" style="margin-top:10px">Try again with the same details</button>
-      <div class="progress-track"><div class="progress-fill" id="trip-progress"></div></div>
-      <div class="msg" id="trip-status"></div>
-      <div id="trip-transport"></div>
-      <div id="trip-days"></div>
-      <div id="trip-notes" style="margin-top:10px"></div>
-    </div>
-  </div>
-
-  <footer>
-    Safar runs on free open models. Built on the open-sourced TravBuddy backend
-    (<a href="https://github.com/sahil28123/travbuddy_backend">upstream</a>, see NOTICE).
-  </footer>
 </div>
+
+<!-- Logged-in experience -->
+<div id="planner" class="hidden">
+  <div class="discover">
+    <h1>Where to next?</h1>
+    <div class="sub">Pick a destination and Safar plans the route and days. Or start from scratch.</div>
+    <div class="grid">
+      <div class="dest" data-dest="Coorg" style="background-image:url('img/coorg.jpg')">
+        <div class="dest-meta"><span class="dest-name">Coorg</span><span class="dest-sub">2-3 days · hills and coffee estates</span></div>
+        <span class="plan-chip">Plan &rarr;</span>
+      </div>
+      <div class="dest" data-dest="Hampi" style="background-image:url('img/hampi.jpg')">
+        <div class="dest-meta"><span class="dest-name">Hampi</span><span class="dest-sub">2-3 days · ruins and boulders</span></div>
+        <span class="plan-chip">Plan &rarr;</span>
+      </div>
+      <div class="dest" data-dest="Gokarna" style="background-image:url('img/gokarna.jpg')">
+        <div class="dest-meta"><span class="dest-name">Gokarna</span><span class="dest-sub">2-4 days · beaches and cliffs</span></div>
+        <span class="plan-chip">Plan &rarr;</span>
+      </div>
+    </div>
+    <button class="scratch" id="scratch-btn">Somewhere else? Plan from scratch</button>
+  </div>
+
+  <!-- Step-by-step planner sheet -->
+  <div id="sheet" class="hidden">
+    <div class="sheet-backdrop"></div>
+    <div class="sheet-panel">
+      <div class="sheet-head">
+        <button id="sheet-close" aria-label="Close">&#10005;</button>
+        <span id="step-label">Step 1 of 3</span>
+        <div class="ticks"><i class="on"></i><i></i><i></i></div>
+      </div>
+
+      <div class="step" data-step="1">
+        <h2>Your route</h2>
+        <div class="sub">Where are you starting, and where to?</div>
+        <label>From</label>
+        <input id="origin" placeholder="Bengaluru">
+        <label>To</label>
+        <input id="destination" placeholder="Gokarna">
+        <button class="cta" id="next-1" disabled>Continue</button>
+      </div>
+
+      <div class="step hidden" data-step="2">
+        <h2>Trip basics</h2>
+        <div class="sub">How long, how many, and when.</div>
+        <div class="meta-row2" style="margin-top:14px">
+          <div><label>Start (date &amp; time)</label><input type="datetime-local" id="departure_date"></div>
+          <div><label>End (date &amp; time)</label><input type="datetime-local" id="end_date"></div>
+        </div>
+        <div class="meta-row2" style="margin-top:8px">
+          <div><label>Travellers</label><input type="number" id="travelers" value="1" min="1" max="12"></div>
+          <div></div>
+        </div>
+        <button class="cta" id="next-2">Continue</button>
+        <button class="ghost" id="back-2">Back</button>
+      </div>
+
+      <div class="step hidden" data-step="3">
+        <h2>Style</h2>
+        <div class="sub">Budget and anything specific you want.</div>
+        <label>Budget</label>
+        <div class="chips" id="budget-seg">
+          <button type="button" data-val="low">Low</button>
+          <button type="button" data-val="mid" class="on">Mid</button>
+          <button type="button" data-val="high">High</button>
+        </div>
+        <select id="budget" style="display:none">
+          <option value="low">Low</option>
+          <option value="mid" selected>Mid</option>
+          <option value="high">High</option>
+        </select>
+        <details>
+          <summary>Interests and comments</summary>
+          <label>Interests (comma separated, optional)</label>
+          <input id="interests" placeholder="beaches, cafes, trekking">
+          <label>Comments (optional - preferences, must-see places, stops along the way)</label>
+          <textarea id="comments" rows="3" placeholder="e.g. start early, avoid long treks, stop at Belur on the way"></textarea>
+        </details>
+        <button class="cta" id="plan-btn">Plan my trip</button>
+        <button class="ghost" id="back-3">Back</button>
+        <div class="msg" id="plan-msg"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="post hidden" id="trip-card">
+    <div class="post-head">
+      <div class="avatar">S</div>
+      <div>
+        <div class="trip-title" id="trip-title"></div>
+        <div class="route" id="trip-route"></div>
+      </div>
+    </div>
+    <div class="progress-track"><div class="progress-fill" id="trip-progress"></div></div>
+    <div class="msg" id="trip-status"></div>
+    <div class="unavail hidden" id="trip-error" style="width:100%"></div>
+    <button class="ghost hidden" id="trip-retry" style="width:100%;margin-top:10px">Try again with the same details</button>
+    <div id="trip-transport"></div>
+    <div id="trip-days"></div>
+    <div id="trip-notes" style="margin-top:10px"></div>
+  </div>
+</div>
+
+<footer>
+  Safar plans trips with free AI models. Built on the source-available TravBuddy backend
+  (<a href="https://github.com/sahil28123/travbuddy_backend">upstream</a>, see NOTICE).
+  Photos: Wikimedia Commons contributors, CC licences.
+</footer>
 
 <script type="module">
 import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
@@ -148,22 +332,6 @@ import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js
 const $ = (id) => document.getElementById(id);
 let supabase = null;
 let pollTimer = null;
-
-async function resumeActiveTrip() {
-  let tripId = null;
-  try { tripId = localStorage.getItem("safar_active_trip"); } catch (_) {}
-  if (!tripId) return;
-  try {
-    const res = await fetch("/api/v3/trips/" + tripId, {
-      headers: { "Authorization": "Bearer " + await token() },
-    });
-    if (!res.ok) { if (res.status === 404 || res.status === 403) { try { localStorage.removeItem("safar_active_trip"); } catch (_) {} } return; }
-    const env = await res.json();
-    $("trip-card").classList.remove("hidden");
-    renderTrip(env);
-    if (env.status === "planning") pollTrip(tripId);
-  } catch (_) { /* offline or transient - leave the form as-is */ }
-}
 
 async function boot() {
   const cfg = await (await fetch("/api/v1/public-config")).json();
@@ -211,32 +379,81 @@ async function token() {
   return session ? session.access_token : null;
 }
 
+function resumeActiveTrip() {
+  let id = null;
+  try { id = localStorage.getItem("safar_active_trip"); } catch (_) {}
+  if (!id) return;
+  $("trip-card").classList.remove("hidden");
+  pollTrip(id);
+}
+
 function showPlanner() {
   setTimeout(resumeActiveTrip, 0);
   $("auth-card").classList.add("hidden");
   $("planner").classList.remove("hidden");
+  $("signout-btn").classList.remove("hidden");
 }
 
+/* ── planner sheet: one step at a time ── */
+function showStep(n) {
+  document.querySelectorAll(".step").forEach(s => s.classList.toggle("hidden", +s.dataset.step !== n));
+  $("step-label").textContent = "Step " + n + " of 3";
+  document.querySelectorAll(".ticks i").forEach((t, i) => t.classList.toggle("on", i < n));
+}
+function openPlanner(dest) {
+  if (dest) $("destination").value = dest;
+  $("sheet").classList.remove("hidden");
+  checkRoute();
+  showStep(1);
+  (dest ? $("origin") : $("destination")).focus();
+}
+function checkRoute() {
+  $("next-1").disabled = !($("origin").value.trim() && $("destination").value.trim());
+}
+["origin", "destination"].forEach(i => $(i).addEventListener("input", checkRoute));
+document.querySelectorAll(".dest").forEach(el => {
+  el.addEventListener("click", () => openPlanner(el.dataset.dest));
+});
+$("scratch-btn").onclick = () => openPlanner(null);
+$("sheet-close").onclick = () => $("sheet").classList.add("hidden");
+document.querySelector(".sheet-backdrop").onclick = () => $("sheet").classList.add("hidden");
+$("next-1").onclick = () => showStep(2);
+$("next-2").onclick = () => showStep(3);
+$("back-2").onclick = () => showStep(1);
+$("back-3").onclick = () => showStep(2);
+
+// Budget chips -> hidden select the planner reads
+document.querySelectorAll("#budget-seg button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#budget-seg button").forEach(b => b.classList.remove("on"));
+    btn.classList.add("on");
+    $("budget").value = btn.dataset.val;
+  });
+});
+
 $("plan-btn").onclick = async () => {
-  // datetime-local values are "YYYY-MM-DDTHH:MM"; a bare date means no clock time given.
-  const startV = $("departure_date").value || null;
-  const endV = $("end_date").value || null;
-  const splitDT = (v) => v && v.includes("T") ? { date: v.split("T")[0], time: v.split("T")[1] } : { date: v, time: null };
+  // datetime-local values are "YYYY-MM-DDTHH:MM"; a bare date means no clock time.
+  const splitDT = (v) => v && v.includes("T") ? { date: v.split("T")[0], time: v.split("T")[1] } : { date: v || null, time: null };
+  const startV = $("departure_date").value || null, endV = $("end_date").value || null;
   const startDT = splitDT(startV), endDT = splitDT(endV);
-  const startD = startDT.date, endD = endDT.date;
   let days = 3;
-  if (startD && endD) {
-    if (new Date(endV) <= new Date(startV)) { $("plan-msg").textContent = "End must be after the start."; $("plan-msg").classList.add("err"); return; }
-    const span = Math.round((new Date(endD) - new Date(startD)) / 86400000) + 1;
+  if (startDT.date && endDT.date) {
+    if (new Date(endV) <= new Date(startV)) {
+      $("plan-msg").textContent = "End must be after the start.";
+      $("plan-msg").classList.add("err");
+      return;
+    }
+    const span = Math.round((new Date(endDT.date) - new Date(startDT.date)) / 86400000) + 1;
     days = Math.min(span, 30);
   }
   const body = {
     origin: $("origin").value.trim(),
     destination: $("destination").value.trim(),
-    departure_date: startD,
+    departure_date: startDT.date,
     days: days,
     travelers: parseInt($("travelers").value || "1", 10),
     budget: $("budget").value,
+    interests: $("interests").value.split(",").map(s => s.trim()).filter(Boolean),
     start_time: startDT.time,
     end_time: endDT.time,
     comments: $("comments").value.trim() || null,
@@ -259,7 +476,9 @@ $("plan-btn").onclick = async () => {
     const { trip_id } = await res.json();
     try { localStorage.setItem("safar_active_trip", trip_id); } catch (_) {}
     $("plan-msg").textContent = "";
+    $("sheet").classList.add("hidden");
     $("trip-card").classList.remove("hidden");
+    $("trip-card").scrollIntoView({ behavior: "smooth" });
     pollTrip(trip_id);
   } catch (e) {
     $("plan-msg").textContent = e.message;
@@ -305,6 +524,11 @@ async function pollTrip(tripId) {
       const res = await fetch("/api/v3/trips/" + tripId, {
         headers: { "Authorization": "Bearer " + await token() },
       });
+      if (res.status === 404 || res.status === 403) {
+        try { localStorage.removeItem("safar_active_trip"); } catch (_) {}
+        clearInterval(pollTimer);
+        return;
+      }
       if (!res.ok) return;
       const env = await res.json();
       renderTrip(env);
@@ -343,26 +567,40 @@ function renderTrip(env) {
     retryBtn.classList.add("hidden");
   }
 
-  // Transport
+  // Transport: explicit unavailable state instead of silent emptiness
   const legs = doc.transport || [];
-  $("trip-transport").innerHTML = legs.length
-    ? "<h3 style='margin-top:14px;font-size:15px'>Getting there</h3>" + legs.map(leg => {
-        const opts = (leg.options || []).slice(0, 3).map(o =>
-          `<div class="transport-opt"><b>${esc(o.mode || o.provider || "Option")}</b>` +
-          `<div class="meta">${esc(o.summary || o.name || "")} ${o.price ? " - ₹" + esc(o.price) : ""}</div></div>`
-        ).join("");
-        return `<div style="margin-top:10px"><span class="pill">${esc(leg.from || "")} → ${esc(leg.to || "")}</span></div>` + opts;
-      }).join("")
-    : "";
+  if (env.status !== "planning") {
+    const hasOptions = legs.some(leg => (leg.options || []).length > 0);
+    $("trip-transport").innerHTML = "<h3 class='sec'>Getting there</h3>" + (hasOptions
+      ? legs.map(leg => {
+          const opts = (leg.options || []).slice(0, 3).map(o =>
+            `<div class="transport-opt"><b>${esc(o.mode || o.provider || "Option")}</b>` +
+            `<div class="meta">${esc(o.summary || o.name || "")} ${o.price ? " - ₹" + esc(o.price) : ""}</div></div>`
+          ).join("");
+          return `<div style="margin-top:8px"><span class="pill">${esc(leg.from || "")} → ${esc(leg.to || "")}</span></div>` + opts;
+        }).join("")
+      : `<div class="unavail">Live fares and bookable transport options are not available on this free deployment yet. The route above is AI-planned; check operators directly for tickets.</div>`);
+  } else {
+    $("trip-transport").innerHTML = legs.length
+      ? "<h3 class='sec'>Getting there</h3>" + legs.map(leg =>
+          `<div style="margin-top:8px"><span class="pill">${esc(leg.from || "")} → ${esc(leg.to || "")}</span></div>`).join("")
+      : "";
+  }
+  // Stays: booking is not wired up on this deployment - say so explicitly.
+  if (env.status !== "planning" && !$("stays-note")) {
+    $("trip-notes").insertAdjacentHTML("beforebegin",
+      `<h3 class="sec">Stays</h3>` +
+      `<div class="unavail" id="stays-note">Stay booking is not available on this free deployment yet. The itinerary suggests areas to stay; book directly with properties.</div>`);
+  }
 
-  // Itinerary
-  const days = doc.itinerary || [];
+  // Itinerary (supports both flat day objects and city->days nesting)
+  const days = (doc.itinerary || []).flatMap(d => d.days ? d.days.map(dd => ({...dd, city: dd.city || d.city})) : [d]);
   $("trip-days").innerHTML = days.map((d, i) => {
-    const items = (d.items || d.activities || []).map(it =>
+    const items = (d.activities || d.items || []).map(it =>
       `<div class="item">${esc(it.title || it.name || it)}` +
       (it.description ? `<small>${esc(it.description)}</small>` : "") + `</div>`
     ).join("");
-    return `<div class="day"><h3><span>Day ${esc(d.day ?? i + 1)}</span> ${esc(d.city || d.title || "")}</h3>${items}</div>`;
+    return `<div class="day"><h3><span>Day ${esc(d.day ?? i + 1)}</span> ${esc(d.theme || d.city || d.title || "")}</h3>${items}</div>`;
   }).join("");
 
   // Notes
