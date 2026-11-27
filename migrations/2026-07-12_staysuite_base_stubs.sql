@@ -184,3 +184,81 @@ CREATE TABLE IF NOT EXISTS public.tasks (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Bare columns referenced by later CHECK constraints on stub tables.
+ALTER TABLE public.platform_coupons ADD COLUMN IF NOT EXISTS kind text;
+ALTER TABLE public.platform_coupons ADD COLUMN IF NOT EXISTS razorpay_offer_id text;
+ALTER TABLE public.platform_coupons ADD COLUMN IF NOT EXISTS value numeric;
+ALTER TABLE public.platform_coupons ADD COLUMN IF NOT EXISTS code text;
+
+-- Columns the app reads/writes on partner stubs (app/services/pms/*, app/deps/property.py).
+ALTER TABLE public.partners ADD COLUMN IF NOT EXISTS owner_id uuid;
+ALTER TABLE public.partner_members ADD COLUMN IF NOT EXISTS partner_id uuid;
+ALTER TABLE public.partner_members ADD COLUMN IF NOT EXISTS profile_id uuid;
+ALTER TABLE public.partner_members ADD COLUMN IF NOT EXISTS role text;
+ALTER TABLE public.partner_members ADD COLUMN IF NOT EXISTS status text;
+ALTER TABLE public.partner_members ADD COLUMN IF NOT EXISTS property_ids jsonb;
+ALTER TABLE public.partner_members ADD COLUMN IF NOT EXISTS permissions jsonb;
+ALTER TABLE public.partner_members ADD COLUMN IF NOT EXISTS accepted_at timestamptz;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'partner_members_partner_profile_key'
+  ) THEN
+    ALTER TABLE public.partner_members
+      ADD CONSTRAINT partner_members_partner_profile_key UNIQUE (partner_id, profile_id);
+  END IF;
+END $$;
+
+-- Safar fresh-project fix: upstream RLS policies call these partner-auth helpers
+-- but never committed their definitions. Reconstructed from app/deps/property.py
+-- and app/services/pms/workspace.py membership semantics. DEFAULT DENY: anything
+-- ambiguous (no active member row, no owner row, missing permission key) is false.
+CREATE OR REPLACE FUNCTION public.owns_partner(pid uuid)
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.partners p
+    WHERE p.id = pid AND p.owner_id = auth.uid()
+  ) OR EXISTS (
+    SELECT 1 FROM public.partner_members pm
+    WHERE pm.partner_id = pid
+      AND pm.profile_id = auth.uid()
+      AND pm.status = 'active'
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION public.has_partner_perm(pid uuid, perm text)
+RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+  m record;
+BEGIN
+  IF EXISTS (SELECT 1 FROM public.partners p WHERE p.id = pid AND p.owner_id = auth.uid()) THEN
+    RETURN true;
+  END IF;
+  SELECT role, permissions INTO m FROM public.partner_members
+  WHERE partner_id = pid AND profile_id = auth.uid() AND status = 'active'
+  LIMIT 1;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+  IF m.role = 'owner' THEN
+    RETURN true;
+  END IF;
+  RETURN coalesce((m.permissions ->> perm)::boolean, false);
+END;
+$$;
+
+-- agent_tools provisioning rows (2026-08-23_a_selling_agent...) and
+-- provider_cost_rates pricing rows (2026-08-24_a_model_nobody_priced_is_free).
+ALTER TABLE public.agent_tools ADD COLUMN IF NOT EXISTS agent_id uuid;
+ALTER TABLE public.agent_tools ADD COLUMN IF NOT EXISTS tool_name text;
+ALTER TABLE public.agent_tools ADD COLUMN IF NOT EXISTS enabled boolean;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'agent_tools_agent_tool_key') THEN
+    ALTER TABLE public.agent_tools ADD CONSTRAINT agent_tools_agent_tool_key UNIQUE (agent_id, tool_name);
+  END IF;
+END $$;
+ALTER TABLE public.provider_cost_rates ADD COLUMN IF NOT EXISTS cost_per_unit_micros bigint;
+ALTER TABLE public.provider_cost_rates ADD COLUMN IF NOT EXISTS currency text;
+ALTER TABLE public.provider_cost_rates ADD COLUMN IF NOT EXISTS source text;
