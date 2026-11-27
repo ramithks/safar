@@ -233,21 +233,7 @@
       <div class="day-tabs">
         <span class="dt on" data-day="1">Day 1</span><span class="dt" data-day="2">Day 2</span><span class="dt" data-day="3">Day 3</span>
       </div>
-      <div class="day day-panel on" data-day="1">
-        <div class="slot"><div class="time">06:00</div><div class="what"><b>Overnight bus arrives, Gokarna town</b><span>Check in, drop bags, breakfast near the bus stand.</span></div><span class="tagchip">Travel</span></div>
-        <div class="slot"><div class="time">10:30</div><div class="what"><b>Kudle Beach</b><span>Slow morning on the sand; shacks open for lunch by noon.</span></div><span class="tagchip">Beach</span></div>
-        <div class="slot"><div class="time">16:30</div><div class="what"><b>Om Beach sunset</b><span>Walk the shore from Namaste Cafe side; best light around 5:40.</span></div><span class="tagchip">Beach</span></div>
-        <div class="slot"><div class="time">20:00</div><div class="what"><b>Dinner in town</b><span>Local thali places along Car Street.</span></div><span class="tagchip">Food</span></div>
-      </div>
-      <div class="day day-panel" data-day="2">
-        <div class="slot"><div class="time">09:00</div><div class="what"><b>Half Moon Beach hike</b><span>Trail over the headland from Om Beach; carry water.</span></div><span class="tagchip">Trek</span></div>
-        <div class="slot"><div class="time">13:00</div><div class="what"><b>Paradise Beach</b><span>Boat or hike; quietest of the four beaches.</span></div><span class="tagchip">Beach</span></div>
-        <div class="slot"><div class="time">18:30</div><div class="what"><b>Mahabaleshwar Temple</b><span>Evening aarti in the old town.</span></div><span class="tagchip">Town</span></div>
-      </div>
-      <div class="day day-panel" data-day="3">
-        <div class="slot"><div class="time">08:00</div><div class="what"><b>Mirjan Fort</b><span>16th-century laterite fort, 11 km from town.</span></div><span class="tagchip">Heritage</span></div>
-        <div class="slot"><div class="time">14:00</div><div class="what"><b>Return bus to Bengaluru</b><span>Overnight or late-afternoon departure.</span></div><span class="tagchip">Travel</span></div>
-      </div>
+      <div id="dayPanels"></div>
     </div>
   </div>
 </div>
@@ -275,6 +261,38 @@
     tabs.forEach(x => x.classList.toggle('on', x === t));
     document.querySelectorAll('.day-panel').forEach(p => p.classList.toggle('on', p.dataset.day === t.dataset.day));
   }));
+  const DAYS = {
+    'Gokarna': [
+      [['06:00','Overnight bus arrives, Gokarna town','Check in, drop bags, breakfast near the bus stand.','Travel'],['10:30','Kudle Beach','Slow morning on the sand; shacks open for lunch by noon.','Beach'],['16:30','Om Beach sunset','Walk the shore from Namaste Cafe side; best light around 5:40.','Beach'],['20:00','Dinner in town','Local thali places along Car Street.','Food']],
+      [['09:00','Half Moon Beach hike','Trail over the headland from Om Beach; carry water.','Trek'],['13:00','Paradise Beach','Boat or hike; quietest of the four beaches.','Beach'],['18:30','Mahabaleshwar Temple','Evening aarti in the old town.','Town']],
+      [['08:00','Mirjan Fort','16th-century laterite fort, 11 km from town.','Heritage'],['14:00','Return bus to Bengaluru','Overnight or late-afternoon departure.','Travel']]
+    ],
+    'Coorg': [
+      [['06:30','Arrive Madikeri','Check in, breakfast at a local mess.','Travel'],['10:00','Abbey Falls','Short walk through coffee estates to the falls.','Nature'],['16:00','Raja\'s Seat sunset','Garden viewpoint over the valley.','View'],['19:30','Kodava dinner','Pandi curry and akki rotti at a local home-style place.','Food']],
+      [['08:00','Dubare Elephant Camp','Morning river crossing; go early for the bathing session.','Nature'],['13:30','Coffee estate walk','Guided walk through a working plantation near Kushalnagar.','Estate'],['17:00','Namdroling Monastery','Golden Temple at Bylakuppe; prayer hall closes by 6.','Culture']],
+      [['07:00','Mandalpatti viewpoint','Jeep up for the early mist over the hills.','View'],['13:00','Return to Bengaluru','~5.5 hrs via Kushalnagar.','Travel']]
+    ],
+    'Wayanad': [
+      [['07:00','Arrive Kalpetta','Check in, breakfast in town.','Travel'],['10:30','Banasura Sagar Dam','Earth dam with speedboat rides; hills behind.','Nature'],['16:00','Pookode Lake','Forested freshwater lake, paddle boats.','Nature'],['19:30','Dinner in Kalpetta','Kerala meals; try the local biryani.','Food']],
+      [['07:30','Edakkal Caves','Morning climb to the petroglyph caves; steps involved.','Heritage'],['13:00','Bamboo Craft Village','Wayanad heritage museum stop on the way back.','Culture'],['16:30','Lakkidi viewpoint','Thamarassery churam hairpins, best at dusk.','View']],
+      [['08:00','Tea estate walk, Vythiri','Morning walk through the estates.','Estate'],['13:00','Return to Bengaluru','~6 hrs via Mysuru.','Travel']]
+    ],
+    'Hampi': [
+      [['07:00','Arrive Hosapete','Check in, breakfast; auto to Hampi Bazaar.','Travel'],['10:00','Virupaksha Temple','The living temple at the heart of Hampi.','Heritage'],['15:00','Vittala Temple','Stone chariot and musical pillars.','Heritage'],['18:00','Matanga Hill sunset','Climb for the classic Hampi sunset.','View']],
+      [['08:00','Coracle ride on the Tungabhadra','Round boat ride near the bathing ghats.','River'],['11:00','Anegundi village','Older than Hampi; quiet lanes and fort remains.','Village'],['16:00','Hemakuta Hill','Cluster of small temples, golden hour light.','Heritage']],
+      [['08:00','Lotus Mahal + Elephant Stables','Zenana enclosure before the heat.','Heritage'],['13:00','Return to Bengaluru','~6 hrs via Hosapete.','Travel']]
+    ]
+  };
+  function renderDays(name) {
+    const data = DAYS[name] || DAYS['Gokarna'];
+    const box = document.getElementById('dayPanels');
+    box.innerHTML = data.map((slots, i) =>
+      '<div class="day day-panel' + (i === 0 ? ' on' : '') + '" data-day="' + (i+1) + '">' +
+      slots.map(sl => '<div class="slot"><div class="time">' + sl[0] + '</div><div class="what"><b>' + sl[1] + '</b><span>' + sl[2] + '</span></div><span class="tagchip">' + sl[3] + '</span></div>').join('') +
+      '</div>').join('');
+    const tt = document.querySelectorAll('.dt');
+    tt.forEach((t, i) => t.classList.toggle('on', i === 0));
+  }
   const PHOTOS = {
     'Gokarna': ['https://thumb.wikimedia.org/wikipedia/commons/thumb/f/f0/PXL_20260103_101009613_People_and_Beach_Om_Beach_Gokarna%2C_Karnataka_19.jpg/1280px-PXL_20260103_101009613_People_and_Beach_Om_Beach_Gokarna%2C_Karnataka_19.jpg','Om Beach, Gokarna'],
     'Coorg': ['https://thumb.wikimedia.org/wikipedia/commons/thumb/9/94/Coffee_Coconuts_Pepper_Estate_Coorg_Feb24_A7C_09365.jpg/1280px-Coffee_Coconuts_Pepper_Estate_Coorg_Feb24_A7C_09365.jpg','Coffee estate, Coorg'],
@@ -282,6 +300,7 @@
     'Hampi': ['https://thumb.wikimedia.org/wikipedia/commons/thumb/b/b9/Complex_of_Virupaksha_Temple%2C_Hampi_%2804%29.jpg/1280px-Complex_of_Virupaksha_Temple%2C_Hampi_%2804%29.jpg','Virupaksha Temple, Hampi']
   };
   function applyDest(name) {
+    renderDays(name);
     const p = PHOTOS[name] || PHOTOS['Gokarna'];
     document.getElementById('tripPhoto').src = p[0];
     document.getElementById('itinPhoto').src = p[0];
@@ -289,6 +308,7 @@
     document.getElementById('itinTitle').textContent = name + ', 3 days';
     document.getElementById('itinMeta').textContent = 'Bengaluru \u2192 ' + name + ' \u00b7 5 - 7 Dec \u00b7 2 travellers';
   }
+  renderDays('Gokarna');
   document.querySelectorAll('.pcard').forEach(c => c.addEventListener('click', () => {
     const name = c.querySelector('.info h3').textContent;
     dest.value = name; applyDest(name); open(); window.scrollTo({ top: 0, behavior: 'smooth' });
