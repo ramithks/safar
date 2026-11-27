@@ -385,11 +385,21 @@ def rank_options(options: list[TransportOption], prefer: str | None = None,
     recommendation."""
     axis = _prefer_for(prefer, budget)
 
+    # Same-day anchor, aligned with leg_travel_days: when a hop has any
+    # same-day arrival, the recommendation must not silently be an overnight
+    # ride that lands the morning AFTER the itinerary's day 1 (cheapest-first
+    # did exactly that). An explicit user pick still wins via leg.selection —
+    # this only orders the derived recommendation.
+    def _overnight(o: TransportOption) -> int:
+        if not any(option_day_span(x) == 0 for x in options):
+            return 0
+        return 0 if option_day_span(o) == 0 else 1
+
     def cost_key(o: TransportOption) -> tuple:
-        return (_sold_out(o), o.fare_per_person or 1e12, o.duration_min or 1e12, _mode_rank(o.mode))
+        return (_sold_out(o), _overnight(o), o.fare_per_person or 1e12, o.duration_min or 1e12, _mode_rank(o.mode))
 
     def time_key(o: TransportOption) -> tuple:
-        return (_sold_out(o), o.duration_min or 1e12, o.fare_per_person or 1e12, _mode_rank(o.mode))
+        return (_sold_out(o), _overnight(o), o.duration_min or 1e12, o.fare_per_person or 1e12, _mode_rank(o.mode))
 
     def bal_key(o: TransportOption) -> tuple:
         # Balanced: normalise fare & duration into a blended score.
@@ -397,7 +407,7 @@ def rank_options(options: list[TransportOption], prefer: str | None = None,
         durs = [x.duration_min for x in options if x.duration_min] or [1]
         f = (o.fare_per_person or max(fares)) / max(fares)
         d = (o.duration_min or max(durs)) / max(durs)
-        return (_sold_out(o), 0.6 * f + 0.4 * d, _mode_rank(o.mode))
+        return (_sold_out(o), _overnight(o), 0.6 * f + 0.4 * d, _mode_rank(o.mode))
 
     key = {"cheapest": cost_key, "fastest": time_key, "earliest": time_key}.get(axis, bal_key)
     return sorted(options, key=key)

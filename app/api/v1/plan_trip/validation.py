@@ -323,20 +323,36 @@ def annotate_confidence(days: list[dict]) -> None:
             act["confidence_score"] = compute_confidence_score(act)
 
 
-def filter_low_confidence(days: list[dict], threshold: float = FILTER_THRESHOLD) -> list[str]:
+def filter_low_confidence(days: list[dict], threshold: float = FILTER_THRESHOLD,
+                          floor: int = 3) -> list[str]:
     """
     Remove activities below threshold.
-    Guarantees each day keeps at least 2 activities.
+    Guarantees each day keeps at least `floor` activities (or all it had).
     Returns list of dropped activity titles for logging.
+
+    Two failure modes this must not have:
+    - every activity on a day scoring below threshold means the grounding
+      source (places enrichment) produced NO signal for that day — filtering
+      on an absent signal strips a full day down to a single stop, so the
+      day is left untouched instead;
+    - the rescue used to top a gutted day up by one activity only, still
+      leaving an unusable 1-activity day — it now tops up to `floor`.
     """
     removed: list[str] = []
     for day in days:
         acts = day.get("activities") or []
+        if not acts:
+            continue
+        scores = [a.get("confidence_score", 1.0) for a in acts]
+        if max(scores) < threshold:
+            # No grounding signal at all for this day — keep the plan whole.
+            continue
         kept = [a for a in acts if a.get("confidence_score", 1.0) >= threshold]
-        dropped = [a for a in acts if a.get("confidence_score", 1.0) < threshold]
-
-        if len(kept) < 2 and dropped:
-            dropped.sort(key=lambda a: a.get("confidence_score", 0.0), reverse=True)
+        dropped = sorted(
+            (a for a in acts if a.get("confidence_score", 1.0) < threshold),
+            key=lambda a: a.get("confidence_score", 0.0), reverse=True)
+        floor_n = min(floor, len(acts))
+        while dropped and len(kept) < floor_n:
             kept.append(dropped.pop(0))
 
         removed.extend(a.get("title", "unknown") for a in dropped)

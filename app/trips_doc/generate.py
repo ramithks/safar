@@ -159,7 +159,45 @@ def _retime_day1_for_arrival(graph: G.TripGraph, spec: dict, flags: list[str]) -
     arr_m = _mins(arr_clock)
     if arr_m is None:
         return
+    arr_date = arr[:10]
+    leg_date = str(getattr(leg, "date", "") or "")
+    overnight = bool(arr_date and leg_date and arr_date > leg_date)
     acts = (dst.days[0] or {}).get("activities") or []
+
+    if overnight:
+        # The ride in force lands the morning AFTER day 1 (an explicit
+        # overnight pick — the derived recommendation is anchored same-day).
+        # Every day-1 destination activity is unreachable on day 1: the
+        # traveller is in transit. Move them onto the arrival day, re-timed
+        # from the arrival clock, and say exactly what happened.
+        if not acts:
+            return
+        moved, dropped = [], []
+        cur = arr_m
+        for a in acts:
+            dur = int(a.get("duration_min") or 90)
+            if cur + dur > 21 * 60:
+                dropped.append(a)
+                continue
+            a["start_time"] = f"{cur // 60:02d}:{cur % 60:02d}"
+            a["retimed_for_arrival"] = True
+            moved.append(a)
+            cur += dur + 30
+        dst.days[0]["activities"] = []
+        if len(dst.days) > 1:
+            dst.days[1]["activities"] = moved + (dst.days[1].get("activities") or [])
+        else:
+            dst.days[0]["activities"] = moved  # no later day to carry them
+        names = ", ".join(a.get("title") or "?" for a in dropped)
+        flags.append(
+            f"Your ride reaches {dst.city} at {arr_clock} on {arr_date} — the morning "
+            f"after day 1 — so day 1 at the destination is travel time. Its activities "
+            f"were moved to after arrival"
+            + (f"; not everything fit before evening and was left out: {names}. " if dropped else ". ")
+            + "Times from arrival onward are approximate."
+        )
+        return
+
     early = [a for a in acts
              if (_mins(str(a.get("start_time") or a.get("time") or "")) or 9999) < arr_m]
     if not early:

@@ -449,7 +449,10 @@
         if (!r.ok) return;
         const env = await r.json();
         renderRealTrip(env);
-        if (env.status !== 'planning') { clearInterval(pollTimer); status(''); }
+        if (env.status !== 'planning') {
+          clearInterval(pollTimer); status('');
+          loadMyTrips();  // refresh the card list: Planning % -> Ready / Did not finish without a manual reload
+        }
         else status('Planning... ' + (env.progress || 0) + '%');
       } catch (_) { /* keep polling */ }
     };
@@ -525,7 +528,7 @@
     if (days.length) {
       box.innerHTML = days.map((dd, i) => {
         const items = (dd.activities || dd.items || []).map(it =>
-          '<div class="slot"><div class="time">' + esc(it.time || '') + '</div><div class="what"><b>' + esc(it.title || it.name || it) + '</b>' + (it.description ? '<span>' + esc(it.description) + '</span>' : '') + '</div></div>').join('');
+          '<div class="slot"><div class="time">' + esc(it.time || it.start_time || '') + '</div><div class="what"><b>' + esc(it.title || it.name || it) + '</b>' + (it.description ? '<span>' + esc(it.description) + '</span>' : '') + '</div></div>').join('');
         return '<div class="day day-panel' + (i === 0 ? ' on' : '') + '" data-day="' + (i + 1) + '">' + items + '</div>';
       }).join('');
       document.querySelector('.day-tabs').innerHTML = days.map((dd, i) =>
