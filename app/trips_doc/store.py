@@ -34,6 +34,22 @@ async def get_row(trip_id: str) -> dict | None:
     return await run_db(get_row_sync, trip_id)
 
 
+_LIST_COLS = "id, title, status, progress, created_at, updated_at"
+
+
+def list_mine_sync(user_id: str, limit: int = 20) -> list[dict]:
+    """The user's own trips, newest first — summary fields only, no doc."""
+    res = (get_db().table("trip_states").select(_LIST_COLS)
+           .eq("user_id", user_id)
+           .order("created_at", desc=True)
+           .limit(limit).execute())
+    return res.data or []
+
+
+async def list_mine(user_id: str, limit: int = 20) -> list[dict]:
+    return await run_db(list_mine_sync, user_id, limit)
+
+
 # ── writes ───────────────────────────────────────────────────────────────────
 
 def create_trip_sync(user_id: str | None, doc: dict) -> str:

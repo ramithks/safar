@@ -79,6 +79,14 @@ async def create_trip(request: Request, body: PlanRequest, user=Depends(require_
     return {"trip_id": trip_id, "status": "planning"}
 
 
+# ── list (the signed-in user's own trips, newest first) ────────────────────
+
+@router.get("")
+async def list_trips(user=Depends(require_user)):
+    rows = await store.list_mine(str(user.id))
+    return {"trips": rows}
+
+
 # ── read (the polling target) ────────────────────────────────────────────────
 
 @router.get("/{trip_id}")
