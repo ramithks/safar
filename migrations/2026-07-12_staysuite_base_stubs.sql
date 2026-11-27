@@ -86,14 +86,13 @@ CREATE TABLE IF NOT EXISTS public.provider_cost_rates (
 );
 
 CREATE TABLE IF NOT EXISTS public.quotes (
-  group_tier_id uuid references public.group_rate_tiers(id) on delete set null,
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS public.rate_plans (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  derived_from_plan_id uuid references public.rate_plans(id) on delete restrict,
+  derived_from_plan_id uuid,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
