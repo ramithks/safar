@@ -233,8 +233,9 @@ async def run_pipeline(
                 return _no_results(
                     job_id, reel_url, duration_seconds, len(unique_frames),
                     "ANALYSIS_UNAVAILABLE",
-                    "The free analysis models are rate-limited right now, so this Reel could not be analysed. Try again in a few minutes.",
+                    "The free analysis models on this deployment have reached their daily usage limit, so this Reel could not be analysed. Analysis will be available again after the provider's free quota resets.",
                     metadata,
+                    status="failed",
                 )
             return _no_results(
                 job_id, reel_url, duration_seconds, len(unique_frames),
@@ -594,10 +595,11 @@ def _no_results(
     reason: str,
     hint: str,
     metadata: Optional[dict],
+    status: str = "completed",
 ) -> ReelResult:
     return ReelResult(
         job_id=job_id,
-        status="completed",
+        status=status,
         reel=ReelInfo(url=reel_url, duration_seconds=duration, frame_count=frame_count),
         summary=ReelSummary(total_locations=0, unique_places=0),
         timeline=[],
