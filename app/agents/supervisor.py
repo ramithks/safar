@@ -551,7 +551,9 @@ async def supervisor_run(
                 k: merged[k]
                 for k in ("trip_name", "destination", "destination_description",
                           "cover_photo_ref", "days",
-                          "trip_intelligence", "currency")
+                          "trip_intelligence", "trip_quality", "currency",
+                          "journey_summary", "transport_verified",
+                          "return_buffer", "return_buffer_note")
                 if k in merged
             }
 

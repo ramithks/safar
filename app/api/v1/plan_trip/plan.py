@@ -388,7 +388,9 @@ async def _save_trip(user_id: str, body: PlanRequest, merged: dict, end_date: st
             k: merged[k]
             for k in ("trip_name", "destination", "destination_description",
                       "destination_photo_ref", "image", "days",
-                      "trip_intelligence", "currency")
+                      "trip_intelligence", "trip_quality", "currency",
+                      "journey_summary", "transport_verified",
+                      "return_buffer", "return_buffer_note")
             if k in merged
         }
 
