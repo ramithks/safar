@@ -84,6 +84,8 @@ def trim_transport_option(opt: G.TransportOption) -> dict:
         "fare_per_person": opt.fare_per_person,
         "currency": opt.currency or "INR",
         "available": opt.available if opt.available is not None else (G._sold_out(opt) == 0),
+        "fare_waitlist": opt.fare_waitlist,
+        "availability_note": opt.availability_note,
         "booking_url": _first(raw, "booking_url", "booking_link", "deep_link", "url"),
     }))
     return out

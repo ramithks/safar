@@ -13,7 +13,7 @@ import logging
 from difflib import SequenceMatcher
 
 from app.services.places import search_places, get_place_details
-from app.services.osm_places import search_osm
+from app.services.osm_places import ground_activity
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ def _apply_osm(act: dict, hit: dict) -> None:
     is. Does NOT confirm hours, prices or reviews — those stay unset."""
     act["lat"] = hit["lat"]
     act["lng"] = hit["lng"]
-    act["address"] = hit.get("display_name")
+    act["address"] = hit.get("display_name") or hit.get("name")
     act["place_id"] = None  # never a Google place_id; keeps Google-only UI paths off
     act["source"] = "openstreetmap"
     act["grounded"] = "server"
@@ -108,18 +108,13 @@ def _apply_osm(act: dict, hit: dict) -> None:
 
 
 async def _hydrate_osm(act: dict, destination: str) -> bool:
-    """Free grounding tier: verify the named place via OpenStreetMap."""
+    """Free grounding tier: verify the named place against the city's OSM
+    POI list (one cached Overpass query per city — no systematic geocoding)."""
     title = act.get("title", "")
     for prefix in ["Check-in at", "Check-out from", "Dinner at", "Lunch at", "Breakfast at", "Visit", "Explore"]:
         title = title.replace(prefix, "").strip()
-    if not title:
-        return False
-    hit = await search_osm(f"{title}, {destination}")
+    hit = await ground_activity(title, destination)
     if not hit:
-        return False
-    # The returned name must actually resemble the requested title — a vague
-    # query matching a town centre is not verification of the venue.
-    if _sim(title, hit.get("name") or "") <= 0.45 and _sim(title, (hit.get("display_name") or "").split(",")[0]) <= 0.45:
         return False
     _apply_osm(act, hit)
     return True

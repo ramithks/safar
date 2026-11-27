@@ -129,6 +129,39 @@ def _window_flags(graph: G.TripGraph, spec: dict) -> list[str]:
     return flags
 
 
+def _waitlist_flags(graph: G.TripGraph, spec: dict, flags: list[str]) -> None:
+    """A waitlisted fare is not a confirmed seat. When the recommended ride on
+    a leg carries one, the caveat must be visible next to the pick, not only
+    inside provider class data."""
+    try:
+        _, outbound, inbound = G.ordered_path(graph)
+    except Exception:  # noqa: BLE001
+        return
+    budget = spec.get("budget_tier")
+    window = _return_deadline(spec)
+    arrive_by, not_before = window if window else (None, None)
+    for leg in outbound + ([inbound] if inbound else []):
+        is_return = inbound is not None and leg is inbound
+        route = G.active_route(leg, None, budget,
+                               arrive_by=arrive_by if is_return else None,
+                               not_before=not_before if is_return else None)
+        if not route or not route.hops:
+            continue
+        for i, hop in enumerate(route.hops):
+            final = i == len(route.hops) - 1
+            opt = G.selected_option_for_hop(
+                leg, route, i, None, budget,
+                arrive_by=arrive_by if (is_return and final) else None,
+                not_before=not_before if (is_return and final) else None)
+            if opt and opt.availability_note:
+                dep = str(opt.departure or "")
+                dep_clock = dep[11:16] if len(dep) >= 16 else dep[:5]
+                flags.append(
+                    f"{hop.from_city} → {hop.to_city}: {opt.operator or opt.mode} "
+                    f"({dep_clock}) — {opt.availability_note}"
+                )
+
+
 def _retime_day1_for_arrival(graph: G.TripGraph, spec: dict, flags: list[str]) -> None:
     """Day 1 at the terminal cannot start before the traveller actually
     arrives. Re-time that day's activities from the anchored arrival onward
@@ -339,12 +372,14 @@ def _retime_final_day_for_departure(graph: G.TripGraph, spec: dict, flags: list[
         return
     window = _return_deadline(spec)
     arrive_by, not_before = window if window else (None, None)
-    route = G.active_route(inbound, None, spec.get("budget_tier"), arrive_by=arrive_by)
+    route = G.active_route(inbound, None, spec.get("budget_tier"), arrive_by=arrive_by,
+                           not_before=not_before)
     if not route or not route.hops:
         return
     hop = route.hops[-1]
     opt = G.selected_option_for_hop(inbound, route, len(route.hops) - 1, None,
-                                    spec.get("budget_tier"), arrive_by=arrive_by)
+                                    spec.get("budget_tier"), arrive_by=arrive_by,
+                                    not_before=not_before)
     if not opt or not opt.departure:
         return
     dst = graph.node(inbound.from_node_id)
@@ -511,6 +546,7 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
     _retime_day1_for_arrival(graph, spec, window_flags)
     _retime_final_day_for_departure(graph, spec, window_flags)
     _enforce_transfer_gaps(stayed, window_flags)
+    _waitlist_flags(graph, spec, window_flags)
     for _ms in ((terminal_trip.get("trip_quality") or {}).get("must_stops") or []):
         if _ms.get("injected") or _ms.get("feasibility") == "unverified":
             window_flags.append(

@@ -70,6 +70,13 @@ class TransportOption(BaseModel):
     # the stored graph. Older options (pre-denorm) leave it None and _sold_out
     # falls back to computing it from `raw`.
     available: Optional[bool] = None
+    # Waitlist honesty (trains): the provider's cheapest class is often a
+    # waitlist, not a confirmed seat. fare_per_person is the cheapest
+    # CONFIRMED-available class fare when class data exists; a cheaper
+    # waitlisted fare is carried separately and must never be presented as
+    # a confirmed price.
+    fare_waitlist: Optional[float] = None
+    availability_note: Optional[str] = None
     # Permanent search-store reference (search_results.id) — the v4 typed link.
     # Stamped by the store-first write at generation time; the read path
     # hydrates `raw` back by this id (exact, no fuzzy matching).
@@ -177,10 +184,47 @@ class TripGraph(BaseModel):
 
 def _fare(mode: str, item: dict) -> float:
     if mode == "train":
+        confirmed, waitlist, _note = _train_fare_fields(item)
+        if confirmed:
+            return confirmed
+        if waitlist:
+            return waitlist
         return item.get("cheapest_fare") or 0
     if mode == "bus":
         return item.get("fare_discounted") or item.get("fare_original") or 0
     return item.get("price_total") or 0          # flight
+
+
+def _train_fare_fields(item: dict) -> tuple[float | None, float | None, str | None]:
+    """(cheapest confirmed fare, cheapest waitlisted fare, note) from a
+    ConfirmTKT train item's available_classes. A waitlist with a prediction
+    is not a confirmed seat: the two fares must never blur."""
+    confirmed_fare = waitlist_fare = None
+    confirmed_cls = waitlist_cls = None
+    wl_display = wl_pred = None
+    for c in item.get("available_classes") or []:
+        fare = c.get("fare")
+        if not fare:
+            continue
+        avail = str(c.get("availability") or c.get("display") or "").upper()
+        seats = c.get("available_seats")
+        is_confirmed = avail.startswith(("AVAILABLE", "AVL")) or (isinstance(seats, (int, float)) and seats > 0)
+        is_waitlist = not is_confirmed and ("WL" in avail or str(c.get("prediction_status") or "").upper() in ("WL", "RAC"))
+        if is_confirmed and (confirmed_fare is None or fare < confirmed_fare):
+            confirmed_fare, confirmed_cls = fare, c.get("code")
+        elif is_waitlist and (waitlist_fare is None or fare < waitlist_fare):
+            waitlist_fare, waitlist_cls = fare, c.get("code")
+            wl_display = c.get("display") or c.get("availability")
+            wl_pred = c.get("prediction")
+    note = None
+    if waitlist_fare and (confirmed_fare is None or waitlist_fare < confirmed_fare):
+        note = (
+            f"Cheapest fare Rs {waitlist_fare} ({waitlist_cls}) is a waitlist"
+            + (f" ({wl_display}, {wl_pred} prediction)" if wl_pred else (f" ({wl_display})" if wl_display else ""))
+            + (f"; a confirmed seat starts at Rs {confirmed_fare} ({confirmed_cls})" if confirmed_fare else "; no confirmed seat on this train")
+            + ". A waitlist prediction is not a confirmed seat."
+        )
+    return confirmed_fare, waitlist_fare, note
 
 
 def _name(mode: str, item: dict) -> str:
@@ -205,6 +249,8 @@ def option_from_item(mode: str, item: dict, oid: str) -> TransportOption:
         duration_min=item.get("duration_min"),
         fare_per_person=_fare(mode, item),
         available=option_is_available(mode, item),
+        fare_waitlist=(_train_fare_fields(item)[1] if mode == "train" else None),
+        availability_note=(_train_fare_fields(item)[2] if mode == "train" else None),
         raw=raw,
     )
 
