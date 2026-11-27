@@ -24,16 +24,16 @@
     position: sticky; top: 0; z-index: 30;
     display: flex; align-items: center; gap: 26px;
     padding: 13px 26px;
-    background: rgba(0,0,0,0.7); backdrop-filter: blur(12px);
+    background: rgba(0,0,0,0.7); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
     border-bottom: 1px solid var(--line);
   }
-  .logo { font-size: 21px; font-weight: 800; }
+  .logo { font-size: 21px; font-weight: 800; flex: none; white-space: nowrap; }
   .logo em { font-style: normal; color: var(--accent); }
   nav .links { display: flex; gap: 4px; }
   nav .links a { color: var(--muted); text-decoration: none; font-size: 14px; font-weight: 600; padding: 7px 12px; border-radius: 9px; white-space: nowrap; }
   nav .links a:hover { color: var(--text); }
   nav .spacer { flex: 1; }
-  .avatar { width: 33px; height: 33px; border-radius: 50%; background: linear-gradient(135deg, #ff7a59, #c2442a); display: grid; place-items: center; font-size: 13px; font-weight: 700; }
+  .avatar { flex: none; width: 33px; height: 33px; border-radius: 50%; background: linear-gradient(135deg, #ff7a59, #c2442a); display: grid; place-items: center; font-size: 13px; font-weight: 700; }
 
   .page { max-width: 1120px; margin: 0 auto; padding: 0 26px 60px; }
 
@@ -49,7 +49,7 @@
   .hero h1 { font-size: 32px; letter-spacing: -0.6px; }
   .hero h1 .acc { color: var(--accent); }
   .hero .h-sub { color: rgba(255,255,255,0.85); font-size: 14px; margin-top: 6px; }
-  .entry { margin-top: 16px; background: rgba(10,10,10,0.72); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.16); border-radius: 16px; padding: 14px; }
+  .entry { margin-top: 16px; background: rgba(10,10,10,0.72); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.16); border-radius: 16px; padding: 14px; }
   .dest-row { display: flex; gap: 10px; }
   .dest-row input {
     flex: 1; min-width: 0; background: rgba(0,0,0,0.6); border: 1px solid var(--line); color: var(--text);
@@ -81,7 +81,7 @@
   .pcard .info { position: absolute; left: 14px; right: 14px; bottom: 13px; }
   .pcard .info h3 { font-size: 18px; }
   .pcard .info .m { color: rgba(255,255,255,0.82); font-size: 12px; margin-top: 2px; }
-  .pcard .plan { position: absolute; top: 12px; right: 12px; background: rgba(0,0,0,0.6); backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,0.2); color: #fff; font-size: 11.5px; font-weight: 700; padding: 6px 11px; border-radius: 999px; }
+  .pcard .plan { position: absolute; top: 12px; right: 12px; background: rgba(0,0,0,0.6); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,0.2); color: #fff; font-size: 11.5px; font-weight: 700; padding: 6px 11px; border-radius: 999px; }
 
   /* ---------- my trips + itinerary ---------- */
   .trip-card { display: flex; gap: 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; cursor: pointer; }
@@ -194,6 +194,13 @@
     .slot .time { width: 56px; font-size: 12px; }
     .slot .tagchip { font-size: 10px; padding: 3px 7px; }
     footer { padding: 22px 16px calc(30px + env(safe-area-inset-bottom, 0px)); }
+  }
+  @media (max-width: 380px) {
+    nav { gap: 8px; padding: 12px 10px; }
+    nav .links a { padding: 7px 5px; font-size: 12px; }
+    .logo { font-size: 18px; }
+    .signout { font-size: 11.5px; }
+    .avatar { width: 30px; height: 30px; font-size: 12px; }
   }
 </style>
 </head>
