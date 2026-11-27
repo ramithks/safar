@@ -273,11 +273,11 @@ ALTER TABLE public.reservations DROP COLUMN IF EXISTS total_paise CASCADE;
 ALTER TABLE public.reservations ADD COLUMN total_paise numeric;
 
 CREATE TABLE IF NOT EXISTS public.room_types (
-  accessible boolean,
+  accessible text,
   bathroom text,
   bed_count integer,
   children_allowed text,
-  connecting boolean,
+  connecting text,
   created_at timestamptz NOT NULL DEFAULT now(),
   crib text,
   crib_paise integer,
@@ -291,7 +291,7 @@ CREATE TABLE IF NOT EXISTS public.room_types (
 );
 
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS accessible CASCADE;
-ALTER TABLE public.room_types ADD COLUMN accessible boolean;
+ALTER TABLE public.room_types ADD COLUMN accessible text;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS bathroom CASCADE;
 ALTER TABLE public.room_types ADD COLUMN bathroom text;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS bed_count CASCADE;
@@ -299,7 +299,7 @@ ALTER TABLE public.room_types ADD COLUMN bed_count integer;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS children_allowed CASCADE;
 ALTER TABLE public.room_types ADD COLUMN children_allowed text;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS connecting CASCADE;
-ALTER TABLE public.room_types ADD COLUMN connecting boolean;
+ALTER TABLE public.room_types ADD COLUMN connecting text;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS crib CASCADE;
 ALTER TABLE public.room_types ADD COLUMN crib text;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS crib_paise CASCADE;
