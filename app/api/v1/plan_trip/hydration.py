@@ -13,8 +13,27 @@ import logging
 from difflib import SequenceMatcher
 
 from app.services.places import search_places, get_place_details
+from app.services.osm_places import search_osm
 
 logger = logging.getLogger(__name__)
+
+# Fields that are only trustworthy when set by THIS hydration pass. The LLM
+# writes plausible-looking place_id/source/rating values for venues it invents
+# (observed: fabricated Google-style place_ids shared across activities), so
+# model-provided grounding is stripped before hydration and only server-side
+# lookup results may restore it.
+_GROUNDING_FIELDS = [
+    "place_id", "lat", "lng", "address", "rating", "user_ratings_total",
+    "opening_hours", "open_now", "maps_url", "photo_url", "photos",
+    "website", "phone", "grounded",
+]
+
+
+def _strip_llm_grounding(act: dict) -> None:
+    """Zero every grounding field the model may have fabricated."""
+    for k in _GROUNDING_FIELDS:
+        act.pop(k, None)
+    act["source"] = "ai_suggested"
 
 
 def _sim(a: str, b: str) -> float:
@@ -42,6 +61,7 @@ def _apply(act: dict, place: dict) -> None:
     act["rating"]    = place.get("rating")
     act["user_ratings_total"] = place.get("user_ratings_total")
     act["source"]    = "google_places"
+    act["grounded"]  = "server"
     act["photos"]    = [photo_ref] if photo_ref else []
     act["maps_url"]  = (
         f"https://www.google.com/maps/place/?q=place_id:{pid}" if pid
@@ -61,6 +81,48 @@ def _apply_defaults(act: dict) -> None:
     act.setdefault("opening_hours", [])
     act.setdefault("open_now", None)
     act.setdefault("source", "ai_suggested")
+
+
+def _apply_osm(act: dict, hit: dict) -> None:
+    """Apply an OpenStreetMap match: confirms the place exists and where it
+    is. Does NOT confirm hours, prices or reviews — those stay unset."""
+    act["lat"] = hit["lat"]
+    act["lng"] = hit["lng"]
+    act["address"] = hit.get("display_name")
+    act["place_id"] = None  # never a Google place_id; keeps Google-only UI paths off
+    act["source"] = "openstreetmap"
+    act["grounded"] = "server"
+    act["maps_url"] = (
+        f"https://www.openstreetmap.org/{hit['osm_type']}/{hit['osm_id']}"
+        if hit.get("osm_type") and hit.get("osm_id")
+        else f"https://www.openstreetmap.org/?mlat={hit['lat']}&mlon={hit['lng']}#map=17/{hit['lat']}/{hit['lng']}"
+    )
+    act.setdefault("photos", [])
+    act.setdefault("photo_url", None)
+    act.setdefault("rating", None)
+    act.setdefault("user_ratings_total", None)
+    act.setdefault("opening_hours", [])
+    act.setdefault("open_now", None)
+    act.setdefault("website", None)
+    act.setdefault("phone", None)
+
+
+async def _hydrate_osm(act: dict, destination: str) -> bool:
+    """Free grounding tier: verify the named place via OpenStreetMap."""
+    title = act.get("title", "")
+    for prefix in ["Check-in at", "Check-out from", "Dinner at", "Lunch at", "Breakfast at", "Visit", "Explore"]:
+        title = title.replace(prefix, "").strip()
+    if not title:
+        return False
+    hit = await search_osm(f"{title}, {destination}")
+    if not hit:
+        return False
+    # The returned name must actually resemble the requested title — a vague
+    # query matching a town centre is not verification of the venue.
+    if _sim(title, hit.get("name") or "") <= 0.45 and _sim(title, (hit.get("display_name") or "").split(",")[0]) <= 0.45:
+        return False
+    _apply_osm(act, hit)
+    return True
 
 
 # ── Tier 2: one batch search per day, fuzzy match ────────────────────────────
@@ -111,6 +173,9 @@ async def _hydrate_individual(act: dict, destination: str) -> None:
             return
     except Exception:
         pass
+    # Free tier: Google Places needs a billing key; OpenStreetMap does not.
+    if await _hydrate_osm(act, destination):
+        return
     _apply_defaults(act)
 
 
@@ -124,6 +189,13 @@ async def batch_hydrate_days(days: list[dict], destination: str, place_lookup: d
     Tier 2 (cheap):  batch search per day → fuzzy match
     Tier 3 (rare):   individual search for unresolved activities
     """
+    # Strip model-fabricated grounding first: from here on, a place_id,
+    # rating or coordinate on an activity means a server-side lookup put it
+    # there, never the LLM.
+    for day in days:
+        for act in (day.get("activities") or []):
+            _strip_llm_grounding(act)
+
     tier1_count = 0
     for day in days:
         for act in (day.get("activities") or []):

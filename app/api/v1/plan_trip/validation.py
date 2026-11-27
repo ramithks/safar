@@ -297,20 +297,27 @@ FILTER_THRESHOLD = 0.30
 def compute_confidence_score(act: dict) -> float:
     score = 0.0
 
-    if act.get("place_id") and act.get("source") == "google_places":
+    # Grounding signals only count when a server-side lookup produced them
+    # (hydration strips model-provided place_id/source/rating before this
+    # runs; the grounded marker makes the trust boundary explicit).
+    server = act.get("grounded") == "server"
+    if server and act.get("place_id") and act.get("source") == "google_places":
         score += 0.40
-    elif act.get("place_id"):
+    elif server and act.get("place_id"):
         score += 0.20
+    elif server and act.get("source") == "openstreetmap" and act.get("lat"):
+        # OSM confirms the place exists and where it is; no ratings/hours.
+        score += 0.35
 
-    rating = act.get("rating") or 0
+    rating = (act.get("rating") or 0) if server else 0
     if rating > 0:
         score += (min(float(rating), 5.0) / 5.0) * 0.30
 
-    reviews = act.get("user_ratings_total") or 0
+    reviews = (act.get("user_ratings_total") or 0) if server else 0
     if reviews > 0:
         score += min(math.log10(float(reviews)) / 4.0, 1.0) * 0.20
 
-    if act.get("opening_hours"):
+    if server and act.get("opening_hours"):
         score += 0.10
 
     return round(min(score, 1.0), 2)
