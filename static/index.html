@@ -118,6 +118,7 @@
   .transport-opt { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 10px; background: var(--bg); }
   .transport-opt b { font-size: 14px; }
   .transport-opt .meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
+  .unavail { border: 1px dashed var(--line); background: var(--bg); color: var(--muted); border-radius: 10px; padding: 12px; font-size: 13px; margin-top: 10px; line-height: 1.5; }
   .hidden { display: none; }
   footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 40px; line-height: 1.7; }
   a { color: var(--ocean); text-decoration: none; }
@@ -136,7 +137,7 @@
 <div class="hero">
   <div class="hero-inner">
     <h1>Safar</h1>
-    <p>Tell it where. It plans the whole trip: route, stays and days.</p>
+    <p>Tell it where. It plans your route and day-by-day itinerary.</p>
   </div>
 </div>
 
@@ -346,15 +347,29 @@ function renderTrip(env) {
 
   // Transport
   const legs = doc.transport || [];
-  $("trip-transport").innerHTML = legs.length
-    ? "<h3 style='margin-top:14px;font-size:15px'>Getting there</h3>" + legs.map(leg => {
-        const opts = (leg.options || []).slice(0, 3).map(o =>
-          `<div class="transport-opt"><b>${esc(o.mode || o.provider || "Option")}</b>` +
-          `<div class="meta">${esc(o.summary || o.name || "")} ${o.price ? " - ₹" + esc(o.price) : ""}</div></div>`
-        ).join("");
-        return `<div style="margin-top:10px"><span class="pill">${esc(leg.from || "")} → ${esc(leg.to || "")}</span></div>` + opts;
-      }).join("")
-    : "";
+  if (env.status !== "planning") {
+    const hasOptions = legs.some(leg => (leg.options || []).length > 0);
+    $("trip-transport").innerHTML = "<h3 style='margin-top:14px;font-size:15px'>Getting there</h3>" + (hasOptions
+      ? legs.map(leg => {
+          const opts = (leg.options || []).slice(0, 3).map(o =>
+            `<div class="transport-opt"><b>${esc(o.mode || o.provider || "Option")}</b>` +
+            `<div class="meta">${esc(o.summary || o.name || "")} ${o.price ? " - ₹" + esc(o.price) : ""}</div></div>`
+          ).join("");
+          return `<div style="margin-top:10px"><span class="pill">${esc(leg.from || "")} → ${esc(leg.to || "")}</span></div>` + opts;
+        }).join("")
+      : `<div class="unavail">Live fares and bookable transport options are not available on this free deployment yet. The route above is AI-planned; check operators directly for tickets.</div>`);
+  } else {
+    $("trip-transport").innerHTML = legs.length
+      ? "<h3 style='margin-top:14px;font-size:15px'>Getting there</h3>" + legs.map(leg =>
+          `<div style="margin-top:10px"><span class="pill">${esc(leg.from || "")} → ${esc(leg.to || "")}</span></div>`).join("")
+      : "";
+  }
+  // Stays: booking is not wired up on this deployment - say so explicitly.
+  if (env.status !== "planning") {
+    $("trip-notes").insertAdjacentHTML("beforebegin",
+      `<h3 style="margin-top:14px;font-size:15px">Stays</h3>` +
+      `<div class="unavail">Stay booking is not available on this free deployment yet. The itinerary suggests areas to stay; book directly with properties.</div>`);
+  }
 
   // Itinerary
   const days = doc.itinerary || [];
