@@ -16,6 +16,7 @@ leans on it entirely) had no floor under it.
 
 Storage: Redis, so counters survive restarts and are shared across workers.
 """
+import os
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -46,4 +47,10 @@ def _user_or_ip(request) -> str:
 
 # swallow_errors: if Redis is briefly unreachable, fail open (skip limiting)
 # instead of 500ing every rate-limited endpoint.
-limiter = Limiter(key_func=_user_or_ip, storage_uri=settings.redis_url, swallow_errors=True)
+# Safar: when REDIS_URL is unset entirely (free-tier deploy), slowapi still
+# runs its header-injection path for decorated routes and crashes on the unset
+# request.state.view_rate_limit, so use in-memory storage instead of a
+# localhost Redis that will never answer. Per-process limiting: acceptable on
+# the single-instance free deployment; set REDIS_URL to restore shared limits.
+_limiter_storage = os.environ.get("REDIS_URL") or "memory://"
+limiter = Limiter(key_func=_user_or_ip, storage_uri=_limiter_storage, swallow_errors=True)
