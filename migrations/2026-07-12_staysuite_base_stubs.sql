@@ -287,7 +287,7 @@ CREATE TABLE IF NOT EXISTS public.room_types (
   max_adults integer,
   max_children integer,
   photo_meta jsonb not null default '{}'::jsonb,
-  smoking boolean
+  smoking text
 );
 
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS accessible CASCADE;
@@ -315,7 +315,7 @@ ALTER TABLE public.room_types ADD COLUMN max_children integer;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS photo_meta CASCADE;
 ALTER TABLE public.room_types ADD COLUMN photo_meta jsonb not null default '{}'::jsonb;
 ALTER TABLE public.room_types DROP COLUMN IF EXISTS smoking CASCADE;
-ALTER TABLE public.room_types ADD COLUMN smoking boolean;
+ALTER TABLE public.room_types ADD COLUMN smoking text;
 
 CREATE TABLE IF NOT EXISTS public.services (
   availability text,
