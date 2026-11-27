@@ -515,6 +515,10 @@
       document.querySelector('.day-tabs').innerHTML = days.map((dd, i) =>
         '<span class="dt' + (i === 0 ? ' on' : '') + '" data-day="' + (i + 1) + '">Day ' + (dd.day ?? i + 1) + '</span>').join('');
       wireTabs();
+    } else {
+      // a real trip with no days (e.g. failed before planning) must not keep stale sample panels
+      box.innerHTML = '';
+      document.querySelector('.day-tabs').innerHTML = '';
     }
     if (env.status !== 'planning' && env.status === 'ready' && !(doc.transport || []).some(l => (l.options || []).length)) {
       box.insertAdjacentHTML('beforeend', '<div class="sample-banner" style="display:block">Live fares and bookable transport are not available on this free deployment yet. The route above is AI-planned; check operators directly for tickets.</div>');
