@@ -83,12 +83,25 @@ def _apply_defaults(act: dict) -> None:
     act.setdefault("source", "ai_suggested")
 
 
-def _apply_osm(act: dict, hit: dict) -> None:
+def _apply_osm(act: dict, hit: dict, city: str = "") -> None:
     """Apply an OpenStreetMap match: confirms the place exists and where it
-    is. Does NOT confirm hours, prices or reviews — those stay unset."""
+    is — nothing more. The planner's narrative (features, history, tips)
+    is NOT verified by a name/location match, so it is replaced with a
+    neutral description whose claims match the evidence."""
     act["lat"] = hit["lat"]
     act["lng"] = hit["lng"]
     act["address"] = hit.get("display_name") or hit.get("name")
+    kind = {
+        "attraction": "Attraction", "viewpoint": "Viewpoint", "museum": "Museum",
+        "zoo": "Zoo", "theme_park": "Theme park", "gallery": "Gallery",
+        "artwork": "Artwork", "place_of_worship": "Place of worship",
+        "waterfall": "Waterfall", "peak": "Peak",
+    }.get((hit.get("category") or "").lower(), "Place")
+    where = f" in {city}" if city else ""
+    act["description"] = (
+        f"{kind}{where} — name and location verified via OpenStreetMap. "
+        "Opening hours, entry fees and other details are not independently verified."
+    )
     act["place_id"] = None  # never a Google place_id; keeps Google-only UI paths off
     act["source"] = "openstreetmap"
     act["grounded"] = "server"
@@ -116,7 +129,7 @@ async def _hydrate_osm(act: dict, destination: str) -> bool:
     hit = await ground_activity(title, destination)
     if not hit:
         return False
-    _apply_osm(act, hit)
+    _apply_osm(act, hit, destination)
     return True
 
 

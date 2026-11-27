@@ -129,6 +129,59 @@ def _window_flags(graph: G.TripGraph, spec: dict) -> list[str]:
     return flags
 
 
+async def _backfill_sparse_days(stayed: list, flags: list[str],
+                                  minimum: int = 3, add: int = 3) -> None:
+    """A day the honest filters trimmed to almost nothing is not useful. Add
+    REAL nearby places from the stop's OpenStreetMap POI list — never
+    invented names, never a fabricated clock: additions are unscheduled
+    ('slot them as you like') so no false timing is claimed."""
+    from app.services.osm_places import city_pois, backfill_pois
+    for node in stayed:
+        if not node.days:
+            continue
+        try:
+            pois = await city_pois(node.city or "")
+        except Exception:  # noqa: BLE001
+            pois = []
+        if not pois:
+            continue
+        for day in node.days:
+            acts = day.get("activities") or []
+            if len(acts) >= minimum:
+                continue
+            titles = [str(a.get("title") or "") for a in acts]
+            extra = backfill_pois(pois, titles, limit=min(add, minimum - len(acts)))
+            if not extra:
+                continue
+            for poi in extra:
+                acts.append({
+                    "title": poi["name"],
+                    "description": (
+                        "Verified nearby place (OpenStreetMap name and location), added "
+                        "because this day was light. No time slot assigned — slot it as "
+                        "you like; opening hours and details are not independently verified."
+                    ),
+                    "category": (poi.get("category") or "attraction").replace("_", " ").title(),
+                    "start_time": None,
+                    "lat": poi["lat"],
+                    "lng": poi["lng"],
+                    "source": "openstreetmap",
+                    "grounded": "server",
+                    "backfilled": True,
+                    "maps_url": (
+                        f"https://www.openstreetmap.org/{poi['osm_type']}/{poi['osm_id']}"
+                        if poi.get("osm_type") and poi.get("osm_id")
+                        else f"https://www.openstreetmap.org/?mlat={poi['lat']}&mlon={poi['lng']}#map=17/{poi['lat']}/{poi['lng']}"
+                    ),
+                })
+            day["activities"] = acts
+            flags.append(
+                f"Day {day.get('day') or ''} in {node.city} was light after grounded "
+                f"timing was applied, so it now also lists verified nearby places "
+                f"({', '.join(p['name'] for p in extra)}) — unscheduled, no invented times."
+            )
+
+
 def _waitlist_flags(graph: G.TripGraph, spec: dict, flags: list[str]) -> None:
     """A waitlisted fare is not a confirmed seat. When the recommended ride on
     a leg carries one, the caveat must be visible next to the pick, not only
@@ -547,6 +600,7 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
     _retime_final_day_for_departure(graph, spec, window_flags)
     _enforce_transfer_gaps(stayed, window_flags)
     _waitlist_flags(graph, spec, window_flags)
+    await _backfill_sparse_days(stayed, window_flags)
     for _ms in ((terminal_trip.get("trip_quality") or {}).get("must_stops") or []):
         if _ms.get("injected") or _ms.get("feasibility") == "unverified":
             window_flags.append(
