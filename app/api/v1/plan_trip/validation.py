@@ -361,6 +361,34 @@ def filter_low_confidence(days: list[dict], threshold: float = FILTER_THRESHOLD,
     return removed
 
 
+def scrub_unverified_activities(days: list[dict], threshold: float = FILTER_THRESHOLD) -> list[str]:
+    """An activity with no grounding below the threshold is an idea, not a
+    place. Keeping it for a full day must not keep the model's invented
+    specifics: rewrite its title/description to an honest, explicitly
+    unverified suggestion. Grounded activities (places data, ratings) are
+    untouched. Returns the titles that were scrubbed, for logging."""
+    scrubbed: list[str] = []
+    for day in days:
+        for a in (day.get("activities") or []):
+            if a.get("requested_stop"):
+                continue  # must-stop injections already label themselves
+            if a.get("confidence_score", 1.0) >= threshold:
+                continue
+            old = a.get("title") or ""
+            cat = (a.get("category") or "Stop").strip() or "Stop"
+            a["title"] = f"{cat} - suggested, not verified"
+            a["description"] = (
+                "The planner suggested this, but no live listing, reviews or "
+                "opening hours were found for it - treat it as an idea to check "
+                "locally, not a confirmed place."
+            )
+            a["estimated_cost"] = "Unknown"
+            a["unverified"] = True
+            if old and old != a["title"]:
+                scrubbed.append(old)
+    return scrubbed
+
+
 # ── Must-stop enforcement ────────────────────────────────────────────────────
 
 _STOP_RE = re.compile(

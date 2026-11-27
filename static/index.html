@@ -406,11 +406,15 @@
   $('signout-btn').onclick = async () => { await sb.auth.signOut(); location.reload(); };
 
   // ── trip list (real saved-trip reads; ownership enforced server-side) ──
+  // Neutral placeholder for destinations without a verified image — never
+  // show one place's photo under another place's name.
+  const NEUTRAL_PHOTO = 'data:image/svg+xml;utf8,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720"><rect width="100%" height="100%" fill="#1a1a1a"/></svg>');
   function photoFor(titleText) {
     for (const name of Object.keys(PHOTOS)) {
       if ((titleText || '').toLowerCase().includes(name.toLowerCase())) return PHOTOS[name][0];
     }
-    return PHOTOS['Gokarna'][0];
+    return NEUTRAL_PHOTO;
   }
 
   async function loadMyTrips() {

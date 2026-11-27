@@ -173,7 +173,7 @@ def _retime_day1_for_arrival(graph: G.TripGraph, spec: dict, flags: list[str]) -
         if not acts:
             return
         moved, dropped = [], []
-        cur = arr_m
+        cur = arr_m + _ARRIVAL_TRANSFER_MIN
         for a in acts:
             dur = int(a.get("duration_min") or 90)
             if cur + dur > 21 * 60:
@@ -202,7 +202,7 @@ def _retime_day1_for_arrival(graph: G.TripGraph, spec: dict, flags: list[str]) -
              if (_mins(str(a.get("start_time") or a.get("time") or "")) or 9999) < arr_m]
     if not early:
         return
-    cur = arr_m
+    cur = arr_m + _ARRIVAL_TRANSFER_MIN
     kept, dropped = [], []
     for a in acts:
         dur = int(a.get("duration_min") or 90)
@@ -230,6 +230,83 @@ def _retime_day1_for_arrival(graph: G.TripGraph, spec: dict, flags: list[str]) -
             "original morning slots weren't reachable with the grounded transport. "
             "Times from arrival onward are approximate."
         )
+
+
+# Local transfer from the bus/train drop point to the first activity: the
+# arrival clock is the vehicle's, not the traveller's feet on the ground.
+_ARRIVAL_TRANSFER_MIN = 45
+# Assumed overland speed for inter-activity transfers when both ends have
+# coordinates; 30 km/h is a conservative hill-road figure, not a promise.
+_TRANSFER_KMH = 30.0
+_MIN_TRANSFER_MIN = 30
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    from math import asin, cos, radians, sin, sqrt
+    r = 6371.0
+    dlat, dlng = radians(lat2 - lat1), radians(lng2 - lng1)
+    h = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
+    return 2 * r * asin(sqrt(h))
+
+
+def _act_coords(a: dict) -> tuple[float, float] | None:
+    try:
+        lat, lng = a.get("lat"), a.get("lng")
+        if lat is None and isinstance(a.get("location"), dict):
+            lat, lng = a["location"].get("lat"), a["location"].get("lng")
+        if lat is None or lng is None:
+            return None
+        return float(lat), float(lng)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _enforce_transfer_gaps(stayed: list, flags: list[str]) -> None:
+    """Consecutive activities need real travel time between them: an arrival
+    clock alone doesn't make a 90-minute-drive pair 30 minutes apart. Push
+    later activities forward to fit the transfer; what pushes past the
+    evening is dropped and named in a flag, never silently squeezed."""
+    def _mins(t: str) -> int | None:
+        try:
+            return int(t[:2]) * 60 + int(t[3:5])
+        except Exception:  # noqa: BLE001
+            return None
+
+    for node in stayed:
+        for day in (getattr(node, "days", None) or []):
+            acts = day.get("activities") or []
+            if len(acts) < 2:
+                continue
+            kept, dropped = [], []
+            prev_end, prev_coords = None, None
+            for a in acts:
+                start = _mins(str(a.get("start_time") or a.get("time") or ""))
+                dur = int(a.get("duration_min") or 90)
+                if start is not None and prev_end is not None:
+                    coords = _act_coords(a)
+                    gap = _MIN_TRANSFER_MIN
+                    if coords and prev_coords:
+                        km = _haversine_km(prev_coords[0], prev_coords[1], coords[0], coords[1])
+                        gap = max(_MIN_TRANSFER_MIN, int(km / _TRANSFER_KMH * 60))
+                    if start < prev_end + gap:
+                        start = prev_end + gap
+                        a["start_time"] = f"{start // 60:02d}:{start % 60:02d}"
+                        a["transfer_adjusted"] = True
+                if start is not None and start + dur > 21 * 60:
+                    dropped.append(a)
+                    continue
+                kept.append(a)
+                if start is not None:
+                    prev_end = start + dur
+                    prev_coords = _act_coords(a) or prev_coords
+            if dropped:
+                day["activities"] = kept
+                names = ", ".join(x.get("title") or "?" for x in dropped)
+                flags.append(
+                    f"Day {day.get('day')}: realistic travel time between stops didn't "
+                    f"leave room for everything before evening, so it no longer "
+                    f"includes: {names}."
+                )
 
 
 async def run_generation(trip_id: str, spec: dict, user_id: str,
@@ -353,6 +430,7 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
     weather = await _wait_weather(weather_task)
     window_flags = _window_flags(graph, spec)
     _retime_day1_for_arrival(graph, spec, window_flags)
+    _enforce_transfer_gaps(stayed, window_flags)
     for _ms in ((terminal_trip.get("trip_quality") or {}).get("must_stops") or []):
         if _ms.get("injected") or _ms.get("feasibility") == "unverified":
             window_flags.append(

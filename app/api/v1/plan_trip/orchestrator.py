@@ -34,7 +34,7 @@ from .helpers import (
 )
 from .hydration import batch_hydrate_days
 from .validation import (
-    annotate_confidence, filter_low_confidence,
+    annotate_confidence, filter_low_confidence, scrub_unverified_activities,
     trip_health_check, auto_fix_trip,
     enforce_must_stops,
 )
@@ -233,6 +233,9 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
     dropped = filter_low_confidence(days)
     if dropped:
         logger.debug("[plan_trip] Dropped %d low-confidence activities: %s", len(dropped), dropped)
+    scrubbed = scrub_unverified_activities(days)
+    if scrubbed:
+        logger.info("[plan_trip] Scrubbed invented specifics from ungrounded activities: %s", scrubbed)
 
     # ── Trip health check + auto-fix ─────────────────────────────────────────
     health = trip_health_check(days)
