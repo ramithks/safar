@@ -268,7 +268,7 @@ def rank_hotels(hotels: list[dict], budget: str = "mid") -> list[dict]:
     cheap hotels. We normalise against the cheapest in THIS result set instead.
 
     Partner stays are pinned above the ranked list instead of being scored into
-    it — they are the stays TravBuddy can actually take a booking for, and the
+    it — they are the stays Safar can actually take a booking for, and the
     card tags them as such.
     """
     from app.services.partner_stays import pin_partners

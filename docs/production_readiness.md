@@ -1,4 +1,4 @@
-# StayOS — risk register and production-readiness gates
+# StaySuite — risk register and production-readiness gates
 
 *Written 2026-08-25 for the final hardening pass. Mission 1 asks for a written
 risk register before fixing; this is it, with what happened to each entry.*
@@ -19,9 +19,9 @@ problem. **P2** is performance, UX or maintainability.
 | 4 | P0 | Inventory drift invisible until a guest arrives | Reconciliation existed; nothing ran it. Found real drift twice, both times by hand | **Closed.** Hourly beat task, reports and never corrects. The 18 (really 24) oversold units are repaired — see 13 and 14. **All ten active properties reconcile to zero** |
 | 5 | P1 | `"room 204 mein AC nahi chal raha"` → group pricing for 204 rooms | Reproduced | **Closed.** `room_number` is its own entity; `"204 wala room"` too |
 | 6 | P1 | `"thanks"` loading all 38 tool schemas | 7,607 tokens measured on one of the commonest turns | **Closed.** 823 tokens. `"ok"` deliberately excluded — it can mean *yes, book it* |
-| 7 | P1 | Test double cannot express what production queries | `or_` and `lt` were missing and made whole paths untestable — twice | **Bounded.** Every operator the StayOS guest path uses is now expressible. `maybe_single` (51 sites) is marketplace-only |
-| 8 | P2 | Beat guards assumed one task prefix | My own new task tripped three of them | **Closed.** Both StayOS prefixes accepted; the task is routed |
-| 9 | P1 | A guardrail block keeps no record of what it refused | 0 of 30 blocks retain the reply text. §17 asks *why did StayOS say this?* and for the largest failure class on product traffic there is no answer without a log search on a run id nobody has | **Closed.** The refused reply rides the internal telemetry channel into `agent_runs.required_actions`; never in model context, never sent |
+| 7 | P1 | Test double cannot express what production queries | `or_` and `lt` were missing and made whole paths untestable — twice | **Bounded.** Every operator the StaySuite guest path uses is now expressible. `maybe_single` (51 sites) is marketplace-only |
+| 8 | P2 | Beat guards assumed one task prefix | My own new task tripped three of them | **Closed.** Both StaySuite prefixes accepted; the task is routed |
+| 9 | P1 | A guardrail block keeps no record of what it refused | 0 of 30 blocks retain the reply text. §17 asks *why did StaySuite say this?* and for the largest failure class on product traffic there is no answer without a log search on a run id nobody has | **Closed.** The refused reply rides the internal telemetry channel into `agent_runs.required_actions`; never in model context, never sent |
 | 10 | P1 | The evaluation marked a model unsafe by a rule the product does not enforce | Gemini 2.5 failed the promotion gate on `leaked_ids = 2`; both were payment links, which the guardrail deliberately allows by masking URLs first | **Closed.** The scorer calls `_internal_leak` rather than re-walking the pattern list; a test asserts the two never disagree on any reply |
 | 11 | P1 | A quarter of the 3.x column was not 3.x | 11 of 44 turns finished on the fallback tier after two empty completions, all stamped with the configured model | **Closed.** `RunResult.served_by` carries every model the turn touched |
 | 12 | P1 | `"checkout kitne baje hai?"` read as a request for a price | The matrix's *control* turn required a business action on 4/4 runs on **both** model families — the signature of a system bug charged to a model | **Closed.** The clock phrase is stripped before price words are looked for, so a message asking both still asks a price |

@@ -8,7 +8,7 @@ Sources searched simultaneously:
 Results are filtered to hotels within max_distance_km of the destination,
 deduplicated by name, and sorted richest-first (booking_url + price + photos).
 
-TravBuddy's own partner stays are then PINNED above that merged list (see
+Safar's own partner stays are then PINNED above that merged list (see
 app/services/partner_stays). They are not scored against OTA rows and never
 enter the ranking — they are a small, tagged group on top, because they are the
 only stays we can actually take a booking for. Injecting them here rather than

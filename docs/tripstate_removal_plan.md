@@ -167,7 +167,7 @@ individually non-idempotent. A full-document UPDATE is naturally idempotent —
 - `trips` — My Trips mirror (**stays**; `trips.id == trip_states.id`,
   `planner="workspace"` marker the frontend routes on).
 
-**Frontend (travbuddy_website, `/plan` workspace)**
+**Frontend (safar_website, `/plan` workspace)**
 - SSE client applying patch events to a local state tree
 - Fat-vs-skinny patch awareness (recent commit e527528: "client-side fat
   transport projections to preserve UI state during streaming")
@@ -237,7 +237,7 @@ switch):
   the result through `doc_from_graph`-style trimming into the new shape.
   This is the last thing the old read machinery ever does.
 
-**Step 5 — Frontend switch (2–3 days, travbuddy_website)** — see §7.
+**Step 5 — Frontend switch (2–3 days, safar_website)** — see §7.
 
 **Step 6 — Delete (1 day, the fun one)**
 - Delete: `copilot.py`, `agent.py`, `structural.py`, `patch.py`, `store.py`,
@@ -392,7 +392,7 @@ surfaces (`/recommend`, `/hotels`).
 
 ---
 
-## 7. Frontend Changes (travbuddy_website `/plan`)
+## 7. Frontend Changes (safar_website `/plan`)
 
 - **One state object.** The workspace holds the TripDoc from `GET /trips/{id}`
   (React Query/SWR). Delete: the SSE client, patch applier, fat/skinny

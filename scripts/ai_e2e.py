@@ -15,7 +15,7 @@ for reasons that have nothing to do with this code.
 Assertions are on **database state and action traces**, never on the agent's
 prose. A run that produced a lovely sentence and no ticket is a failure.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/ai_e2e.py
 

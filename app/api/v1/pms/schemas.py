@@ -1,9 +1,9 @@
 """
 Request and response models for the PMS API.
 
-Field names are camelCase because the consumer is the TravBuddy Partner PWA,
+Field names are camelCase because the consumer is the Safar Partner PWA,
 whose `PmsApi` interface these mirror one-for-one (see
-Travbuddy_supply_os/src/data/api.ts). Converting at the edge here is cheaper
+Safar_supply_os/src/data/api.ts). Converting at the edge here is cheaper
 than a mapping layer in the client, and it keeps the contract legible on both
 sides: a field in this file has exactly one counterpart in the TypeScript.
 
@@ -1761,7 +1761,7 @@ class PublicSiteOut(BaseModel):
     # moves for reasons a reader cannot see is one Google learns to ignore.
     updatedAt: str | None = None
     # The hotel's own custom domain, when it has one verified. The canonical
-    # lives there rather than on travbuddy.in — a hotel that connected its own
+    # lives there rather than on safar.example.com — a hotel that connected its own
     # address should not have us outranking it for its own name.
     domain: str | None = None
 
@@ -1772,7 +1772,7 @@ class PublicHotelIndexOut(BaseModel):
 
     Deliberately not the full site: this list is read to decide *which* URLs to
     submit, and the decision needs counts rather than content. Every field here
-    is a signal in `stayosHotelGate` on the website side, and the gate and the
+    is a signal in `staysuiteHotelGate` on the website side, and the gate and the
     sitemap must see the same numbers or they will disagree about the same
     hotel.
     """
@@ -1960,7 +1960,7 @@ class WebsiteConfigOut(BaseModel):
     propertyId: str
     template: str
     status: str
-    travbuddyPath: str = ""
+    safarPath: str = ""
     domain: str | None = None
     headline: str = ""
     tagline: str = ""
@@ -2470,7 +2470,7 @@ class RoomTypeCreateRequest(BaseModel):
     bedType: str | None = Field(default=None, max_length=60)
     sizeSqft: int | None = Field(default=None, ge=30, le=20_000)
     amenities: list[str] | None = Field(default=None)
-    # URLs the hotel already has — their website, their Instagram. StayOS has
+    # URLs the hotel already has — their website, their Instagram. StaySuite has
     # no image storage, and pretending otherwise with a half-built uploader
     # would be worse than taking a link that already works.
     photos: list[str] | None = Field(default=None)

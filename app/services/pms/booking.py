@@ -507,7 +507,7 @@ async def create_reservation(
 
         paid = max(0, min(int(token_paise or 0), q["total_paise"]))
 
-        # What StayOS keeps and what the hotel is owed — decided here, once, and
+        # What StaySuite keeps and what the hotel is owed — decided here, once, and
         # never recomputed. §37: a booking preserves its own financial truth, so
         # renegotiating this partner's rate next year must not change what this
         # stay was worth. A partner row that cannot be read falls back to the

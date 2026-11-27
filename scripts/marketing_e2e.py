@@ -25,7 +25,7 @@ The assertion that matters most is scenario 11. A guest opts out *while the
 campaign is running*, and the message that was already queued for them must not
 go. Everything else here is plumbing around that one property.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/marketing_e2e.py            # deterministic
     ./venv/bin/python scripts/marketing_e2e.py --gemini   # + the live model

@@ -1,5 +1,5 @@
 -- ============================================================================
--- TravBuddy Trip Engine v4 — pre-change snapshots (integrity layer)
+-- Safar Trip Engine v4 — pre-change snapshots (integrity layer)
 -- Design: docs/trip_engine_architecture.md §3, §6
 -- Idempotent: safe to re-run.
 --

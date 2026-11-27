@@ -25,7 +25,7 @@ from app.workers.celery_app import celery_app
 logger = logging.getLogger(__name__)
 
 
-@celery_app.task(name="travbuddy.partners.revert_intro_commission", max_retries=0)
+@celery_app.task(name="safar.partners.revert_intro_commission", max_retries=0)
 def revert_intro_commission_task() -> dict:
     """
     Move every partner whose intro rate has lapsed onto their base rate.

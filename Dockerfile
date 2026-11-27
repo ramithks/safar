@@ -21,11 +21,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Create temp dirs
-RUN mkdir -p /tmp/travbuddy/places_cache
+RUN mkdir -p /tmp/safar/places_cache
 
 EXPOSE 8000
 
-# --workers 4: multiple processes so one slow request can't stall the API.
-# --proxy-headers + --forwarded-allow-ips: trust X-Forwarded-For from Traefik,
-#   otherwise every client shares Traefik's IP and per-IP rate limits break.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# Free-tier friendly start: one web process (512 MB hosts), honouring the
+# platform's $PORT. RUN_WORKER=true additionally starts the Celery worker and
+# beat in the same container (needs REDIS_URL) for single-service free deploys.
+COPY start.sh .
+RUN chmod +x start.sh
+CMD ["./start.sh"]

@@ -226,7 +226,7 @@ def test_a_room_without_a_description_is_named(db):
 
 # ── the two definitions of "ready for Google" ────────────────────────────────
 #
-# There are two, and they must be the same decision. `stayosHotelGate` in the
+# There are two, and they must be the same decision. `staysuiteHotelGate` in the
 # website decides what actually gets indexed; `readiness` decides what a
 # hotelier is told. They had drifted, and the drift told hoteliers the opposite
 # of the truth: Casa Mandala was live in the sitemap with `index, follow` on the

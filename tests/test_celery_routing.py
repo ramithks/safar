@@ -8,7 +8,7 @@ executed by the wrong deployment reads the wrong database.
 Celery decides that, not the code that calls `.delay()`. Without routing every
 task lands on the single default queue both workers consume, and whichever
 worker grabs it first runs it. Sharing one Redis makes the collision certain
-rather than likely, and the StayOS service is meant to be configured by copying
+rather than likely, and the StaySuite service is meant to be configured by copying
 the marketplace's environment — `REDIS_URL` included.
 
 The asymmetry in these tests is deliberate and is the whole design: the
@@ -23,28 +23,28 @@ import pytest
 from app.workers.celery_app import celery_app
 
 HOTEL_OS_TASKS = [
-    "travbuddy.messaging.process_conversation",
-    "travbuddy.marketing.run_campaign",
+    "safar.messaging.process_conversation",
+    "safar.marketing.run_campaign",
     # Scheduled by the marketplace's beat — the only one that runs a beat — and
-    # executed only by the StayOS worker. It reads `conversations`, which the
+    # executed only by the StaySuite worker. It reads `conversations`, which the
     # marketplace project has never had.
-    "travbuddy.messaging.sweep_waiting_guests",
+    "safar.messaging.sweep_waiting_guests",
     # Reads `room_inventory` and `reservations` per property and reports drift.
-    # Hotel tables throughout, so it must reach the StayOS worker — a
+    # Hotel tables throughout, so it must reach the StaySuite worker — a
     # reconciliation run against the marketplace database would find every
     # hotel's inventory missing and say so hourly.
-    "travbuddy.pms.reconcile_inventory",
+    "safar.pms.reconcile_inventory",
 ]
 
 MARKETPLACE_TASKS = [
-    "travbuddy.analyze_reel",
-    "travbuddy.partners.revert_intro_commission",
-    "travbuddy.reco.refresh_expected_price",
-    "travbuddy.reco.refresh_destination_priors",
-    "travbuddy.reco.fit_centroids",
-    "travbuddy.reco.embed_and_profile",
-    "travbuddy.reco.embed_hotel",
-    "travbuddy.reco.profile_hotel",
+    "safar.analyze_reel",
+    "safar.partners.revert_intro_commission",
+    "safar.reco.refresh_expected_price",
+    "safar.reco.refresh_destination_priors",
+    "safar.reco.fit_centroids",
+    "safar.reco.embed_and_profile",
+    "safar.reco.embed_hotel",
+    "safar.reco.profile_hotel",
 ]
 
 
@@ -86,8 +86,8 @@ def test_everything_beat_schedules_is_routed_to_a_deployment_that_can_run_it():
     *executing*. `revert_intro_commission` is unrouted, so beat's own worker
     picks it up — correct, because it writes to `partners`, a table that also
     exists meaning something entirely different in the hotel OS. The waiting
-    sweep is routed to `hotelos`, so beat publishes it and the StayOS worker —
-    the one process with StayOS's `SUPABASE_URL` — is the only one that can
+    sweep is routed to `hotelos`, so beat publishes it and the StaySuite worker —
+    the one process with StaySuite's `SUPABASE_URL` — is the only one that can
     take it.
 
     The rule this holds is therefore not "no hotel-OS task in the schedule" but
@@ -96,7 +96,7 @@ def test_everything_beat_schedules_is_routed_to_a_deployment_that_can_run_it():
     route is one the marketplace worker will execute against the marketplace
     database, whatever it was written for.
 
-    One operational consequence, recorded in `DEPLOYING_STAYOS.md`: the StayOS
+    One operational consequence, recorded in `DEPLOYING_STAYSUITE.md`: the StaySuite
     sweep stops if the *marketplace* beat stops. It is a scheduled reminder
     rather than part of any guest's path, so that degrades to no reminders
     rather than to anything a guest sees.
@@ -116,7 +116,7 @@ def test_every_registered_task_is_routed_somewhere_a_worker_listens():
     """
     A task routed to a queue nobody consumes never runs, and nothing errors.
     The two queues in production are `celery` (marketplace worker, no -Q) and
-    `hotelos` (StayOS worker, -Q hotelos).
+    `hotelos` (StaySuite worker, -Q hotelos).
     """
     listened = {"celery", "hotelos"}
     for task in HOTEL_OS_TASKS + MARKETPLACE_TASKS:
@@ -129,53 +129,53 @@ class TestTheBeatThatOwnsTheSweep:
     """
     A scheduled task is not a running task, and this pair was never connected.
 
-    `stayos-waiting-guests` has been in `beat_schedule` since the escalation
+    `staysuite-waiting-guests` has been in `beat_schedule` since the escalation
     work, carrying a comment that the marketplace beat would enqueue it and the
-    StayOS worker would run it off the `hotelos` queue. That reasoning assumed
+    StaySuite worker would run it off the `hotelos` queue. That reasoning assumed
     one broker.
 
-    It is not one broker. `docker-compose.stayos.yml` brings up its own Redis
+    It is not one broker. `docker-compose.staysuite.yml` brings up its own Redis
     and points its api and worker at it, so the marketplace beat enqueues onto
-    the marketplace broker and the StayOS worker listens to the StayOS broker.
+    the marketplace broker and the StaySuite worker listens to the StaySuite broker.
     The task has never been delivered. Nothing errors — the guest simply waits,
     and production had zero rows in `agent_escalations`, ever.
 
-    Two things are asserted here and neither is about Celery: that a StayOS
+    Two things are asserted here and neither is about Celery: that a StaySuite
     beat schedules the sweep, and that it schedules **nothing that writes to a
     marketplace table**. The second is why there was no beat service to begin
     with, and it is still the right worry.
     """
 
-    def test_a_stayos_beat_schedules_the_sweep(self, monkeypatch):
+    def test_a_staysuite_beat_schedules_the_sweep(self, monkeypatch):
         from app.workers import celery_app as mod
 
-        monkeypatch.setenv("CELERY_BEAT_ROLE", "stayos")
-        assert "stayos-waiting-guests" in mod._beat_schedule()
+        monkeypatch.setenv("CELERY_BEAT_ROLE", "staysuite")
+        assert "staysuite-waiting-guests" in mod._beat_schedule()
 
-    def test_a_stayos_beat_schedules_nothing_that_writes_to_the_marketplace(
+    def test_a_staysuite_beat_schedules_nothing_that_writes_to_the_marketplace(
         self, monkeypatch,
     ):
         """
         `revert_intro_commission` writes hourly to `partners`, a table that also
-        exists and means something entirely different in the hotel OS. A StayOS
+        exists and means something entirely different in the hotel OS. A StaySuite
         beat running it would point it at a hotel database.
         """
         from app.workers import celery_app as mod
 
-        monkeypatch.setenv("CELERY_BEAT_ROLE", "stayos")
+        monkeypatch.setenv("CELERY_BEAT_ROLE", "staysuite")
         scheduled = {e["task"] for e in mod._beat_schedule().values()}
 
-        assert "travbuddy.partners.revert_intro_commission" not in scheduled
+        assert "safar.partners.revert_intro_commission" not in scheduled
         for task in scheduled:
-            # **Two prefixes, not one.** `travbuddy.messaging.*` was the
-            # whole of StayOS on the beat until inventory reconciliation
-            # joined it, and `travbuddy.pms.*` is equally the hotel side —
+            # **Two prefixes, not one.** `safar.messaging.*` was the
+            # whole of StaySuite on the beat until inventory reconciliation
+            # joined it, and `safar.pms.*` is equally the hotel side —
             # renaming a reconciliation task "messaging" to satisfy a
             # prefix check would be the dishonest way past this. What the
             # rule is actually for is keeping *marketplace* tasks off a
             # beat pointed at a hotel database, and that is unchanged.
-            assert task.startswith(("travbuddy.messaging.", "travbuddy.pms.")), (
-                f"{task} is on the StayOS beat and belongs to neither the\n"
+            assert task.startswith(("safar.messaging.", "safar.pms.")), (
+                f"{task} is on the StaySuite beat and belongs to neither the\n"
                 f"messaging nor the hotel side"
             )
 
@@ -204,7 +204,7 @@ class TestTheBeatThatOwnsTheSweep:
 
         monkeypatch.delenv("CELERY_BEAT_ROLE", raising=False)
         every = set(mod._beat_schedule())
-        assert "stayos-waiting-guests" in every
+        assert "staysuite-waiting-guests" in every
         assert "partner-intro-commission-hourly" in every
 
     def test_an_unrecognised_role_schedules_everything_rather_than_nothing(
@@ -218,8 +218,8 @@ class TestTheBeatThatOwnsTheSweep:
         """
         from app.workers import celery_app as mod
 
-        monkeypatch.setenv("CELERY_BEAT_ROLE", "stayoss")
-        assert "stayos-waiting-guests" in mod._beat_schedule()
+        monkeypatch.setenv("CELERY_BEAT_ROLE", "staysuites")
+        assert "staysuite-waiting-guests" in mod._beat_schedule()
 
     def test_the_two_roles_together_are_the_whole_schedule(self, monkeypatch):
         """
@@ -229,17 +229,17 @@ class TestTheBeatThatOwnsTheSweep:
         """
         from app.workers import celery_app as mod
 
-        monkeypatch.setenv("CELERY_BEAT_ROLE", "stayos")
-        stayos = set(mod._beat_schedule())
+        monkeypatch.setenv("CELERY_BEAT_ROLE", "staysuite")
+        staysuite = set(mod._beat_schedule())
         monkeypatch.setenv("CELERY_BEAT_ROLE", "marketplace")
         marketplace = set(mod._beat_schedule())
         monkeypatch.setenv("CELERY_BEAT_ROLE", "all")
         everything = set(mod._beat_schedule())
 
-        assert stayos | marketplace == everything
-        assert not (stayos & marketplace), "an entry is scheduled by both beats"
+        assert staysuite | marketplace == everything
+        assert not (staysuite & marketplace), "an entry is scheduled by both beats"
 
-    def test_the_stayos_compose_actually_runs_a_beat(self):
+    def test_the_staysuite_compose_actually_runs_a_beat(self):
         """
         The half that is not Python. A schedule nothing executes is what this
         whole class is about, so the compose file is read rather than trusted.
@@ -249,17 +249,17 @@ class TestTheBeatThatOwnsTheSweep:
         import yaml
 
         root = pathlib.Path(__file__).resolve().parent.parent
-        compose = yaml.safe_load((root / "docker-compose.stayos.yml").read_text())
+        compose = yaml.safe_load((root / "docker-compose.staysuite.yml").read_text())
         services = compose["services"]
 
         assert "beat" in services, (
-            "the StayOS stack has no beat service, so nothing fires the "
+            "the StaySuite stack has no beat service, so nothing fires the "
             "waiting-guest sweep and a waiting guest reaches nobody"
         )
         beat = services["beat"]
         assert "beat" in beat["command"]
-        assert "CELERY_BEAT_ROLE=stayos" in beat["environment"], (
-            "the StayOS beat is not scoped, so it would also run "
+        assert "CELERY_BEAT_ROLE=staysuite" in beat["environment"], (
+            "the StaySuite beat is not scoped, so it would also run "
             "revert_intro_commission against a hotel database"
         )
         # Same broker as the worker that has to receive the task.

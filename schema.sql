@@ -1,4 +1,4 @@
--- TravBuddy — single source of truth
+-- Safar — single source of truth
 -- Run this on a fresh Supabase project to recreate the full schema.
 
 -- ============================================================

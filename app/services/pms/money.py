@@ -1,7 +1,7 @@
 """
 What a stay costs, what has been paid, and what is still owed — computed once.
 
-Every surface in StayOS quotes money at a guest or at a hotelier: the Instagram
+Every surface in StaySuite quotes money at a guest or at a hotelier: the Instagram
 agent, the booking confirmation, the receipt, `/b/{token}`, the check-in page,
 the inbox session panel and the partner dashboard's reservation list. Before
 this module there were **four** different answers to "what is the balance", and

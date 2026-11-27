@@ -176,21 +176,21 @@ class TestItIsActuallyScheduled:
     sweep sat in a schedule that no running beat owned, for four months.
     """
 
-    def test_it_is_on_the_stayos_beat(self, monkeypatch):
-        monkeypatch.setenv("CELERY_BEAT_ROLE", "stayos")
+    def test_it_is_on_the_staysuite_beat(self, monkeypatch):
+        monkeypatch.setenv("CELERY_BEAT_ROLE", "staysuite")
         import importlib
 
         from app.workers import celery_app as module
 
         importlib.reload(module)
         schedule = module._beat_schedule()
-        assert "stayos-inventory-drift" in schedule
-        assert schedule["stayos-inventory-drift"]["task"] == \
-            "travbuddy.pms.reconcile_inventory"
+        assert "staysuite-inventory-drift" in schedule
+        assert schedule["staysuite-inventory-drift"]["task"] == \
+            "safar.pms.reconcile_inventory"
 
     def test_and_the_task_it_names_exists(self):
         from app.workers.celery_app import celery_app
 
-        importlib_task = "travbuddy.pms.reconcile_inventory"
+        importlib_task = "safar.pms.reconcile_inventory"
         assert importlib_task in celery_app.tasks, (
             "beat would fire this name into the void")

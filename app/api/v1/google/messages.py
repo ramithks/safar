@@ -100,7 +100,7 @@ _MESSAGES: dict[str, HumanError] = {
         action="connect",
     ),
     "already_claimed": HumanError(
-        "That Google listing is already connected to another hotel on StayOS. Disconnect it "
+        "That Google listing is already connected to another hotel on StaySuite. Disconnect it "
         "there first, or pick a different listing.",
         actionable=True,
         action="choose",
@@ -108,12 +108,12 @@ _MESSAGES: dict[str, HumanError] = {
 
     # ── ours, not theirs ─────────────────────────────────────────────────
     "not_configured": HumanError(
-        "Google Business Profile isn't switched on for StayOS yet. We're working on it — "
+        "Google Business Profile isn't switched on for StaySuite yet. We're working on it — "
         "nothing for you to do.",
         actionable=False,
     ),
     "not_approved": HumanError(
-        "Reviews and posts aren't available yet while Google finishes approving StayOS. "
+        "Reviews and posts aren't available yet while Google finishes approving StaySuite. "
         "Your profile is connected and everything else keeps working.",
         actionable=False,
     ),

@@ -2,7 +2,7 @@
 """
 Move a marketplace partner onto the hotel OS, with a year on the house.
 
-    travbuddy.in (uabxtdhxbamuhthxnhid)          partner.travbuddy.in (rdlozq…)
+    safar.example.com (uabxtdhxbamuhthxnhid)          partner.safar.example.com (rdlozq…)
     ──────────────────────────────────          ──────────────────────────────
     partners                          ──────►   partners
     partner_listings (kind='hotel')   ──────►   properties
@@ -35,7 +35,7 @@ review.
 printed for each one. Sending those is a decision about contacting real
 customers, and it belongs to a person, not to this script.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/migrate_partners.py              # dry run, all eligible
     ./venv/bin/python scripts/migrate_partners.py --slug hotel-lotus
@@ -477,7 +477,7 @@ def invite_link(email: str) -> str | None:
     admin = {"apikey": SERVICE_KEY, "Authorization": f"Bearer {SERVICE_KEY}"}
     st, d = http(f"{HOTEL_OS_URL}/auth/v1/admin/generate_link", "POST",
                  {"type": "recovery", "email": email,
-                  "redirect_to": "https://partner.travbuddy.in/"}, admin)
+                  "redirect_to": "https://partner.safar.example.com/"}, admin)
     if st in (200, 201) and isinstance(d, dict):
         return d.get("action_link") or (d.get("properties") or {}).get("action_link")
     return None
@@ -735,7 +735,7 @@ def describe(plan: dict, *, apply: bool) -> str:
     # The earlier version of this line printed the URL flat, which read as "this
     # exists now". It does not, until the owner opens Website in the PWA and
     # presses Publish — one click, and the slug below is the one they get.
-    print(f"     Booking page          partner.travbuddy.in/stay/{plan['slug']}"
+    print(f"     Booking page          partner.safar.example.com/stay/{plan['slug']}"
           "  — reserved; live once the owner publishes it (PWA → Website)")
 
     history = plan.get("history") or {}
@@ -759,7 +759,7 @@ def describe(plan: dict, *, apply: bool) -> str:
 
     print(f"\n     Rooms                 {len(plan['rooms'])}")
     print(f"     Rates                 {sum(1 for r in plan['rooms'] if r['sellable'])} sellable")
-    print(f"     StayOS billing        {'CREATED' if apply else 'would be created'}")
+    print(f"     StaySuite billing        {'CREATED' if apply else 'would be created'}")
     print(f"     Free entitlement      {plan['free_until'].replace(year=plan['free_until'].year - 1)}"
           f" → {plan['free_until']}  ({plan['credits']:,} AI credits)")
     print(f"     Warnings              " + (warnings[0] if warnings else "None"))
@@ -821,7 +821,7 @@ def main() -> int:
     else:
         print("""
 Accounts exist and each has an invite link above. **No email has been sent.**
-Those links let someone set a password on partner.travbuddy.in; sending them is
+Those links let someone set a password on partner.safar.example.com; sending them is
 a decision about contacting real customers and it is yours to make.
 """)
     return 0

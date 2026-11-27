@@ -1,4 +1,4 @@
-# TravBuddy Persistence Architecture v3 — Trip State / Search Store / AI Retrieval
+# Safar Persistence Architecture v3 — Trip State / Search Store / AI Retrieval
 
 **Status:** design · **Supersedes:** the single-blob `trip_states.state` model
 **Grounded in:** `app/trip_state/{models,store,patch,generator,graph,copilot,agent}.py`,

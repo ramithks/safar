@@ -50,6 +50,27 @@ class Settings(BaseSettings):
     vertex_model_brain: str = "gemini-2.5-flash"
     vertex_model_muscle: str = "gemini-2.5-flash-lite"
 
+    # ── Free LLM backend (OpenRouter-compatible) ─────────────────────────────
+    # "vertex" keeps the original Google Vertex AI transport. "openrouter"
+    # routes every LLM call (both tiers, JSON extraction, agent turns, and the
+    # reel-vision pipeline) through any OpenAI-compatible API — configured here
+    # for OpenRouter's free models, so the whole app runs at Rs 0 with no GCP
+    # project or service account. Free models are rate-limited shared pools;
+    # app/services/freellm.py rotates through the fallback list on 429s.
+    llm_backend: str = "vertex"
+    openrouter_api_key: Optional[str] = None
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_model_brain: str = "google/gemma-4-31b-it:free"
+    openrouter_model_muscle: str = "google/gemma-4-26b-a4b-it:free"
+    openrouter_model_vision: str = "google/gemma-4-31b-it:free"
+    openrouter_fallback_models: str = (
+        "nvidia/nemotron-3.5-super-vl:free,inclusionai/ling-3.2-flash:free,"
+        "nvidia/nemotron-3.5-lightning:free,openrouter/free"
+    )
+
+    # Branding — surfaced in the API title, UI and outbound request headers.
+    app_brand_name: str = "Safar"
+
     # Embeddings for the recommendation engine (docs/recommendation_engine.md).
     # 384-dim is deliberate: ~4k hotels, not 100M docs — half the RAM/index, no
     # measurable recall loss at this scale.
@@ -71,7 +92,7 @@ class Settings(BaseSettings):
     # (`rdlozqvuywtgsodunait` against `uabxtdhxbamuhthxnhid`) and `get_db()`
     # builds one client from one `SUPABASE_URL`. A marketplace deployment with
     # these routes mounted answers 500 to every one of them, because the tables
-    # are not there — so StayOS is its own deployment of this codebase with
+    # are not there — so StaySuite is its own deployment of this codebase with
     # `.env.hotelos`, and the marketplace stays correct without anybody having
     # to remember to switch something off.
     enable_hotel_os: bool = False
@@ -282,13 +303,13 @@ class Settings(BaseSettings):
     # production rather than derived from the request, because deriving it from
     # a proxied Host header is how an open redirect gets built by accident.
     #
-    # ⚠ Moved with the rename to `api.hostos.in`. Meta will not accept the new
+    # ⚠ Moved with the rename to `api.staysuite.example.com`. Meta will not accept the new
     # string until it is added to the app's Redirect URL list in the Meta
     # console — the default changing here does not change what Meta compares
     # against, and a mismatch fails the callback, not the consent screen, so it
     # looks like the hotel refused.
     instagram_redirect_uri: str = (
-        "https://api.hostos.in/api/v1/messaging/instagram/oauth/callback"
+        "https://api.staysuite.example.com/api/v1/messaging/instagram/oauth/callback"
     )
 
     # ── Meta ads ─────────────────────────────────────────────────────────────
@@ -329,7 +350,7 @@ class Settings(BaseSettings):
 
     # Where the owner lands when the connection succeeds or fails. The callback
     # appends ?instagram=connected or ?instagram=error&reason=…
-    pms_app_url: str = "https://app.hostos.in"
+    pms_app_url: str = "https://app.staysuite.example.com"
 
     # How long a signed OAuth `state` stays valid. It is a CSRF token and a
     # round trip through Meta's consent screen, so minutes, not hours.
@@ -342,7 +363,7 @@ class Settings(BaseSettings):
 
     # ── Google Business Profile ─────────────────────────────────────────────
     #
-    # **Off, and off is the launch decision rather than an accident.** StayOS
+    # **Off, and off is the launch decision rather than an accident.** StaySuite
     # launches on two channels a hotel can switch on by itself today — its own
     # website and Instagram. Google is written, tested and dormant: it needs a
     # Cloud OAuth client and an approved Google access request before reviews
@@ -369,7 +390,7 @@ class Settings(BaseSettings):
     # redirect URIs" in the Google console before this deploys, or the callback
     # is rejected with `redirect_uri_mismatch`.
     google_oauth_redirect_uri: str = (
-        "https://api.hostos.in/api/v1/google/oauth/callback"
+        "https://api.staysuite.example.com/api/v1/google/oauth/callback"
     )
 
     # One scope, and it is the only one Business Profile publishes. There is no
@@ -435,7 +456,7 @@ class Settings(BaseSettings):
     max_locations: int = 20
 
     # Cache
-    places_cache_dir: str = "/tmp/travbuddy/places_cache"
+    places_cache_dir: str = "/tmp/safar/places_cache"
     places_cache_ttl_seconds: int = 604800  # 7 days
 
     # Job queue — and the Celery broker, and the rate limiter's storage, and
@@ -453,7 +474,7 @@ class Settings(BaseSettings):
     # holding this default. See `redis_target()` for the redacted form used in
     # logs and health output.
     # The two deployments share a Redis server and must not share a namespace:
-    # the marketplace is on database 0, StayOS on 1. That is belt to the queue
+    # the marketplace is on database 0, StaySuite on 1. That is belt to the queue
     # routing's braces (`workers/celery_app.py`) — routing is what stops a task
     # crossing over; separate databases keep result keys and locks apart too.
     redis_url: str = "redis://localhost:6379/0"
@@ -475,7 +496,7 @@ class Settings(BaseSettings):
     # Bulk Explore Seeder — shared secret for POST /api/v1/bulk-generate-explore
     bulk_explore_api_key: Optional[str] = None
 
-    # Internal admin API (travbuddy_dashboard) — shared passcode sent as
+    # Internal admin API (safar_dashboard) — shared passcode sent as
     # X-Admin-Passcode. Unset means every /api/v1/admin/* route 503s, so a
     # missing env var fails closed instead of opening the admin surface.
     admin_api_passcode: Optional[str] = None
@@ -483,8 +504,8 @@ class Settings(BaseSettings):
     # Transactional email (Resend). Admin-triggered mail (approve/reject) is
     # sent from here; traveller/partner mail from the website. No key = no-op.
     resend_api_key: Optional[str] = None
-    resend_from: str = "TravBuddy <hello@travbuddy.in>"
-    site_url: str = "https://travbuddy.in"
+    resend_from: str = "Safar <hello@safar.example.com>"
+    site_url: str = "https://safar.example.com"
 
     # Shared with the website's /api/revalidate route. Unset means the SEO ping
     # is skipped, which is the right default for a development box and for any
@@ -508,9 +529,9 @@ class Settings(BaseSettings):
     # APP_ENV unset, so an env-name check would have left it exposed.
     expose_api_docs: bool = False
     log_level: str = "INFO"
-    temp_dir: str = "/tmp/travbuddy"
+    temp_dir: str = "/tmp/safar"
 
-    # Sentry — error tracking (project: travbuddy_backend, id: 4511325237346304)
+    # Sentry — error tracking (project: safar_backend, id: 4511325237346304)
     sentry_dsn: Optional[str] = None
     sentry_traces_sample_rate: float = 0.1
     sentry_profiles_sample_rate: float = 0.1

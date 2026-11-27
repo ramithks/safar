@@ -13,7 +13,7 @@ AM" fails, and so does a fluent paragraph that never says a time. The failure
 this exists to catch is the one that looks fine in a screenshot — an assistant
 that sounds like a hotel and is quietly making the answers up.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/ai_employee_check.py
 

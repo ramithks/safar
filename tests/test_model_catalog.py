@@ -2,7 +2,7 @@
 Where a model lives, what it costs to think, and what a 404 actually means.
 
 Every fact asserted here was measured against real Vertex on project
-travbuddy-499007 before it was written down — the catalogue is a record of
+safar-499007 before it was written down — the catalogue is a record of
 `generateContent` calls, not of documentation. The tests exist because the
 failure mode is silent and expensive: a model asked for in a location that does
 not serve it returns `404`, which is character-for-character what a model

@@ -14,7 +14,7 @@ public projection then dropped.
 So this asserts the only thing that matters to a hotelier, which is that the
 photograph they uploaded on Tuesday is on the page a guest opens on Wednesday.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010 &
     ./venv/bin/python scripts/website_roundtrip_e2e.py
@@ -43,22 +43,22 @@ SB = f"https://{REF}.supabase.co"
 # Local by default, so `uvicorn --port 8010 &` and run it. Point it at the
 # deployed backend to verify a release actually serves what it was given:
 #
-#     STAYOS_API=https://api.hostos.in/api/v1/pms \
+#     STAYSUITE_API=https://api.staysuite.example.com/api/v1/pms \
 #       ./venv/bin/python scripts/website_roundtrip_e2e.py
 #
 # The distinction matters more here than in most suites. Every failure this
 # script is for lives in the join between a save and a publish, and a local
 # process reading the production database proves the code is right without
 # proving the box is running it.
-API = os.environ.get("STAYOS_API", "http://127.0.0.1:8010/api/v1/pms")
+API = os.environ.get("STAYSUITE_API", "http://127.0.0.1:8010/api/v1/pms")
 PROP = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 SLUG = "casa-mandala-anjuna"
 
 # Two photographs the hotel is supposed to own. Distinctive enough that finding
 # them on the public page cannot be a coincidence with a seeded fixture.
-COVER = "https://images.stayos.test/roundtrip/cover-veranda.jpg"
-GALLERY_ONE = "https://images.stayos.test/roundtrip/pool-at-dusk.jpg"
-GALLERY_TWO = "https://images.stayos.test/roundtrip/breakfast-terrace.jpg"
+COVER = "https://images.staysuite.test/roundtrip/cover-veranda.jpg"
+GALLERY_ONE = "https://images.staysuite.test/roundtrip/pool-at-dusk.jpg"
+GALLERY_TWO = "https://images.staysuite.test/roundtrip/breakfast-terrace.jpg"
 
 PASS = FAIL = 0
 
@@ -142,7 +142,7 @@ def photos_in(payload) -> list[str]:
 
     def walk(value):
         if isinstance(value, str):
-            if value.startswith("http") and "stayos.test" in value:
+            if value.startswith("http") and "staysuite.test" in value:
                 found.append(value)
         elif isinstance(value, dict):
             for item in value.values():
@@ -244,7 +244,7 @@ def main() -> int:
         # `WebsiteUpdateRequest` and `settings.website_strict_fields`.
         st_extra, extra = http(
             f"{API}/properties/{PROP}/website", "PATCH",
-            {"cover_image": "https://images.stayos.test/roundtrip/ignored.jpg",
+            {"cover_image": "https://images.staysuite.test/roundtrip/ignored.jpg",
              "tagline": "Rooms around a courtyard"},
             headers=manager,
         )

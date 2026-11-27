@@ -25,7 +25,7 @@ not have:
   * **the credit line holding under concurrency** — two quotes at once when only
     one fits, and the money released when a quote is refused or expires
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010
     ./venv/bin/python scripts/b2b_e2e.py

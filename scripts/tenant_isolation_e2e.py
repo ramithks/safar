@@ -25,11 +25,11 @@ Reads only. Nothing here writes anything that succeeds — that is the point.
 """
 import base64, json, os, subprocess, urllib.error, urllib.request
 
-# Which StayOS to test. Defaults to the uvicorn this suite's docstring tells
-# you to start; set STAYOS_API_BASE=https://api.hostos.in to run
+# Which StaySuite to test. Defaults to the uvicorn this suite's docstring tells
+# you to start; set STAYSUITE_API_BASE=https://api.staysuite.example.com to run
 # the same assertions against the deployed one, which is the only way to find
 # out whether what is live behaves like what is on this branch.
-API = os.environ.get("STAYOS_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1"
+API = os.environ.get("STAYSUITE_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1"
 REF = "rdlozqvuywtgsodunait"
 SB = f"https://{REF}.supabase.co/auth/v1"
 ANANDI = "47f4cbf8-7cad-4369-a4c9-a4a70a0c29c0"

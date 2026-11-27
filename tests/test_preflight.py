@@ -1,10 +1,10 @@
 """
 A degradation nobody is told about lasts a day.
 
-That is not hypothetical. `REVALIDATE_SECRET` was never set on the StayOS
+That is not hypothetical. `REVALIDATE_SECRET` was never set on the StaySuite
 backend. `seo_ping.hotel_changed` handled it exactly right — skip, log at
 `debug`, never fail a hotelier's publish — and so every hotel that published sat
-stale on travbuddy.in with nothing anywhere saying why. It was found by noticing
+stale on safar.example.com with nothing anywhere saying why. It was found by noticing
 that a re-publish moved the backend's `updatedAt` and not the website's sitemap.
 
 The behaviour was right. The volume was wrong. These tests are about the volume.

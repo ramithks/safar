@@ -163,18 +163,18 @@ result_test.json
 result_gold.json
 scraper_health.json
 
-# Hotel-OS database (Supabase project rdlozqvuywtgsodunait) and the StayOS
+# Hotel-OS database (Supabase project rdlozqvuywtgsodunait) and the StaySuite
 # deployment's environment. Real service-role credentials, the Vertex service
 # account and the Razorpay secret — none of it may ever reach the repo.
 #
 # `.env.hotelos`         local development
-# `.env.stayos.coolify`  the same variables with production values, for pasting
-#                        into the StayOS Coolify service — see DEPLOYING_STAYOS.md
+# `.env.staysuite.coolify`  the same variables with production values, for pasting
+#                        into the StaySuite Coolify service — see DEPLOYING_STAYSUITE.md
 #
 # The glob covers both plus any .bak a regeneration leaves behind. A stale
 # backup holds a live service key just as surely as the file it copied.
 .env.hotelos*
-.env.stayos*
+.env.staysuite*
 backups/
 
 # Evaluation output. A run's raw turns are evidence for the run that produced

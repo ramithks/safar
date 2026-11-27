@@ -17,12 +17,12 @@ not theirs is an enumeration oracle over every hotel on the platform, and the
 API refuses to distinguish the two on purpose. A 403 anywhere below is a
 finding, not a pass.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010
     ./venv/bin/python scripts/tenant_security_e2e.py
 
-⚠ Creates one auth user at `@tenant.stayos.test` and the hotel it owns, and
+⚠ Creates one auth user at `@tenant.staysuite.test` and the hotel it owns, and
 sweeps both at each end.
 """
 import base64
@@ -37,13 +37,13 @@ from datetime import date, timedelta
 
 REF = "rdlozqvuywtgsodunait"
 SB = f"https://{REF}.supabase.co"
-API = os.environ.get("STAYOS_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
+API = os.environ.get("STAYSUITE_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
 
 # Casa Mandala — a real hotel under a partner this script never joins.
 OTHER = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 
 TAG = uuid.uuid4().hex[:8]
-EMAIL = f"owner-{TAG}@tenant.stayos.test"
+EMAIL = f"owner-{TAG}@tenant.staysuite.test"
 PASSWORD = "TenantTest!2026"
 
 passed = failed = 0
@@ -102,7 +102,7 @@ ANON = [k["api_key"] for k in _keys if k.get("name") == "anon"][0]
 _OURS = ("select p.id from public.properties p "
          "join public.partners pt on pt.id = p.partner_id "
          "join auth.users u on u.id = pt.owner_id "
-         "where u.email like '%@tenant.stayos.test'")
+         "where u.email like '%@tenant.staysuite.test'")
 
 
 def sweep():
@@ -114,8 +114,8 @@ delete from public.agent_configs c using public.agents a
  where c.agent_id = a.id and a.property_id in ({_OURS});
 delete from public.agents a where a.property_id in ({_OURS});
 delete from public.partners pt using auth.users u
- where pt.owner_id = u.id and u.email like '%@tenant.stayos.test';
-delete from auth.users where email like '%@tenant.stayos.test';
+ where pt.owner_id = u.id and u.email like '%@tenant.staysuite.test';
+delete from auth.users where email like '%@tenant.staysuite.test';
 """)
 
 
@@ -251,11 +251,11 @@ def main():
       insert into auth.users (id, instance_id, aud, role, email, encrypted_password,
                               email_confirmed_at, created_at, updated_at)
       values (gen_random_uuid(), '00000000-0000-0000-0000-000000000000', 'authenticated',
-              'authenticated', 'desk-{TAG}@tenant.stayos.test', '', now(), now(), now());
+              'authenticated', 'desk-{TAG}@tenant.staysuite.test', '', now(), now(), now());
       insert into public.partner_members (partner_id, profile_id, role, status)
       select p.partner_id, u.id, 'receptionist', 'active'
       from public.properties p, auth.users u
-      where p.id = '{mine}' and u.email = 'desk-{TAG}@tenant.stayos.test';
+      where p.id = '{mine}' and u.email = 'desk-{TAG}@tenant.staysuite.test';
     """)
     st, _ = http(f"{SB}/auth/v1/admin/users", headers={"apikey": ANON})
     # The receptionist has no password; the check that matters is the API's own

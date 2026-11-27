@@ -24,7 +24,7 @@ password hashes is a liability rather than an asset), the schema itself (that
 is the migrations, in git), and conversation history (large, and recoverable in
 the sense that matters — nobody bills from it).
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/backup_hotel_os.py                  # ./backups/
     ./venv/bin/python scripts/backup_hotel_os.py --out /some/dir

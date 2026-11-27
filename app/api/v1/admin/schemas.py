@@ -53,7 +53,7 @@ class PartnerLoginLinkRequest(BaseModel):
 
 
 class PartnerInviteRequest(BaseModel):
-    """Open a dashboard for a business that has no TravBuddy account yet."""
+    """Open a dashboard for a business that has no Safar account yet."""
 
     # Shape check only — pydantic's EmailStr would pull in email-validator, and
     # GoTrue is the real judge of whether an address is usable anyway.

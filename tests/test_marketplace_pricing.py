@@ -177,7 +177,7 @@ class TestQuote:
         assert q.amount_paise == 600_000
 
     def test_discount_before_commission(self):
-        # ₹2,000 gross, 10% off -> ₹1,800 charged, 5% of ₹1,800 to TravBuddy.
+        # ₹2,000 gross, 10% off -> ₹1,800 charged, 5% of ₹1,800 to Safar.
         q = p.quote(
             [200_000],
             quantity=1,

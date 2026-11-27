@@ -545,8 +545,8 @@ def _hosts_of(urls) -> set[str]:
 
 def _host_allowed(host: str, allowed: set[str]) -> bool:
     # Subdomains of an allowed host pass; a host that merely *ends with* the
-    # string does not. "evil-travbuddy.in" must not be let through by
-    # "travbuddy.in", which a bare `endswith` would do.
+    # string does not. "evil-safar.example.com" must not be let through by
+    # "safar.example.com", which a bare `endswith` would do.
     return any(host == a or host.endswith(f".{a}") for a in allowed)
 
 

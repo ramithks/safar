@@ -113,7 +113,7 @@ async def _recommend(
             "pricey versus the rest.\n\n"
         )
     prompt = (
-        f"You are TravBuddy's travel booking assistant. {intro}\n\n"
+        f"You are Safar's travel booking assistant. {intro}\n\n"
         f"Trip context: {json.dumps(context, ensure_ascii=False)}\n\n"
         + (f"What we know about this traveller (personalise the pick + the reason, "
            f"but never override the trip's explicit constraints): {traveller}\n\n"

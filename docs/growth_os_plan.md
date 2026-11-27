@@ -1,4 +1,4 @@
-# TravBuddy Growth OS — Workspace Polish, Community/Referral, SEO Scale
+# Safar Growth OS — Workspace Polish, Community/Referral, SEO Scale
 
 *Written 2026-07-16. Companion to `docs/trip_engine_architecture.md` (engine v4,
 shipped). This plan covers the product/growth layer: workspace UX, the

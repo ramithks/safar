@@ -1,5 +1,5 @@
 ================================================================
-  TRAVBUDDY BACKEND
+  SAFAR BACKEND
 ================================================================
 
 A FastAPI backend for AI-powered trip planning and Instagram

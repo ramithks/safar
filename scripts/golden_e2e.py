@@ -15,7 +15,7 @@ working from "do you have a room" to "here's your bill".
 So it runs in order, and a step that fails does not stop the ones after it —
 the point is a map of where the journey breaks, not the first place it breaks.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010
     ./venv/bin/python scripts/golden_e2e.py
@@ -37,11 +37,11 @@ from datetime import date, timedelta
 
 REF = "rdlozqvuywtgsodunait"
 SB = f"https://{REF}.supabase.co"
-# Which StayOS to test. Defaults to the uvicorn each suite's docstring tells
-# you to start; set STAYOS_API_BASE=https://api.hostos.in to run
+# Which StaySuite to test. Defaults to the uvicorn each suite's docstring tells
+# you to start; set STAYSUITE_API_BASE=https://api.staysuite.example.com to run
 # the same assertions against the deployed one, which is the only way to find
 # out whether what is live behaves like what is on this branch.
-API = os.environ.get("STAYOS_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
+API = os.environ.get("STAYSUITE_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
 
 HOTEL_SLUG = "anandi-house-udaipur"
 OWNER_EMAIL = "owner@anandihouse.demo"

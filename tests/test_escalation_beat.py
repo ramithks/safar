@@ -10,11 +10,11 @@ to the `hotelos` queue.
 All of them passed, for months, while `agent_escalations` had **zero rows for
 all time**. Nothing was scheduling the task.
 
-The gap was between the links: `docker-compose.stayos.yml` had no beat service,
+The gap was between the links: `docker-compose.staysuite.yml` had no beat service,
 deliberately, justified by a comment saying every entry in `beat_schedule` was a
 marketplace task — true when written, false the day the sweep was added. And
 even if a beat had existed, the marketplace one enqueues onto the marketplace
-broker while the StayOS worker listens to StayOS's own Redis, so the two would
+broker while the StaySuite worker listens to StaySuite's own Redis, so the two would
 never have met.
 
 §9 is explicit about what that means for this file: *do not count "beat service
@@ -24,9 +24,9 @@ calls the Celery task body itself, and asserts a manager's phone was written to.
 
 The four links, in order:
 
-    1  the schedule contains the sweep, under the StayOS role
+    1  the schedule contains the sweep, under the StaySuite role
     2  the name in the schedule resolves to a task that is actually registered
-    3  that task routes to the queue the StayOS worker consumes
+    3  that task routes to the queue the StaySuite worker consumes
     4  running it notifies a hotel about a real waiting guest
 
 Link 2 is the one that looks like paranoia and is not: a schedule entry is a
@@ -46,9 +46,9 @@ from tests.fake_supabase import FakeDb
 PROPERTY = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 PARTNER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
-SWEEP = "travbuddy.messaging.sweep_waiting_guests"
+SWEEP = "safar.messaging.sweep_waiting_guests"
 
-COMPOSE = pathlib.Path(__file__).resolve().parent.parent / "docker-compose.stayos.yml"
+COMPOSE = pathlib.Path(__file__).resolve().parent.parent / "docker-compose.staysuite.yml"
 
 
 def run(coro):
@@ -69,24 +69,24 @@ def role(monkeypatch):
 
 # ── link 1: the schedule ────────────────────────────────────────────────────
 
-def test_a_stayos_beat_schedules_the_sweep(role):
-    schedule = role("stayos")
+def test_a_staysuite_beat_schedules_the_sweep(role):
+    schedule = role("staysuite")
     assert SWEEP in {entry["task"] for entry in schedule.values()}
 
 
-def test_a_stayos_beat_schedules_nothing_that_writes_to_a_marketplace_table(role):
+def test_a_staysuite_beat_schedules_nothing_that_writes_to_a_marketplace_table(role):
     """
     The reason the schedule is split by role rather than shared.
 
     `revert_intro_commission` writes hourly to `partners` — a table that exists
-    in both databases and means something entirely different in each. A StayOS
+    in both databases and means something entirely different in each. A StaySuite
     beat running it would rewrite hotel rows with marketplace semantics, which
     is the one outcome worse than the sweep not running at all.
     """
-    tasks = {entry["task"] for entry in role("stayos").values()}
+    tasks = {entry["task"] for entry in role("staysuite").values()}
 
     # **Asserted as a property, not as a fixed set.** This read
-    # `== {SWEEP}`, true while the sweep was the only StayOS scheduled task,
+    # `== {SWEEP}`, true while the sweep was the only StaySuite scheduled task,
     # which turned every *addition* into a failure — including the inventory
     # reconciliation, which is exactly the kind of thing that belongs here.
     #
@@ -95,8 +95,8 @@ def test_a_stayos_beat_schedules_nothing_that_writes_to_a_marketplace_table(role
     # fails on the one entry the docstring names.
     assert SWEEP in tasks
     for task in tasks:
-        assert task.startswith(("travbuddy.messaging.", "travbuddy.pms.")), (
-            f"{task} is on the StayOS beat and belongs to neither the "
+        assert task.startswith(("safar.messaging.", "safar.pms.")), (
+            f"{task} is on the StaySuite beat and belongs to neither the "
             f"messaging nor the hotel side")
     assert not any("partners" in task for task in tasks)
 
@@ -118,7 +118,7 @@ def test_an_unrecognised_role_schedules_everything_rather_than_nothing(role):
     A typo in a compose file must not silently stop every scheduled task in the
     deployment. Loud in the log, harmless in effect.
     """
-    schedule = role("stayoss")
+    schedule = role("staysuites")
     assert SWEEP in {e["task"] for e in schedule.values()}
 
 
@@ -179,9 +179,9 @@ def test_the_include_list_covers_everything_the_schedule_names():
 
 # ── link 3: the queue ───────────────────────────────────────────────────────
 
-def test_the_sweep_routes_to_the_queue_the_stayos_worker_consumes():
+def test_the_sweep_routes_to_the_queue_the_staysuite_worker_consumes():
     """
-    Routing is by prefix — `travbuddy.messaging.*` → `hotelos` — which is what
+    Routing is by prefix — `safar.messaging.*` → `hotelos` — which is what
     makes the task read the hotel database rather than the marketplace one.
     """
     routes = celery_module.celery_app.conf.task_routes
@@ -200,12 +200,12 @@ def test_the_compose_file_runs_a_beat_and_says_which_one():
     original bug and a diff that removes it should fail something.
 
     Deliberately not the whole proof — the test below is. This asserts only
-    that the deployment declares a beat, gives it the StayOS role, and points it
+    that the deployment declares a beat, gives it the StaySuite role, and points it
     at the same broker as the worker beside it. That last part is the one the
     marketplace beat got wrong.
     """
     text = COMPOSE.read_text()
-    assert "CELERY_BEAT_ROLE=stayos" in text or "CELERY_BEAT_ROLE: stayos" in text
+    assert "CELERY_BEAT_ROLE=staysuite" in text or "CELERY_BEAT_ROLE: staysuite" in text
     assert "beat" in text
     # One broker for the pair. Two Redises is precisely how the sweep was
     # enqueued somewhere nothing was listening.

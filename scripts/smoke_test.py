@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Smoke test for every TravBuddy API endpoint.
+Smoke test for every Safar API endpoint.
 
 Checks that each route is reachable and behaves as expected:
   - public routes return 200
@@ -28,7 +28,7 @@ import sys
 import urllib.error
 import urllib.request
 
-DEFAULT_BASE = "https://backend.travbuddy.in"
+DEFAULT_BASE = "https://backend.safar.example.com"
 
 # Placeholder IDs: valid-looking UUIDs that won't exist in the DB.
 # A 404 whose body is NOT FastAPI's bare {"detail": "Not Found"} means the
@@ -177,7 +177,7 @@ def evaluate(expects: str, status: int, body: bytes, has_token: bool) -> tuple[b
 
 
 def main():
-    ap = argparse.ArgumentParser(description="TravBuddy API smoke test")
+    ap = argparse.ArgumentParser(description="Safar API smoke test")
     ap.add_argument("--base", default=os.environ.get("BASE_URL", DEFAULT_BASE))
     ap.add_argument("--timeout", type=int, default=30)
     args = ap.parse_args()

@@ -1,12 +1,12 @@
 """
-TravBuddy group-trip authoring.
+Safar group-trip authoring.
 
-Until now TravBuddy's own trips were hand-written JSON in the Supabase table
+Until now Safar's own trips were hand-written JSON in the Supabase table
 editor while partners got a real editor — the one remaining place where the
 "same table, same template" promise wasn't matched by the tooling.
 
 These endpoints create and edit rows with `partner_id = NULL`, which is what
-makes a trip TravBuddy's. Everything else — the content contract, the public
+makes a trip Safar's. Everything else — the content contract, the public
 template, the booking path — is identical to a partner's package, so the only
 difference a traveller ever sees stays the "Organised by" line.
 
@@ -64,7 +64,7 @@ def publish_gaps(row: dict) -> list[PublishGap]:
     """
     What's still missing before this can go live.
 
-    Mirrors `tripPublishGaps()` on the website so a TravBuddy trip is held to
+    Mirrors `tripPublishGaps()` on the website so a Safar trip is held to
     exactly the bar a partner's is. A traveller pays upfront for a fixed
     departure, so the date, seats, day plan and inclusions are all required.
     """
@@ -188,10 +188,10 @@ def _to_model(row: dict) -> AdminTrip:
         content=row.get("content") or {}, status=row.get("status") or "draft",
         booking_mode=row.get("booking_mode") or "whatsapp",
         partner_id=row.get("partner_id"),
-        is_travbuddy=row.get("partner_id") is None,
+        is_safar=row.get("partner_id") is None,
         views=row.get("views") or 0, leads=row.get("leads") or 0,
         updated_at=row.get("updated_at") or "",
-        public_url=f"https://travbuddy.in/trips/{row['slug']}",
+        public_url=f"https://safar.example.com/trips/{row['slug']}",
         gaps=publish_gaps(row),
     )
 
@@ -213,7 +213,7 @@ async def list_trips(
     request: Request,
     _admin: AdminIdentity = Depends(require_admin),
 ) -> list[AdminTrip]:
-    """Every trip — TravBuddy's and partners' — since they share one table."""
+    """Every trip — Safar's and partners' — since they share one table."""
     res = await run_db(
         lambda: get_db().table("group_trips").select("*")
         .order("updated_at", desc=True).limit(300).execute()
@@ -241,7 +241,7 @@ async def create_trip(
     admin: AdminIdentity = Depends(require_admin),
 ) -> TripSaved:
     """
-    Create a TravBuddy trip.
+    Create a Safar trip.
 
     `partner_id` stays NULL — that's what makes it ours. Always starts as a
     draft: publishing is a separate, deliberate act.
@@ -352,7 +352,7 @@ async def publish_trip(
     admin: AdminIdentity = Depends(require_admin),
 ) -> TripSaved:
     """
-    Take a TravBuddy trip live, or pull it back to a draft.
+    Take a Safar trip live, or pull it back to a draft.
 
     No review queue: it's our own trip and an admin is already the reviewer.
     The publish bar still applies — the same one partners face.
@@ -391,7 +391,7 @@ async def publish_trip(
     )
     await emit(action, {
         "actor": admin.actor, "entity_id": trip_id, "entity_label": row.get("title"),
-        "public_url": f"https://travbuddy.in/trips/{row.get('slug')}",
+        "public_url": f"https://safar.example.com/trips/{row.get('slug')}",
     })
 
     return TripSaved(

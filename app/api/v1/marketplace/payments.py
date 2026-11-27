@@ -421,7 +421,7 @@ async def _price_booking(body, listing: dict, coupon: dict | None) -> tuple[pric
         listing.get("partner_id"),
         # A NULL partner_id is what makes a trip OURS (see admin/trips.py), and
         # ours are stamped 0 — there is nobody to take a cut from. Falling
-        # through to the kind's 10% here would have TravBuddy invoicing itself.
+        # through to the kind's 10% here would have Safar invoicing itself.
         fallback=(
             float(listing["commission_pct"])
             if listing.get("commission_pct") is not None
@@ -1045,7 +1045,7 @@ async def start_subscription(
     # than from the standard price — a ₹299/month partner reading "₹499/year" on
     # the Razorpay sheet is a support ticket at best.
     blurb = (
-        f"TravBuddy plan — ₹{amount_paise // 100:,}/"
+        f"Safar plan — ₹{amount_paise // 100:,}/"
         f"{'month' if period == 'monthly' else 'year'}, cancel anytime"
     )
     if coupon and not deal:
@@ -1053,7 +1053,7 @@ async def start_subscription(
     elif deal:
         # A deal code IS the price, so "X, then ₹299/month" would be nonsense.
         # Its own description already carries the commission half of the deal.
-        blurb = f"TravBuddy plan — {plan_coupons.describe(coupon)}, cancel anytime"
+        blurb = f"Safar plan — {plan_coupons.describe(coupon)}, cancel anytime"
 
     return SubscribeResponse(
         ok=True,
@@ -1062,7 +1062,7 @@ async def start_subscription(
         period=period,
         currency="INR",
         key_id=razorpay.public_key_id(),
-        name="TravBuddy",
+        name="Safar",
         description=blurb,
         prefill={
             "name": partner.get("brand_name") or "",
@@ -1155,7 +1155,7 @@ async def _ensure_plan(amount_paise: int = STAY_PLAN_YEARLY_PAISE, period: str =
     rupees = amount_paise // 100
     plan = await razorpay.create_plan(
         amount_paise=amount_paise,
-        name=f"TravBuddy plan (₹{rupees}/{'month' if period == 'monthly' else 'year'})",
+        name=f"Safar plan (₹{rupees}/{'month' if period == 'monthly' else 'year'})",
         period=period,
     )
     await run_db(

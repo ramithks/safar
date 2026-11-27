@@ -6,7 +6,7 @@
     a tone          ─┘                          │
                                                 └─► refused, original kept
 
-**The model may rephrase. It may not add.** Everything else on a HostOS website
+**The model may rephrase. It may not add.** Everything else on a StaySuite website
 is composed from columns by `website_compose`, with no model anywhere in the
 path, because an invented amenity is a promise the hotel has to keep and has no
 digit in it for `claims.py` to catch. This module is the single exception, and

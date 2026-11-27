@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-A hotel points its own address at StayOS.
+A hotel points its own address at StaySuite.
 
     claim ──► two DNS records ──► check ──► still pending ──► verified
                                                                 │
@@ -130,7 +130,7 @@ def main():
 
     section("what may not be claimed")
     for bad, why in [
-        ("partner.travbuddy.in", "a TravBuddy host"),
+        ("partner.safar.example.com", "a Safar host"),
         ("not-a-domain", "not a hostname"),
         ("", "empty"),
         ("http://", "a scheme and nothing else"),
@@ -149,9 +149,9 @@ def main():
     records = {r["type"]: r for r in (d or {}).get("records") or []}
     check("two records are handed over", set(records) == {"TXT", "CNAME"}, list(records))
     check("the TXT record proves ownership",
-          records.get("TXT", {}).get("name") == f"_travbuddy.{TEST_DOMAIN}")
+          records.get("TXT", {}).get("name") == f"_safar.{TEST_DOMAIN}")
     check("its value is something we generated",
-          str(records.get("TXT", {}).get("value", "")).startswith("travbuddy-verify="))
+          str(records.get("TXT", {}).get("value", "")).startswith("safar-verify="))
     check("neither is in DNS yet", not any(r["found"] for r in records.values()))
     token = records["TXT"]["value"]
 
@@ -220,7 +220,7 @@ def main():
     st, _ = http(f"{API}/pms/public/sites/by-host?host={TEST_DOMAIN}")
     check("and stops resolving immediately", st == 404, st)
     st, d = http(f"{API}/pms/public/hotels/{SLUG}")
-    check("the TravBuddy address never stopped working", st == 200, st)
+    check("the Safar address never stopped working", st == 200, st)
 
     cleanup()
     print(f"\n══ {PASS} passed, {FAIL} failed ══")

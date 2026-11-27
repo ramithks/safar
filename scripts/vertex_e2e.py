@@ -14,7 +14,7 @@ and a CI job that fails because Google is having an afternoon is a CI job people
 learn to ignore. `scripts/ai_e2e.py` and `scripts/whatsapp_e2e.py` stay
 deterministic and stay in the gates; this runs when somebody asks it to.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a      # .env is read by pydantic for Vertex
     ./venv/bin/python scripts/vertex_e2e.py
 
@@ -119,7 +119,7 @@ except Exception as exc:  # noqa: BLE001
 
 if not reachable:
     print("\n  This suite needs Vertex. Nothing was asserted.")
-    print("  Check GOOGLE_SERVICE_ACCOUNT_JSON / GCP_PROJECT in travbuddy_backend/.env,")
+    print("  Check GOOGLE_SERVICE_ACCOUNT_JSON / GCP_PROJECT in safar_backend/.env,")
     print(f"  and that {settings.hotel_model_conversation} is enabled for the project.")
     sys.exit(2)
 

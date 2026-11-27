@@ -23,12 +23,12 @@ works and says nothing about whether a hotelier can reach it.
 can read is worse than no floor; a rule scoped to somebody else's rate plan is
 one that silently never fires. Both are asserted.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010
     ./venv/bin/python scripts/hotel_os_e2e.py
 
-⚠ Creates one auth user at `@hotelos.stayos.test` and the hotel it owns, and
+⚠ Creates one auth user at `@hotelos.staysuite.test` and the hotel it owns, and
 sweeps both at each end. Nothing outside that namespace is touched.
 """
 import base64
@@ -43,14 +43,14 @@ from datetime import date, timedelta
 
 REF = "rdlozqvuywtgsodunait"
 SB = f"https://{REF}.supabase.co"
-API = os.environ.get("STAYOS_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
+API = os.environ.get("STAYSUITE_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
 
 # Casa Mandala — a real property under a different partner. The cross-tenant
 # negative, reused from onboarding_e2e so both suites point at the same hotel.
 OTHER_PROPERTY = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 
 TAG = uuid.uuid4().hex[:8]
-EMAIL = f"owner-{TAG}@hotelos.stayos.test"
+EMAIL = f"owner-{TAG}@hotelos.staysuite.test"
 PASSWORD = "HotelOwner!2026"
 HOTEL = f"Neelkanth Haveli {TAG[:4].upper()}"
 
@@ -110,7 +110,7 @@ ANON = [k["api_key"] for k in _keys if k.get("name") == "anon"][0]
 _OURS = ("select p.id from public.properties p "
          "join public.partners pt on pt.id = p.partner_id "
          "join auth.users u on u.id = pt.owner_id "
-         "where u.email like '%@hotelos.stayos.test'")
+         "where u.email like '%@hotelos.staysuite.test'")
 
 
 def sweep():
@@ -131,8 +131,8 @@ delete from public.agent_configs c using public.agents a
  where c.agent_id = a.id and a.property_id in ({_OURS});
 delete from public.agents a where a.property_id in ({_OURS});
 delete from public.partners pt using auth.users u
- where pt.owner_id = u.id and u.email like '%@hotelos.stayos.test';
-delete from auth.users where email like '%@hotelos.stayos.test';
+ where pt.owner_id = u.id and u.email like '%@hotelos.staysuite.test';
+delete from auth.users where email like '%@hotelos.staysuite.test';
 """)
 
 

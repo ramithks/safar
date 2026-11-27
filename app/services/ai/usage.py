@@ -41,7 +41,7 @@ class TurnUsage:
 
     **Two things, kept apart on purpose.**
 
-    `tokens_*` and `model` are what the *provider* charged TravBuddy. They are a
+    `tokens_*` and `model` are what the *provider* charged Safar. They are a
     cost, they are denominated in a vendor's units, and they change when Google
     changes a price list.
 

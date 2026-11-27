@@ -11,7 +11,7 @@ webhook and that we do the right thing when they do.**
 This script proves it, or says plainly that it has not happened yet. It is not
 a gate: it needs a public URL and a human to complete one Checkout.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/razorpay_boundary_check.py
 
@@ -166,7 +166,7 @@ No payment on file exists at Razorpay, which means every settlement recorded so
 far was signed locally by a test suite. The webhook is registered and the route
 answers, so what remains is one Checkout completed by a person:
 
-    1. cd Travbuddy_supply_os && npm run dev
+    1. cd Safar_supply_os && npm run dev
     2. open http://localhost:5173/stay/casa-mandala-anjuna
     3. pick any dates, pay with Razorpay's published test card
        4111 1111 1111 1111, any future expiry, any CVV

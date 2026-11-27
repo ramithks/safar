@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Safar - AI Trip Planner</title>
+<style>
+  :root {
+    --bg: #0b0e11;
+    --card: #141a20;
+    --card2: #1a222b;
+    --line: #26313c;
+    --text: #e8eef2;
+    --muted: #8ba0ae;
+    --lime: #b8f33d;
+    --lime-dim: #8fbf2e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 24px 16px 80px; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 18px 0 6px; }
+  header h1 { font-size: 28px; letter-spacing: -0.5px; }
+  header h1 span { color: var(--lime); }
+  header p { color: var(--muted); font-size: 13px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 20px; margin-top: 18px;
+  }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 5px; }
+  input, select {
+    width: 100%; padding: 11px 12px; border-radius: 9px;
+    border: 1px solid var(--line); background: var(--card2); color: var(--text);
+    font-size: 15px; outline: none;
+  }
+  input:focus, select:focus { border-color: var(--lime-dim); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  button {
+    margin-top: 16px; width: 100%; padding: 13px; border: none; border-radius: 10px;
+    background: var(--lime); color: #10160a; font-size: 15px; font-weight: 700;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); font-weight: 500; }
+  .msg { font-size: 13px; color: var(--muted); margin-top: 12px; min-height: 18px; }
+  .msg.err { color: #ff7b72; }
+  .progress-track { background: var(--card2); border-radius: 99px; height: 8px; margin: 14px 0 6px; overflow: hidden; }
+  .progress-fill { background: var(--lime); height: 100%; width: 0%; transition: width 0.6s ease; }
+  .trip-title { font-size: 20px; font-weight: 700; }
+  .route { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .day { border-top: 1px solid var(--line); padding: 14px 0; }
+  .day h3 { font-size: 15px; margin-bottom: 6px; }
+  .day h3 span { color: var(--lime); }
+  .item { font-size: 14px; color: var(--text); padding: 4px 0 4px 14px; position: relative; }
+  .item::before { content: ""; position: absolute; left: 0; top: 11px; width: 6px; height: 6px; border-radius: 50%; background: var(--lime-dim); }
+  .item small { color: var(--muted); display: block; }
+  .pill { display: inline-block; background: var(--card2); border: 1px solid var(--line); border-radius: 99px; padding: 4px 12px; font-size: 12px; color: var(--muted); margin: 4px 6px 0 0; }
+  .transport-opt { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 10px; background: var(--card2); }
+  .transport-opt b { font-size: 14px; }
+  .transport-opt .meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
+  .hidden { display: none; }
+  footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 40px; line-height: 1.7; }
+  a { color: var(--lime-dim); text-decoration: none; }
+  .signout { float: right; background: none; border: none; color: var(--muted); font-size: 12px; cursor: pointer; width: auto; margin: 0; padding: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><span>Safar</span></h1>
+    <p>AI trip planner. Free and open.</p>
+  </header>
+
+  <!-- Auth -->
+  <div class="card" id="auth-card">
+    <div id="auth-form">
+      <label>Email</label>
+      <input type="email" id="email" placeholder="you@example.com" autocomplete="email">
+      <label>Password</label>
+      <input type="password" id="password" placeholder="6+ characters" autocomplete="current-password">
+      <button id="signin-btn">Sign in</button>
+      <button class="ghost" id="signup-btn">Create account</button>
+      <div class="msg" id="auth-msg"></div>
+    </div>
+  </div>
+
+  <!-- Planner -->
+  <div id="planner" class="hidden">
+    <button class="signout" id="signout-btn">sign out</button>
+    <div class="card">
+      <div class="row">
+        <div><label>From</label><input id="origin" placeholder="Bengaluru"></div>
+        <div><label>To</label><input id="destination" placeholder="Gokarna"></div>
+      </div>
+      <div class="row">
+        <div><label>Departure date</label><input type="date" id="departure_date"></div>
+        <div><label>Days</label><input type="number" id="days" value="3" min="1" max="14"></div>
+      </div>
+      <div class="row">
+        <div><label>Travellers</label><input type="number" id="travelers" value="1" min="1" max="12"></div>
+        <div><label>Budget</label>
+          <select id="budget">
+            <option value="low">Low</option>
+            <option value="mid" selected>Mid</option>
+            <option value="high">High</option>
+          </select>
+        </div>
+      </div>
+      <label>Interests (comma separated, optional)</label>
+      <input id="interests" placeholder="beaches, cafes, trekking">
+      <label>Stops along the way (comma separated cities, optional)</label>
+      <input id="stops" placeholder="Hubballi">
+      <button id="plan-btn">Plan my trip</button>
+      <div class="msg" id="plan-msg"></div>
+    </div>
+
+    <div class="card hidden" id="trip-card">
+      <div class="trip-title" id="trip-title"></div>
+      <div class="route" id="trip-route"></div>
+      <div class="progress-track"><div class="progress-fill" id="trip-progress"></div></div>
+      <div class="msg" id="trip-status"></div>
+      <div id="trip-transport"></div>
+      <div id="trip-days"></div>
+      <div id="trip-notes" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <footer>
+    Safar runs on free open models. Built on the open-sourced TravBuddy backend
+    (<a href="https://github.com/sahil28123/travbuddy_backend">upstream</a>, see NOTICE).
+  </footer>
+</div>
+
+<script type="module">
+import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
+
+const $ = (id) => document.getElementById(id);
+let supabase = null;
+let pollTimer = null;
+
+async function boot() {
+  const cfg = await (await fetch("/api/v1/public-config")).json();
+  document.title = cfg.brand + " - AI Trip Planner";
+  if (!cfg.supabase_url || !cfg.supabase_anon_key) {
+    $("auth-msg").textContent = "Supabase is not configured on this deployment.";
+    $("auth-msg").classList.add("err");
+    return;
+  }
+  supabase = createClient(cfg.supabase_url, cfg.supabase_anon_key);
+  const { data: { session } } = await supabase.auth.getSession();
+  if (session) showPlanner();
+  supabase.auth.onAuthStateChange((_e, s) => { if (s) showPlanner(); });
+}
+
+function authMsg(t, isErr) {
+  $("auth-msg").textContent = t || "";
+  $("auth-msg").classList.toggle("err", !!isErr);
+}
+
+$("signin-btn").onclick = async () => {
+  authMsg("Signing in...");
+  const { error } = await supabase.auth.signInWithPassword({
+    email: $("email").value.trim(), password: $("password").value,
+  });
+  if (error) authMsg(error.message, true);
+};
+
+$("signup-btn").onclick = async () => {
+  authMsg("Creating account...");
+  const { data, error } = await supabase.auth.signUp({
+    email: $("email").value.trim(), password: $("password").value,
+  });
+  if (error) return authMsg(error.message, true);
+  if (data.session) return showPlanner();
+  authMsg("Account created. Confirm the email if asked, then sign in.");
+};
+
+$("signout-btn").onclick = async () => {
+  await supabase.auth.signOut();
+  location.reload();
+};
+
+async function token() {
+  const { data: { session } } = await supabase.auth.getSession();
+  return session ? session.access_token : null;
+}
+
+function showPlanner() {
+  $("auth-card").classList.add("hidden");
+  $("planner").classList.remove("hidden");
+}
+
+$("plan-btn").onclick = async () => {
+  const body = {
+    origin: $("origin").value.trim(),
+    destination: $("destination").value.trim(),
+    departure_date: $("departure_date").value || null,
+    days: parseInt($("days").value || "3", 10),
+    travelers: parseInt($("travelers").value || "1", 10),
+    budget: $("budget").value,
+    interests: $("interests").value.split(",").map(s => s.trim()).filter(Boolean),
+    stops: $("stops").value.split(",").map(s => s.trim()).filter(Boolean),
+  };
+  if (!body.origin || !body.destination) {
+    $("plan-msg").textContent = "From and To are required.";
+    $("plan-msg").classList.add("err");
+    return;
+  }
+  $("plan-msg").classList.remove("err");
+  $("plan-msg").textContent = "Starting the planner...";
+  $("plan-btn").disabled = true;
+  try {
+    const res = await fetch("/api/v3/trips", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + await token() },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error((await res.json()).detail || ("HTTP " + res.status));
+    const { trip_id } = await res.json();
+    $("plan-msg").textContent = "";
+    $("trip-card").classList.remove("hidden");
+    pollTrip(trip_id);
+  } catch (e) {
+    $("plan-msg").textContent = e.message;
+    $("plan-msg").classList.add("err");
+  } finally {
+    $("plan-btn").disabled = false;
+  }
+};
+
+async function pollTrip(tripId) {
+  clearInterval(pollTimer);
+  const tick = async () => {
+    try {
+      const res = await fetch("/api/v3/trips/" + tripId, {
+        headers: { "Authorization": "Bearer " + await token() },
+      });
+      if (!res.ok) return;
+      const env = await res.json();
+      renderTrip(env);
+      if (env.status !== "planning") clearInterval(pollTimer);
+    } catch (_) { /* keep polling */ }
+  };
+  await tick();
+  pollTimer = setInterval(tick, 5000);
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function renderTrip(env) {
+  const doc = env.doc || {};
+  $("trip-title").textContent = doc.title || "Your trip";
+  $("trip-route").textContent = (doc.route || []).join(" → ");
+  $("trip-progress").style.width = (env.progress || 0) + "%";
+  $("trip-status").textContent =
+    env.status === "planning" ? "Planning... " + (env.progress || 0) + "%" :
+    env.status === "ready" ? "Trip plan ready." : ("Status: " + env.status);
+
+  // Transport
+  const legs = doc.transport || [];
+  $("trip-transport").innerHTML = legs.length
+    ? "<h3 style='margin-top:14px;font-size:15px'>Getting there</h3>" + legs.map(leg => {
+        const opts = (leg.options || []).slice(0, 3).map(o =>
+          `<div class="transport-opt"><b>${esc(o.mode || o.provider || "Option")}</b>` +
+          `<div class="meta">${esc(o.summary || o.name || "")} ${o.price ? " - ₹" + esc(o.price) : ""}</div></div>`
+        ).join("");
+        return `<div style="margin-top:10px"><span class="pill">${esc(leg.from || "")} → ${esc(leg.to || "")}</span></div>` + opts;
+      }).join("")
+    : "";
+
+  // Itinerary
+  const days = doc.itinerary || [];
+  $("trip-days").innerHTML = days.map((d, i) => {
+    const items = (d.items || d.activities || []).map(it =>
+      `<div class="item">${esc(it.title || it.name || it)}` +
+      (it.description ? `<small>${esc(it.description)}</small>` : "") + `</div>`
+    ).join("");
+    return `<div class="day"><h3><span>Day ${esc(d.day ?? i + 1)}</span> ${esc(d.city || d.title || "")}</h3>${items}</div>`;
+  }).join("");
+
+  // Notes
+  const notes = doc.notes || [];
+  $("trip-notes").innerHTML = notes.map(n => `<span class="pill">${esc(n.text || n)}</span>`).join("");
+}
+
+boot();
+</script>
+</body>
+</html>

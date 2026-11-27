@@ -1,4 +1,4 @@
-# TravBuddy Recommendation Engine — Engineering Design Document
+# Safar Recommendation Engine — Engineering Design Document
 
 **Status:** Design (v1) · **Owner:** AI Engineering · **Last updated:** 2026-07-13
 **Audience:** backend + ML engineers building the ranking/recommendation stack.
@@ -339,7 +339,7 @@ option always renders one, with a note if constraints were relaxed.
 
 ## Part 5 — Journey Intelligence (the differentiator)
 
-TravBuddy ranks **journeys**, not legs. A journey = `{outbound transport, stay,
+Safar ranks **journeys**, not legs. A journey = `{outbound transport, stay,
 return transport}` over the trip graph. Extends `journey_reasoning.py`.
 
 ### 5.1 Journey Score
@@ -912,7 +912,7 @@ budget_rule + memory injection + strict JSON. Change: feed the new
 ### 13.4 Journey recommendation (`brain`, temp 0.3)
 
 ```
-You are TravBuddy's journey planner. Given transport options per leg and stays for
+You are Safar's journey planner. Given transport options per leg and stays for
 each stop, choose a coherent END-TO-END journey, not the cheapest of each part.
 Weigh: hidden hotel-night from late arrivals, transfer friction, total fatigue,
 and the traveller's persona {persona}. Prefer a journey where arrivals land in

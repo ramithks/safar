@@ -1,7 +1,7 @@
 """
 A hotel's own address.
 
-    app.hostos.in/stay/anandi-house-udaipur            always, free, instant
+    app.staysuite.example.com/stay/anandi-house-udaipur            always, free, instant
     www.anandihouse.com                                theirs, once DNS points here
 
 **Why a hotel wants the second one.** Direct booking is the whole argument for
@@ -59,11 +59,11 @@ CNAME_TARGET = "cname.vercel-dns.com"
 # not a hostname anybody visits, and registrars sort it away from the records a
 # person edits by hand.
 #
-# Still `_travbuddy` after the rename to HostOS, deliberately: this string is
+# Still `_safar` after the rename to StaySuite, deliberately: this string is
 # already in the zone file of every hotel that has verified a domain, and
 # renaming it would un-verify all of them at once for a cosmetic gain nobody
 # but us can see. A future rename has to write both names and accept either.
-TXT_NAME = "_travbuddy"
+TXT_NAME = "_safar"
 
 DOH_ENDPOINTS = (
     "https://cloudflare-dns.com/dns-query",
@@ -72,13 +72,13 @@ DOH_ENDPOINTS = (
 
 # Hostnames nobody may claim, whatever their DNS says.
 #
-# `hostos.in` and its subdomains are ours: a hotel that claimed `app.hostos.in`
+# `staysuite.example.com` and its subdomains are ours: a hotel that claimed `app.staysuite.example.com`
 # would be claiming the PMS itself, and host resolution would then hand the
-# staff app to a booking page. `travbuddy.in` stays on the list even though the
+# staff app to a booking page. `safar.example.com` stays on the list even though the
 # PMS no longer lives there — the marketplace does, and a hotel that claimed a
 # name on it would be claiming a site we run. The rest are the accidents —
 # `localhost` and bare IPs are not domains and reach nothing.
-RESERVED_SUFFIXES = ("hostos.in", "travbuddy.in", "vercel.app", "localhost")
+RESERVED_SUFFIXES = ("staysuite.example.com", "safar.example.com", "vercel.app", "localhost")
 
 _HOST = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$")
 
@@ -126,14 +126,14 @@ def validate(domain: str) -> str:
         )
     if any(domain == s or domain.endswith(f".{s}") for s in RESERVED_SUFFIXES):
         raise DomainError(
-            "That address belongs to TravBuddy. Use a domain you own — your hotel "
-            "already has a free TravBuddy address."
+            "That address belongs to Safar. Use a domain you own — your hotel "
+            "already has a free Safar address."
         )
     return domain
 
 
 def _new_token() -> str:
-    return f"travbuddy-verify={secrets.token_urlsafe(24)}"
+    return f"safar-verify={secrets.token_urlsafe(24)}"
 
 
 # ── looking it up ────────────────────────────────────────────────────────────
@@ -241,7 +241,7 @@ async def claim(property_id: str, raw: str) -> dict:
 
     if await run_db(_claimed_elsewhere, domain, property_id):
         raise DomainError(
-            f"“{domain}” is already connected to another hotel on TravBuddy. If that "
+            f"“{domain}” is already connected to another hotel on Safar. If that "
             "is yours too, disconnect it there first."
         )
 
@@ -259,7 +259,7 @@ async def claim(property_id: str, raw: str) -> dict:
 
 async def release(property_id: str) -> dict:
     """
-    Disconnect. The TravBuddy address keeps working, which is the point of
+    Disconnect. The Safar address keeps working, which is the point of
     having one — a hotel is never off the internet because of a DNS mistake.
     """
     return await run_db(_write, property_id, {

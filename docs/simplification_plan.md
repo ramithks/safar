@@ -57,7 +57,7 @@ Files: `app/services/vertex.py`, `app/api/v1/plan_trip/journey.py`,
 - `agent.py` / `copilot.py` / `builder.py`: untouched. Graph/builder machinery
   stays intact for PR 3/4 and future re-enable.
 
-**Frontend** (travbuddy_website):
+**Frontend** (safar_website):
 - `components/workspace/workspace-client.tsx:23,327` — gate `<AgentConsole/>`
   behind `NEXT_PUBLIC_COPILOT_ENABLED`.
 - `lib/use-trip-workspace.ts` — keep `sendEdit` (~line 1006; carries structured

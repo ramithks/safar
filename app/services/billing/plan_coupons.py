@@ -1,5 +1,5 @@
 """
-Discount codes against the ₹999 StayOS plan.
+Discount codes against the ₹999 StaySuite plan.
 
 The marketplace has a table of the same name against its own ₹499 partner plan,
 in a different Supabase project. This is deliberately the same shape: the

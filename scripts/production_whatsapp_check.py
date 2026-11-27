@@ -15,10 +15,10 @@ the real host, and then the database is asked what happened.
 The message is signed with the app secret we hold. That is not a forgery — it
 is the only way to originate a byte-identical request to the one Meta sends,
 and if this deployment accepts a body signed with a *wrong* key
-(`stayos_backend_check` section 8 proves it does not) then the signature has
+(`staysuite_backend_check` section 8 proves it does not) then the signature has
 stopped meaning anything anyway.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/production_whatsapp_check.py
 
@@ -76,7 +76,7 @@ def post(url: str, body: bytes, secret: str) -> tuple[int, str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--base", default="https://api.hostos.in")
+    ap.add_argument("--base", default="https://api.staysuite.example.com")
     ap.add_argument("--wait", type=int, default=90,
                     help="seconds to wait for the worker to answer")
     ap.add_argument("--message", default="What time is check-in?")

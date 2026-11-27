@@ -459,7 +459,7 @@ async def get_channel_performance(args: PeriodArgs, ctx: AgentContext) -> dict:
         "channels": report["breakdowns"]["sources"],
         "signals": concentration,
         "note": (
-            "'direct', 'travbuddy', 'whatsapp' and 'instagram' are the hotel's "
+            "'direct', 'safar', 'whatsapp' and 'instagram' are the hotel's "
             "own; the OTA rows are gross of commission. There is no channel "
             "manager — OTA reservations are entered by the desk, so their "
             "timing reflects when somebody typed them in."
@@ -710,7 +710,7 @@ async def list_recommendations(args: RecommendationListArgs, ctx: AgentContext) 
 # The Owner Copilot is the only agent that may read any of this. `_require_staff`
 # is on both tools and is the whole boundary: a guest-facing agent has neither
 # in its tool list, and if one ever did, the check would refuse it at runtime
-# rather than trusting the list. A guest asking "how much do you pay TravBuddy"
+# rather than trusting the list. A guest asking "how much do you pay Safar"
 # gets nothing, which is the correct amount of the hotel's commercial position
 # to give a stranger.
 
@@ -722,7 +722,7 @@ class BillingArgs(BaseModel):
 @tool(
     name="get_plan_and_credits",
     description=(
-        "What this hotel pays for StayOS, what state the plan is in, when the "
+        "What this hotel pays for StaySuite, what state the plan is in, when the "
         "next payment is due, how many AI credits are left, and what one "
         "conversation costs on each channel. Use for 'how many credits do I "
         "have', 'when is my next payment', 'how much am I paying', 'what does "

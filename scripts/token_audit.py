@@ -19,7 +19,7 @@ problems with four different fixes:
 It reads `agent_runs` for what production actually spent, and composes prompts
 locally for what each task would cost today. Nothing here calls a model.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/token_audit.py
 """

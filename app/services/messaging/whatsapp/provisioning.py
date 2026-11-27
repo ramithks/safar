@@ -77,7 +77,7 @@ STANDARD_TEMPLATES: tuple[dict, ...] = (
         "parameters": ["guest_name", "property_name", "link"],
         "body": ("Hi {{1}}, you can check in to {{2}} online before you arrive — "
                  "it takes a minute and saves the queue at the desk.\n\n{{3}}"),
-        "example": ["Ravi", "Anandi House", "https://app.hostos.in/c/ah4821"],
+        "example": ["Ravi", "Anandi House", "https://app.staysuite.example.com/c/ah4821"],
     },
     {
         "purpose": "pre_arrival",

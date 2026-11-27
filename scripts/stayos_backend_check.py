@@ -1,7 +1,7 @@
 """
-Is this host a StayOS backend, and is it wired to the right database?
+Is this host a StaySuite backend, and is it wired to the right database?
 
-    ./venv/bin/python scripts/stayos_backend_check.py --base https://api.hostos.in
+    ./venv/bin/python scripts/staysuite_backend_check.py --base https://api.staysuite.example.com
 
 Run it against a new deployment before pointing the PWA at it, and against the
 marketplace host too — it is designed to give the *opposite* answer there, and a
@@ -48,7 +48,7 @@ DEFAULT_EMAIL = "deepak@casamandala.in"
 DEFAULT_PASSWORD = "hotel-os-dev"
 DEFAULT_PROPERTY = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 
-PWA_ORIGIN = "https://app.hostos.in"
+PWA_ORIGIN = "https://app.staysuite.example.com"
 HOSTILE_ORIGIN = "https://evil.example"
 
 passed = failed = 0
@@ -87,7 +87,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Stop at the 3xx instead of following it.
 
     The OAuth callback answers 303 to the PWA. Followed, that check would read
-    whatever app.hostos.in returned and prove nothing about the backend.
+    whatever app.staysuite.example.com returned and prove nothing about the backend.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -146,7 +146,7 @@ def main() -> int:
     base = args.base.rstrip("/")
     api = f"{base}/api/v1"
 
-    print(f"\n══ StayOS backend check ══\n   {base}\n")
+    print(f"\n══ StaySuite backend check ══\n   {base}\n")
 
     # ── 1. is anything there ──────────────────────────────────────────────────
     print("── 1. the service answers ──")
@@ -164,7 +164,7 @@ def main() -> int:
           "every /api/v1/pms route 404s — ENABLE_HOTEL_OS is false here")
     if not mounted:
         print("\n  This is a marketplace deployment. That is correct for "
-              "backend.travbuddy.in\n  and wrong for a StayOS one.\n")
+              "backend.safar.example.com\n  and wrong for a StaySuite one.\n")
         return 1
 
     # ── 3. unauthenticated ────────────────────────────────────────────────────

@@ -51,7 +51,7 @@ from app.services.marketplace_bookings import set_subscription_status
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-SITE = "https://travbuddy.in"
+SITE = "https://safar.example.com"
 PUBLIC_PATH = {"hotel": "stays", "experience": "experiences"}
 
 

@@ -112,7 +112,7 @@ DEFINITION = AgentDefinition(
         "Percentages: a move in occupancy or cancellation rate is in percentage "
         "*points*, never percent. Money and counts move in percent. The tools "
         "give you both and set the one that does not apply to null.\n\n"
-        "You also answer questions about the hotel's own StayOS plan and AI "
+        "You also answer questions about the hotel's own StaySuite plan and AI "
         "credits — what it costs, when the next payment is due, what state the "
         "plan is in, how many credits are left and what the AI employee has "
         "used them on. `get_plan_and_credits` and `get_ai_usage` have those "

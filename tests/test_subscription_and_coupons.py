@@ -159,7 +159,7 @@ def test_authentication_is_active_because_the_mandate_is_real():
 
 def test_no_headline_leaks_our_vocabulary():
     """
-    "StayOS is active" is fine — `active` is an English word an owner uses
+    "StaySuite is active" is fine — `active` is an English word an owner uses
     about their own subscription. What must never appear is anything that only
     means something inside this codebase.
     """
@@ -210,9 +210,9 @@ def test_a_cancelled_plan_says_cancelled_rather_than_ready():
     """
     The regression: `current()` filtered to the live states, so a hotel that
     had just cancelled read as having no plan at all — and the screen said
-    "Your StayOS plan is ready" to somebody who had cancelled a minute earlier.
+    "Your StaySuite plan is ready" to somebody who had cancelled a minute earlier.
     """
-    plan_row = {"name": "StayOS", "price_paise": PRICE, "credit_grant": 3000}
+    plan_row = {"name": "StaySuite", "price_paise": PRICE, "credit_grant": 3000}
     projected = subscription.project({"status": "cancelled"}, plan_row)
     assert "cancelled" in projected["headline"].lower()
     assert projected["serving"] is False
@@ -220,7 +220,7 @@ def test_a_cancelled_plan_says_cancelled_rather_than_ready():
 
 
 def test_the_projection_never_invents_a_price():
-    plan_row = {"name": "StayOS", "price_paise": PRICE, "credit_grant": 3000}
+    plan_row = {"name": "StaySuite", "price_paise": PRICE, "credit_grant": 3000}
     assert subscription.project(None, plan_row)["pricePaise"] == PRICE
     assert subscription.project({"status": "active"}, plan_row)["pricePaise"] == PRICE
 
@@ -295,7 +295,7 @@ def test_the_window_is_a_day():
 
 def test_only_the_owner_copilot_can_read_the_hotels_billing():
     """
-    A guest asking "how much do you pay TravBuddy" must get nothing. The tool
+    A guest asking "how much do you pay Safar" must get nothing. The tool
     list is the first boundary and `_require_staff` inside each tool is the
     second — this asserts the first, which is the one a refactor moves.
     """

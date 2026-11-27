@@ -65,7 +65,7 @@ class QuoteResponse(BaseModel):
     total_paise: int = 0
     #: Charged now — the advance, or the whole total when the item takes none.
     amount_paise: int = 0
-    #: Due to the partner directly. Never passes through TravBuddy.
+    #: Due to the partner directly. Never passes through Safar.
     balance_paise: int = 0
     commission_paise: int = 0
     nights: int | None = None

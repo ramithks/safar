@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-A marketplace partner arrives on StayOS and finds their own hotel.
+A marketplace partner arrives on StaySuite and finds their own hotel.
 
-    travbuddy.in/partner  ──►  partner.travbuddy.in  ──►  their property
+    safar.example.com/partner  ──►  partner.safar.example.com  ──►  their property
             │                                                  │
             └── marketplace listing, untouched ─────────────────┘
 
@@ -21,7 +21,7 @@ exactly the right property, and behaviourally, through a disposable staff
 account added to that same property, which is what exercises the screens, the
 scoping and the refusals.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010
     ./venv/bin/python scripts/partner_migration_e2e.py
@@ -48,7 +48,7 @@ API = "http://127.0.0.1:8010/api/v1/pms"
 SB = mig.HOTEL_OS_URL
 
 TEST_SLUG = "sahil"
-STAFF_EMAIL = "partner-e2e@pilot.stayos.test"
+STAFF_EMAIL = "partner-e2e@pilot.staysuite.test"
 STAFF_PASSWORD = "partner-e2e-dev"
 
 # Another hotel entirely, for the cross-property refusals.
@@ -131,7 +131,7 @@ def main() -> int:  # noqa: C901 — one journey; splitting it hides the order
     property_id = first["property_id"]
 
     check("a property was created", bool(property_id), str(first)[:120])
-    check("the StayOS partner keeps the marketplace partner's uuid",
+    check("the StaySuite partner keeps the marketplace partner's uuid",
           first["partner_id"] == partner["id"], f"{first['partner_id']}")
 
     row = mig.write_hotel_os(f"""
@@ -316,7 +316,7 @@ on conflict do nothing;""")
           and booking["grossPaise"] == expected_paise * 2, f"{st} {str(booking)[:200]}")
 
     st, listed = mig.http(f"{API}/properties/{property_id}/reservations", headers=token)
-    check("which then appears in StayOS",
+    check("which then appears in StaySuite",
           st == 200 and any(r["id"] == booking["id"] for r in listed), str(st))
 
     zero = mig.write_hotel_os(f"""

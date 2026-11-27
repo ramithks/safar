@@ -23,10 +23,10 @@ comes back and what is in it. Over HTTP that answer passes through a projection
 this suite also has to check, so it checks the projection separately and the
 engine at source.
 
-⚠ Creates one hotel under `@negotiation.stayos.test`, with rooms, rates, tiers
+⚠ Creates one hotel under `@negotiation.staysuite.test`, with rooms, rates, tiers
 and rules, and sweeps it at each end. Nothing outside that namespace is touched.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/negotiation_e2e.py
 """
@@ -50,7 +50,7 @@ from app.services.pms.escalation import compose, dedupe_key
 
 REF = "rdlozqvuywtgsodunait"
 TAG = uuid.uuid4().hex[:8]
-EMAIL = f"owner-{TAG}@negotiation.stayos.test"
+EMAIL = f"owner-{TAG}@negotiation.staysuite.test"
 
 passed = failed = 0
 
@@ -108,7 +108,7 @@ delete from public.room_types where property_id in ({_OURS});
 delete from public.properties where partner_id in (
   select id from public.partners where slug like 'negotiation-test-%');
 delete from public.partners where slug like 'negotiation-test-%';
-delete from auth.users where email like '%@negotiation.stayos.test';
+delete from auth.users where email like '%@negotiation.staysuite.test';
 """)
 
 
@@ -330,7 +330,7 @@ async def main():
     check("a four-room stay at ₹4,500 agrees", agreed.verdict == "allowed", agreed.verdict)
     total = agreed.final_total_paise or 0
     split = fees.breakdown(total, 400)
-    check("StayOS keeps 4%", split.fee_paise == round(total * 0.04), str(split.fee_paise))
+    check("StaySuite keeps 4%", split.fee_paise == round(total * 0.04), str(split.fee_paise))
     check("and the two halves sum back to the booking",
           split.fee_paise + split.payout_paise == total, str(split))
 

@@ -373,7 +373,7 @@ def _ensure(property_id: str) -> dict:
             "property_id": property_id,
             "partner_id": prop["partner_id"],
             "draft": default_draft(prop["name"], prop.get("city")),
-            "travbuddy_path": f"/stay/{prop['slug']}",
+            "safar_path": f"/stay/{prop['slug']}",
         }).execute().data[0],
         "property_slug": prop["slug"],
     }
@@ -524,7 +524,7 @@ def _publish(property_id: str, profile_id: str | None) -> dict:
             "published": dict(draft),
             "published_at": datetime.now(timezone.utc).isoformat(),
             "published_by": profile_id,
-            "travbuddy_path": f"/stay/{prop['slug']}",
+            "safar_path": f"/stay/{prop['slug']}",
         }).eq("property_id", property_id).execute().data or []
     )
     return {**(updated[0] if updated else row), "property_slug": prop["slug"]}
@@ -532,7 +532,7 @@ def _publish(property_id: str, profile_id: str | None) -> dict:
 
 async def publish(property_id: str, profile_id: str | None) -> dict:
     row = await run_db(_publish, property_id, profile_id)
-    # The page is live on travbuddy.in a minute later without this; with it, the
+    # The page is live on safar.example.com a minute later without this; with it, the
     # sitemap moves too, which is the half a crawler actually reads. Best
     # effort — see services/pms/seo_ping.
     await seo_ping.hotel_changed(row.get("property_slug"))
@@ -567,7 +567,7 @@ def project(row: dict, *, slug: str | None = None) -> dict:
     One shape, so the builder and the settings screen cannot disagree.
 
     **The address is derived from the property's slug, not from the stored
-    column.** `travbuddy_path` is written at publish time, so a hotel that
+    column.** `safar_path` is written at publish time, so a hotel that
     changes its slug afterwards keeps a stored path that points at a page which
     no longer resolves -- and the settings screen would go on showing the
     owner a dead link as though it were their website. The slug is the one
@@ -579,10 +579,10 @@ def project(row: dict, *, slug: str | None = None) -> dict:
         "propertyId": row["property_id"],
         "template": row.get("template") or "boutique",
         "status": row.get("status") or "draft",
-        "travbuddyPath": (
+        "safarPath": (
             f"/stay/{slug or row.get('property_slug')}"
             if (slug or row.get("property_slug"))
-            else row.get("travbuddy_path") or ""
+            else row.get("safar_path") or ""
         ),
         # Only a domain that actually resolves. A pending one is a claim, not
         # an address, and printing it as "Live at grandhotel.com" while the

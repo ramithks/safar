@@ -1,7 +1,7 @@
-# StayOS Hotel OS — commerce, negotiation, team and marketing
+# StaySuite Hotel OS — commerce, negotiation, team and marketing
 
 Written 2026-08-23, after reading the live code, the live Supabase schema
-(`rdlozqvuywtgsodunait`) and the Vite operator UI in `~/Desktop/Travbuddy_supply_os`.
+(`rdlozqvuywtgsodunait`) and the Vite operator UI in `~/Desktop/Safar_supply_os`.
 
 Working document. Phases run top to bottom; boxes are ticked as they land, and
 anything that turns out to be wrong is recorded here rather than quietly
@@ -49,7 +49,7 @@ section is here so no phase below rebuilds something that already works.
 7. No experiences → **§1.7**.
 8. No hotel team directory (`partner_members.profile_id` is NOT NULL) → **§1.8**.
 9. No notification routing, no escalation lifecycle → **§1.8 + Phase 6**.
-10. **No StayOS fee anywhere in the codebase** → **§1.9 + §2.1**.
+10. **No StaySuite fee anywhere in the codebase** → **§1.9 + §2.1**.
 11. No Meta Marketing API → **§1.10 + Phase 7**.
 12. No hotel-config audit log → **§1.11 + §2.7**.
 13. Cancellation policy a schemaless `jsonb` → **§2.4**.
@@ -245,7 +245,7 @@ the same `require_member`.
 
 ## Not built, and why
 
-* **Publishing to Meta.** StayOS holds `instagram_business_basic` and
+* **Publishing to Meta.** StaySuite holds `instagram_business_basic` and
   `instagram_business_manage_messages` — DM scopes. Ads need `ads_management` on
   a Business account with a funded ad account, a different OAuth configuration
   and a different review. Everything up to the wire is built and tested; the one

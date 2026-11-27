@@ -1,9 +1,9 @@
 """
-Models for TravBuddy group-trip authoring.
+Models for Safar group-trip authoring.
 
 These mirror the `PackageContent` contract the public /trips/{slug} template
 reads (see lib/marketplace/types.ts on the website). Keeping the shapes aligned
-is what lets a TravBuddy trip and a partner package render through one template
+is what lets a Safar trip and a partner package render through one template
 with no forking.
 """
 from typing import Literal
@@ -56,7 +56,7 @@ class TripDraft(BaseModel):
     seo_title: str | None = Field(default=None, max_length=70)
 
     # `instant` — pay on the page — is the default because that is what every
-    # partner trip already does, and a TravBuddy-run trip defaulting to a
+    # partner trip already does, and a Safar-run trip defaulting to a
     # WhatsApp enquiry made OUR trips look less trustworthy than a partner's on
     # an otherwise identical page. Set it to whatsapp/enquiry per trip when a
     # departure genuinely can't be sold online.
@@ -110,7 +110,7 @@ class AdminTrip(BaseModel):
     status: str
     booking_mode: str
     partner_id: str | None = None
-    is_travbuddy: bool
+    is_safar: bool
     views: int = 0
     leads: int = 0
     updated_at: str

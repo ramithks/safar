@@ -65,7 +65,7 @@ def _sort_trains(trains: list[dict], sort: str) -> list[dict]:
 def _tag_recommended(items: list[dict], skip_partners: bool = False) -> list[dict]:
     """Mark the first item (best by the applied sort) as is_recommended=True.
 
-    `skip_partners` moves the flag past TravBuddy's own pinned stays: those lead
+    `skip_partners` moves the flag past Safar's own pinned stays: those lead
     the list because we can book them, not because the ranking chose them, and
     "recommended" has to keep meaning "the best of what we searched". They carry
     their own Partner tag, so nothing goes unlabelled.

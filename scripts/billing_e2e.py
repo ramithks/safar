@@ -353,7 +353,7 @@ def main():
     check("a signed one is accepted", st == 200, f"{st} {d}")
     st, plan = http(plan_url, headers=owner)
     check("the hotel is active", plan["status"] == "active", plan["status"])
-    check("and reads as active", plan["headline"] == "StayOS is active", plan["headline"])
+    check("and reads as active", plan["headline"] == "StaySuite is active", plan["headline"])
     check("authentication alone grants no credits", balance(DEMO) == before,
           f"{before} → {balance(DEMO)}")
     check("but the coupon is now spent",

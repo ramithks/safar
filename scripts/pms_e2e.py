@@ -13,7 +13,7 @@ would have surfaced as a 500 at a front desk.
 
 Needs the API running against the hotel-OS project:
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010
     ./venv/bin/python scripts/pms_e2e.py

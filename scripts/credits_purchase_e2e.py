@@ -22,7 +22,7 @@ signatures are computed with the same HMAC and the same secret the server
 verifies with, which exercises the verification rather than bypassing it — a
 forged signature is asserted to be refused.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010
     ./venv/bin/python scripts/credits_purchase_e2e.py

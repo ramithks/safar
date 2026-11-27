@@ -1,5 +1,5 @@
 -- ============================================================================
--- TravBuddy Persistence v3 — Search Store, View Layer, Reco Index, Trip Memory
+-- Safar Persistence v3 — Search Store, View Layer, Reco Index, Trip Memory
 -- Design: docs/persistence_architecture.md  (Phase 1: additive, dual-write)
 -- Idempotent: safe to re-run. Apply on Supabase (SQL editor / psql).
 --

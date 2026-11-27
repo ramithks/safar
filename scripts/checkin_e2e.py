@@ -19,7 +19,7 @@ must not exist anywhere afterwards: migration 19 keeps four characters and the
 endpoint discards the rest before the row is written, so the assertion is that
 the database cannot produce it.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010
     ./venv/bin/python scripts/checkin_e2e.py
@@ -38,11 +38,11 @@ from datetime import date, timedelta
 
 REF = "rdlozqvuywtgsodunait"
 SB = f"https://{REF}.supabase.co"
-# Which StayOS to test. Defaults to the uvicorn each suite's docstring tells
-# you to start; set STAYOS_API_BASE=https://api.hostos.in to run
+# Which StaySuite to test. Defaults to the uvicorn each suite's docstring tells
+# you to start; set STAYSUITE_API_BASE=https://api.staysuite.example.com to run
 # the same assertions against the deployed one, which is the only way to find
 # out whether what is live behaves like what is on this branch.
-API = os.environ.get("STAYOS_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
+API = os.environ.get("STAYSUITE_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
 
 PROP = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 PARTNER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

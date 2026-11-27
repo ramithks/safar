@@ -45,7 +45,7 @@ group, the haggle, the money, and the confirmation.
       · the confirmation nobody had to ask for, and its receipt link
       · "check karo payment hui?" — with, this time, something to find
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010 &     # the webhook is HTTP
     ./venv/bin/python scripts/replay_e2e.py
@@ -88,7 +88,7 @@ REF = "rdlozqvuywtgsodunait"
 PROPERTY = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 PARTNER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 IG_ACCOUNT = "17841400000000001"
-API = os.environ.get("STAYOS_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
+API = os.environ.get("STAYSUITE_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
 
 registry.load_all()
 db = get_db()

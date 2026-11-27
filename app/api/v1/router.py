@@ -67,17 +67,17 @@ router.include_router(marketplace_payments_router)
 # answers a 500 from PostgREST — including the public ones a guest can reach
 # without a login.
 #
-# That is exactly what happened when StayOS first reached production:
+# That is exactly what happened when StaySuite first reached production:
 # `/api/v1/pms/public/hotels/{slug}` returned INTERNAL_SERVER_ERROR to anybody
 # who asked, because the routes shipped with the marketplace image while the
 # schema they read did not. Mounting them behind the flag turns that into an
 # honest 404 — this deployment does not serve the hotel OS — and costs the
 # marketplace nothing.
 #
-# StayOS therefore runs as its own deployment of this same codebase with
+# StaySuite therefore runs as its own deployment of this same codebase with
 # `.env.hotelos`, which sets `ENABLE_HOTEL_OS=true` along with the project it
 # points at. Default off, so the marketplace is correct with no environment
-# change at all; a StayOS deployment that forgets the flag fails as a clean 404
+# change at all; a StaySuite deployment that forgets the flag fails as a clean 404
 # on every PMS route, which is diagnosable, rather than as a 500 storm.
 if settings.enable_hotel_os:
     router.include_router(pms_router)

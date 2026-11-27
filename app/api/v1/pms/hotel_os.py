@@ -1249,7 +1249,7 @@ async def upsert_audience(
     A saved audience, reusable across campaigns — §30's actual requirement.
 
     **The interests are stored as the hotelier's words, not as Meta interest
-    ids.** Those ids come from a search endpoint StayOS cannot call until an ad
+    ids.** Those ids come from a search endpoint StaySuite cannot call until an ad
     account exists, and inventing them would target an ad at something
     arbitrary. `meta_spec` is the column that will hold what Meta accepted, once
     Meta can be asked.
@@ -1674,7 +1674,7 @@ async def delete_ad_campaign(
     """
     Delete a draft. A campaign Meta knows about cannot be deleted here.
 
-    Removing our row would leave an ad running that nothing in StayOS can see —
+    Removing our row would leave an ad running that nothing in StaySuite can see —
     the hotelier would be spending money on something their dashboard says does
     not exist.
     """

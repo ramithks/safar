@@ -24,7 +24,7 @@ asserts that the rows *this run created* are present, absent or refused. A
 suite that counts arrivals passes on Tuesday and fails on Wednesday for reasons
 that have nothing to do with the code.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/frontdesk_e2e.py            # deterministic
     ./venv/bin/python scripts/frontdesk_e2e.py --gemini   # + the live model

@@ -42,7 +42,7 @@ BUSY_MAX_RETRIES = 24
 
 
 @celery_app.task(
-    name="travbuddy.messaging.process_conversation",
+    name="safar.messaging.process_conversation",
     bind=True,
     # Retried by us, not by Celery's default. A model call that failed once will
     # usually fail again immediately; the backoff is what makes the second
@@ -128,7 +128,7 @@ async def _hand_to_human(conversation_id: str) -> None:
 
 
 @celery_app.task(
-    name="travbuddy.messaging.sweep_waiting_guests",
+    name="safar.messaging.sweep_waiting_guests",
     bind=True,
     # No retry. This runs again on its own in a few minutes and the next run
     # sees the same waiting guests — a retry would only bring the notification
@@ -141,15 +141,15 @@ def sweep_waiting_guests_task(self) -> dict:
     """
     Tell each hotel about the guests nobody came back to.
 
-    Routed to the `hotelos` queue by `travbuddy.messaging.*`, which is what
+    Routed to the `hotelos` queue by `safar.messaging.*`, which is what
     makes it read the right database: it must never be executed by the
     marketplace's worker, which has no `conversations` table.
 
-    **Enqueued by the StayOS beat, not the marketplace's.** This docstring used
+    **Enqueued by the StaySuite beat, not the marketplace's.** This docstring used
     to say the marketplace beat was "the only deployment that runs one", and
     that sentence is why `agent_escalations` was empty for the whole life of the
-    feature: the marketplace beat enqueues onto the marketplace broker, StayOS
-    brings up its own Redis, and the StayOS worker was listening to a queue
+    feature: the marketplace beat enqueues onto the marketplace broker, StaySuite
+    brings up its own Redis, and the StaySuite worker was listening to a queue
     nothing was writing to. Routing was correct and irrelevant — the message
     never crossed. See `celery_app._beat_schedule` and
     `tests/test_escalation_beat.py`, which runs this function rather than
@@ -174,7 +174,7 @@ def sweep_waiting_guests_task(self) -> dict:
 # ── inventory drift, noticed rather than discovered ─────────────────────────
 
 @celery_app.task(
-    name="travbuddy.pms.reconcile_inventory",
+    name="safar.pms.reconcile_inventory",
     # No retry. It runs again in an hour and the next run sees the same drift —
     # a retry would only report it twice.
     max_retries=0,

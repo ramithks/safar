@@ -253,7 +253,7 @@ async def probe_model(model: str, *, configured: list[str] | None = None,
 
 async def probe_production_tiers(**kwargs) -> list[ProbeResult]:
     """
-    Every model a StayOS tier can currently route to, including its fallbacks.
+    Every model a StaySuite tier can currently route to, including its fallbacks.
 
     This is the one to run before and after a deploy. It answers "can this
     build serve traffic", which is not the same as "is Vertex up": a tier whose

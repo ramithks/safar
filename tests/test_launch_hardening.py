@@ -220,8 +220,8 @@ def test_what_people_paste_is_accepted_as_a_hostname(typed, expected):
 
 @pytest.mark.parametrize("bad", [
     "", "   ", "localhost", "hotel", "-hotel.com", "hotel..com",
-    "hostos.in", "app.hostos.in", "api.hostos.in",
-    "partner.travbuddy.in", "travbuddy.in", "anything.vercel.app",
+    "staysuite.example.com", "app.staysuite.example.com", "api.staysuite.example.com",
+    "partner.safar.example.com", "safar.example.com", "anything.vercel.app",
 ])
 def test_what_may_not_be_claimed(bad):
     with pytest.raises(domains.DomainError):
@@ -230,24 +230,24 @@ def test_what_may_not_be_claimed(bad):
 
 def test_our_own_hostnames_are_reserved_by_name_not_by_luck():
     """
-    A hotel that claimed `app.hostos.in` would be claiming the staff app
+    A hotel that claimed `app.staysuite.example.com` would be claiming the staff app
     itself, and host resolution would then serve a booking page to everyone who
     tried to log in.
 
-    `travbuddy.in` is still on the list after the rename because
-    `partner.travbuddy.in` still resolves to this app — a name we redirect is
+    `safar.example.com` is still on the list after the rename because
+    `partner.safar.example.com` still resolves to this app — a name we redirect is
     still a name we own, and still one no hotel may claim.
     """
-    assert "hostos.in" in domains.RESERVED_SUFFIXES
-    assert "travbuddy.in" in domains.RESERVED_SUFFIXES
+    assert "staysuite.example.com" in domains.RESERVED_SUFFIXES
+    assert "safar.example.com" in domains.RESERVED_SUFFIXES
     with pytest.raises(domains.DomainError):
-        domains.validate("staff.hostos.in")
+        domains.validate("staff.staysuite.example.com")
     with pytest.raises(domains.DomainError):
-        domains.validate("staff.travbuddy.in")
+        domains.validate("staff.safar.example.com")
 
 
 def test_a_refusal_is_a_sentence_a_hotel_owner_can_act_on():
-    for bad in ("not-a-domain", "app.hostos.in", "partner.travbuddy.in", ""):
+    for bad in ("not-a-domain", "app.staysuite.example.com", "partner.safar.example.com", ""):
         try:
             domains.validate(bad)
         except domains.DomainError as exc:
@@ -263,8 +263,8 @@ def test_the_ownership_record_is_the_security_control():
     serving their booking page on it. The domain's real owner may never have
     heard of us.
     """
-    assert domains.TXT_NAME == "_travbuddy"
+    assert domains.TXT_NAME == "_safar"
     first = domains._new_token()
-    assert first.startswith("travbuddy-verify=")
+    assert first.startswith("safar-verify=")
     assert first != domains._new_token(), "a guessable token proves nothing"
     assert len(first) > 30

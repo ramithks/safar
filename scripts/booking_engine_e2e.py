@@ -23,7 +23,7 @@ The assertions that matter are the ones about money happening once:
   * a quote used twice
   * the last room sold to two people at the same moment
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010
     ./venv/bin/python scripts/booking_engine_e2e.py

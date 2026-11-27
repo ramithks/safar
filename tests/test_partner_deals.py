@@ -256,7 +256,7 @@ class TestCommissionSource:
     def test_no_partner_falls_back_rather_than_inventing_a_rate(self, wired):
         """
         A NULL partner_id is what makes a group trip OURS, and ours are stamped
-        0. Reaching for a default here would have TravBuddy invoicing itself.
+        0. Reaching for a default here would have Safar invoicing itself.
         """
         wired(_db())
         assert run(partner_terms.commission_pct(None, fallback=0)) == 0

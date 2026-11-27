@@ -313,6 +313,13 @@ async def vertex_generate(
     response_schema: a Gemini-compatible JSON schema — enables native
     structured output (forces responseMimeType to application/json).
     """
+    if settings.llm_backend != "vertex":
+        from app.services import freellm
+        return await freellm.or_generate(
+            contents, model=model, response_mime_type=response_mime_type,
+            response_schema=response_schema, temperature=temperature, seed=seed,
+            max_output_tokens=max_output_tokens, timeout=timeout,
+        )
     model = model or settings.vertex_model_brain
 
     if isinstance(contents, str):
@@ -577,6 +584,14 @@ async def vertex_generate_call(
     much reasoning a task is worth (see services/ai/model_router.py), and a
     classification call and a rate negotiation should not cost the same.
     """
+    if settings.llm_backend != "vertex":
+        from app.services import freellm
+        return await freellm.or_generate_call(
+            contents, model=model, system_instruction=system_instruction,
+            tools=tools, temperature=temperature,
+            max_output_tokens=max_output_tokens, thinking_budget=thinking_budget,
+            timeout=timeout, trace=trace,
+        )
     body: dict = {"contents": contents}
 
     if system_instruction:

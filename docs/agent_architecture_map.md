@@ -1,4 +1,4 @@
-# StayOS agent — the architecture, and where it can still go wrong
+# StaySuite agent — the architecture, and where it can still go wrong
 
 *Written 2026-08-25, for the deep reliability pass. §1 of the brief asks for
 this before anything is changed; the findings at the end are what changing

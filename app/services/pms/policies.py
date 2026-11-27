@@ -452,7 +452,7 @@ def deposit_for(
     What a guest pays now to confirm, and what is left for check-in.
 
     §12 asks for four rules — full payment, a percentage, a fixed token, and pay
-    at hotel — and StayOS already had exactly one of them, `settings.token_pct`,
+    at hotel — and StaySuite already had exactly one of them, `settings.token_pct`,
     which `price_stay` applies. So this adds the other three around it rather
     than replacing the one that works.
 

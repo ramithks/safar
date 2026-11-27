@@ -173,8 +173,8 @@ class TestPhotos:
         stub(monkeypatch, rows=[listing(photos=["/image/abc123", "/image/def456"])])
         photos = run()[0]["photos"]
         assert photos == [
-            "https://travbuddy.in/image/abc123",
-            "https://travbuddy.in/image/def456",
+            "https://safar.example.com/image/abc123",
+            "https://safar.example.com/image/def456",
         ]
 
     def test_absolute_and_protocol_relative_urls_survive(self, monkeypatch):
@@ -183,7 +183,7 @@ class TestPhotos:
 
     def test_junk_entries_are_dropped(self, monkeypatch):
         stub(monkeypatch, rows=[listing(photos=[None, "", "   ", "/image/ok"])])
-        assert run()[0]["photos"] == ["https://travbuddy.in/image/ok"]
+        assert run()[0]["photos"] == ["https://safar.example.com/image/ok"]
 
     def test_a_listing_with_no_usable_photo_is_not_shown(self, monkeypatch):
         stub(monkeypatch, rows=[listing(photos=["", None])])

@@ -1,5 +1,5 @@
 -- ============================================================================
--- TravBuddy Growth OS — group_trips: DB-driven group-trip pages
+-- Safar Growth OS — group_trips: DB-driven group-trip pages
 -- Idempotent: safe to re-run.
 --
 -- One row = one sellable group trip (the /trips/{slug} template page).

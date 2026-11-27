@@ -21,7 +21,7 @@ from app.services.admin_subscribers import _esc, _send, _wrap
 
 logger = logging.getLogger(__name__)
 
-SITE = "https://travbuddy.in"
+SITE = "https://safar.example.com"
 
 
 def _rupees(paise: int | None) -> str:
@@ -35,7 +35,7 @@ async def send_booking_emails(booking: dict) -> None:
     """
     try:
         partner_email = None
-        brand = "TravBuddy"
+        brand = "Safar"
 
         if booking.get("partner_id"):
             res = await run_db(

@@ -30,7 +30,7 @@ def _configured(monkeypatch):
     monkeypatch.setattr(
         settings,
         "instagram_redirect_uri",
-        "https://api.hostos.in/api/v1/messaging/instagram/oauth/callback",
+        "https://api.staysuite.example.com/api/v1/messaging/instagram/oauth/callback",
         raising=False,
     )
     monkeypatch.setattr(settings, "oauth_state_ttl_seconds", 600, raising=False)

@@ -147,7 +147,7 @@ def _create_hotel(
                 "slug": _unique_slug(db, "partners", slugify(hotel_name)),
                 "brand_name": hotel_name,
                 # `partners.whatsapp` is NOT NULL with no default, and the
-                # signup form asks for it as *optional* — StayOS's own advice
+                # signup form asks for it as *optional* — StaySuite's own advice
                 # is not to demand anything a hotel does not need to get
                 # started, and a hotel can be set up, priced and booked
                 # directly without one. So an owner who skips it wrote a null
@@ -969,7 +969,7 @@ async def update_property(*, property_id: str, fields: dict) -> dict:
 # the same number.
 MIN_WEBSITE_PHOTOS = 4
 
-# …and three of the five quality signals, which is `stayosHotelGate` again.
+# …and three of the five quality signals, which is `staysuiteHotelGate` again.
 MIN_WEBSITE_SIGNALS = 3
 
 
@@ -1080,7 +1080,7 @@ def _readiness(property_id: str) -> dict:
     # touches the website".
     #
     # The two had drifted, and the drift told hoteliers the opposite of the
-    # truth. `stayosHotelGate` asks for two requirements and three of five
+    # truth. `staysuiteHotelGate` asks for two requirements and three of five
     # signals; this asked for a hotel with nothing missing at all. So Casa
     # Mandala — live in the sitemap, `index, follow` on the page, four photos,
     # a description, policies, a map pin — read "Google ✗" on its own dashboard
@@ -1091,7 +1091,7 @@ def _readiness(property_id: str) -> dict:
     # Kept as an explicit mirror of `lib/seo/gates.ts` rather than derived from
     # the gap list, because the gap list is a to-do and the gate is a decision,
     # and reading one off the other is what produced the drift. The two are the
-    # same *numbers* on purpose: MIN_WEBSITE_PHOTOS here, MIN_STAYOS_PHOTOS
+    # same *numbers* on purpose: MIN_WEBSITE_PHOTOS here, MIN_STAYSUITE_PHOTOS
     # there, and three signals in both.
     signals = sum((
         len(about) >= 120,

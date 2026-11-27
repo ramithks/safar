@@ -16,7 +16,7 @@ would leave the admin thinking nothing happened when it did.
 
 **But it must not be reported as if it had worked.** `record()` returns whether
 the row landed, and a caller that moves money is expected to say so out loud:
-for a year the StayOS deployment had no `admin_audit_log` table at all, every
+for a year the StaySuite deployment had no `admin_audit_log` table at all, every
 credit grant logged "[audit] FAILED to record", and the operator's screen said
 "1,000 credits granted" with no hint that nothing had been written down. The
 loud log was doing its job and nobody was reading it. Now the person who took

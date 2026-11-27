@@ -9,7 +9,7 @@ Both videos are driven by `scripts/app_review_evidence.py`, which prints each
 request and each response with a pause long enough to read.
 
 ```
-cd travbuddy_backend
+cd safar_backend
 set -a; . ./.env.hotelos; set +a
 ```
 
@@ -60,8 +60,8 @@ just connected presses it to check its number works. It sends one WhatsApp
 message from the hotel's own number and prints the API call and Meta's reply on
 screen — which is exactly what Meta means by embedding the cURL into your site.
 
-**⚠ The card is new, so the live site does not have it yet.** `api.hostos.in`
-and `app.hostos.in` are still running the code from before this work. Two ways
+**⚠ The card is new, so the live site does not have it yet.** `api.staysuite.example.com`
+and `app.staysuite.example.com` are still running the code from before this work. Two ways
 round it, and the quick one is fine:
 
 *Record locally* (no deploy, ~2 minutes to set up). The reviewer is grading a
@@ -70,21 +70,21 @@ served the page.
 
 ```
 # terminal 1 — the backend
-cd travbuddy_backend
+cd safar_backend
 set -a; . ./.env.hotelos; set +a
 ./venv/bin/uvicorn app.main:app --port 8000
 
 # terminal 2 — the app
-cd Travbuddy_supply_os
+cd Safar_supply_os
 npm run dev            # http://localhost:5173, already points at :8000
 ```
 
-*Or deploy* both repos first, and record against `app.hostos.in`. Unambiguous,
+*Or deploy* both repos first, and record against `app.staysuite.example.com`. Unambiguous,
 and you need the deploy for real hotels anyway — but it is not required for the
 video.
 
 Log in as **`owner@anandihouse.demo`**. That is the hotel that owns the real
-verified number (+91 93184 79690, "Travbuddy"); Casa Mandala and the other seed
+verified number (+91 93184 79690, "Safar"); Casa Mandala and the other seed
 hotels are on sandbox connections and will not send anything.
 
 Set up before pressing record: the Settings page on one side, WhatsApp Web

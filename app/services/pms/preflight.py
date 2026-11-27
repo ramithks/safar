@@ -1,8 +1,8 @@
 """
-What StayOS needs configured, checked out loud at boot.
+What StaySuite needs configured, checked out loud at boot.
 
 **The failure this exists for is a silence, not an error.** `REVALIDATE_SECRET`
-was never set on the StayOS backend. `seo_ping.hotel_changed` handles that
+was never set on the StaySuite backend. `seo_ping.hotel_changed` handles that
 correctly — it skips, logs at `debug`, and never fails a hotelier's publish —
 and the consequence was that every hotel that published sat stale on the website
 for up to an hour, for a day, with nothing anywhere saying why. The behaviour was
@@ -10,11 +10,11 @@ right. The volume was wrong.
 
 Two failures with the same shape were already in the deployment notes:
 `GCS_BUCKET_NAME` (photo upload 503s, which reads to a hotelier as their
-connection) and `STAYOS_API_BASE_URL` on the website (every hotel page 404s).
+connection) and `STAYSUITE_API_BASE_URL` on the website (every hotel page 404s).
 
 So: a **degradation** is announced at WARNING with the variable's name and the
 sentence describing what stops working. A **hard requirement** stops the boot,
-because a StayOS process with no database is not a degraded StayOS.
+because a StaySuite process with no database is not a degraded StaySuite.
 
 Deliberately not a health endpoint. A check nobody looks at is the same as no
 check — this runs once, at startup, into the log a deploy tails anyway.
@@ -45,11 +45,11 @@ class Requirement:
 REQUIREMENTS = (
     Requirement(
         env="SUPABASE_URL", attr="supabase_url", fatal=True,
-        consequence="StayOS has no database; nothing will work.",
+        consequence="StaySuite has no database; nothing will work.",
     ),
     Requirement(
         env="SUPABASE_SERVICE_KEY", attr="supabase_service_key", fatal=True,
-        consequence="StayOS cannot write; every booking and message will fail.",
+        consequence="StaySuite cannot write; every booking and message will fail.",
     ),
     Requirement(
         env="GCS_BUCKET_NAME", attr="gcs_bucket_name",
@@ -62,7 +62,7 @@ REQUIREMENTS = (
     Requirement(
         env="REVALIDATE_SECRET", attr="revalidate_secret",
         consequence=(
-            "Publishing a hotel will not purge its pages on travbuddy.in. The "
+            "Publishing a hotel will not purge its pages on safar.example.com. The "
             "site stays stale for up to an hour and the sitemap for up to a "
             "day, with nothing telling the hotelier why."
         ),
@@ -109,21 +109,21 @@ def check() -> list[Requirement]:
     if fatal:
         names = ", ".join(r.env for r in fatal)
         for requirement in fatal:
-            logger.critical("[stayos] %s is not set — %s",
+            logger.critical("[staysuite] %s is not set — %s",
                             requirement.env, requirement.consequence)
-        raise RuntimeError(f"StayOS cannot start without: {names}")
+        raise RuntimeError(f"StaySuite cannot start without: {names}")
 
     for requirement in missing:
         # WARNING, and naming the variable. The whole point: a degradation
         # nobody is told about is one that lasts a day.
-        logger.warning("[stayos] %s is not set — %s",
+        logger.warning("[staysuite] %s is not set — %s",
                        requirement.env, requirement.consequence)
 
     if not missing:
-        logger.info("[stayos] configuration complete: %d required variables present",
+        logger.info("[staysuite] configuration complete: %d required variables present",
                     len(REQUIREMENTS))
     else:
-        logger.warning("[stayos] running degraded: %d of %d variables missing (%s)",
+        logger.warning("[staysuite] running degraded: %d of %d variables missing (%s)",
                        len(missing), len(REQUIREMENTS),
                        ", ".join(r.env for r in missing))
     return missing

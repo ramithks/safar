@@ -1,7 +1,7 @@
 -- Breakfast is a fact, not a sentence.
 --
 -- "Breakfast included hai?" is the second-most-asked question in the live
--- Instagram transcripts and StayOS cannot answer it from structured data. What
+-- Instagram transcripts and StaySuite cannot answer it from structured data. What
 -- exists is `rate_plans.meal_plan` — EP / CP / MAP / AP — which says what a rate
 -- *includes* and nothing about what the meal is, when it is served, what it
 -- costs if it is not included, or whether a vegetarian guest will find anything

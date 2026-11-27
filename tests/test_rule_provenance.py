@@ -375,7 +375,7 @@ class TestAGuardrailBlockLeavesADiagnosis:
     **Thirty guardrail blocks in production and not one retains what was
     refused.** The row holds the phrase that matched and nothing else, so the
     largest failure class on product traffic — 35% — cannot be diagnosed after
-    the fact, and §17's question, *why did StayOS say this?*, has no answer
+    the fact, and §17's question, *why did StaySuite say this?*, has no answer
     without a log search against a run id nobody has.
 
     It matters most where the rule is subtle. Several of those blocks matched

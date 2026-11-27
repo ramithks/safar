@@ -1,5 +1,5 @@
 -- ============================================================================
--- TravBuddy Recommendation Engine — schema migration
+-- Safar Recommendation Engine — schema migration
 -- Design: docs/recommendation_engine.md
 -- Idempotent: safe to re-run. Apply on Supabase (SQL editor / psql).
 -- ============================================================================

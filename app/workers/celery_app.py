@@ -21,26 +21,26 @@ logger = logging.getLogger(__name__)
 #
 # **The sweep was scheduled and never ran, for four months.**
 #
-# `stayos-waiting-guests` sits in the schedule below with a comment saying beat
-# enqueues it and "only the StayOS worker — the one with StayOS's SUPABASE_URL —
+# `staysuite-waiting-guests` sits in the schedule below with a comment saying beat
+# enqueues it and "only the StaySuite worker — the one with StaySuite's SUPABASE_URL —
 # ever runs it". That reasoning assumed one Redis. It is not one Redis:
-# `docker-compose.stayos.yml` brings up its own (`stayos_redis_data`), and its
+# `docker-compose.staysuite.yml` brings up its own (`staysuite_redis_data`), and its
 # api and worker both point at `redis://redis:6379/0` inside their own network.
 #
 # So the marketplace beat enqueues the sweep onto the *marketplace* broker's
-# `hotelos` queue, and the StayOS worker is listening to the *StayOS* broker's
+# `hotelos` queue, and the StaySuite worker is listening to the *StaySuite* broker's
 # `hotelos` queue. The two never meet. No error, no dead letter, no symptom —
 # the guest simply waits, and the notification that was built to reach a
 # manager's phone reaches nothing. Confirmed against production: zero rows in
-# `agent_escalations`, ever, and the StayOS compose has no beat service at all.
+# `agent_escalations`, ever, and the StaySuite compose has no beat service at all.
 #
 # The comment that justified having no beat service — "every scheduled entry is
 # a marketplace task" — was true when it was written and stopped being true when
 # the sweep was added, which is exactly the kind of drift a comment cannot
 # catch and a split cannot hide.
 #
-# So the schedule is split by role rather than shared. A StayOS beat runs the
-# StayOS entries and *only* those: `revert_intro_commission` writes hourly to
+# So the schedule is split by role rather than shared. A StaySuite beat runs the
+# StaySuite entries and *only* those: `revert_intro_commission` writes hourly to
 # `partners`, a table that also exists and means something entirely different
 # in the hotel OS, and pointing it at a hotel database is the one outcome worse
 # than the sweep not running.
@@ -50,31 +50,31 @@ logger = logging.getLogger(__name__)
 
 _MARKETPLACE_SCHEDULE = {
     "reco-expected-price-nightly": {
-        "task": "travbuddy.reco.refresh_expected_price", "schedule": 24 * 3600,
+        "task": "safar.reco.refresh_expected_price", "schedule": 24 * 3600,
     },
     "reco-destination-priors-nightly": {
-        "task": "travbuddy.reco.refresh_destination_priors", "schedule": 24 * 3600,
+        "task": "safar.reco.refresh_destination_priors", "schedule": 24 * 3600,
     },
     "reco-fit-centroids-weekly": {
-        "task": "travbuddy.reco.fit_centroids", "schedule": 7 * 24 * 3600,
+        "task": "safar.reco.fit_centroids", "schedule": 7 * 24 * 3600,
     },
     # Hourly, not nightly: an intro rate ends at a wall-clock moment, and a
     # partner who watches their dashboard flip a rate the morning after it
     # expired asks why. Cheap — it touches only rows that have lapsed.
     #
-    # **Never on a StayOS beat.** It writes to `partners`.
+    # **Never on a StaySuite beat.** It writes to `partners`.
     "partner-intro-commission-hourly": {
-        "task": "travbuddy.partners.revert_intro_commission", "schedule": 3600,
+        "task": "safar.partners.revert_intro_commission", "schedule": 3600,
     },
 }
 
-_STAYOS_SCHEDULE = {
+_STAYSUITE_SCHEDULE = {
     # Every five minutes rather than every minute: `WAITING_AFTER_MINUTES` is
     # ten, so five bounds the worst case at fifteen minutes from a guest's
     # message to a manager's phone, and a sweep that found nothing is one
     # indexed query.
-    "stayos-waiting-guests": {
-        "task": "travbuddy.messaging.sweep_waiting_guests", "schedule": 300,
+    "staysuite-waiting-guests": {
+        "task": "safar.messaging.sweep_waiting_guests", "schedule": 300,
     },
     # Inventory drift is the one class of defect here that does not announce
     # itself. An oversold night sells a room the hotel does not have and nobody
@@ -84,8 +84,8 @@ _STAYOS_SCHEDULE = {
     # Hourly, and it reports rather than corrects — see the task. The
     # reconciliation has existed all along and nothing ran it, which is how both
     # of the real incidents were found by hand.
-    "stayos-inventory-drift": {
-        "task": "travbuddy.pms.reconcile_inventory", "schedule": 3600,
+    "staysuite-inventory-drift": {
+        "task": "safar.pms.reconcile_inventory", "schedule": 3600,
     },
 }
 
@@ -100,7 +100,7 @@ def _beat_schedule() -> dict:
     compose file knows which.
 
         marketplace   the reco and partner tasks (the historical default)
-        stayos        the waiting-guest sweep, and nothing that writes to a
+        staysuite        the waiting-guest sweep, and nothing that writes to a
                       marketplace table
         all           both — the default, so nothing changes for a deployment
                       that does not set it
@@ -108,19 +108,19 @@ def _beat_schedule() -> dict:
     import os
 
     role = (os.environ.get("CELERY_BEAT_ROLE") or "all").strip().lower()
-    if role == "stayos":
-        return dict(_STAYOS_SCHEDULE)
+    if role == "staysuite":
+        return dict(_STAYSUITE_SCHEDULE)
     if role == "marketplace":
         return dict(_MARKETPLACE_SCHEDULE)
     if role != "all":
         logger.warning(
             "CELERY_BEAT_ROLE=%r is not a role; scheduling everything", role,
         )
-    return {**_MARKETPLACE_SCHEDULE, **_STAYOS_SCHEDULE}
+    return {**_MARKETPLACE_SCHEDULE, **_STAYSUITE_SCHEDULE}
 
 
 celery_app = Celery(
-    "travbuddy",
+    "safar",
     broker=settings.redis_url,
     backend=settings.redis_url,
     # Task modules the worker must import so their @task functions register. Without
@@ -177,7 +177,7 @@ celery_app.conf.update(
     # grabs it first runs it: a guest's WhatsApp reply picked up by the
     # marketplace worker looks for `conversations` in a project that has never
     # had that table, and fails in a service nobody was looking at. Sharing one
-    # Redis makes that certain rather than likely — and the StayOS service is
+    # Redis makes that certain rather than likely — and the StaySuite service is
     # meant to be configured by copying the marketplace's environment, `REDIS_URL`
     # included.
     #
@@ -187,19 +187,19 @@ celery_app.conf.update(
     # moment its tasks moved. Renaming its queue to be symmetrical would be a
     # tidier diagram and an outage.
     #
-    # The StayOS worker therefore starts with `-Q hotelos`, and the marketplace
+    # The StaySuite worker therefore starts with `-Q hotelos`, and the marketplace
     # worker's command does not change. Beat belongs to the marketplace
     # deployment: every scheduled entry below is a marketplace task, and
     # `revert_intro_commission` runs hourly and *writes* to `partners` — a table
     # that also exists, meaning something quite different, in the hotel OS.
     task_routes={
-        "travbuddy.messaging.*": {"queue": "hotelos"},
-        "travbuddy.marketing.*": {"queue": "hotelos"},
+        "safar.messaging.*": {"queue": "hotelos"},
+        "safar.marketing.*": {"queue": "hotelos"},
         # The hotel's own operational tasks. Same deployment as messaging —
         # `pms` is the hotel side of this codebase, and a reconciliation that
         # ran on the marketplace worker would be reading a hotel database from
         # a process that has no business with one.
-        "travbuddy.pms.*": {"queue": "hotelos"},
+        "safar.pms.*": {"queue": "hotelos"},
     },
     # Recommendation-engine nightly/weekly maintenance (docs/recommendation_engine.md
     # Part 9.3 / 14.3). Defined here — not in reco_tasks — so `celery beat` sees the
@@ -209,7 +209,7 @@ celery_app.conf.update(
 )
 
 
-@celery_app.task(bind=True, name="travbuddy.analyze_reel", max_retries=0)
+@celery_app.task(bind=True, name="safar.analyze_reel", max_retries=0)
 def analyze_reel_task(
     self,
     job_id: str,

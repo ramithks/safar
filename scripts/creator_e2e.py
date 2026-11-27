@@ -31,7 +31,7 @@ The assertions that matter are the ones a spreadsheet cannot make:
   * **evidence cannot be rewritten** — the chain refuses to be edited or
     deleted, which is what makes the payout defensible three months later.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010
     ./venv/bin/python scripts/creator_e2e.py

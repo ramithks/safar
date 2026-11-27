@@ -26,7 +26,7 @@ left behind before it builds, for the reason `e2e_fixture` gives: a run that
 dies halfway leaves rows, and the run that finds them should not inherit them.
 
 ⚠ Everything here is created under ids beginning `f1…` and emails at
-`@pilot.stayos.test`. Nothing outside that namespace is ever touched, so this
+`@pilot.staysuite.test`. Nothing outside that namespace is ever touched, so this
 cannot disturb Casa Mandala or the three suites that share it.
 """
 import base64
@@ -71,18 +71,18 @@ IG_ACCOUNT_ID = "pilot-ig-777000222"
 
 PASSWORD = "pilot-os-dev"
 NAMES = {
-    "owner@pilot.stayos.test": "Nikhil Sequeira",
-    "manager@pilot.stayos.test": "Aarti Kamat",
-    "reception@pilot.stayos.test": "Riya Menon",
-    "housekeeping@pilot.stayos.test": "Sunil Gaonkar",
-    "agency@pilot.stayos.test": "Rhea Fernandes",
+    "owner@pilot.staysuite.test": "Nikhil Sequeira",
+    "manager@pilot.staysuite.test": "Aarti Kamat",
+    "reception@pilot.staysuite.test": "Riya Menon",
+    "housekeeping@pilot.staysuite.test": "Sunil Gaonkar",
+    "agency@pilot.staysuite.test": "Rhea Fernandes",
 }
 EMAILS = {
-    "owner": "owner@pilot.stayos.test",
-    "manager": "manager@pilot.stayos.test",
-    "reception": "reception@pilot.stayos.test",
-    "housekeeping": "housekeeping@pilot.stayos.test",
-    "agency": "agency@pilot.stayos.test",
+    "owner": "owner@pilot.staysuite.test",
+    "manager": "manager@pilot.staysuite.test",
+    "reception": "reception@pilot.staysuite.test",
+    "housekeeping": "housekeeping@pilot.staysuite.test",
+    "agency": "agency@pilot.staysuite.test",
 }
 
 # Room counts small enough that "the last room" is reachable in a test and

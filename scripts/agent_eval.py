@@ -29,7 +29,7 @@ completion of the correct business action*, and a turn where the model chatted
 and the application priced the rooms is a success. `model called it` is reported
 separately because it is worth knowing, not because it is the target.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/agent_eval.py --runs 8            # ~112 turns
     ./venv/bin/python scripts/agent_eval.py --runs 8 --compare  # both sweeps

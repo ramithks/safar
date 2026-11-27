@@ -1,6 +1,6 @@
 -- The platform fee is a number, not a conversation.
 --
--- StayOS charges 4% of the booking amount, and that fact appears nowhere in the
+-- StaySuite charges 4% of the booking amount, and that fact appears nowhere in the
 -- codebase. Grepped before writing this: no `platform_fee`, no `payout`, no
 -- `settlement`. It exists in a pitch deck and in Sahil's head, which means every
 -- number a hotelier has ever been shown about what they will receive was either
@@ -17,7 +17,7 @@
 -- lives.
 --
 -- **Snapshotted on the reservation, and never recomputed.** §37: a booking must
--- preserve its own financial truth. If TravBuddy renegotiates a hotel to 3%
+-- preserve its own financial truth. If Safar renegotiates a hotel to 3%
 -- next year, last year's settled bookings must keep saying 4%, because that is
 -- what was settled. The columns are written once at creation and are not
 -- derived on read anywhere.
@@ -66,7 +66,7 @@ from public.partners p
 where p.id = r.partner_id and r.platform_fee_paise is null;
 
 comment on column public.reservations.platform_fee_paise is
-  'The StayOS fee on this booking, snapshotted at creation from the partner''s '
+  'The StaySuite fee on this booking, snapshotted at creation from the partner''s '
   'rate at that moment. Never recomputed — a later rate change must not rewrite '
   'a settled booking. Internal: never shown to a guest.';
 comment on column public.partners.platform_fee_bps is

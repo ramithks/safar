@@ -17,7 +17,7 @@ The pipeline, in order — this is the contract:
     season rate (per night) -> gross -> coupon discount -> total -> advance
                                                         -> commission + payout
 
-Discounts come off before commission, so the partner and TravBuddy share the
+Discounts come off before commission, so the partner and Safar share the
 cost of a promotion in proportion. Commission is charged on the TOTAL — the
 whole booking we brought the partner — and deducted from the advance we hold;
 the payout is whatever is left of that advance, so the two always sum back to

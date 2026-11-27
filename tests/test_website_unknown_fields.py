@@ -36,9 +36,9 @@ def request_with(**kwargs) -> schemas.WebsiteUpdateRequest:
 # ── what the schema now does with a name it does not know ───────────────────
 
 def test_the_key_the_suite_actually_sent_is_captured_rather_than_dropped():
-    body = request_with(cover_image="https://images.stayos.test/ignored.jpg")
+    body = request_with(cover_image="https://images.staysuite.test/ignored.jpg")
     assert body.model_extra == {
-        "cover_image": "https://images.stayos.test/ignored.jpg"}
+        "cover_image": "https://images.staysuite.test/ignored.jpg"}
     assert sorted(body.model_extra) == ["cover_image"]
 
 
@@ -102,8 +102,8 @@ def test_the_gallery_still_takes_both_shapes():
     declared, so neither may land in `model_extra`.
     """
     body = request_with(gallery=[
-        "https://images.stayos.test/old.jpg",
-        {"url": "https://images.stayos.test/new.jpg", "category": "pool"},
+        "https://images.staysuite.test/old.jpg",
+        {"url": "https://images.staysuite.test/new.jpg", "category": "pool"},
     ])
     assert not body.model_extra
     assert len(body.gallery) == 2

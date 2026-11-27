@@ -46,10 +46,10 @@ CHANNEL = "whatsapp"
 # drift the first time either is edited.
 _SAYS = {
     "PARTNER_REMOVED":
-        "This hotel removed HostOS from its WhatsApp account. Reconnect to start "
+        "This hotel removed StaySuite from its WhatsApp account. Reconnect to start "
         "answering guests again.",
     "PARTNER_APP_UNINSTALLED":
-        "HostOS was removed from this WhatsApp account. Reconnect to start "
+        "StaySuite was removed from this WhatsApp account. Reconnect to start "
         "answering guests again.",
     "ACCOUNT_VIOLATION":
         "Meta has flagged this WhatsApp account. Guests may not receive replies "
@@ -62,7 +62,7 @@ _SAYS = {
     "DISABLED_UPDATE":
         "Meta has disabled this WhatsApp account.",
     "ACCOUNT_OFFBOARDED":
-        "This WhatsApp account has been moved away from HostOS.",
+        "This WhatsApp account has been moved away from StaySuite.",
 }
 
 # The events that mean we can no longer send as this hotel. A credential left

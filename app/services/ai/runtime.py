@@ -953,7 +953,7 @@ async def run_turn(
                 # retains what was actually refused — the row holds the phrase
                 # that matched and nothing else. So the largest failure class on
                 # product traffic (35%) cannot be diagnosed after the fact, and
-                # §17's question — *why did StayOS say this?* — has no answer
+                # §17's question — *why did StaySuite say this?* — has no answer
                 # without a log search against a run id nobody has.
                 #
                 # It matters most where the rule is subtle. Several blocks

@@ -1,4 +1,4 @@
-# StayOS Agent 2.0 — audit and plan
+# StaySuite Agent 2.0 — audit and plan
 
 Written 2026-08-22, after inspecting the live code and the live Supabase data.
 Working document: phases are executed top to bottom, boxes ticked as they land.
@@ -14,13 +14,13 @@ section records what was found so no phase below rebuilds something.
 
 | Thing | Where |
 | --- | --- |
-| Agent runtime, tools, messaging, PMS | `~/Desktop/travbuddy_backend` (FastAPI) |
-| StayOS operator UI + guest surfaces | `~/Desktop/Travbuddy_supply_os` (Vite SPA, `partner.travbuddy.in`) |
-| Consumer site | `~/Desktop/Travbuddy_website` (Next.js, `travbuddy.in`) |
-| **StayOS database** | Supabase `rdlozqvuywtgsodunait` ("Travbuddy agency") |
-| Marketplace/consumer database | Supabase `uabxtdhxbamuhthxnhid` ("Travbuddy") |
+| Agent runtime, tools, messaging, PMS | `~/Desktop/safar_backend` (FastAPI) |
+| StaySuite operator UI + guest surfaces | `~/Desktop/Safar_supply_os` (Vite SPA, `partner.safar.example.com`) |
+| Consumer site | `~/Desktop/Safar_website` (Next.js, `safar.example.com`) |
+| **StaySuite database** | Supabase `rdlozqvuywtgsodunait` ("Safar agency") |
+| Marketplace/consumer database | Supabase `uabxtdhxbamuhthxnhid` ("Safar") |
 
-`enable_hotel_os` gates the PMS routes; StayOS is its own deployment of the same
+`enable_hotel_os` gates the PMS routes; StaySuite is its own deployment of the same
 codebase with `.env.hotelos`.
 
 ### 0.2 The Instagram path, as it actually runs
@@ -134,9 +134,9 @@ Root causes, all still live:
 - **`properties.lat/lon` is null for 9 of 10 properties**, `policies` empty for 7.
 - **The hotel website has no SEO or AEO at all.** `/stay/:slug` is a lazy React
   route in a Vite SPA. `index.html` ships one static
-  `<title>TravBuddy Partner</title>`, no per-hotel metadata, no server-rendered
+  `<title>Safar Partner</title>`, no per-hotel metadata, no server-rendered
   content, no JSON-LD, no sitemap, no canonical. To Google and to any answer
-  engine, every StayOS hotel website is one blank page.
+  engine, every StaySuite hotel website is one blank page.
 - **`razorpay_webhook_events` has RLS disabled** (flagged by the advisor).
 - **Booking confirmation page**: `/pay/:orderId` shows a result but there is no
   durable, tokenised "view my booking + receipt" URL to send on Instagram.
@@ -350,7 +350,7 @@ and twenty-one room types, and two of twenty-one have a description.
         means unchanged and an empty value means cleared. Without that
         distinction, renaming a room would silently empty its description.
       * **There was nowhere to put a file.** The form asked for photo *links*
-        — "paste them from your website, or Instagram" — because StayOS had no
+        — "paste them from your website, or Instagram" — because StaySuite had no
         image storage. Every hotel answered it with nothing. New:
         `POST /properties/{id}/media`, multipart, property-scoped prefix built
         server-side, 5 MB, JPG/PNG/WebP/AVIF, straight to the GCS bucket the
@@ -366,12 +366,12 @@ and twenty-one room types, and two of twenty-one have a description.
         slowest part of the form should not run at the moment the owner thinks
         they are finished, on a connection that may not survive it.
 
-      **Deployment change, recorded in `DEPLOYING_STAYOS.md`:** `GCS_BUCKET_NAME`
-      was on that document's *"must NOT be set"* list — correct until StayOS
+      **Deployment change, recorded in `DEPLOYING_STAYSUITE.md`:** `GCS_BUCKET_NAME`
+      was on that document's *"must NOT be set"* list — correct until StaySuite
       grew an uploader. It is now required, and its absence answers 503 with a
       readable sentence and a log line naming the variable, rather than a 500
       from inside the GCS client. ⚠ **Still to do on the production
-      environment**: add `GCS_BUCKET_NAME=travbuddy-media-2` in Coolify.
+      environment**: add `GCS_BUCKET_NAME=safar-media-2` in Coolify.
 
 - [x] **4.2** AI room import — `services/pms/extract.py`, plus
       `POST /properties/{id}/extract/{text,file}`.
@@ -731,7 +731,7 @@ Suites green: 1,206 unit · onboarding 65 · golden 88 · pms 134 · sales 185.
       property is one), `PostalAddress`, `GeoCoordinates`, `HotelRoom` with
       `Offer`/`UnitPriceSpecification` at `unitCode: DAY`, `FAQPage` as
       `mainEntityOfPage`, `BreadcrumbList`. **No `aggregateRating`, no
-      `review`, no `starRating`** — StayOS has no review corpus and inventing
+      `review`, no `starRating`** — StaySuite has no review corpus and inventing
       one is the fastest route to a manual action.
 - [x] **7.5** FAQ from verified fields only. An empty field produces no
       question rather than a "please contact us" non-answer occupying a snippet
@@ -739,11 +739,11 @@ Suites green: 1,206 unit · onboarding 65 · golden 88 · pms 134 · sales 185.
 - [x] **7.6** Room pages, gated harder than their hotels: prose **and** two
       photos of their own, or the page renders and is not submitted. Without
       that test every hotel spawns four near-duplicates of itself.
-- [x] **7.7** `stayosHotelGate` — photos and a sellable room are requirements;
+- [x] **7.7** `staysuiteHotelGate` — photos and a sellable room are requirements;
       description, room photos, policies, location and amenities are signals.
       Failing is `noindex,follow` and absence from the sitemap; the page still
       renders, still links and still takes bookings.
-- [x] **7.8** Sitemap sections `stayos-hotels` and `stayos-rooms` under the
+- [x] **7.8** Sitemap sections `staysuite-hotels` and `staysuite-rooms` under the
       existing `<sitemapindex>`, with `lastmod` from the website's own publish
       time. `/book` added to core.
 - [x] **7.9** `next/image` with `priority` + `sizes` on the hero;
@@ -767,17 +767,17 @@ rate plan, verified custom domain and a content `updatedAt`.
 hotel's own domain when it had one — which sounds right and is backwards: that
 domain serves the Vite SPA with one static title and no rendered content, so it
 would have asked Google to keep the emptier of the two pages. Canonical stays on
-travbuddy.in; the hotel's domain is credited as schema `sameAs` and a visible
+safar.example.com; the hotel's domain is credited as schema `sameAs` and a visible
 link, and the comment says what has to change for that to flip.
 
-**One real bug the build caught.** `lib/stayos.ts` first read
-`PLAN_API_BASE_URL`. StayOS is a *separate deployment on a separate host*
-(`stayos-backend.travbuddy.in`), so that would have 404'd every hotel page in
-production; it surfaced because pointing the shared variable at StayOS broke the
-catalogue sitemap instead. Now `STAYOS_API_BASE_URL`.
+**One real bug the build caught.** `lib/staysuite.ts` first read
+`PLAN_API_BASE_URL`. StaySuite is a *separate deployment on a separate host*
+(`staysuite-backend.safar.example.com`), so that would have 404'd every hotel page in
+production; it surfaced because pointing the shared variable at StaySuite broke the
+catalogue sitemap instead. Now `STAYSUITE_API_BASE_URL`.
 
-⚠ **Production env**: set `STAYOS_API_BASE_URL` on Vercel, and
-`REVALIDATE_SECRET` on both the website and the StayOS backend, or the SEO ping
+⚠ **Production env**: set `STAYSUITE_API_BASE_URL` on Vercel, and
+`REVALIDATE_SECRET` on both the website and the StaySuite backend, or the SEO ping
 is skipped (it logs at debug and never fails a publish).
 
 ⚠ **Honest state of the data**: of ten published hotels, only Casa Mandala —
@@ -955,26 +955,26 @@ Checked by calling the live hosts, not by reading a dashboard.
 
 **Live and correct**
 
-- StayOS backend (Coolify): `/public/hotels` 200, `/public/bookings/{token}` 200
+- StaySuite backend (Coolify): `/public/hotels` 200, `/public/bookings/{token}` 200
   on a real token and 404 on an unknown one, `readiness`, `extract/correct`, the
   session panel, and photo upload straight through to
-  `travbuddy-media-2` with a publicly readable URL.
+  `safar-media-2` with a publicly readable URL.
 - Website (Vercel): `/book`, `/book/{slug}`, `/book/{slug}/rooms/{room}`, and
   `/b/{token}` all render. Robots match the gate per hotel — Casa Mandala
   `index, follow`, the three hotels with no photos `noindex`. `/b/` is
   `noindex, nofollow, nocache`. The canonical stays the bare hotel URL under
   `?checkin=&checkout=&adults=&rooms=`. JSON-LD carries LodgingBusiness,
   HotelRoom, Offer + UnitPriceSpecification, FAQPage and BreadcrumbList. Both
-  StayOS sitemap sections are in the index and `/api/revalidate` refuses a
+  StaySuite sitemap sections are in the index and `/api/revalidate` refuses a
   wrong secret and purges all five paths with the right one.
 
 **Two things still outstanding**
 
 - [ ] **The partner app has not been redeployed.** The bundle at
-      partner.travbuddy.in contains Phase 5's readiness panel and none of this
+      partner.safar.example.com contains Phase 5's readiness panel and none of this
       work — no session panel, no draft correction. The commits are pushed;
       the Vercel project just has not rebuilt.
-- [ ] **`REVALIDATE_SECRET` is not set on the StayOS backend.** Proven rather
+- [ ] **`REVALIDATE_SECRET` is not set on the StaySuite backend.** Proven rather
       than assumed: re-publishing Casa Mandala moved the backend's `updatedAt`
       to 19:47:54 and left the website's sitemap on 09:31:02; a manual purge
       with the same payload moved it immediately. The receiver works and the
@@ -1113,7 +1113,7 @@ wrong was narrower and worse.
       behaviour was right and the volume was wrong, and it cost a day of stale
       pages. Never logs a value.
 - [x] **Demo data stops being a production signal.** `Casa Mandala` is a
-      fictional hotel in Anjuna and was the **only** StayOS hotel in the sitemap
+      fictional hotel in Anjuna and was the **only** StaySuite hotel in the sitemap
       and submitted to IndexNow — it passed the quality gate, which made it the
       dangerous case rather than the safe one. `properties.is_demo` on the six
       seeded properties; the four real ones untouched.
@@ -1143,13 +1143,13 @@ tenant_isolation 49 · ai 98 · sales 185 · golden 88 · onboarding 65 · websi
 oversold.
 
 **Deployment note.** The backend auto-deploys from a push to this repository —
-pushing `stayos-production-hardening` built and restarted it, with about 45
+pushing `staysuite-production-hardening` built and restarted it, with about 45
 seconds of 502s. That was not intended and is worth knowing before the next
 branch push.
 
 ## Still open after this phase
 
-- [ ] **`REVALIDATE_SECRET` on the StayOS backend.** The preflight now says so
+- [ ] **`REVALIDATE_SECRET` on the StaySuite backend.** The preflight now says so
       at boot on every start; the variable still has to be set in Coolify.
 - [ ] **The website has not deployed.** It is on a feature branch, so the demo
       gate is not live there. The backend change alone drops Casa Mandala from
@@ -1183,11 +1183,11 @@ production database said when it was asked a direct question.
       is the more urgent, because a promise was made.
 
       Scheduled by the marketplace's beat and routed to `hotelos`, so only the
-      worker holding StayOS's database can run it. `test_celery_routing`'s "no
+      worker holding StaySuite's database can run it. `test_celery_routing`'s "no
       hotel-OS task in the schedule" rule is replaced by the thing it stood in
       for: *nothing may be scheduled that the worker consuming its queue cannot
-      run.* **Operational consequence, recorded in `DEPLOYING_STAYOS.md`: if the
-      marketplace beat stops, StayOS stops telling hotels about waiting guests.**
+      run.* **Operational consequence, recorded in `DEPLOYING_STAYSUITE.md`: if the
+      marketplace beat stops, StaySuite stops telling hotels about waiting guests.**
 
 - [x] **Two exclusions, both from looking at production rather than at the
       design.** Nine conversations were waiting the day this was written and
@@ -1240,7 +1240,7 @@ production database said when it was asked a direct question.
 
 ## 11.3 The sale, replayed until it broke
 
-- [x] **The reply guardrail was refusing the payment link.** Every link StayOS
+- [x] **The reply guardrail was refusing the payment link.** Every link StaySuite
       issues is `/pay/order_TTNlZOqsCGlaWH` — a Razorpay order id — and the
       snake-case rule that keeps `folio_entries` away from guests matches it
       exactly. The one message that takes the money was blocked and the guest

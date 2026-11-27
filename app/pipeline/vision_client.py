@@ -259,7 +259,7 @@ def analyze_frames(
     if not frames:
         return []
 
-    if not settings.gcp_project:
+    if settings.llm_backend == "vertex" and not settings.gcp_project:
         logger.error("GCP_PROJECT not set — vision analysis disabled")
         return [VisionResult(frame=f) for f in frames]
 
@@ -416,6 +416,9 @@ def _run_batch_with_retry(
     # Ordered attempt plan: every account across the region chain. Primary's
     # regions come first (uses the $300 credit); the fallback account's regions
     # are reached only after the primary keeps returning 429.
+    if settings.llm_backend != "vertex":
+        return _call_freellm_batch(frames, image_bytes_list, prompt)
+
     plan: list[tuple[_VertexAccount, str]] = [
         (account, location)
         for account in _get_accounts()
@@ -522,6 +525,38 @@ def _call_gemini_batch(
 # ── Response parsing ───────────────────────────────────────────────────────────
 
 
+def _call_freellm_batch(
+    frames: list[ExtractedFrame],
+    image_bytes_list: list[bytes],
+    prompt: str,
+) -> list[VisionResult]:
+    """Free-LLM twin of _call_gemini_batch: same batch contract, OpenRouter
+    vision model underneath (no GCP credentials, no cost). Parses the returned
+    JSON array with the same logic as the Gemini path."""
+    import base64
+
+    from app.services import freellm
+
+    frames_b64: list[tuple[str, str]] = []
+    for img_bytes in image_bytes_list:
+        frames_b64.append(("image/jpeg", base64.b64encode(img_bytes).decode() if img_bytes else ""))
+    # Drop unreadable frames from the request but keep indices aligned by
+    # re-mapping results through the placeholder text approach the Gemini path
+    # uses: send only valid images, parse, then align by position.
+    valid = [(i, fb) for i, fb in enumerate(frames_b64) if fb[1]]
+    try:
+        text = freellm.vision_generate_sync(
+            prompt,
+            _BATCH_SYSTEM_PROMPT,
+            [fb for _, fb in valid],
+            max_output_tokens=12288,
+        )
+    except Exception as exc:
+        logger.error(f"Free-LLM batch call failed: {type(exc).__name__}: {exc}")
+        return [VisionResult(frame=f) for f in frames]
+    return _parse_batch_text(text, frames)
+
+
 def _parse_batch_response(response, frames: list[ExtractedFrame]) -> list[VisionResult]:
     """
     Parse the batch JSON array response from Gemini.
@@ -545,6 +580,17 @@ def _parse_batch_response(response, frames: list[ExtractedFrame]) -> list[Vision
             logger.warning("Batch response: no output text from Gemini")
             return empty
 
+        return _parse_batch_text(text, frames)
+    except (AttributeError, ValueError) as e:
+        logger.warning(f"Batch response: could not read text: {e}")
+        return empty
+
+
+def _parse_batch_text(text: str, frames: list[ExtractedFrame]) -> list[VisionResult]:
+    """Parse the batch JSON array from raw model text (shared by both
+    backends). Falls back to an empty result for any frame it can't parse."""
+    empty = [VisionResult(frame=f) for f in frames]
+    try:
         # Strip markdown fences if the model included them despite instructions
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.DOTALL)
         data_list = json.loads(cleaned)

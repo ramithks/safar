@@ -92,7 +92,7 @@ class LocationOut(BaseModel):
     title: str
     address: Optional[str] = None
     isVerified: bool = False
-    # True when another property on StayOS already holds this listing. Shown
+    # True when another property on StaySuite already holds this listing. Shown
     # greyed rather than hidden: an owner who cannot find their hotel in the
     # list needs to know it is taken, not that it is missing.
     alreadyClaimed: bool = False

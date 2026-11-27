@@ -19,7 +19,7 @@ would be the worst possible way to discover a mistake.
 the recipient is masked; only Meta's message ids, which are not secret and are
 the whole point of the trace, appear in full.
 
-    cd travbuddy_backend
+    cd safar_backend
     # in .env, never on the command line:
     #   WHATSAPP_ACCESS_TOKEN / WHATSAPP_APP_SECRET / WHATSAPP_VERIFY_TOKEN
     #   WHATSAPP_TEST_RECIPIENT / WHATSAPP_TEST_PHONE_NUMBER_ID
@@ -109,7 +109,7 @@ if missing:
     # Loudly, and all at once. Half-configured is the state that wastes the most
     # time, because each run reveals one more missing thing.
     print("\n  Not configured. Missing: " + ", ".join(missing))
-    print("  Put them in travbuddy_backend/.env — never on the command line,")
+    print("  Put them in safar_backend/.env — never on the command line,")
     print("  where they end up in shell history and this terminal's scrollback.")
     print("\n  REAL META NOT TESTED")
     sys.exit(2)
@@ -218,7 +218,7 @@ if window_open:
     # Free text, which is what the agent sends on a live conversation.
     try:
         sent = run(messaging.send(
-            conversation, body=f"TravBuddy Partner smoke test {tag}. No reply needed.",
+            conversation, body=f"Safar Partner smoke test {tag}. No reply needed.",
             author="staff", author_name="Smoke test",
             client_reference=f"smoke:{tag}",
         ))
@@ -289,7 +289,7 @@ check("and it was metered",
 # Idempotency, against the real provider.
 again = run(messaging.send(
     conversation,
-    body=f"TravBuddy Partner smoke test {tag}. No reply needed." if window_open else None,
+    body=f"Safar Partner smoke test {tag}. No reply needed." if window_open else None,
     purpose=None if window_open else "reengagement",
     template_values=None if window_open else {}, language="en_US",
     author="staff", client_reference=f"smoke:{tag}",

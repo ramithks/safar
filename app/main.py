@@ -1,5 +1,5 @@
 """
-TravBuddy Backend
+Safar Backend
 FastAPI application entry point.
 """
 import logging
@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Places API client init failed (non-fatal): {e}")
 
-    # What StayOS needs, said out loud at boot.
+    # What StaySuite needs, said out loud at boot.
     #
     # Same principle as the Redis line below and for the same reason: the
     # failure that cost a day was `REVALIDATE_SECRET` being unset, which
@@ -104,14 +104,14 @@ async def lifespan(app: FastAPI):
         logger.info("Redis: %s (REDIS_URL unset, using the default)",
                     redis_target())
 
-    logger.info(f"TravBuddy backend started (env={settings.app_env})")
+    logger.info(f"Safar backend started (env={settings.app_env})")
     yield
-    logger.info("TravBuddy backend shutting down")
+    logger.info("Safar backend shutting down")
 
 
 # ── App ──────────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="TravBuddy API",
+    title="Safar API",
     description="Extract location timelines from Instagram Reels",
     version="1.0.0",
     lifespan=lifespan,
@@ -158,15 +158,15 @@ async def _correlate(request, call_next):
 
 # CORS — driven by ALLOWED_ORIGINS (comma-separated). Mobile clients don't
 # enforce CORS, but the PMS is a browser app on a different origin to this API,
-# so for HostOS this list is the difference between the front desk working and
+# so for StaySuite this list is the difference between the front desk working and
 # every request failing a preflight. The marketplace needs it too: lib/search.ts
-# and lib/recommend.ts are called from Client Components on travbuddy.in, so
+# and lib/recommend.ts are called from Client Components on safar.example.com, so
 # this list is load-bearing for the traveller site as well as for hotels.
 #
 # **Nothing here can refuse to boot.** Every branch ends with a usable list.
 # That is a deliberate reversal: the first two versions of this block raised —
 # once on an empty list, once on a wildcard — and both were wrong for the same
-# reason. This process also serves travbuddy.in. A misconfigured header is a
+# reason. This process also serves safar.example.com. A misconfigured header is a
 # security finding; a process that will not start is an outage for every
 # traveller, every partner and both mobile apps at once, and the second is not
 # a proportionate way to prevent the first.
@@ -187,7 +187,7 @@ async def _correlate(request, call_next):
 # preview is not production and should not be able to talk to production; if one
 # needs to, name it in ALLOWED_ORIGINS for as long as that is true.
 #
-# `partner.travbuddy.in` was the PWA's address through the pilot and is **not**
+# `partner.safar.example.com` was the PWA's address through the pilot and is **not**
 # on this list. It was kept for one commit on the theory that a desk with the
 # PWA installed on the old origin would go on calling this API from a hostname
 # nothing else mentions — true in principle, and the database says it never
@@ -195,11 +195,11 @@ async def _correlate(request, call_next):
 # host, outbound to the founder's own Instagram. Nothing to strand, so the name
 # is retired rather than carried.
 PRODUCTION_ORIGINS = [
-    "https://app.hostos.in",
-    "https://hostos.in",
-    "https://www.hostos.in",
-    "https://travbuddy.in",
-    "https://www.travbuddy.in",
+    "https://app.staysuite.example.com",
+    "https://staysuite.example.com",
+    "https://www.staysuite.example.com",
+    "https://safar.example.com",
+    "https://www.safar.example.com",
 ]
 
 
@@ -249,6 +249,28 @@ app.include_router(router)
 app.include_router(router_v3)
 
 
+# ── Public config + UI ───────────────────────────────────────────────────────
+# The single-page UI (static/) needs the Supabase anon key at runtime. The anon
+# key is public by design — row-level security on the Supabase side is what
+# protects the data, same as any browser client.
+@app.get("/api/v1/public-config", include_in_schema=False)
+async def public_config():
+    return {
+        "brand": settings.app_brand_name,
+        "supabase_url": settings.supabase_url,
+        "supabase_anon_key": settings.supabase_anon_key,
+    }
+
+
+_static_dir = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static"
+)
+if os.path.isdir(_static_dir):
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/", StaticFiles(directory=_static_dir, html=True), name="ui")
+
+
 # ── Exception handlers ───────────────────────────────────────────────────────────
 @app.exception_handler(PermissionError)
 async def permission_error_handler(request: Request, exc: PermissionError):
@@ -282,7 +304,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.get("/")
 async def root():
     return {
-        "service": "TravBuddy API",
+        "service": "Safar API",
         "version": "1.0.0",
         "docs": "/docs",
         "health": "/api/v1/health",

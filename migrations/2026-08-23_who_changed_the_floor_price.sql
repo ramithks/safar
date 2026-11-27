@@ -1,6 +1,6 @@
 -- Who changed the floor price.
 --
--- `admin_audit_log` records what TravBuddy staff do to a hotel. Nothing records
+-- `admin_audit_log` records what Safar staff do to a hotel. Nothing records
 -- what a hotel does to itself, and §42 names exactly the fields where that
 -- matters: prices, the negotiation floor, B2B and group rates, payment rules,
 -- cancellation terms, team permissions. Those are the changes that are noticed a

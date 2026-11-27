@@ -7,7 +7,7 @@ broker consumes nothing and reports nothing, so guest replies and campaigns
 stop happening with no error anywhere. The health check is the only surface
 that speaks up, which makes what it says load-bearing.
 
-The StayOS production deployment came up with
+The StaySuite production deployment came up with
 `Error 111 connecting to localhost:6379. Connection refused.` — which reads
 like Redis is down. It meant `REDIS_URL` had never been set and the
 development default had survived into a container, where nothing listens on
@@ -186,8 +186,8 @@ class TestHealthMessage:
 class TestTheTwoDeployments:
     def test_the_dev_default_is_database_zero(self):
         """
-        StayOS production belongs on database 1. If the default ever moves to a
-        non-zero database this comment and DEPLOYING_STAYOS.md both need
+        StaySuite production belongs on database 1. If the default ever moves to a
+        non-zero database this comment and DEPLOYING_STAYSUITE.md both need
         revisiting, so pin it.
         """
         assert Settings.model_fields["redis_url"].default.endswith("/0")

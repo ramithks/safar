@@ -1,5 +1,5 @@
 """
-TravBuddy recommendation engine.
+Safar recommendation engine.
 
 A thin, fast, reliable layer over the data the scrapers already produce. Design +
 rationale live in ``docs/recommendation_engine.md``. Guiding rules, enforced across

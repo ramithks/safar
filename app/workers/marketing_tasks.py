@@ -81,7 +81,7 @@ def campaign_lock(campaign_id: str):
 
 
 @celery_app.task(
-    name="travbuddy.marketing.run_campaign",
+    name="safar.marketing.run_campaign",
     bind=True,
     # Retried, because a campaign that stopped half-way through has a resumable
     # remainder and abandoning it leaves a hotel with a partly-sent campaign and

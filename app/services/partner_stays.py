@@ -2,7 +2,7 @@
 Partner stays inside hotel search — our own inventory, shown first.
 
 Every other row in a stay search is an OTA listing we merely link out to. A
-partner listing is different in kind: the owner is on TravBuddy, the price is
+partner listing is different in kind: the owner is on Safar, the price is
 theirs, and the booking completes *here* (instant checkout or an enquiry we
 own). That is why these rows lead the list and carry a `Partner` tag — the
 traveller is being shown a different product, and the tag says so. Ranking the
@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 # The `source` tag partner rows carry. Providers are matched on this string in
 # the website's provider registry — keep the two in step.
-PARTNER_SOURCE = "travbuddy"
+PARTNER_SOURCE = "safar"
 
 # Partner inventory is thin by design; more than three pinned rows and the
 # organic list stops being the list.
@@ -284,7 +284,7 @@ def _to_hotel(row: dict, price: int, rooms: list[dict],
         "booking_mode": row.get("booking_mode") or "whatsapp",
         # the tag itself
         "is_partner": True,
-        "partner_name": partner.get("brand_name") or "TravBuddy",
+        "partner_name": partner.get("brand_name") or "Safar",
         "partner_slug": partner.get("slug"),
         "partner_verified": bool(partner.get("verified")),
         "listing_id": str(row["id"]),

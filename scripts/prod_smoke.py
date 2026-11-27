@@ -25,9 +25,9 @@ import sys
 import urllib.error
 import urllib.request
 
-BACKEND = "https://api.hostos.in"
-WEBSITE = "https://travbuddy.in"
-PARTNER = "https://partner.travbuddy.in"
+BACKEND = "https://api.staysuite.example.com"
+WEBSITE = "https://safar.example.com"
+PARTNER = "https://partner.safar.example.com"
 
 # A hotel that is real, and one that is seeded. The first must stay visible and
 # the second must disappear from everything a crawler reads.
@@ -48,7 +48,7 @@ def check(label, cond, detail=""):
 
 
 def get(url, headers=None, timeout=30):
-    req = urllib.request.Request(url, headers={"User-Agent": "stayos-smoke/1", **(headers or {})})
+    req = urllib.request.Request(url, headers={"User-Agent": "staysuite-smoke/1", **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.read().decode("utf-8", "replace"), dict(r.headers)
@@ -79,7 +79,7 @@ def main() -> int:
     ap.add_argument("--partner", default=PARTNER)
     args = ap.parse_args()
 
-    print("══ StayOS production smoke ══\n")
+    print("══ StaySuite production smoke ══\n")
 
     # ── the services answer at all ──────────────────────────────────────────
     print("── reachable ──")
@@ -115,8 +115,8 @@ def main() -> int:
               bool(robots) and "noindex" in robots.group(1),
               robots.group(1) if robots else "no robots tag found")
 
-    status, sitemap, _ = get(f"{args.website}/sitemaps/stayos-hotels.xml")
-    check("the StayOS hotel sitemap answers", status == 200, status)
+    status, sitemap, _ = get(f"{args.website}/sitemaps/staysuite-hotels.xml")
+    check("the StaySuite hotel sitemap answers", status == 200, status)
     if status == 200:
         check("and no longer carries the fictional hotel",
               DEMO_HOTEL not in sitemap, sitemap[:200])
@@ -150,7 +150,7 @@ def main() -> int:
     # ── §25 revalidation ────────────────────────────────────────────────────
     print("\n── revalidation ──")
     status, body = post(f"{args.website}/api/revalidate",
-                        {"kind": "stayos_hotel", "slug": REAL_HOTEL},
+                        {"kind": "staysuite_hotel", "slug": REAL_HOTEL},
                         {"x-revalidate-secret": "definitely-not-the-secret"})
     check("the website refuses a wrong revalidation secret", status == 403, f"{status} {body[:120]}")
     check("and 503 would mean it is not configured at all", status != 503, body[:120])

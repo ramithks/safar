@@ -30,7 +30,7 @@ there would have taken the channel from it — `routing._PRIORITY` puts Sales
 first, deliberately — and `whatsapp_e2e` would have failed on a routing decision
 that was working exactly as designed.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/sales_e2e.py            # deterministic
     ./venv/bin/python scripts/sales_e2e.py --gemini   # + the live model

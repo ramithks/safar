@@ -1,5 +1,5 @@
 """
-goSTOPS → TravBuddy normalisation.
+goSTOPS → Safar normalisation.
 
 Two shapes are produced here:
   hostel_row(...)   catalog entry + optional detail → a `hostels` table row
@@ -20,7 +20,7 @@ SOURCE = "gostops"
 # attribute referral traffic to us. utm_content carries the hostel slug for
 # per-property reporting; our GA fires a matching booking_click event.
 _UTM_PARAMS = {
-    "utm_source": "travbuddy",
+    "utm_source": "safar",
     "utm_medium": "referral",
     "utm_campaign": "workstations",
 }

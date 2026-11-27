@@ -36,7 +36,7 @@ The model is scripted, for the same reason every other suite here scripts it: a
 test that needs a live model to prove a payment was recorded is testing the
 model.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python -m uvicorn app.main:app --port 8010 &
     ./venv/bin/python scripts/payment_status_e2e.py
@@ -73,11 +73,11 @@ from app.services.ai import guardrails, provisioning, registry, runtime  # noqa:
 from app.services.ai.providers import EchoProvider  # noqa: E402
 
 REF = "rdlozqvuywtgsodunait"
-# Which StayOS to test. Defaults to the uvicorn each suite's docstring tells
-# you to start; set STAYOS_API_BASE=https://api.hostos.in to run
+# Which StaySuite to test. Defaults to the uvicorn each suite's docstring tells
+# you to start; set STAYSUITE_API_BASE=https://api.staysuite.example.com to run
 # the same assertions against the deployed one, which is the only way to find
 # out whether what is live behaves like what is on this branch.
-API = os.environ.get("STAYOS_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
+API = os.environ.get("STAYSUITE_API_BASE", "http://127.0.0.1:8010").rstrip("/") + "/api/v1/pms"
 
 # The sales property, for the same reason sales_e2e uses it: its own partner,
 # its own billing account, its own wallet. Nothing this suite books or spends

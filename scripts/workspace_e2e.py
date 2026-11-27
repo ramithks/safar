@@ -14,10 +14,10 @@ did not exist. That is the worst shape a gap can have: the Guests page drew
 invented people in the same typeface as real ones, so nothing looked wrong.
 
 **Most of what is asserted here is who may not read.** A guest list is names,
-phone numbers and stay history; a margin row is what TravBuddy paid Google. The
+phone numbers and stay history; a margin row is what Safar paid Google. The
 interesting assertions are the 403s.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010
     ./venv/bin/python scripts/workspace_e2e.py

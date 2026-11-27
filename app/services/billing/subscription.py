@@ -111,7 +111,7 @@ def _plan_row() -> dict:
         .execute().data or []
     )
     if not rows:
-        raise SubscriptionError("StayOS isn't available to subscribe to right now.")
+        raise SubscriptionError("StaySuite isn't available to subscribe to right now.")
     return rows[0]
 
 
@@ -159,7 +159,7 @@ async def ensure_razorpay_plan(plan_row: dict) -> str:
 
     created = await razorpay.create_plan(
         amount_paise=price,
-        name=plan_row.get("name") or "StayOS",
+        name=plan_row.get("name") or "StaySuite",
         period=plan_row.get("billing_period") or "monthly",
     )
     razorpay_plan_id = created["id"]
@@ -177,7 +177,7 @@ def _latest_subscription(property_id: str) -> dict | None:
 
     It used to filter to the live states, and a hotel that had just cancelled
     therefore read as having no subscription at all — so the screen said "Your
-    StayOS plan is ready" to somebody who had cancelled thirty seconds earlier,
+    StaySuite plan is ready" to somebody who had cancelled thirty seconds earlier,
     and never once said "cancelled". Every state has a sentence in `HEADLINE`;
     the way to show them is to fetch the row that has one.
 
@@ -258,7 +258,7 @@ async def start(
 
     live = await current(property_id)
     if live and live["status"] in LIVE_STATUSES:
-        raise SubscriptionError("StayOS is already running on this hotel.")
+        raise SubscriptionError("StaySuite is already running on this hotel.")
 
     plan_row = await plan()
     price = int(plan_row["price_paise"])
@@ -308,7 +308,7 @@ async def start(
     return Checkout(
         razorpay_subscription_id=created["id"],
         razorpay_key_id=razorpay.public_key_id() or "",
-        plan_name=plan_row.get("name") or "StayOS",
+        plan_name=plan_row.get("name") or "StaySuite",
         amount_paise=price,
         first_payment_paise=discount.first_payment_paise if discount else price,
         currency="INR",
@@ -434,7 +434,7 @@ async def record_charge(
             source_id=row["id"],
             actor_type="system",
             metadata={
-                "reason": f"{plan_row.get('name') or 'StayOS'} subscription",
+                "reason": f"{plan_row.get('name') or 'StaySuite'} subscription",
                 "paymentId": payment_id,
                 "invoiceId": invoice_id,
             },
@@ -452,7 +452,7 @@ async def record_charge(
     # webhook, which is the common case, grants nothing either.
     #
     # Its own bucket kind and its own label, so the hotel's credit history
-    # reads "+2,000 Launch bonus" beside "+3,000 StayOS subscription" rather
+    # reads "+2,000 Launch bonus" beside "+3,000 StaySuite subscription" rather
     # than one unexplained 5,000. The two have different lifetimes and an
     # owner asking "what did I actually buy" needs to see which is which.
     bonus_amount = int(plan_row.get("signup_bonus_credits") or 0)
@@ -539,17 +539,17 @@ def is_serving(row: dict | None) -> bool:
 # One sentence per state, written for a hotel owner. No status string reaches a
 # screen — `past_due` is not a thing anybody outside this file should read.
 HEADLINE = {
-    "none":     ("Your StayOS plan is ready", "Start it whenever you're ready."),
+    "none":     ("Your StaySuite plan is ready", "Start it whenever you're ready."),
     "pending":  ("Waiting for your approval",
                  "Finish approving the payment and your AI employee starts working."),
-    "trialing": ("StayOS is active", "You're on a free period."),
-    "active":   ("StayOS is active", ""),
+    "trialing": ("StaySuite is active", "You're on a free period."),
+    "active":   ("StaySuite is active", ""),
     "past_due": ("Your last payment didn't go through",
                  "Update your payment method to keep your AI employee running."),
-    "paused":   ("StayOS is paused", "Resume whenever you're ready."),
-    "cancelled": ("Your StayOS plan is cancelled",
+    "paused":   ("StaySuite is paused", "Resume whenever you're ready."),
+    "cancelled": ("Your StaySuite plan is cancelled",
                   "Your AI employee has stopped answering guests."),
-    "expired":  ("Your StayOS plan has ended", "Start it again whenever you like."),
+    "expired":  ("Your StaySuite plan has ended", "Start it again whenever you like."),
 }
 
 
@@ -561,7 +561,7 @@ def project(row: dict | None, plan_row: dict) -> dict:
         "status": status,
         "headline": headline,
         "detail": detail,
-        "planName": plan_row.get("name") or "StayOS",
+        "planName": plan_row.get("name") or "StaySuite",
         "pricePaise": int(plan_row.get("price_paise") or 0),
         "billingPeriod": plan_row.get("billing_period") or "monthly",
         "includedCredits": int(plan_row.get("credit_grant") or 0),

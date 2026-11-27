@@ -599,7 +599,7 @@ def _seo(found: dict, headline: str, about: str) -> dict:
     city = _title(prop.get("city") or "")
     title = f"{name}, {city} — book direct" if city else f"{name} — book direct"
     # The last sentence of `about` is ours, not the hotel's — it says booking
-    # here books direct, which is true of every HostOS page and therefore says
+    # here books direct, which is true of every StaySuite page and therefore says
     # nothing about *this* hotel in a search result.
     description = about.split(" Booking on this page")[0].strip() or headline
     return {"title": _fit(title, 70), "description": _fit(description, 180)}

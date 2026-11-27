@@ -55,7 +55,7 @@ def _wrap(heading: str, body: str, cta: tuple[str, str] | None = None) -> str:
         '<table role="presentation" style="max-width:520px;margin:0 auto;background:#fff;'
         'border-radius:16px;border:1px solid #e2e8f0"><tr><td style="padding:28px">'
         '<p style="margin:0 0 4px;font-size:12px;font-weight:700;letter-spacing:.08em;'
-        'text-transform:uppercase;color:#2563eb">TravBuddy</p>'
+        'text-transform:uppercase;color:#2563eb">Safar</p>'
         f'<h1 style="margin:0 0 16px;font-size:20px;line-height:1.3">{_esc(heading)}</h1>'
         f'<div style="font-size:15px;line-height:1.6;color:#334155">{body}</div>{button}'
         "</td></tr></table></body></html>"
@@ -107,7 +107,7 @@ async def email_on_approved(_event: str, payload: dict) -> None:
 
     await _send(
         email,
-        f'"{title}" is live on TravBuddy',
+        f'"{title}" is live on Safar',
         _wrap(
             "You're live",
             f'<p style="margin:0 0 12px"><strong>{_esc(title)}</strong> is now on the marketplace '

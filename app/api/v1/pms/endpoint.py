@@ -294,7 +294,7 @@ async def list_tasks(request: Request, property_id: str, member=Depends(require_
 
 # ── onboarding ───────────────────────────────────────────────────────────────
 # The half of the product that did not exist. Everything below `/properties/{id}`
-# assumed a hotel; nothing made one, so the only way onto StayOS was a script
+# assumed a hotel; nothing made one, so the only way onto StaySuite was a script
 # somebody ran on a laptop.
 #
 # `require_user`, not `require_member`, on the first route only — there is no
@@ -686,7 +686,7 @@ async def upload_property_media(
 
     **Why this had to exist before the photo tool could be useful.** The room
     form asked for photo *links* — "paste them from your website, or Instagram"
-    — because StayOS had no image storage, and every hotel on it responded by
+    — because StaySuite had no image storage, and every hotel on it responded by
     entering none. Zero photos across ten properties. An AI employee that has
     been taught to send room photos and has none to send is the same product it
     was before, with a better excuse.
@@ -730,7 +730,7 @@ async def upload_property_media(
 
     # Checked before the file is read rather than discovered inside the client.
     #
-    # StayOS is a separate deployment from the marketplace and does not inherit
+    # StaySuite is a separate deployment from the marketplace and does not inherit
     # its environment: `GCS_BUCKET_NAME` and the service account are set on one
     # and were not on the other. Without this, a hotelier uploading their first
     # room photo got "that upload did not go through" — which reads as their
@@ -739,7 +739,7 @@ async def upload_property_media(
     if not settings.gcs_bucket_name:
         logger.error(
             "[pms] photo upload attempted with no GCS_BUCKET_NAME configured; "
-            "StayOS needs GCS_BUCKET_NAME and GOOGLE_SERVICE_ACCOUNT_JSON in "
+            "StaySuite needs GCS_BUCKET_NAME and GOOGLE_SERVICE_ACCOUNT_JSON in "
             "its environment",
         )
         raise HTTPException(
@@ -749,7 +749,7 @@ async def upload_property_media(
         )
 
     safe_folder = re.sub(r"[^a-z0-9-]", "", folder or "", flags=re.I)[:32] or "rooms"
-    path = f"stayos/{property_id}/{safe_folder}/{uuid.uuid4()}.{ext}"
+    path = f"staysuite/{property_id}/{safe_folder}/{uuid.uuid4()}.{ext}"
 
     try:
         # to_thread: the GCS client is blocking and a 5 MB PUT would otherwise
@@ -4145,7 +4145,7 @@ async def _fulfil_booking(order: dict) -> dict:
         guest_name=guest.get("fullName") or "Guest",
         guest_phone=guest.get("phone"),
         guest_email=guest.get("email"),
-        source="travbuddy" if (order.get("attribution") or {}).get("source") == "travbuddy"
+        source="safar" if (order.get("attribution") or {}).get("source") == "safar"
                else "direct",
         # What was actually paid now. The rest is balance due on the folio,
         # which is what a folio is for.
@@ -4924,7 +4924,7 @@ async def get_website_inventory(
     request: Request, property_id: str, member=Depends(require_member("rates")),
 ):
     """
-    What HostOS already knows about this hotel.
+    What StaySuite already knows about this hotel.
 
     Read before generating, and shown as the counts themselves — "8 room types,
     42 photographs, current rates" — because the argument this product is
@@ -5020,7 +5020,7 @@ async def unpublish_website(
 #
 #   PUT    …/website/domain          claim it, and get the two records to add
 #   POST   …/website/domain/verify   look at real DNS and say what is there
-#   DELETE …/website/domain          disconnect; the TravBuddy address remains
+#   DELETE …/website/domain          disconnect; the Safar address remains
 #
 # `rates`, matching the rest of the builder: which address a hotel sells itself
 # under is a commercial decision, not a front-desk one.

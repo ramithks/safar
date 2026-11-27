@@ -6,7 +6,7 @@ that exist in the hotel-OS Supabase project and in no other. The marketplace
 runs from a different project, and `get_db()` builds one client from one
 `SUPABASE_URL`, so a marketplace process with these routes mounted answers 500
 to every one of them. That is not hypothetical: it is what
-`backend.travbuddy.in` did the moment StayOS first reached production, on the
+`backend.safar.example.com` did the moment StaySuite first reached production, on the
 public hotel page a guest can reach without logging in.
 
 The flag is therefore off by default, and these tests exist to keep it that
@@ -46,7 +46,7 @@ class TestTheDefault:
         used to call `Settings()` and read whatever was in the ambient
         environment, so it asserted "the default is off" while actually
         measuring the developer's shell. On a clean shell it passed; on any
-        machine with `.env.hotelos` sourced — which is every machine StayOS is
+        machine with `.env.hotelos` sourced — which is every machine StaySuite is
         worked on — it failed, for a reason that had nothing to do with the
         code. A test that fails on the developer's machine and passes in CI is
         a test people learn to ignore, and this one guards the marketplace
@@ -89,7 +89,7 @@ class TestWhatIsMounted:
     @pytest.mark.parametrize("enabled", [True, False])
     def test_the_marketplace_is_unaffected_either_way(self, monkeypatch, enabled):
         """
-        The flag must never be able to change what travbuddy.in gets. This is
+        The flag must never be able to change what safar.example.com gets. This is
         the assertion that makes the flag safe to deploy at all.
         """
         paths = _mounted(monkeypatch, enabled=enabled)

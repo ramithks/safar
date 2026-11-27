@@ -576,7 +576,7 @@ def _status(prop: dict) -> dict:
         return len(db.table(table).select("id").eq("property_id", pid)
                    .limit(1000).execute().data or [])
 
-    web = (db.table("hotel_websites").select("status,travbuddy_path")
+    web = (db.table("hotel_websites").select("status,safar_path")
            .eq("property_id", pid).limit(1).execute().data or [{}])[0]
     return {
         "propertyId": pid, "partnerId": prop["partner_id"], "slug": prop["slug"],
@@ -584,7 +584,7 @@ def _status(prop: dict) -> dict:
         "ratePlans": n("rate_plans"), "services": n("services"),
         "knowledge": n("property_knowledge"), "agents": n("agents"),
         "reservations": n("reservations"),
-        "website": web.get("status"), "websitePath": web.get("travbuddy_path"),
+        "website": web.get("status"), "websitePath": web.get("safar_path"),
     }
 
 
@@ -603,7 +603,7 @@ async def main() -> int:
     for k, v in result.items():
         print(f"  {k:<14} {v}")
     print(f"\n  owner login  {OWNER_EMAIL} / {PASSWORD}")
-    print(f"  hotel site   https://partner.travbuddy.in/stay/{result['slug']}")
+    print(f"  hotel site   https://partner.safar.example.com/stay/{result['slug']}")
     print()
     return 0
 

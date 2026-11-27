@@ -15,7 +15,7 @@ do, the actual request, and Meta's actual answer, with a pause between them long
 enough to read. Nothing is hidden behind a spinner and nothing succeeds
 silently — a reviewer who cannot see the API call cannot grant the permission.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/app_review_evidence.py --management
     ./venv/bin/python scripts/app_review_evidence.py --messaging
@@ -58,7 +58,7 @@ from app.services.messaging.whatsapp.onboarding import OnboardingError  # noqa: 
 # The template the management video creates. Suffixed with the date so a second
 # recording does not collide with the first — Meta locks a template name for 30
 # days after deletion, so reusing one name makes the video unrepeatable.
-TEMPLATE_PREFIX = "hostos_review_demo"
+TEMPLATE_PREFIX = "staysuite_review_demo"
 
 BEAT = 2.5  # seconds between steps, so a viewer can read each one
 
@@ -216,7 +216,7 @@ async def messaging(wait: int) -> int:
     beat()
 
     stamp = time.strftime("%H:%M:%S")
-    text = (f"HostOS App Review demonstration — {stamp}. "
+    text = (f"StaySuite App Review demonstration — {stamp}. "
             "This message was sent by our application through the WhatsApp Cloud API.")
 
     say(1, "The message we are about to send")

@@ -1,18 +1,18 @@
-# StayOS — the hotel-OS deployment of this same repository.
+# StaySuite — the hotel-OS deployment of this same repository.
 #
-# Coolify build pack: Docker Compose. Compose file: /docker-compose.stayos.yml
+# Coolify build pack: Docker Compose. Compose file: /docker-compose.staysuite.yml
 #
 # The marketplace stack is `docker-compose.yml`. This is its sibling: same
 # image, different Supabase project, its own Redis, its own hostname. Neither
 # file knows about the other and they share nothing at runtime.
 #
-#   marketplace   backend.travbuddy.in          uabxtdhxbamuhthxnhid
-#   StayOS        api.hostos.in   rdlozqvuywtgsodunait
+#   marketplace   backend.safar.example.com          uabxtdhxbamuhthxnhid
+#   StaySuite        api.staysuite.example.com   rdlozqvuywtgsodunait
 #
 # ── Redis belongs to this stack ──────────────────────────────────────────────
 #
 # The marketplace's Redis is a service inside *its* compose stack: no password,
-# and not reachable from another Coolify application. Pointing StayOS at a
+# and not reachable from another Coolify application. Pointing StaySuite at a
 # `redis` hostname from outside reached something else entirely and answered
 # `Authentication required.` The `redis` service below is this stack's own —
 # Docker's network puts it on the hostname `redis` for the containers in this
@@ -27,13 +27,13 @@
 # ── the worker is not optional ───────────────────────────────────────────────
 #
 # The image's CMD is uvicorn, so a Dockerfile-build-pack deployment runs the
-# API alone. StayOS had no Celery worker at all: messaging and marketing tasks
+# API alone. StaySuite had no Celery worker at all: messaging and marketing tasks
 # would queue forever with nothing in any log saying so.
 #
 # ── environment ──────────────────────────────────────────────────────────────
 #
 # Everything except REDIS_URL comes from Coolify's environment — paste
-# `.env.stayos.coolify` there. REDIS_URL is set per-service below because it
+# `.env.staysuite.coolify` there. REDIS_URL is set per-service below because it
 # describes this stack's topology rather than a secret, and a compose
 # `environment:` value wins over Coolify's tab. Do not also set it in Coolify.
 #
@@ -44,7 +44,7 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     volumes:
-      - stayos_redis_data:/data
+      - staysuite_redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -56,28 +56,28 @@ services:
     expose:
       - "8000"
     labels:
-      # Router and service names are `stayos`, not `api` — the marketplace
+      # Router and service names are `staysuite`, not `api` — the marketplace
       # stack already registers `traefik.http.routers.api` on this same Traefik,
       # and two routers of one name is one router.
       - "traefik.enable=true"
-      # Both names during the cutover. `api.hostos.in` is where the backend
-      # lives now; `stayos-backend.travbuddy.in` is still claimed because two
+      # Both names during the cutover. `api.staysuite.example.com` is where the backend
+      # lives now; `staysuite-backend.safar.example.com` is still claimed because two
       # things outside this repo still point at it — the PWA bundle currently
       # deployed (VITE_API_BASE_URL is baked in at build time, so it changes
       # only on a rebuild) and the Instagram webhook URL registered in the Meta
       # console, which is Meta's configuration and not ours. Drop the second
       # Host() once the PWA has been rebuilt and the webhook repointed;
       # removing it earlier stops message delivery with no error on our side.
-      - "traefik.http.routers.stayos.rule=Host(`api.hostos.in`) || Host(`stayos-backend.travbuddy.in`)"
-      - "traefik.http.routers.stayos.entrypoints=https"
-      - "traefik.http.routers.stayos.tls=true"
-      - "traefik.http.routers.stayos.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.stayos.service=stayos"
-      - "traefik.http.services.stayos.loadbalancer.server.port=8000"
+      - "traefik.http.routers.staysuite.rule=Host(`api.staysuite.example.com`) || Host(`staysuite-backend.safar.example.com`)"
+      - "traefik.http.routers.staysuite.entrypoints=https"
+      - "traefik.http.routers.staysuite.tls=true"
+      - "traefik.http.routers.staysuite.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.staysuite.service=staysuite"
+      - "traefik.http.services.staysuite.loadbalancer.server.port=8000"
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - TEMP_DIR=/tmp/stayos
-      - PLACES_CACHE_DIR=/tmp/stayos/places_cache
+      - TEMP_DIR=/tmp/staysuite
+      - PLACES_CACHE_DIR=/tmp/staysuite/places_cache
     depends_on:
       redis:
         condition: service_healthy
@@ -92,14 +92,14 @@ services:
     command: celery -A app.workers.celery_app.celery_app worker --loglevel=info -Q hotelos --concurrency=${CELERY_CONCURRENCY:-4}
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - TEMP_DIR=/tmp/stayos
-      - PLACES_CACHE_DIR=/tmp/stayos/places_cache
+      - TEMP_DIR=/tmp/staysuite
+      - PLACES_CACHE_DIR=/tmp/staysuite/places_cache
     depends_on:
       redis:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── beat, scoped to StayOS's own schedule ───────────────────────────────────
+  # ── beat, scoped to StaySuite's own schedule ───────────────────────────────────
   #
   # There was deliberately no beat service here, and the reason given was that
   # "every entry in beat_schedule is a marketplace task, and
@@ -109,17 +109,17 @@ services:
   # That was true when it was written. It stopped being true when the
   # waiting-guest sweep was added to the schedule, and nobody noticed, because
   # the entry carried a comment explaining that the *marketplace* beat would
-  # enqueue it and the StayOS worker would pick it up off the `hotelos` queue.
+  # enqueue it and the StaySuite worker would pick it up off the `hotelos` queue.
   #
   # That reasoning assumed one broker. This file brings up its own Redis, and
   # the api and worker above both point at it. So the marketplace beat enqueues
-  # the sweep onto the marketplace broker and the StayOS worker listens to the
-  # StayOS broker, and the task has never once been delivered. There is no
+  # the sweep onto the marketplace broker and the StaySuite worker listens to the
+  # StaySuite broker, and the task has never once been delivered. There is no
   # error to find: the guest simply waits, and the notification built to reach
   # a manager's phone reaches nothing. Production had zero rows in
   # `agent_escalations`, ever.
   #
-  # `CELERY_BEAT_ROLE=stayos` is what makes this safe rather than a rerun of
+  # `CELERY_BEAT_ROLE=staysuite` is what makes this safe rather than a rerun of
   # the original problem: it schedules the sweep and nothing else, so nothing
   # on this beat can write to a marketplace table. See
   # `app/workers/celery_app._beat_schedule`.
@@ -133,9 +133,9 @@ services:
     command: celery -A app.workers.celery_app.celery_app beat --loglevel=info
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - CELERY_BEAT_ROLE=stayos
-      - TEMP_DIR=/tmp/stayos
-      - PLACES_CACHE_DIR=/tmp/stayos/places_cache
+      - CELERY_BEAT_ROLE=staysuite
+      - TEMP_DIR=/tmp/staysuite
+      - PLACES_CACHE_DIR=/tmp/staysuite/places_cache
     depends_on:
       redis:
         condition: service_healthy
@@ -144,4 +144,4 @@ services:
       replicas: 1
 
 volumes:
-  stayos_redis_data:
+  staysuite_redis_data:

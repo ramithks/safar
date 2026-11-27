@@ -55,7 +55,7 @@ def _slug(name: str, city: str, hotel_id: str) -> str:
 
 
 # ── embed_hotel ──────────────────────────────────────────────────────────────────
-@celery_app.task(name="travbuddy.reco.embed_hotel", max_retries=0)
+@celery_app.task(name="safar.reco.embed_hotel", max_retries=0)
 def embed_hotel_task(hotel_id: str) -> dict:
     from app.db.client import get_db
     from app.services.embeddings import embed_one
@@ -98,7 +98,7 @@ _PROFILE_SCHEMA = {
 }
 
 
-@celery_app.task(name="travbuddy.reco.profile_hotel", max_retries=0)
+@celery_app.task(name="safar.reco.profile_hotel", max_retries=0)
 def profile_hotel_task(hotel_id: str, force_llm: bool = False) -> dict:
     """Tags + SEO prose for a hotel. Tags come from rules → cluster (cheap).
     The LLM one_liner/seo_summary runs when the cluster is ambiguous OR when
@@ -196,7 +196,7 @@ def _evidence(h: dict) -> dict:
     ) if h.get(k) is not None}
 
 
-@celery_app.task(name="travbuddy.reco.embed_and_profile", max_retries=0)
+@celery_app.task(name="safar.reco.embed_and_profile", max_retries=0)
 def embed_and_profile_task(hotel_ids: list[str]) -> dict:
     """Convenience: embed then profile a batch (embed first so cluster has a vector)."""
     done = 0
@@ -211,7 +211,7 @@ def embed_and_profile_task(hotel_ids: list[str]) -> dict:
 
 
 # ── Nightly aggregation jobs ─────────────────────────────────────────────────────
-@celery_app.task(name="travbuddy.reco.refresh_expected_price", max_retries=0)
+@celery_app.task(name="safar.reco.refresh_expected_price", max_retries=0)
 def refresh_expected_price_task() -> dict:
     """Price-fairness model: per (destination, mode) p10/p50/p90 from transport_options
     + hotels history. Feeds features.PriceFairness."""
@@ -239,7 +239,7 @@ def refresh_expected_price_task() -> dict:
     return {"status": "ok", "rows": len(out)}
 
 
-@celery_app.task(name="travbuddy.reco.refresh_destination_priors", max_retries=0)
+@celery_app.task(name="safar.reco.refresh_destination_priors", max_retries=0)
 def refresh_destination_priors_task() -> dict:
     """Cold-start priors: modal personality tags per destination from hotel_profiles
     of hotels people actually engaged with."""
@@ -264,7 +264,7 @@ def refresh_destination_priors_task() -> dict:
     return {"status": "ok", "destinations": len(out)}
 
 
-@celery_app.task(name="travbuddy.reco.fit_centroids", max_retries=0)
+@celery_app.task(name="safar.reco.fit_centroids", max_retries=0)
 def fit_centroids_task() -> dict:
     """Re-fit personality centroids = mean of embeddings of hotels tagged with each
     personality. Cheap; runs occasionally."""

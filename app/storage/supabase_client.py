@@ -121,7 +121,7 @@ def auto_save_completed_job(job_id: str, user_id: Optional[str] = None):
                     "thumbnail_url": r.get("thumbnail_url"),
                     "video_url": r.get("video_url"),
                     "place_category": r.get("place_category"),
-                    "description": "Discovered with TravBuddy AI.",
+                    "description": "Discovered with Safar AI.",
                     "vibes": ["AI Curated"],
                     "is_liked": False,
                 }

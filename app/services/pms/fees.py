@@ -1,7 +1,7 @@
 """
-What StayOS keeps, and what the hotel receives.
+What StaySuite keeps, and what the hotel receives.
 
-StayOS charges 4% of the booking amount. That number covers the payment gateway
+StaySuite charges 4% of the booking amount. That number covers the payment gateway
 and every other platform charge, and before this module it existed nowhere in
 the codebase — not as a column, not as a constant, not as a comment. Every
 figure a hotelier had ever been shown about what they would be paid was either
@@ -49,7 +49,7 @@ class FeeBreakdown:
     """
     One booking's split, in integer paise.
 
-    `total_paise` is what the guest owes. `fee_paise` is what StayOS keeps.
+    `total_paise` is what the guest owes. `fee_paise` is what StaySuite keeps.
     `payout_paise` is what the hotel is owed, and it is `total - fee` by
     construction rather than by a second calculation — the two must sum back to
     the total exactly, and the only way to guarantee that is to derive one from
@@ -108,7 +108,7 @@ def breakdown(total_paise: int, fee_bps: int | None = None) -> FeeBreakdown:
     depending on the round, never to nobody.
 
     A negative or zero total produces a zero fee rather than a negative one. A
-    refunded booking is not a booking StayOS pays the hotel for the privilege of
+    refunded booking is not a booking StaySuite pays the hotel for the privilege of
     having taken.
     """
     total = max(int(total_paise or 0), 0)

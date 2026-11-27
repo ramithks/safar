@@ -34,7 +34,7 @@ class FakeOutcome:
     ok: bool = True
 
 
-TRUSTED = {"app.hostos.in", "travbuddy.in"}
+TRUSTED = {"app.staysuite.example.com", "safar.example.com"}
 
 
 def check(reply, outcomes, history=None):
@@ -55,28 +55,28 @@ class TestInventedLinks:
 
     def test_a_link_a_tool_actually_returned_is_allowed(self):
         verdict = check(
-            "Your total is ₹7,168. Pay here: https://app.hostos.in/pay/order_TS6",
+            "Your total is ₹7,168. Pay here: https://app.staysuite.example.com/pay/order_TS6",
             [
                 FakeOutcome("get_quote", {"totalPaise": 716800}),
                 FakeOutcome(
                     "create_booking_payment_link",
-                    {"payUrl": "https://app.hostos.in/pay/order_TS6"},
+                    {"payUrl": "https://app.staysuite.example.com/pay/order_TS6"},
                 ),
             ],
         )
         assert verdict.ok
 
     def test_a_lookalike_domain_does_not_pass_as_a_suffix(self):
-        # `endswith("travbuddy.in")` would let this through. That is the bug
+        # `endswith("safar.example.com")` would let this through. That is the bug
         # this assertion exists to prevent somebody reintroducing.
         verdict = check(
-            "Pay at https://evil-travbuddy.in/pay/x", [FakeOutcome("get_quote", {"totalPaise": 1})]
+            "Pay at https://evil-safar.example.com/pay/x", [FakeOutcome("get_quote", {"totalPaise": 1})]
         )
         assert not verdict.ok
 
     def test_a_subdomain_of_a_trusted_host_is_allowed(self):
         verdict = check(
-            "Our rooms are at https://anandi.travbuddy.in/rooms",
+            "Our rooms are at https://anandi.safar.example.com/rooms",
             [FakeOutcome("get_property_knowledge", {"answer": "ok"})],
         )
         assert verdict.ok
@@ -94,10 +94,10 @@ class TestInventedLinks:
 
     def test_a_link_the_agent_itself_sent_earlier_may_be_repeated(self):
         history = [
-            {"role": "assistant", "content": "Pay here: https://app.hostos.in/pay/order_A"}
+            {"role": "assistant", "content": "Pay here: https://app.staysuite.example.com/pay/order_A"}
         ]
         verdict = check(
-            "Here's that link again: https://app.hostos.in/pay/order_A",
+            "Here's that link again: https://app.staysuite.example.com/pay/order_A",
             [FakeOutcome("get_property_knowledge", {"answer": "ok"})],
             history,
         )
@@ -415,7 +415,7 @@ def test_a_payment_link_is_not_a_leaked_table_name():
     """
     The most expensive false positive found in this system.
 
-    Every payment link StayOS issues is `/pay/order_TTNlZOqsCGlaWH` — a
+    Every payment link StaySuite issues is `/pay/order_TTNlZOqsCGlaWH` — a
     Razorpay order id, `order_` and all — and the snake-case rule that keeps
     `folio_entries` away from guests matches it exactly. So the one message
     that takes the money was refused, and the guest asking to pay was handed to
@@ -426,10 +426,10 @@ def test_a_payment_link_is_not_a_leaked_table_name():
     was written to find.
     """
     reply = ("Aap ₹8,602 abhi pay kar sakte hain.\n\n"
-             "Payment link: https://travbuddy.in/pay/order_TTNlZOqsCGlaWH")
+             "Payment link: https://safar.example.com/pay/order_TTNlZOqsCGlaWH")
     outcome = FakeOutcome(
         tool="create_booking_payment_link",
-        output={"payUrl": "https://travbuddy.in/pay/order_TTNlZOqsCGlaWH",
+        output={"payUrl": "https://safar.example.com/pay/order_TTNlZOqsCGlaWH",
                 "tokenPaise": 860200},
     )
 
@@ -443,7 +443,7 @@ def test_masking_links_does_not_let_a_table_name_through_in_prose():
     tool name in a sentence.
     """
     reply = ("Maine folio_entries check kiya. "
-             "Link: https://travbuddy.in/pay/order_ABC123")
+             "Link: https://safar.example.com/pay/order_ABC123")
     outcome = FakeOutcome(tool="get_booking_status", output={"state": "PENDING"})
 
     verdict = guardrails.check_reply(reply, tool_outputs=[outcome])

@@ -1,7 +1,7 @@
 """
 Marketplace matching — turn a trip intent into ranked partner inventory.
 
-This is the piece that makes TravBuddy different from an OTA: the traveller
+This is the piece that makes Safar different from an OTA: the traveller
 never searches. The planner already knows the destination, dates, group size,
 budget and interests, so the marketplace is consulted *during* planning and the
 result is woven into the itinerary.
@@ -398,7 +398,7 @@ def _score_completeness(row: dict) -> tuple[float, str | None]:
 def _score_trust(row: dict) -> tuple[float, str | None]:
     partner = row.get("partner") or {}
     if not partner:
-        # A TravBuddy-run trip. Attribution travels in `partner_name`, not in
+        # A Safar-run trip. Attribution travels in `partner_name`, not in
         # `why` — "who runs it" is not a reason to book it.
         return 0.9, None
 
@@ -508,7 +508,7 @@ def _build_item(row: dict, kind: str, score: float, whys: list[str], day: int | 
         "url": url,
         "booking_type": booking_type,
         "cta": cta,
-        "partner_name": partner.get("brand_name") if partner else "TravBuddy",
+        "partner_name": partner.get("brand_name") if partner else "Safar",
         "partner_slug": partner.get("slug") if partner else None,
         "verified": bool(partner.get("verified")) if partner else True,
         "confidence": round(score, 3),

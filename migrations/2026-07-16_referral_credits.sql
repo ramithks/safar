@@ -1,5 +1,5 @@
 -- ============================================================================
--- TravBuddy Growth OS — referral codes + travel-wallet credit ledger +
+-- Safar Growth OS — referral codes + travel-wallet credit ledger +
 -- public group trips (docs/growth_os_plan.md Phase 2)
 -- Idempotent: safe to re-run.
 --

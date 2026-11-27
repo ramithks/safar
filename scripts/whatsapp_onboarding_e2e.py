@@ -21,7 +21,7 @@ the module boundary before the first assertion, and the suite asserts that too
 — a run that silently fell through to the real API would onboard a WABA that
 does not exist and leave a credential nobody can revoke.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/whatsapp_onboarding_e2e.py
 """

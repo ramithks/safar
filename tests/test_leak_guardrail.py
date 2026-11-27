@@ -126,7 +126,7 @@ REAL_REPLIES = [
     "Booking number: TB-TLWBTQ\n2026-09-11 se 2026-09-15 tak, 2 rooms\n"
     "Abhi diya: ₹10,752 · Hotel par dena hai: ₹43,008",
     # Money, links and markdown.
-    "Please use this link to pay ₹1,434: https://app.hostos.in/pay/order_TSMDblAc9s07cI. "
+    "Please use this link to pay ₹1,434: https://app.staysuite.example.com/pay/order_TSMDblAc9s07cI. "
     "The remaining ₹5,734 will be due at the hotel, making the total ₹7,168.",
     "*   **Lake View Deluxe** with breakfast: from ₹9,600\n"
     "*   **Heritage Suite** with breakfast: from ₹17,000",

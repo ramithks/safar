@@ -1,4 +1,4 @@
-# TravBuddy Backend — Run Commands
+# Safar Backend — Run Commands
 
 Every command you'll actually run, what it does, and when to use it. Run all of
 these from the repo root with the virtualenv active unless noted.

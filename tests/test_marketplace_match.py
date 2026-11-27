@@ -105,8 +105,8 @@ def package(**over):
     return row
 
 
-def travbuddy_package(**over):
-    """partner_id null + no join = a TravBuddy-run trip."""
+def safar_package(**over):
+    """partner_id null + no join = a Safar-run trip."""
     row = package(id="p-tb", slug="udaipur-weekend", title="Udaipur Weekend",
                   destination="Udaipur", partner_id=None, partner=None)
     row.update(over)
@@ -252,15 +252,15 @@ class TestWhyLines:
         if r["sections"]:
             assert not any("Covers all" in w for w in r["sections"][0]["items"][0]["why"])
 
-    def test_travbuddy_trip_is_attributed_not_called_a_partner(self, monkeypatch):
+    def test_safar_trip_is_attributed_not_called_a_partner(self, monkeypatch):
         """Attribution rides on `partner_name`, not on a `why` line — "who runs
         it" is not a reason to book it, and burning a scarce why slot on it
         pushed real reasons off the card."""
-        stub(monkeypatch, trips=[travbuddy_package()])
+        stub(monkeypatch, trips=[safar_package()])
         item = match_inventory(ctx(destination="Udaipur"))["sections"][0]["items"][0]
-        assert item["partner_name"] == "TravBuddy"
+        assert item["partner_name"] == "Safar"
         assert item["verified"] is True
-        assert not any("TravBuddy" in w for w in item["why"])
+        assert not any("Safar" in w for w in item["why"])
 
     def test_the_three_why_slots_go_to_the_most_useful_reasons(self, monkeypatch):
         stub(monkeypatch, trips=[package()])
@@ -355,8 +355,8 @@ class TestBudgetScenarios:
 # ── mixed inventory + caps ───────────────────────────────────────────────────
 
 class TestInventoryMix:
-    def test_partner_and_travbuddy_packages_compete_on_merit(self, monkeypatch):
-        tb = travbuddy_package(destination="Manali", slug="tb-manali", id="tb",
+    def test_partner_and_safar_packages_compete_on_merit(self, monkeypatch):
+        tb = safar_package(destination="Manali", slug="tb-manali", id="tb",
                                duration_days=4, price_from=8800)
         stub(monkeypatch, trips=[tb, package()])
         r = match_inventory(ctx())
@@ -367,8 +367,8 @@ class TestInventoryMix:
         r = match_inventory(ctx())
         assert {s["kind"] for s in r["sections"]} == {"hotel", "experience"}
 
-    def test_only_travbuddy_inventory(self, monkeypatch):
-        stub(monkeypatch, trips=[travbuddy_package(destination="Manali", duration_days=4)])
+    def test_only_safar_inventory(self, monkeypatch):
+        stub(monkeypatch, trips=[safar_package(destination="Manali", duration_days=4)])
         r = match_inventory(ctx())
         assert [s["kind"] for s in r["sections"]] == ["package"]
 

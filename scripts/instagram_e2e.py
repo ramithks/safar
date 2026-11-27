@@ -21,7 +21,7 @@ test that needs a live model to prove a complaint becomes a ticket is testing
 the model. Everything between the webhook and the database is production code.
 The real-model boundary is scripts/vertex_e2e.py.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/instagram_e2e.py
 

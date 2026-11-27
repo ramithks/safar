@@ -19,7 +19,7 @@ The model is scripted (`EchoProvider`) for the same reason as in ai_e2e.py: a
 test that needs a live model to prove a complaint becomes a ticket is testing
 the model. Everything between the webhook and the database is production code.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/python scripts/whatsapp_e2e.py
 

@@ -5,7 +5,7 @@ listing draft.
   POST /api/v1/marketplace/extract/text   {text, kind_hint?, generate_copy?}
   POST /api/v1/marketplace/extract/file   multipart: file, kind_hint?
 
-Both are authenticated (a partner is a signed-in TravBuddy user) and rate
+Both are authenticated (a partner is a signed-in Safar user) and rate
 limited — each call is two Gemini round-trips, so this is the most expensive
 endpoint a partner can hit.
 

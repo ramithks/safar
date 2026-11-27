@@ -1,8 +1,8 @@
-# TravBuddy Backend — CLAUDE.md
+# Safar Backend — CLAUDE.md
 
 ## What this project is
 
-TravBuddy extracts a structured **location timeline** from any Instagram Reel — answer the question "where in the world was this filmed?" The backend handles the full pipeline: download → scene detection → frame deduplication → AI vision → place enrichment → persist.
+Safar extracts a structured **location timeline** from any Instagram Reel — answer the question "where in the world was this filmed?" The backend handles the full pipeline: download → scene detection → frame deduplication → AI vision → place enrichment → persist.
 
 **Built entirely with Claude Code as the primary agentic coding harness.**
 

@@ -45,7 +45,7 @@ from app.services import admin_subscribers  # noqa: F401
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-SITE = "https://travbuddy.in"
+SITE = "https://safar.example.com"
 BRAND = "partner:partners(brand_name, slug, verified)"
 
 TABLE = {"experience": "partner_listings", "group_trip": "group_trips"}
@@ -155,7 +155,7 @@ def queue(request: Request, _admin: AdminIdentity = Depends(require_admin)) -> l
     for r in trips:
         items.append(QueueItem(
             id=r["id"], kind="group_trip", slug=r["slug"], title=r["title"],
-            brand=(r.get("partner") or {}).get("brand_name") or "TravBuddy",
+            brand=(r.get("partner") or {}).get("brand_name") or "Safar",
             partner_id=r.get("partner_id"),
             destination=r.get("destination"),
             price=r.get("price_from"),

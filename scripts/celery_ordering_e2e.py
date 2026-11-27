@@ -107,7 +107,7 @@ if not workers:
 
 check("a worker is listening", bool(workers), str(list(workers)))
 check("and it knows how to process a conversation",
-      "travbuddy.messaging.process_conversation" in registered, str(sorted(registered))[:200])
+      "safar.messaging.process_conversation" in registered, str(sorted(registered))[:200])
 
 
 # ── two guests, several messages each ────────────────────────────────────────

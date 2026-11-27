@@ -29,12 +29,12 @@ no double booking, no double charge, no double payout, no silent loss.
 from every principal in the system, and asserts the refusal rather than the
 success.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010
     ./venv/bin/python scripts/pilot_e2e.py
 
-⚠ Creates a whole hotel under the `f1…` id namespace and `@pilot.stayos.test`
+⚠ Creates a whole hotel under the `f1…` id namespace and `@pilot.staysuite.test`
 logins, and deletes it again on the way out. It cannot touch Casa Mandala or
 the three properties the other suites share.
 """

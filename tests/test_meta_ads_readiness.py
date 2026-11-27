@@ -83,7 +83,7 @@ def test_each_missing_thing_is_something_a_hotelier_can_act_on():
 
 def test_a_connected_instagram_is_not_an_ad_account():
     """
-    The distinction the whole module exists to hold. StayOS has Instagram
+    The distinction the whole module exists to hold. StaySuite has Instagram
     *messaging* scopes — reading and replying to DMs — and creating ads needs
     `ads_management` on a Meta Business account with a funded ad account. They
     look adjacent and share nothing.

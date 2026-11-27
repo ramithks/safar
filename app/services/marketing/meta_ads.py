@@ -18,7 +18,7 @@ rather than one, because a status is exactly the kind of thing that drifts:
   3. **The screen.** `not_connected` is a first-class state with its own
      explanation, not an error dialog over a UI that otherwise looks ready.
 
-**What is built and what is not.** StayOS holds Instagram *messaging*
+**What is built and what is not.** StaySuite holds Instagram *messaging*
 credentials — `instagram_business_basic` and `instagram_business_manage_messages`
 — which are the scopes for reading and replying to DMs. Creating ads needs
 `ads_management` on a Meta *Business* account with a funded ad account, a

@@ -5,7 +5,7 @@ Give every hotel the AI employee it was sold.
     ./venv/bin/python scripts/provision_missing_agents.py            # dry run
     ./venv/bin/python scripts/provision_missing_agents.py --apply
 
-`migrate_partners.py` moved the marketplace's hotels onto StayOS — partner,
+`migrate_partners.py` moved the marketplace's hotels onto StaySuite — partner,
 property, rooms, rates, billing, a transition entitlement — and never called
 `ai/provisioning.provision()`, because until onboarding existed nothing did.
 Every agent row in the hotel OS was created either by the seed or by

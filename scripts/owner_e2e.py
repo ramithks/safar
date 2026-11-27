@@ -26,7 +26,7 @@ with almost nothing in it, and the agent must return INSUFFICIENT_DATA rather
 than a confident recommendation. Every other check here is about numbers being
 right; that one is about the system knowing when it does not have any.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010     # scenarios 1-3, 15-17
     ./venv/bin/python scripts/owner_e2e.py          # deterministic
@@ -99,8 +99,8 @@ PLAN_ADV = "aaaaaaaa-0000-4000-8000-000000000202"
 #
 # So this suite creates its own auth users through the GoTrue admin API and
 # touches nobody else's. `handle_new_user()` mirrors them into `profiles`.
-OWNER_EMAIL = "owner-e2e@travbuddy.test"
-NON_OWNER_EMAIL = "housekeeping-e2e@travbuddy.test"
+OWNER_EMAIL = "owner-e2e@safar.test"
+NON_OWNER_EMAIL = "housekeeping-e2e@safar.test"
 E2E_PASSWORD = "hotel-os-dev"
 # A member of a different partner entirely. Read-only here — this suite asserts
 # that they see nothing, and asserting that changes nothing about them.

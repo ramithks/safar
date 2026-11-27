@@ -1,12 +1,12 @@
 """
-Telling travbuddy.in that a hotel's page has changed.
+Telling safar.example.com that a hotel's page has changed.
 
     publish / unpublish / rooms edited
               │
-              └──► POST travbuddy.in/api/revalidate  {kind: stayos_hotel, slug}
+              └──► POST safar.example.com/api/revalidate  {kind: staysuite_hotel, slug}
                           │
                           ├─ purge /book/{slug} and its room pages
-                          ├─ purge /sitemaps/stayos-*.xml and /sitemap.xml
+                          ├─ purge /sitemaps/staysuite-*.xml and /sitemap.xml
                           └─ submit the URL to IndexNow
 
 **Why a ping rather than a shorter cache.** The hotel page is ISR on a one-hour
@@ -45,7 +45,7 @@ async def hotel_changed(slug: str | None) -> None:
     base = (getattr(settings, "site_url", None) or "").rstrip("/")
     secret = getattr(settings, "revalidate_secret", None)
     if not (base and secret):
-        # Not configured is a normal state — a development box, or a StayOS
+        # Not configured is a normal state — a development box, or a StaySuite
         # deployment with no website in front of it. Said once, at debug.
         logger.debug("no revalidate hook configured; skipping SEO ping for %s", slug)
         return
@@ -54,7 +54,7 @@ async def hotel_changed(slug: str | None) -> None:
         async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
             response = await client.post(
                 f"{base}/api/revalidate",
-                json={"kind": "stayos_hotel", "slug": slug},
+                json={"kind": "staysuite_hotel", "slug": slug},
                 headers={"x-revalidate-secret": secret},
             )
         if response.status_code >= 400:

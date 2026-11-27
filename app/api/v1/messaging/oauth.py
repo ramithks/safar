@@ -480,7 +480,7 @@ async def get_channels(
         db = get_db()
         site = (
             db.table("hotel_websites")
-            .select("status,domain,travbuddy_path")
+            .select("status,domain,safar_path")
             .eq("property_id", property_id).limit(1).execute().data or []
         )
         instagram = (
@@ -529,7 +529,7 @@ async def get_channels(
         # A custom domain wins; otherwise the path the website service wrote at
         # publish time; otherwise the slug. Three fallbacks because a hotel that
         # is live must always have somewhere to click through to.
-        path = site.get("travbuddy_path") or f"/stay/{found['slug']}"
+        path = site.get("safar_path") or f"/stay/{found['slug']}"
         live_url = f"https://{site['domain']}" if site.get("domain") else f"{base}{path}"
         # The headline is the address, not the word "Live" — the badge beside it
         # already says that, and what an owner actually wants to read here is
@@ -570,7 +570,7 @@ async def get_channels(
 
     # ── Google Business Profile ──
     #
-    # Written, tested, and not shown. StayOS launches on the two channels a
+    # Written, tested, and not shown. StaySuite launches on the two channels a
     # hotel can switch on for itself; Google needs an approved access request
     # from us before a review reply or a post works at all, so a row here would
     # be a Connect button leading to a wall. It is not listed as "coming soon"
@@ -611,7 +611,7 @@ async def get_channels(
                 id="google", name="Google Business Profile", state="not_connected",
                 headline="Not connected",
                 detail="Travellers find you on Google. Reply to reviews and post offers "
-                       "without leaving StayOS.",
+                       "without leaving StaySuite.",
                 action="Connect Google",
             ))
 
@@ -673,7 +673,7 @@ async def instagram_deauthorize(request: Request, signed_request: str = Form(def
         (
             db.table("instagram_connections")
             .update({"status": "disconnected",
-                     "last_error": "The hotel removed StayOS from this Instagram account."})
+                     "last_error": "The hotel removed StaySuite from this Instagram account."})
             .eq("instagram_account_id", account_id)
             .execute()
         )

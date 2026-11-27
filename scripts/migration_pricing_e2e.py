@@ -19,7 +19,7 @@ The second half is the one that matters. A resolver that returns ₹3,600 and a
 engines disagreeing, which is the failure this whole architecture is arranged
 to prevent.
 
-    cd travbuddy_backend
+    cd safar_backend
     set -a; . ./.env.hotelos; set +a
     ./venv/bin/uvicorn app.main:app --port 8010          # for the booking half
     ./venv/bin/python scripts/migration_pricing_e2e.py

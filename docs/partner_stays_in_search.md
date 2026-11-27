@@ -1,10 +1,10 @@
 # Partner stays in hotel search
 
-TravBuddy's own partner inventory is now **pinned above** the searched OTA
+Safar's own partner inventory is now **pinned above** the searched OTA
 results on every stays surface, tagged `Verified`.
 
-The tag says the listing was published by TravBuddy after its completeness
-gates — the same promise `/stays` already makes ("TravBuddy Verified Stays").
+The tag says the listing was published by Safar after its completeness
+gates — the same promise `/stays` already makes ("Safar Verified Stays").
 It is **not** the `partners.verified` column, which is a separate and stricter
 check (no live partner has it set today). Apart from the tag and the placement,
 a partner card behaves exactly like every other result: same CTA wording, same
@@ -32,7 +32,7 @@ positioning against.* That rule is intact, and this does not break it:
   `is_featured` are not read at all.
 
 What justifies the placement is that these rows are a different product: the
-booking completes on TravBuddy, at the owner's price, with an owner we can
+booking completes on Safar, at the owner's price, with an owner we can
 reach — not a hand-off to Booking.com.
 
 ## How it works
