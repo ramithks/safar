@@ -6,16 +6,14 @@
 <title>Safar - AI Trip Planner</title>
 <style>
   :root {
-    --bg: #0c1016;
-    --card: #151b24;
-    --card2: #1b232e;
-    --line: rgba(255, 255, 255, 0.08);
-    --text: #eef2f6;
-    --muted: #8d9aa8;
-    --gold: #e3ac55;
-    --gold-deep: #c98f35;
-    --gold-soft: rgba(227, 172, 85, 0.14);
-    --shadow: 0 10px 34px rgba(0, 0, 0, 0.45);
+    --bg: #000000;
+    --surface: #0d0d0d;
+    --surface2: #1a1a1a;
+    --line: #262626;
+    --text: #f5f5f5;
+    --muted: #a8a8a8;
+    --blue: #0095f6;
+    --grad: linear-gradient(45deg, #f9ce34 0%, #ee2a7b 48%, #6228d7 100%);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -25,196 +23,213 @@
     -webkit-font-smoothing: antialiased;
   }
 
-  /* ── hero ─────────────────────────────────────────────── */
-  .hero {
-    position: relative;
-    background: url("https://raw.githubusercontent.com/ramithks/safar/ui-preview/static/img/coorg.jpg") center 32% / cover no-repeat;
-    min-height: 340px;
-    display: flex; align-items: flex-end;
+  /* ── top bar ──────────────────────────────────────────── */
+  .topbar {
+    position: sticky; top: 0; z-index: 20;
+    background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
   }
-  .hero::before {
-    content: ""; position: absolute; inset: 0;
-    background: linear-gradient(180deg, rgba(12, 16, 22, 0.42) 0%, rgba(12, 16, 22, 0.55) 46%, rgba(12, 16, 22, 0.97) 100%);
+  .topbar-in {
+    max-width: 470px; margin: 0 auto; height: 54px;
+    display: flex; align-items: center; padding: 0 14px;
   }
-  .hero-inner {
-    position: relative; width: 100%; max-width: 980px;
-    margin: 0 auto; padding: 120px 20px 74px;
-  }
-  .hero h1 {
-    color: #ffffff; font-size: 52px; font-weight: 800; letter-spacing: -2px;
-    line-height: 1.02; margin: 0 0 12px;
-  }
-  .hero h1 em { font-style: normal; color: var(--gold); }
-  .hero p {
-    display: inline-block; color: rgba(238, 242, 246, 0.94); font-size: 15px; margin: 0;
-    background: rgba(12, 16, 22, 0.55); border: 1px solid var(--line);
-    padding: 7px 14px; border-radius: 99px; backdrop-filter: blur(6px);
+  .logo { font-size: 25px; font-weight: 800; letter-spacing: -1px; }
+  .logo em {
+    font-style: normal;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
   }
 
-  .wrap { max-width: 980px; margin: 0 auto; padding: 0 20px 90px; }
+  .feed { max-width: 470px; margin: 0 auto; padding: 0 8px 60px; }
 
-  /* ── cards ────────────────────────────────────────────── */
-  .card {
-    background: var(--card); border: 1px solid var(--line);
-    border-radius: 20px; padding: 26px; margin-top: 20px;
-    box-shadow: var(--shadow);
+  /* ── stories strip ────────────────────────────────────── */
+  .stories {
+    display: flex; gap: 16px; overflow-x: auto;
+    padding: 18px 8px 6px; scrollbar-width: none;
   }
-  .card.lift { margin-top: -46px; position: relative; }
-  .card h2 { font-size: 19px; font-weight: 700; letter-spacing: -0.3px; margin-bottom: 4px; }
-  .card .sub { color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+  .stories::-webkit-scrollbar { display: none; }
+  .dest { display: flex; flex-direction: column; align-items: center; gap: 6px; cursor: pointer; width: 72px; flex: none; }
+  .dest .ring {
+    width: 66px; height: 66px; border-radius: 50%;
+    background: var(--grad); padding: 3px;
+  }
+  .dest .photo {
+    width: 100%; height: 100%; border-radius: 50%;
+    border: 2px solid var(--bg);
+    background-size: cover; background-position: center;
+  }
+  .dest span { font-size: 12px; color: var(--text); font-weight: 600; }
+  .dest small { font-size: 10px; color: var(--muted); margin-top: -4px; }
 
-  /* ── form controls ────────────────────────────────────── */
-  label { display: block; font-size: 11px; font-weight: 700; color: var(--muted); margin: 16px 0 6px; text-transform: uppercase; letter-spacing: 0.9px; }
-  input, select {
-    width: 100%; padding: 14px 15px; border-radius: 12px;
-    border: 1px solid var(--line); background: var(--card2); color: var(--text);
-    font-size: 16px; outline: none; transition: border-color .15s ease;
+  /* ── post cards ───────────────────────────────────────── */
+  .post {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 12px; margin: 14px 0; padding: 18px 16px;
   }
-  input:focus, select:focus { border-color: var(--gold); }
-  input::placeholder { color: #5d6b7a; }
-  .route-row { display: grid; grid-template-columns: 1fr 44px 1fr; gap: 10px; align-items: end; }
-  .route-row label { margin-top: 0; }
-  .route-arrow {
-    color: var(--gold); font-size: 20px; text-align: center; padding-bottom: 14px;
-    user-select: none;
-  }
-  .mini-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
-  .mini-row input { padding: 11px 13px; font-size: 15px; }
+  .post h2 { font-size: 16px; font-weight: 700; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
 
-  .seg { display: flex; gap: 8px; margin-top: 6px; }
-  .seg button {
-    flex: 1; margin: 0; padding: 11px 0; border-radius: 11px;
-    background: var(--card2); color: var(--muted); border: 1px solid var(--line);
-    font-size: 14px; font-weight: 600; cursor: pointer;
+  /* ── route composer ───────────────────────────────────── */
+  .rail { position: relative; margin-top: 14px; }
+  .rail::before {
+    content: ""; position: absolute; left: 7px; top: 26px; bottom: 26px;
+    width: 2px; background: var(--line);
   }
-  .seg button.on {
-    background: var(--gold-soft); color: var(--gold); border-color: var(--gold);
+  .field { position: relative; }
+  .field::before {
+    content: ""; position: absolute; left: 2px; top: 20px;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--blue); z-index: 1;
   }
+  .field.to::before { background: transparent; border: 3px solid #ee2a7b; width: 8px; height: 8px; left: 4px; top: 22px; }
+  .field input {
+    width: 100%; background: transparent; border: none;
+    border-bottom: 1px solid var(--line);
+    padding: 14px 8px 12px 28px; font-size: 15px; color: var(--text); outline: none;
+  }
+  .field input:focus { border-bottom-color: var(--blue); }
+  .field input::placeholder { color: #6a6a6a; }
 
-  details { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 4px; }
+  label { display: block; font-size: 10px; font-weight: 700; color: var(--muted); margin: 14px 0 6px; text-transform: uppercase; letter-spacing: 0.8px; }
+
+  .chips { display: flex; gap: 8px; }
+  .chips button {
+    flex: 1; padding: 8px 0; border-radius: 99px; cursor: pointer;
+    background: transparent; border: 1px solid var(--line);
+    color: var(--muted); font-size: 13px; font-weight: 600;
+  }
+  .chips button.on { background: #ffffff; border-color: #ffffff; color: #000000; }
+
+  .meta-row { display: grid; grid-template-columns: 1fr 1fr 1.3fr; gap: 8px; }
+  .meta-row input {
+    width: 100%; background: var(--surface2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 9px 10px; font-size: 14px; color: var(--text); outline: none;
+  }
+  .meta-row input:focus { border-color: var(--blue); }
+  .meta-row label { margin-top: 0; }
+
+  details { margin-top: 14px; border-top: 1px solid var(--line); }
   summary {
     cursor: pointer; color: var(--muted); font-size: 13px; font-weight: 600;
-    padding: 10px 0; list-style: none;
+    padding: 12px 0; list-style: none;
   }
-  summary::before { content: "+ "; color: var(--gold); font-weight: 700; }
+  summary::before { content: "+ "; color: var(--blue); font-weight: 700; }
   details[open] summary::before { content: "- "; }
+  details input {
+    width: 100%; background: var(--surface2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px; font-size: 14px; color: var(--text);
+    outline: none; margin-bottom: 4px;
+  }
+  details input:focus { border-color: var(--blue); }
+  details input::placeholder { color: #6a6a6a; }
 
   button.cta {
-    margin-top: 22px; width: 100%; padding: 16px; border: none; border-radius: 14px;
-    background: linear-gradient(135deg, var(--gold) 0%, var(--gold-deep) 100%);
-    color: #221503; font-size: 16px; font-weight: 800; letter-spacing: 0.2px;
-    cursor: pointer;
+    margin-top: 16px; width: 100%; padding: 13px; border: none; border-radius: 10px;
+    background: var(--grad); color: #ffffff;
+    font-size: 15px; font-weight: 700; cursor: pointer;
   }
   button.cta:disabled { opacity: 0.45; cursor: default; }
   button.ghost {
-    margin-top: 12px; width: 100%; padding: 13px; border-radius: 12px;
+    margin-top: 10px; width: 100%; padding: 11px; border-radius: 10px;
     background: transparent; color: var(--muted); border: 1px solid var(--line);
-    font-size: 14px; font-weight: 600; cursor: pointer;
+    font-size: 13px; font-weight: 600; cursor: pointer;
   }
-  .msg { font-size: 13px; color: var(--muted); margin-top: 12px; min-height: 18px; }
-  .msg.err { color: #f08a7b; }
+  .msg { font-size: 12px; color: var(--muted); margin-top: 10px; min-height: 16px; }
+  .msg.err { color: #ed4956; }
 
-  /* ── destination strip ────────────────────────────────── */
-  .strip-title { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin: 34px 0 12px; }
-  .strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
-  .dest {
-    position: relative; border-radius: 16px; overflow: hidden; cursor: pointer;
-    width: 100%; height: 150px; aspect-ratio: 4 / 3;
-    border: 1px solid var(--line); box-shadow: var(--shadow);
-    background-size: cover; background-position: center;
-    transition: transform .18s ease;
+  /* ── auth ─────────────────────────────────────────────── */
+  #auth-card { margin-top: 60px; padding: 36px 26px; text-align: center; }
+  #auth-card .logo { font-size: 40px; display: block; margin-bottom: 6px; }
+  #auth-card .tag { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
+  #auth-form { text-align: left; }
+  #auth-form input {
+    width: 100%; background: var(--surface2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 12px; font-size: 14px; color: var(--text);
+    outline: none; margin-bottom: 8px;
   }
-  .dest:hover { transform: translateY(-3px); }
-  .dest::after {
-    content: ""; position: absolute; inset: 0;
-    background: linear-gradient(180deg, rgba(12,16,22,0.05) 40%, rgba(12,16,22,0.82) 100%);
-  }
-  .dest span {
-    position: absolute; left: 12px; bottom: 10px; z-index: 1;
-    color: #fff; font-size: 16px; font-weight: 700; letter-spacing: -0.2px;
-  }
-  .dest small {
-    position: absolute; left: 10px; top: 10px; z-index: 1;
-    background: rgba(12, 16, 22, 0.72); color: var(--gold);
-    border: 1px solid rgba(227, 172, 85, 0.35);
-    font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 99px;
-    backdrop-filter: blur(4px);
-  }
+  #auth-form input:focus { border-color: #4d4d4d; }
+  #auth-form input::placeholder { color: #6a6a6a; }
+  #auth-form label { position: absolute; left: -9999px; }
+  #signin-btn { background: var(--blue); color: #fff; border: none; border-radius: 8px; width: 100%; padding: 12px; font-size: 14px; font-weight: 700; margin-top: 6px; cursor: pointer; }
+  .signup-note { color: var(--muted); font-size: 12px; margin-top: 16px; text-align: center; line-height: 1.5; }
 
   /* ── trip plan ────────────────────────────────────────── */
-  .progress-track { background: var(--card2); border-radius: 99px; height: 7px; margin: 16px 0 6px; overflow: hidden; }
-  .progress-fill { background: linear-gradient(90deg, var(--gold), var(--gold-deep)); height: 100%; width: 0%; transition: width 0.6s ease; }
-  .trip-title { font-size: 23px; font-weight: 800; letter-spacing: -0.5px; }
-  .route { color: var(--muted); font-size: 13px; margin-top: 5px; }
-  .day { border-top: 1px solid var(--line); padding: 16px 0; }
-  .day h3 { font-size: 15px; margin-bottom: 8px; font-weight: 700; }
-  .day h3 span { color: var(--gold); }
-  .item { font-size: 14px; color: var(--text); padding: 5px 0 5px 16px; position: relative; }
-  .item::before { content: ""; position: absolute; left: 0; top: 12px; width: 7px; height: 7px; border-radius: 50%; background: var(--gold); }
-  .item small { color: var(--muted); display: block; margin-top: 1px; }
-  .pill { display: inline-block; background: var(--card2); border: 1px solid var(--line); border-radius: 99px; padding: 5px 13px; font-size: 12px; color: var(--muted); margin: 5px 6px 0 0; }
-  .transport-opt { border: 1px solid var(--line); border-radius: 12px; padding: 13px 14px; margin-top: 10px; background: var(--card2); }
+  .post-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .avatar {
+    width: 38px; height: 38px; border-radius: 50%; flex: none;
+    background: var(--grad); display: flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 800; font-size: 17px;
+  }
+  .trip-title { font-size: 15px; font-weight: 700; }
+  .route { color: var(--muted); font-size: 12px; margin-top: 1px; }
+  .progress-track { background: var(--surface2); border-radius: 99px; height: 3px; margin: 12px 0 8px; overflow: hidden; }
+  .progress-fill { background: var(--grad); height: 100%; width: 0%; transition: width 0.6s ease; }
+
+  .day { border-left: 2px solid var(--line); margin: 14px 0 0 6px; padding: 2px 0 8px 16px; position: relative; }
+  .day::before {
+    content: ""; position: absolute; left: -6px; top: 6px;
+    width: 10px; height: 10px; border-radius: 50%; background: var(--grad);
+  }
+  .day h3 { font-size: 14px; margin-bottom: 8px; font-weight: 700; }
+  .day h3 span { color: var(--blue); margin-right: 6px; }
+  .item { font-size: 14px; color: var(--text); padding: 5px 0; }
+  .item small { color: var(--muted); display: block; margin-top: 1px; font-size: 12.5px; line-height: 1.45; }
+
+  .pill { display: inline-block; background: var(--surface2); border: 1px solid var(--line); border-radius: 99px; padding: 4px 12px; font-size: 12px; color: var(--muted); margin: 5px 6px 0 0; }
+  .transport-opt { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 8px; background: var(--surface2); }
   .transport-opt b { font-size: 14px; }
   .transport-opt .meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
-  .unavail { border: 1px dashed rgba(255,255,255,0.16); background: var(--card2); color: var(--muted); border-radius: 12px; padding: 13px 14px; font-size: 13px; margin-top: 10px; line-height: 1.55; }
-  .sample-banner { background: rgba(227, 172, 85, 0.10); border: 1px solid rgba(227, 172, 85, 0.4); color: var(--gold); border-radius: 12px; padding: 11px 15px; font-size: 13px; font-weight: 600; margin-bottom: 14px; }
-  .hidden { display: none; }
-  footer { text-align: center; color: #5d6b7a; font-size: 12px; margin-top: 46px; line-height: 1.7; }
-  a { color: var(--gold); text-decoration: none; }
-  .signout { float: right; background: none; border: none; color: var(--muted); font-size: 12px; cursor: pointer; width: auto; margin: 0; padding: 4px; }
-  .signout:hover { color: var(--gold); background: none; }
-
-  @media (max-width: 640px) {
-    .hero { min-height: 270px; }
-    .hero-inner { padding: 88px 16px 62px; }
-    .hero h1 { font-size: 38px; letter-spacing: -1.2px; }
-    .wrap { padding: 0 14px 70px; }
-    .card { padding: 20px; border-radius: 18px; }
-    .strip { grid-template-columns: 1fr 1fr; gap: 10px; }
-    .dest { height: 120px; }
-    .mini-row { grid-template-columns: 1fr 1fr; }
+  .unavail { border: 1px dashed #383838; background: transparent; color: var(--muted); border-radius: 10px; padding: 12px; font-size: 12.5px; margin-top: 8px; line-height: 1.55; }
+  .sample-banner {
+    border: 1px solid #4d3a1f; background: rgba(249, 206, 52, 0.07); color: #f9ce34;
+    border-radius: 8px; padding: 10px 12px; font-size: 12px; font-weight: 600; margin-bottom: 14px;
   }
+  .hidden { display: none; }
+  h3.sec { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-top: 18px; }
+  footer { text-align: center; color: #555555; font-size: 11px; margin-top: 34px; line-height: 1.7; }
+  a { color: var(--blue); text-decoration: none; }
+  .signout { background: none; border: none; color: var(--muted); font-size: 12px; cursor: pointer; width: auto; margin: 0; padding: 4px; float: right; }
+  .signout:hover { color: var(--text); }
 </style>
 </head>
 <body>
-<div class="hero">
-  <div class="hero-inner">
-    <h1>Safar<em>.</em></h1>
-    <p>Tell it where. It plans your route and day-by-day itinerary.</p>
-  </div>
-</div>
+<div class="topbar"><div class="topbar-in"><div class="logo">safar<em>.</em></div></div></div>
 
-<div class="wrap">
+<div class="feed">
 
   <!-- Auth -->
-  <div class="card lift" id="auth-card">
-    <h2>Welcome back</h2>
-    <div class="sub">Sign in to plan your next trip.</div>
+  <div class="post" id="auth-card">
+    <span class="logo">safar<em>.</em></span>
+    <div class="tag">Tell it where. It plans your route and day-by-day itinerary.</div>
     <div id="auth-form">
       <label>Email</label>
-      <input type="email" id="email" placeholder="you@example.com" autocomplete="email">
+      <input type="email" id="email" placeholder="Email" autocomplete="email">
       <label>Password</label>
-      <input type="password" id="password" placeholder="6+ characters" autocomplete="current-password">
-      <button class="cta" id="signin-btn">Sign in</button>
-      <button class="ghost" id="signup-btn" disabled style="opacity:0.5;cursor:not-allowed">Sign-ups closed for now</button>
-      <div class="msg" style="margin-top:8px;min-height:0">New accounts are paused while Safar is in early testing.</div>
+      <input type="password" id="password" placeholder="Password" autocomplete="current-password">
+      <button id="signin-btn">Sign in</button>
+      <div class="signup-note">New accounts are paused while Safar is in early testing.</div>
       <div class="msg" id="auth-msg"></div>
     </div>
   </div>
 
   <!-- Planner -->
   <div id="planner" class="hidden">
-    <button class="signout" id="signout-btn">sign out</button>
-    <div class="card lift">
-      <h2>Plan a trip</h2>
+
+    <div class="stories">
+      <div class="dest" data-dest="Coorg"><div class="ring"><div class="photo" style="background-image:url('https://raw.githubusercontent.com/ramithks/safar/ui-preview/static/img/coorg.jpg')"></div></div><span>Coorg</span><small>2-3 days</small></div>
+      <div class="dest" data-dest="Hampi"><div class="ring"><div class="photo" style="background-image:url('https://raw.githubusercontent.com/ramithks/safar/ui-preview/static/img/hampi.jpg')"></div></div><span>Hampi</span><small>2-3 days</small></div>
+      <div class="dest" data-dest="Gokarna"><div class="ring"><div class="photo" style="background-image:url('https://raw.githubusercontent.com/ramithks/safar/ui-preview/static/img/gokarna.jpg')"></div></div><span>Gokarna</span><small>2-4 days</small></div>
+    </div>
+
+    <div class="post">
+      <button class="signout" id="signout-btn">Sign out</button>
+      <h2>New trip</h2>
       <div class="sub">Two fields to start. Everything else is optional.</div>
-      <div class="route-row">
-        <div><label>From</label><input id="origin" placeholder="Bengaluru"></div>
-        <div class="route-arrow">&rarr;</div>
-        <div><label>To</label><input id="destination" placeholder="Coorg"></div>
+      <div class="rail">
+        <div class="field"><input id="origin" placeholder="From - Bengaluru"></div>
+        <div class="field to"><input id="destination" placeholder="To - Gokarna"></div>
       </div>
       <label>Budget</label>
-      <div class="seg" id="budget-seg">
+      <div class="chips" id="budget-seg">
         <button type="button" data-val="low">Low</button>
         <button type="button" data-val="mid" class="on">Mid</button>
         <button type="button" data-val="high">High</button>
@@ -224,7 +239,7 @@
         <option value="mid" selected>Mid</option>
         <option value="high">High</option>
       </select>
-      <div class="mini-row">
+      <div class="meta-row" style="margin-top:14px">
         <div><label>Days</label><input type="number" id="days" value="3" min="1" max="14"></div>
         <div><label>Travellers</label><input type="number" id="travelers" value="1" min="1" max="12"></div>
         <div><label>Departure</label><input type="date" id="departure_date"></div>
@@ -232,24 +247,22 @@
       <details>
         <summary>Interests and stops along the way</summary>
         <label>Interests (comma separated, optional)</label>
-        <input id="interests" placeholder="coffee estates, viewpoints, food">
+        <input id="interests" placeholder="beaches, cafes, trekking">
         <label>Stops along the way (comma separated cities, optional)</label>
-        <input id="stops" placeholder="Mysuru">
+        <input id="stops" placeholder="Hubballi">
       </details>
       <button class="cta" id="plan-btn">Plan my trip</button>
       <div class="msg" id="plan-msg"></div>
     </div>
 
-    <div class="strip-title">Popular from Bengaluru</div>
-    <div class="strip">
-      <div class="dest" data-dest="Coorg" style="background-image:url('img/coorg.jpg')"><small>2-3 days</small><span>Coorg</span></div>
-      <div class="dest" data-dest="Hampi" style="background-image:url('img/hampi.jpg')"><small>2-3 days</small><span>Hampi</span></div>
-      <div class="dest" data-dest="Gokarna" style="background-image:url('img/gokarna.jpg')"><small>2-4 days</small><span>Gokarna</span></div>
-    </div>
-
-    <div class="card hidden" id="trip-card">
-      <div class="trip-title" id="trip-title"></div>
-      <div class="route" id="trip-route"></div>
+    <div class="post hidden" id="trip-card">
+      <div class="post-head">
+        <div class="avatar">S</div>
+        <div>
+          <div class="trip-title" id="trip-title"></div>
+          <div class="route" id="trip-route"></div>
+        </div>
+      </div>
       <div class="progress-track"><div class="progress-fill" id="trip-progress"></div></div>
       <div class="msg" id="trip-status"></div>
       <div id="trip-transport"></div>
@@ -314,7 +327,7 @@ function showPlanner() {
   $("planner").classList.remove("hidden");
 }
 
-// Budget segmented control -> hidden select the planner reads
+// Budget chips -> hidden select the planner reads
 document.querySelectorAll("#budget-seg button").forEach(btn => {
   btn.addEventListener("click", () => {
     document.querySelectorAll("#budget-seg button").forEach(b => b.classList.remove("on"));
@@ -403,25 +416,25 @@ function renderTrip(env) {
   const legs = doc.transport || [];
   if (env.status !== "planning") {
     const hasOptions = legs.some(leg => (leg.options || []).length > 0);
-    $("trip-transport").innerHTML = "<h3 style='margin-top:16px;font-size:15px'>Getting there</h3>" + (hasOptions
+    $("trip-transport").innerHTML = "<h3 class='sec'>Getting there</h3>" + (hasOptions
       ? legs.map(leg => {
           const opts = (leg.options || []).slice(0, 3).map(o =>
             `<div class="transport-opt"><b>${esc(o.mode || o.provider || "Option")}</b>` +
             `<div class="meta">${esc(o.summary || o.name || "")} ${o.price ? " - ₹" + esc(o.price) : ""}</div></div>`
           ).join("");
-          return `<div style="margin-top:10px"><span class="pill">${esc(leg.from || "")} → ${esc(leg.to || "")}</span></div>` + opts;
+          return `<div style="margin-top:8px"><span class="pill">${esc(leg.from || "")} → ${esc(leg.to || "")}</span></div>` + opts;
         }).join("")
       : `<div class="unavail">Live fares and bookable transport options are not available on this free deployment yet. The route above is AI-planned; check operators directly for tickets.</div>`);
   } else {
     $("trip-transport").innerHTML = legs.length
-      ? "<h3 style='margin-top:16px;font-size:15px'>Getting there</h3>" + legs.map(leg =>
-          `<div style="margin-top:10px"><span class="pill">${esc(leg.from || "")} → ${esc(leg.to || "")}</span></div>`).join("")
+      ? "<h3 class='sec'>Getting there</h3>" + legs.map(leg =>
+          `<div style="margin-top:8px"><span class="pill">${esc(leg.from || "")} → ${esc(leg.to || "")}</span></div>`).join("")
       : "";
   }
   // Stays: booking is not wired up on this deployment - say so explicitly.
   if (env.status !== "planning" && !$("stays-note")) {
     $("trip-notes").insertAdjacentHTML("beforebegin",
-      `<h3 style="margin-top:16px;font-size:15px">Stays</h3>` +
+      `<h3 class="sec">Stays</h3>` +
       `<div class="unavail" id="stays-note">Stay booking is not available on this free deployment yet. The itinerary suggests areas to stay; book directly with properties.</div>`);
   }
 
