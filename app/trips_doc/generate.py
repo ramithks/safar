@@ -125,6 +125,58 @@ def _window_flags(graph: G.TripGraph, spec: dict) -> list[str]:
     return flags
 
 
+def _retime_day1_for_arrival(graph: G.TripGraph, spec: dict, flags: list[str]) -> None:
+    """Day 1 at the terminal cannot start before the traveller actually
+    arrives. Re-time that day's activities from the anchored arrival onward
+    and flag it — never present a ready-to-follow morning that the grounded
+    transport makes impossible."""
+    try:
+        _, outbound, _ = G.ordered_path(graph)
+    except Exception:  # noqa: BLE001
+        return
+    if not outbound:
+        return
+    leg = outbound[-1]
+    route = G.active_route(leg, None, spec.get("budget_tier"))
+    if not route or not route.hops:
+        return
+    opt = G.selected_option_for_hop(leg, route, len(route.hops) - 1, None,
+                                    spec.get("budget_tier"))
+    arr = str(getattr(opt, "arrival", "") or "")
+    if len(arr) < 16:
+        return
+    dst = graph.node(leg.to_node_id)
+    if dst is None or not dst.days:
+        return
+
+    def _mins(t: str) -> int | None:
+        try:
+            return int(t[:2]) * 60 + int(t[3:5])
+        except Exception:  # noqa: BLE001
+            return None
+
+    arr_clock = arr[11:16]
+    arr_m = _mins(arr_clock)
+    if arr_m is None:
+        return
+    acts = (dst.days[0] or {}).get("activities") or []
+    early = [a for a in acts
+             if (_mins(str(a.get("start_time") or a.get("time") or "")) or 9999) < arr_m]
+    if not early:
+        return
+    cur = arr_m
+    for a in acts:
+        dur = int(a.get("duration_min") or 90)
+        a["start_time"] = f"{cur // 60:02d}:{cur % 60:02d}"
+        a["retimed_for_arrival"] = True
+        cur += dur + 30
+    flags.append(
+        f"Day 1 in {dst.city} was re-timed around your {arr_clock} arrival — the "
+        "original morning slots weren't reachable with the grounded transport. "
+        "Times from arrival onward are approximate."
+    )
+
+
 async def run_generation(trip_id: str, spec: dict, user_id: str,
                          prior_doc: dict | None = None) -> None:
     """Entry point: admit through the global generation queue, then build."""
@@ -245,6 +297,13 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
     await B._geocode_nodes(graph)
     weather = await _wait_weather(weather_task)
     window_flags = _window_flags(graph, spec)
+    _retime_day1_for_arrival(graph, spec, window_flags)
+    for _ms in ((terminal_trip.get("trip_quality") or {}).get("must_stops") or []):
+        if _ms.get("injected") or _ms.get("feasibility") == "unverified":
+            window_flags.append(
+                f"Requested stop at {_ms.get('place')}: included in the plan as a "
+                "requested waypoint — routing and detour time are not verified."
+            )
 
     # ── final doc ────────────────────────────────────────────────────────────
     title = (terminal_trip.get("trip_name")
