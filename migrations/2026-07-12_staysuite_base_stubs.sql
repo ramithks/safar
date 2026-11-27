@@ -452,3 +452,6 @@ ALTER TABLE public.agent_actions ADD COLUMN property_id uuid;
 
 ALTER TABLE public.agent_actions DROP COLUMN IF EXISTS status CASCADE;
 ALTER TABLE public.agent_actions ADD COLUMN status text;
+
+ALTER TABLE public.hotel_websites DROP COLUMN IF EXISTS template CASCADE;
+ALTER TABLE public.hotel_websites ADD COLUMN template text;
