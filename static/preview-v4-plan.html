@@ -350,6 +350,11 @@
   function esc(s2) { return String(s2 ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
   function renderRealTrip(env) {
     const doc = env.doc || {};
+    const dName = dest.value.trim();
+    if (PHOTOS[dName]) {
+      document.getElementById('tripPhoto').src = PHOTOS[dName][0];
+      document.getElementById('itinPhoto').src = PHOTOS[dName][0];
+    }
     results.classList.add('on');
     document.getElementById('tripTitle').textContent = doc.title || 'Your trip';
     document.getElementById('itinTitle').textContent = doc.title || 'Your trip';
