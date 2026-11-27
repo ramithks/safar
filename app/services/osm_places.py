@@ -232,6 +232,20 @@ def _normtext(v: str) -> str:
     return re.sub(r"[^a-z0-9 ]+", " ", v).strip()
 
 
+_ACTIVITY_WORDS = {
+    "trek", "trekking", "trail", "summit", "hike", "hiking", "tour", "visit",
+    "viewpoint", "view", "point", "sunrise", "sunset", "stargazing", "spot",
+    "climb", "walk", "safari", "ride", "experience", "day", "trip",
+}
+
+
+def _activity_core(title: str) -> str:
+    """Activity phrasing ('Mullayanagiri Trek - Summit Trail') stripped to the
+    place it is about ('mullayanagiri') so venue matching compares places."""
+    toks = [t for t in _normtext(title).split() if t not in _ACTIVITY_WORDS]
+    return " ".join(toks)
+
+
 def _matches(title: str, name: str) -> bool:
     """Verify a name match two ways only: near-identical spelling
     (Chennakesava/Chennakeshava), or every token of the shorter string
@@ -241,7 +255,9 @@ def _matches(title: str, name: str) -> bool:
     name = _normtext(name)
     if not name:
         return False
-    for cand in {_normtext(title), _normtext(title.split(",")[0])}:
+    cands = {_normtext(title), _normtext(title.split(",")[0]),
+             _activity_core(title), _activity_core(title.split(",")[0])}
+    for cand in cands:
         if not cand:
             continue
         if _sim(cand, name) >= 0.8:

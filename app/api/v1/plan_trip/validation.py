@@ -305,8 +305,9 @@ def compute_confidence_score(act: dict) -> float:
         score += 0.40
     elif server and act.get("place_id"):
         score += 0.20
-    elif server and act.get("source") == "openstreetmap" and act.get("lat"):
-        # OSM confirms the place exists and where it is; no ratings/hours.
+    elif server and act.get("source") in ("openstreetmap", "wikidata") and act.get("lat"):
+        # A server-side OSM/Wikidata match confirms the place exists and
+        # where it is; no ratings/hours.
         score += 0.35
 
     rating = (act.get("rating") or 0) if server else 0
