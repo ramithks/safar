@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model_brain: str = "google/gemma-4-31b-it:free"
     openrouter_model_muscle: str = "google/gemma-4-26b-a4b-it:free"
-    openrouter_model_vision: str = "google/gemma-4-31b-it:free"
+    openrouter_model_vision: str = "nvidia/nemotron-3.5-super-vl:free"
     openrouter_fallback_models: str = (
         "nvidia/nemotron-3.5-super-vl:free,inclusionai/ling-3.2-flash:free,"
         "nvidia/nemotron-3.5-lightning:free,openrouter/free"

@@ -138,13 +138,32 @@ def analyze_reel(request: Request, body: AnalyzeReelRequest, user=Depends(requir
         create_reel_job(job_id=job_id, user_id=str(user.id), reel_url=canonical_url)
 
     from app.workers.celery_app import analyze_reel_task
-    analyze_reel_task.delay(
-        job_id=job_id,
-        reel_url=canonical_url,
-        options=body.options.model_dump(),
-        metadata=body.metadata,
-        user_id=str(user.id),
-    )
+    from app.workers.job_store import redis_available
+    if redis_available():
+        analyze_reel_task.delay(
+            job_id=job_id,
+            reel_url=canonical_url,
+            options=body.options.model_dump(),
+            metadata=body.metadata,
+            user_id=str(user.id),
+        )
+    else:
+        # Free single-instance deployment: no Redis, no Celery worker. Run the
+        # pipeline in-process on a daemon thread (same pattern as the trip
+        # planner's in-process generation) so the feature still works.
+        import threading
+        logger.info("No Redis/worker - running reel job %s in-process", job_id)
+        threading.Thread(
+            target=analyze_reel_task.apply,
+            kwargs={"kwargs": {
+                "job_id": job_id,
+                "reel_url": canonical_url,
+                "options": body.options.model_dump(),
+                "metadata": body.metadata,
+                "user_id": str(user.id),
+            }},
+            daemon=True,
+        ).start()
 
     logger.info(f"Job {job_id} queued for {canonical_url} (user={user.id})")
     return AnalyzeReelResponse(
