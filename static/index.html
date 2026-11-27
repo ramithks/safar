@@ -6,137 +6,180 @@
 <title>Safar - AI Trip Planner</title>
 <style>
   :root {
-    --bg: #faf7f1;
-    --card: #ffffff;
-    --line: #e7ddcd;
-    --text: #1d3a4a;
-    --muted: #6b7f8a;
-    --ocean: #0b6e8c;
-    --ocean-dark: #085268;
-    --ocean-soft: #e3f0f4;
-    --sand: #f3ead9;
-    --shadow: 0 2px 14px rgba(29, 58, 74, 0.08);
+    --bg: #0c1016;
+    --card: #151b24;
+    --card2: #1b232e;
+    --line: rgba(255, 255, 255, 0.08);
+    --text: #eef2f6;
+    --muted: #8d9aa8;
+    --gold: #e3ac55;
+    --gold-deep: #c98f35;
+    --gold-soft: rgba(227, 172, 85, 0.14);
+    --shadow: 0 10px 34px rgba(0, 0, 0, 0.45);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     background: var(--bg); color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
   }
 
   /* ── hero ─────────────────────────────────────────────── */
   .hero {
     position: relative;
-    background: url("img/coorg.jpg") center 38% / cover no-repeat;
-    min-height: 300px;
+    background: url("img/coorg.jpg") center 32% / cover no-repeat;
+    min-height: 340px;
     display: flex; align-items: flex-end;
   }
   .hero::before {
     content: ""; position: absolute; inset: 0;
-    background: linear-gradient(180deg, rgba(9, 45, 60, 0.28) 0%, rgba(9, 45, 60, 0.78) 100%);
+    background: linear-gradient(180deg, rgba(12, 16, 22, 0.42) 0%, rgba(12, 16, 22, 0.55) 46%, rgba(12, 16, 22, 0.97) 100%);
   }
   .hero-inner {
-    position: relative; width: 100%; max-width: 1020px;
-    margin: 0 auto; padding: 96px 16px 64px;
+    position: relative; width: 100%; max-width: 980px;
+    margin: 0 auto; padding: 120px 20px 74px;
   }
   .hero h1 {
-    color: #ffffff; font-size: 40px; letter-spacing: -1px;
-    line-height: 1.1; margin: 0 0 8px; text-shadow: 0 1px 10px rgba(0,0,0,0.35);
+    color: #ffffff; font-size: 52px; font-weight: 800; letter-spacing: -2px;
+    line-height: 1.02; margin: 0 0 12px;
   }
+  .hero h1 em { font-style: normal; color: var(--gold); }
   .hero p {
-    display: inline-block; color: #ffffff; font-size: 15px; margin: 0;
-    text-shadow: 0 1px 4px rgba(0,0,0,0.65), 0 2px 14px rgba(0,0,0,0.5);
-    background: rgba(9, 45, 60, 0.38); padding: 5px 12px; border-radius: 8px;
+    display: inline-block; color: rgba(238, 242, 246, 0.94); font-size: 15px; margin: 0;
+    background: rgba(12, 16, 22, 0.55); border: 1px solid var(--line);
+    padding: 7px 14px; border-radius: 99px; backdrop-filter: blur(6px);
   }
 
-  .wrap { max-width: 1020px; margin: 0 auto; padding: 0 16px 80px; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 20px 90px; }
 
-  /* ── cards & forms ────────────────────────────────────── */
+  /* ── cards ────────────────────────────────────────────── */
   .card {
     background: var(--card); border: 1px solid var(--line);
-    border-radius: 16px; padding: 22px; margin-top: 18px;
+    border-radius: 20px; padding: 26px; margin-top: 20px;
     box-shadow: var(--shadow);
   }
-  .card.lift { margin-top: -34px; position: relative; }
-  label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 5px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .card.lift { margin-top: -46px; position: relative; }
+  .card h2 { font-size: 19px; font-weight: 700; letter-spacing: -0.3px; margin-bottom: 4px; }
+  .card .sub { color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+
+  /* ── form controls ────────────────────────────────────── */
+  label { display: block; font-size: 11px; font-weight: 700; color: var(--muted); margin: 16px 0 6px; text-transform: uppercase; letter-spacing: 0.9px; }
   input, select {
-    width: 100%; padding: 11px 12px; border-radius: 10px;
-    border: 1px solid var(--line); background: var(--bg); color: var(--text);
-    font-size: 15px; outline: none;
+    width: 100%; padding: 14px 15px; border-radius: 12px;
+    border: 1px solid var(--line); background: var(--card2); color: var(--text);
+    font-size: 16px; outline: none; transition: border-color .15s ease;
   }
-  input:focus, select:focus { border-color: var(--ocean); box-shadow: 0 0 0 3px var(--ocean-soft); }
-  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  @media (min-width: 860px) {
-    .row.cols4 { grid-template-columns: repeat(4, 1fr); }
+  input:focus, select:focus { border-color: var(--gold); }
+  input::placeholder { color: #5d6b7a; }
+  .route-row { display: grid; grid-template-columns: 1fr 44px 1fr; gap: 10px; align-items: end; }
+  .route-row label { margin-top: 0; }
+  .route-arrow {
+    color: var(--gold); font-size: 20px; text-align: center; padding-bottom: 14px;
+    user-select: none;
   }
-  button {
-    margin-top: 16px; width: 100%; padding: 13px; border: none; border-radius: 11px;
-    background: var(--ocean); color: #ffffff; font-size: 15px; font-weight: 700;
+  .mini-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .mini-row input { padding: 11px 13px; font-size: 15px; }
+
+  .seg { display: flex; gap: 8px; margin-top: 6px; }
+  .seg button {
+    flex: 1; margin: 0; padding: 11px 0; border-radius: 11px;
+    background: var(--card2); color: var(--muted); border: 1px solid var(--line);
+    font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  .seg button.on {
+    background: var(--gold-soft); color: var(--gold); border-color: var(--gold);
+  }
+
+  details { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 4px; }
+  summary {
+    cursor: pointer; color: var(--muted); font-size: 13px; font-weight: 600;
+    padding: 10px 0; list-style: none;
+  }
+  summary::before { content: "+ "; color: var(--gold); font-weight: 700; }
+  details[open] summary::before { content: "- "; }
+
+  button.cta {
+    margin-top: 22px; width: 100%; padding: 16px; border: none; border-radius: 14px;
+    background: linear-gradient(135deg, var(--gold) 0%, var(--gold-deep) 100%);
+    color: #221503; font-size: 16px; font-weight: 800; letter-spacing: 0.2px;
     cursor: pointer;
   }
-  button:hover { background: var(--ocean-dark); }
-  button:disabled { opacity: 0.45; cursor: default; }
-  button.ghost { background: transparent; color: var(--ocean); border: 1.5px solid var(--ocean); font-weight: 600; }
-  button.ghost:hover { background: var(--ocean-soft); }
+  button.cta:disabled { opacity: 0.45; cursor: default; }
+  button.ghost {
+    margin-top: 12px; width: 100%; padding: 13px; border-radius: 12px;
+    background: transparent; color: var(--muted); border: 1px solid var(--line);
+    font-size: 14px; font-weight: 600; cursor: pointer;
+  }
   .msg { font-size: 13px; color: var(--muted); margin-top: 12px; min-height: 18px; }
-  .msg.err { color: #c0472b; }
+  .msg.err { color: #f08a7b; }
 
   /* ── destination strip ────────────────────────────────── */
-  .strip-title { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; margin: 26px 0 10px; }
-  .strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .strip-title { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin: 34px 0 12px; }
+  .strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
   .dest {
-    position: relative; border-radius: 14px; overflow: hidden; cursor: pointer;
-    width: 100%; height: 132px; aspect-ratio: 4 / 3; border: 1px solid var(--line); box-shadow: var(--shadow);
+    position: relative; border-radius: 16px; overflow: hidden; cursor: pointer;
+    width: 100%; height: 150px; aspect-ratio: 4 / 3;
+    border: 1px solid var(--line); box-shadow: var(--shadow);
     background-size: cover; background-position: center;
+    transition: transform .18s ease;
   }
+  .dest:hover { transform: translateY(-3px); }
   .dest::after {
     content: ""; position: absolute; inset: 0;
-    background: linear-gradient(180deg, transparent 45%, rgba(9, 45, 60, 0.66) 100%);
+    background: linear-gradient(180deg, rgba(12,16,22,0.05) 40%, rgba(12,16,22,0.82) 100%);
   }
   .dest span {
-    position: absolute; left: 10px; bottom: 8px; z-index: 1;
-    color: #fff; font-size: 14px; font-weight: 700; text-shadow: 0 1px 6px rgba(0,0,0,0.4);
+    position: absolute; left: 12px; bottom: 10px; z-index: 1;
+    color: #fff; font-size: 16px; font-weight: 700; letter-spacing: -0.2px;
   }
   .dest small {
-    position: absolute; left: 8px; top: 8px; z-index: 1;
-    background: rgba(255,255,255,0.94); color: var(--ocean-dark);
-    font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 99px;
+    position: absolute; left: 10px; top: 10px; z-index: 1;
+    background: rgba(12, 16, 22, 0.72); color: var(--gold);
+    border: 1px solid rgba(227, 172, 85, 0.35);
+    font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 99px;
+    backdrop-filter: blur(4px);
   }
 
   /* ── trip plan ────────────────────────────────────────── */
-  .progress-track { background: var(--sand); border-radius: 99px; height: 8px; margin: 14px 0 6px; overflow: hidden; }
-  .progress-fill { background: var(--ocean); height: 100%; width: 0%; transition: width 0.6s ease; }
-  .trip-title { font-size: 20px; font-weight: 700; }
-  .route { color: var(--muted); font-size: 13px; margin-top: 4px; }
-  .day { border-top: 1px solid var(--line); padding: 14px 0; }
-  .day h3 { font-size: 15px; margin-bottom: 6px; }
-  .day h3 span { color: var(--ocean); }
-  .item { font-size: 14px; color: var(--text); padding: 4px 0 4px 14px; position: relative; }
-  .item::before { content: ""; position: absolute; left: 0; top: 11px; width: 6px; height: 6px; border-radius: 50%; background: var(--ocean); }
-  .item small { color: var(--muted); display: block; }
-  .pill { display: inline-block; background: var(--sand); border: 1px solid var(--line); border-radius: 99px; padding: 4px 12px; font-size: 12px; color: var(--text); margin: 4px 6px 0 0; }
-  .transport-opt { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 10px; background: var(--bg); }
+  .progress-track { background: var(--card2); border-radius: 99px; height: 7px; margin: 16px 0 6px; overflow: hidden; }
+  .progress-fill { background: linear-gradient(90deg, var(--gold), var(--gold-deep)); height: 100%; width: 0%; transition: width 0.6s ease; }
+  .trip-title { font-size: 23px; font-weight: 800; letter-spacing: -0.5px; }
+  .route { color: var(--muted); font-size: 13px; margin-top: 5px; }
+  .day { border-top: 1px solid var(--line); padding: 16px 0; }
+  .day h3 { font-size: 15px; margin-bottom: 8px; font-weight: 700; }
+  .day h3 span { color: var(--gold); }
+  .item { font-size: 14px; color: var(--text); padding: 5px 0 5px 16px; position: relative; }
+  .item::before { content: ""; position: absolute; left: 0; top: 12px; width: 7px; height: 7px; border-radius: 50%; background: var(--gold); }
+  .item small { color: var(--muted); display: block; margin-top: 1px; }
+  .pill { display: inline-block; background: var(--card2); border: 1px solid var(--line); border-radius: 99px; padding: 5px 13px; font-size: 12px; color: var(--muted); margin: 5px 6px 0 0; }
+  .transport-opt { border: 1px solid var(--line); border-radius: 12px; padding: 13px 14px; margin-top: 10px; background: var(--card2); }
   .transport-opt b { font-size: 14px; }
   .transport-opt .meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
-  .unavail { border: 1px dashed var(--line); background: var(--bg); color: var(--muted); border-radius: 10px; padding: 12px; font-size: 13px; margin-top: 10px; line-height: 1.5; }
+  .unavail { border: 1px dashed rgba(255,255,255,0.16); background: var(--card2); color: var(--muted); border-radius: 12px; padding: 13px 14px; font-size: 13px; margin-top: 10px; line-height: 1.55; }
+  .sample-banner { background: rgba(227, 172, 85, 0.10); border: 1px solid rgba(227, 172, 85, 0.4); color: var(--gold); border-radius: 12px; padding: 11px 15px; font-size: 13px; font-weight: 600; margin-bottom: 14px; }
   .hidden { display: none; }
-  footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 40px; line-height: 1.7; }
-  a { color: var(--ocean); text-decoration: none; }
+  footer { text-align: center; color: #5d6b7a; font-size: 12px; margin-top: 46px; line-height: 1.7; }
+  a { color: var(--gold); text-decoration: none; }
   .signout { float: right; background: none; border: none; color: var(--muted); font-size: 12px; cursor: pointer; width: auto; margin: 0; padding: 4px; }
-  .signout:hover { color: var(--ocean); background: none; }
+  .signout:hover { color: var(--gold); background: none; }
 
-  @media (max-width: 560px) {
-    .hero { min-height: 220px; }
-    .hero-inner { padding: 72px 16px 78px; }
-    .hero h1 { font-size: 32px; }
-    .strip { grid-template-columns: 1fr 1fr; }
+  @media (max-width: 640px) {
+    .hero { min-height: 270px; }
+    .hero-inner { padding: 88px 16px 62px; }
+    .hero h1 { font-size: 38px; letter-spacing: -1.2px; }
+    .wrap { padding: 0 14px 70px; }
+    .card { padding: 20px; border-radius: 18px; }
+    .strip { grid-template-columns: 1fr 1fr; gap: 10px; }
+    .dest { height: 120px; }
+    .mini-row { grid-template-columns: 1fr 1fr; }
   }
 </style>
 </head>
 <body>
 <div class="hero">
   <div class="hero-inner">
-    <h1>Safar</h1>
+    <h1>Safar<em>.</em></h1>
     <p>Tell it where. It plans your route and day-by-day itinerary.</p>
   </div>
 </div>
@@ -145,14 +188,16 @@
 
   <!-- Auth -->
   <div class="card lift" id="auth-card">
+    <h2>Welcome back</h2>
+    <div class="sub">Sign in to plan your next trip.</div>
     <div id="auth-form">
       <label>Email</label>
       <input type="email" id="email" placeholder="you@example.com" autocomplete="email">
       <label>Password</label>
       <input type="password" id="password" placeholder="6+ characters" autocomplete="current-password">
-      <button id="signin-btn">Sign in</button>
-      <button class="ghost" id="signup-btn" disabled style="opacity:0.55;cursor:not-allowed">Sign-ups closed for now</button>
-      <div class="msg" style="margin-top:6px;min-height:0">New accounts are paused while Safar is in early testing.</div>
+      <button class="cta" id="signin-btn">Sign in</button>
+      <button class="ghost" id="signup-btn" disabled style="opacity:0.5;cursor:not-allowed">Sign-ups closed for now</button>
+      <div class="msg" style="margin-top:8px;min-height:0">New accounts are paused while Safar is in early testing.</div>
       <div class="msg" id="auth-msg"></div>
     </div>
   </div>
@@ -161,27 +206,37 @@
   <div id="planner" class="hidden">
     <button class="signout" id="signout-btn">sign out</button>
     <div class="card lift">
-      <div class="row cols4">
+      <h2>Plan a trip</h2>
+      <div class="sub">Two fields to start. Everything else is optional.</div>
+      <div class="route-row">
         <div><label>From</label><input id="origin" placeholder="Bengaluru"></div>
-        <div><label>To</label><input id="destination" placeholder="Gokarna"></div>
-        <div><label>Departure date</label><input type="date" id="departure_date"></div>
+        <div class="route-arrow">&rarr;</div>
+        <div><label>To</label><input id="destination" placeholder="Coorg"></div>
+      </div>
+      <label>Budget</label>
+      <div class="seg" id="budget-seg">
+        <button type="button" data-val="low">Low</button>
+        <button type="button" data-val="mid" class="on">Mid</button>
+        <button type="button" data-val="high">High</button>
+      </div>
+      <select id="budget" style="display:none">
+        <option value="low">Low</option>
+        <option value="mid" selected>Mid</option>
+        <option value="high">High</option>
+      </select>
+      <div class="mini-row">
         <div><label>Days</label><input type="number" id="days" value="3" min="1" max="14"></div>
-      </div>
-      <div class="row">
         <div><label>Travellers</label><input type="number" id="travelers" value="1" min="1" max="12"></div>
-        <div><label>Budget</label>
-          <select id="budget">
-            <option value="low">Low</option>
-            <option value="mid" selected>Mid</option>
-            <option value="high">High</option>
-          </select>
-        </div>
+        <div><label>Departure</label><input type="date" id="departure_date"></div>
       </div>
-      <label>Interests (comma separated, optional)</label>
-      <input id="interests" placeholder="beaches, cafes, trekking">
-      <label>Stops along the way (comma separated cities, optional)</label>
-      <input id="stops" placeholder="Hubballi">
-      <button id="plan-btn">Plan my trip</button>
+      <details>
+        <summary>Interests and stops along the way</summary>
+        <label>Interests (comma separated, optional)</label>
+        <input id="interests" placeholder="coffee estates, viewpoints, food">
+        <label>Stops along the way (comma separated cities, optional)</label>
+        <input id="stops" placeholder="Mysuru">
+      </details>
+      <button class="cta" id="plan-btn">Plan my trip</button>
       <div class="msg" id="plan-msg"></div>
     </div>
 
@@ -244,16 +299,6 @@ $("signin-btn").onclick = async () => {
   if (error) authMsg(error.message, true);
 };
 
-$("signup-btn").onclick = async () => {
-  authMsg("Creating account...");
-  const { data, error } = await supabase.auth.signUp({
-    email: $("email").value.trim(), password: $("password").value,
-  });
-  if (error) return authMsg(error.message, true);
-  if (data.session) return showPlanner();
-  authMsg("Account created. Confirm the email if asked, then sign in.");
-};
-
 $("signout-btn").onclick = async () => {
   await supabase.auth.signOut();
   location.reload();
@@ -268,6 +313,15 @@ function showPlanner() {
   $("auth-card").classList.add("hidden");
   $("planner").classList.remove("hidden");
 }
+
+// Budget segmented control -> hidden select the planner reads
+document.querySelectorAll("#budget-seg button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#budget-seg button").forEach(b => b.classList.remove("on"));
+    btn.classList.add("on");
+    $("budget").value = btn.dataset.val;
+  });
+});
 
 document.querySelectorAll(".dest").forEach(el => {
   el.addEventListener("click", () => {
@@ -345,11 +399,11 @@ function renderTrip(env) {
     env.status === "planning" ? "Planning... " + (env.progress || 0) + "%" :
     env.status === "ready" ? "Trip plan ready." : ("Status: " + env.status);
 
-  // Transport
+  // Transport: explicit unavailable state instead of silent emptiness
   const legs = doc.transport || [];
   if (env.status !== "planning") {
     const hasOptions = legs.some(leg => (leg.options || []).length > 0);
-    $("trip-transport").innerHTML = "<h3 style='margin-top:14px;font-size:15px'>Getting there</h3>" + (hasOptions
+    $("trip-transport").innerHTML = "<h3 style='margin-top:16px;font-size:15px'>Getting there</h3>" + (hasOptions
       ? legs.map(leg => {
           const opts = (leg.options || []).slice(0, 3).map(o =>
             `<div class="transport-opt"><b>${esc(o.mode || o.provider || "Option")}</b>` +
@@ -360,25 +414,25 @@ function renderTrip(env) {
       : `<div class="unavail">Live fares and bookable transport options are not available on this free deployment yet. The route above is AI-planned; check operators directly for tickets.</div>`);
   } else {
     $("trip-transport").innerHTML = legs.length
-      ? "<h3 style='margin-top:14px;font-size:15px'>Getting there</h3>" + legs.map(leg =>
+      ? "<h3 style='margin-top:16px;font-size:15px'>Getting there</h3>" + legs.map(leg =>
           `<div style="margin-top:10px"><span class="pill">${esc(leg.from || "")} → ${esc(leg.to || "")}</span></div>`).join("")
       : "";
   }
   // Stays: booking is not wired up on this deployment - say so explicitly.
-  if (env.status !== "planning") {
+  if (env.status !== "planning" && !$("stays-note")) {
     $("trip-notes").insertAdjacentHTML("beforebegin",
-      `<h3 style="margin-top:14px;font-size:15px">Stays</h3>` +
-      `<div class="unavail">Stay booking is not available on this free deployment yet. The itinerary suggests areas to stay; book directly with properties.</div>`);
+      `<h3 style="margin-top:16px;font-size:15px">Stays</h3>` +
+      `<div class="unavail" id="stays-note">Stay booking is not available on this free deployment yet. The itinerary suggests areas to stay; book directly with properties.</div>`);
   }
 
-  // Itinerary
-  const days = doc.itinerary || [];
+  // Itinerary (supports both flat day objects and city->days nesting)
+  const days = (doc.itinerary || []).flatMap(d => d.days ? d.days.map(dd => ({...dd, city: dd.city || d.city})) : [d]);
   $("trip-days").innerHTML = days.map((d, i) => {
-    const items = (d.items || d.activities || []).map(it =>
+    const items = (d.activities || d.items || []).map(it =>
       `<div class="item">${esc(it.title || it.name || it)}` +
       (it.description ? `<small>${esc(it.description)}</small>` : "") + `</div>`
     ).join("");
-    return `<div class="day"><h3><span>Day ${esc(d.day ?? i + 1)}</span> ${esc(d.city || d.title || "")}</h3>${items}</div>`;
+    return `<div class="day"><h3><span>Day ${esc(d.day ?? i + 1)}</span> ${esc(d.theme || d.city || d.title || "")}</h3>${items}</div>`;
   }).join("");
 
   // Notes
