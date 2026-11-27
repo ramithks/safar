@@ -35,6 +35,15 @@ logger = logging.getLogger(__name__)
 
 _client: httpx.AsyncClient | None = None
 
+# OpenRouter's account-level "free-models-per-day" 429 means every free model
+# on the key is dead until the daily reset. Sweeping the fallback list anyway
+# burns minutes while a trip spinner sits at "Starting", so the first such
+# 429 short-circuits all calls for a while (re-probed at most every 30 min,
+# since the reset moment is provider-side and unknown).
+_daily_quota_blocked_until = 0.0  # time.monotonic() deadline
+_DAILY_QUOTA_MARKERS = ("free-models-per-day", "free models per day",
+                        "daily quota")
+
 
 class FreeLLMError(RuntimeError):
     """All fallback models failed."""
@@ -182,6 +191,9 @@ def _usable(data: dict) -> bool:
 
 async def _chat(body: dict, *, models: list[str], timeout: float) -> dict:
     """Try each model in turn on rate-limit / transient errors."""
+    global _daily_quota_blocked_until
+    if time.monotonic() < _daily_quota_blocked_until:
+        raise FreeLLMError("free-models daily quota exhausted (cached)")
     client = _get_client()
     last_err: Exception | None = None
     for attempt, model in enumerate(models):
@@ -192,6 +204,16 @@ async def _chat(body: dict, *, models: list[str], timeout: float) -> dict:
             try:
                 resp = await client.post("/chat/completions", json=payload, timeout=timeout)
                 if resp.status_code in (429, 500, 502, 503, 504):
+                    if resp.status_code == 429:
+                        try:
+                            body_l = resp.text[:600].lower()
+                        except Exception:  # noqa: BLE001
+                            body_l = ""
+                        if any(mk in body_l for mk in _DAILY_QUOTA_MARKERS):
+                            _daily_quota_blocked_until = time.monotonic() + 1800
+                            logger.warning("[freellm] %s → daily free quota exhausted; failing fast (no fallback sweep)", model)
+                            raise FreeLLMError(
+                                f"{model}: free daily quota exhausted (free-models-per-day)")
                     ra = resp.headers.get("retry-after")
                     delay = min(float(ra), 8.0) if ra else min(2.0 * (retry + 1), 6.0)
                     logger.warning("[freellm] %s → %s, backing off %.1fs", model, resp.status_code, delay)

@@ -103,8 +103,8 @@
         <div><label>To</label><input id="destination" placeholder="Gokarna"></div>
       </div>
       <div class="row">
-        <div><label>Start date</label><input type="date" id="departure_date"></div>
-        <div><label>End date</label><input type="date" id="end_date"></div>
+        <div><label>Start (date &amp; time)</label><input type="datetime-local" id="departure_date"></div>
+        <div><label>End (date &amp; time)</label><input type="datetime-local" id="end_date"></div>
       </div>
       <div class="row">
         <div><label>Travellers</label><input type="number" id="travelers" value="1" min="1" max="12"></div>
@@ -216,12 +216,16 @@ function showPlanner() {
 }
 
 $("plan-btn").onclick = async () => {
-  const startD = $("departure_date").value || null;
-  const endD = $("end_date").value || null;
+  // datetime-local values are "YYYY-MM-DDTHH:MM"; a bare date means no clock time given.
+  const startV = $("departure_date").value || null;
+  const endV = $("end_date").value || null;
+  const splitDT = (v) => v && v.includes("T") ? { date: v.split("T")[0], time: v.split("T")[1] } : { date: v, time: null };
+  const startDT = splitDT(startV), endDT = splitDT(endV);
+  const startD = startDT.date, endD = endDT.date;
   let days = 3;
   if (startD && endD) {
+    if (new Date(endV) <= new Date(startV)) { $("plan-msg").textContent = "End must be after the start."; $("plan-msg").classList.add("err"); return; }
     const span = Math.round((new Date(endD) - new Date(startD)) / 86400000) + 1;
-    if (span < 1) { $("plan-msg").textContent = "End date must be on or after the start date."; $("plan-msg").classList.add("err"); return; }
     days = Math.min(span, 30);
   }
   const body = {
@@ -231,6 +235,8 @@ $("plan-btn").onclick = async () => {
     days: days,
     travelers: parseInt($("travelers").value || "1", 10),
     budget: $("budget").value,
+    start_time: startDT.time,
+    end_time: endDT.time,
     comments: $("comments").value.trim() || null,
   };
   if (!body.origin || !body.destination) {

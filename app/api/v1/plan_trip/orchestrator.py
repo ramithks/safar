@@ -191,7 +191,13 @@ async def run_plan_trip(body: PlanTripRequest, user_id: str, trace: RequestTrace
         interests=", ".join(body.interests) or "general sightseeing",
         notes_block=(("Traveller notes (respect these preferences; places named "
                       "here should appear in the plan): " + body.notes + "\n")
-                     if getattr(body, "notes", None) else ""),
+                     if getattr(body, "notes", None) else "")
+        + (("Timing constraints: " + "; ".join(t for t in [
+            (f"the trip starts at {body.start_time} local time on the first day - "
+             "keep that morning realistic" if getattr(body, "start_time", None) else ""),
+            (f"it must wrap up by {body.end_time} local time on the last day - "
+             "plan the final day accordingly" if getattr(body, "end_time", None) else ""),
+        ] if t) + ".\n") if (getattr(body, "start_time", None) or getattr(body, "end_time", None)) else ""),
     )
 
     # Deterministic sampling: identical filters → identical itinerary.

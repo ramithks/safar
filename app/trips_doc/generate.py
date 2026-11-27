@@ -144,6 +144,7 @@ async def _generate(trip_id: str, spec: dict, user_id: str,
         "travelers": travelers, "budget_tier": budget,
         "interests": spec.get("interests") or [], "stops": spec.get("stops") or [],
         "comments": spec.get("comments") or "",
+        "start_time": spec.get("start_time"), "end_time": spec.get("end_time"),
     }}
     await store.put_doc(trip_id, doc_from_graph(
         trip_id, spec, graph, status="planning", progress=10))
@@ -228,6 +229,8 @@ async def _fill_itineraries_and_stays(graph: G.TripGraph, stayed: list[G.TripSto
     from app.api.v1.plan_trip.models import PlanTripRequest
     from app.api.v1.plan_trip.orchestrator import run_plan_trip
 
+    first_stop_id = stayed[0].id if stayed else None
+
     async def _itinerary_for(node: G.TripStop) -> dict | None:
         days = (node.nights or 1) + (1 if node.role == "terminal" else 0)
         try:
@@ -237,6 +240,11 @@ async def _fill_itineraries_and_stays(graph: G.TripGraph, stayed: list[G.TripSto
                     travelers=travelers, interests=spec.get("interests") or [],
                     notes=spec.get("comments") or None,
                     start_date=node.arrival_date, end_date=node.departure_date,
+                    # Clock times bind where they actually happen: the start
+                    # time on the first stop's day 1, the end time on the
+                    # terminal stop's last day.
+                    start_time=(spec.get("start_time") if node.id == first_stop_id else None),
+                    end_time=(spec.get("end_time") if node.role == "terminal" else None),
                     skip_user_trips=True,
                 ),
                 user_id, profile={},

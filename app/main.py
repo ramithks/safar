@@ -104,6 +104,25 @@ async def lifespan(app: FastAPI):
         logger.info("Redis: %s (REDIS_URL unset, using the default)",
                     redis_target())
 
+    # Orphaned-trip sweep: in-process generation dies with the process, so any
+    # trip left "planning" by a previous life is terminal in truth. Runs after
+    # boot so the service is live first; the 3-minute age guard avoids racing a
+    # briefly-overlapping old instance's fresh writes.
+    try:
+        import asyncio as _asyncio
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        from app.trips_doc import store as _trip_store
+
+        async def _orphan_sweep() -> None:
+            cutoff = (_dt.now(_tz.utc) - _td(minutes=3)).isoformat()
+            await _trip_store.fail_orphaned_planning(
+                "This plan was interrupted when the server restarted (the free "
+                "host sleeps and redeploys). Please start a new trip.", cutoff)
+
+        _asyncio.get_event_loop().create_task(_orphan_sweep())
+    except Exception as _exc:  # noqa: BLE001 - never block startup on the sweep
+        logger.warning("[trip-doc] orphan sweep scheduling failed: %s", _exc)
+
     logger.info(f"Safar backend started (env={settings.app_env})")
     yield
     logger.info("Safar backend shutting down")

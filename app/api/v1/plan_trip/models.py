@@ -15,6 +15,19 @@ def _validate_not_past_date(v: str | None) -> str | None:
     return v
 
 
+def _validate_hhmm(v: str | None) -> str | None:
+    if not v:
+        return v
+    try:
+        hh, mm = v.split(":")
+        h, m = int(hh), int(mm)
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise ValueError("time must be in HH:MM 24-hour format")
+    return f"{int(hh):02d}:{int(mm):02d}"
+
+
 class PlanTripRequest(BaseModel):
     destination: str
     days: int = 3
@@ -24,9 +37,16 @@ class PlanTripRequest(BaseModel):
     interests: list[str] = []
     start_date: str | None = None
     end_date: str | None = None
+    start_time: str | None = None   # "HH:MM" local — trip starts this time on day 1
+    end_time: str | None = None     # "HH:MM" local — trip wraps up by this time on the last day
     is_public: bool = True
     skip_user_trips: bool = False
     include_itinerary: bool = True
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_times(cls, v: str | None) -> str | None:
+        return _validate_hhmm(v)
 
     @field_validator("destination")
     @classmethod
@@ -124,11 +144,18 @@ class PlanRequest(BaseModel):
     interests: list[str] = []
     stops: list[StopSpec] = []
     comments: str | None = None     # free-text preferences; stops may be named here
+    start_time: str | None = None   # "HH:MM" local — leaving around this time on day 1
+    end_time: str | None = None     # "HH:MM" local — back by this time on the last day
 
     @field_validator("departure_date")
     @classmethod
     def validate_departure_date(cls, v: str | None) -> str | None:
         return _validate_not_past_date(v)
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_times(cls, v: str | None) -> str | None:
+        return _validate_hhmm(v)
 
     @field_validator("stops", mode="before")
     @classmethod

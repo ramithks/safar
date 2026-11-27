@@ -120,3 +120,32 @@ def archive_doc_sync(trip_id: str, doc: dict, reason: str) -> None:
             .eq("trip_id", trip_id).order("created_at", desc=True).execute().data or [])
     for stale in rows[5:]:
         db.table("trip_snapshots").delete().eq("id", stale["id"]).execute()
+
+
+# ── startup orphan sweep ─────────────────────────────────────────────────────
+
+def _stale_planning_ids_sync(older_than_iso: str) -> list[str]:
+    res = (get_db().table("trip_states").select("id")
+           .eq("status", "planning").lt("updated_at", older_than_iso).execute())
+    return [r["id"] for r in (res.data or [])]
+
+
+async def fail_orphaned_planning(reason: str, older_than_iso: str) -> int:
+    """Generation runs in this process, so a trip still 'planning' long after
+    its last write at boot was orphaned by a restart, deploy or free-tier
+    sleep and will never advance. Mark it a terminal error with an honest
+    reason instead of letting it spin forever. The age guard avoids touching
+    a fresh trip a briefly-overlapping old instance may still be writing."""
+    try:
+        ids = await run_db(_stale_planning_ids_sync, older_than_iso)
+    except Exception:  # noqa: BLE001 - a boot sweep must never block startup
+        logger.error("[trip-doc] orphan sweep query failed", exc_info=True)
+        return 0
+    for trip_id in ids:
+        try:
+            await set_status(trip_id, "error", progress=100, error=reason)
+        except Exception:  # noqa: BLE001
+            logger.error("[trip-doc] could not orphan-fail %s", trip_id)
+    if ids:
+        logger.info("[trip-doc] marked %d orphaned planning trip(s) as error", len(ids))
+    return len(ids)
