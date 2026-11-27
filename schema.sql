@@ -1,3 +1,7 @@
+-- Safar fresh-project fix: helper SQL functions reference tables created
+-- later in this file; PG validates SQL function bodies at CREATE time otherwise.
+SET check_function_bodies = false;
+
 -- Safar — single source of truth
 -- Run this on a fresh Supabase project to recreate the full schema.
 

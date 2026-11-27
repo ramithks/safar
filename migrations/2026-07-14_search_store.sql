@@ -134,4 +134,3 @@ CREATE POLICY trip_memory_read ON public.trip_memory FOR SELECT
                  WHERE t.id = trip_memory.trip_id
                    AND (t.user_id = auth.uid() OR t.visibility IN ('link','public'))));
 -- No INSERT/UPDATE/DELETE policies: writes go through the service role (bypasses RLS).
-</content>
